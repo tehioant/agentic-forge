@@ -42,7 +42,7 @@ python -m factory_v1 --state /private/operator/state.sqlite --operator-id 42 \
 
 Successful commands print one JSON record and exit 0. Refusals and operational errors print a JSON error on stderr and exit 2; argument errors use argparse's stderr/help and exit 2.
 
-- Missing approval, wrong operator, ambiguous repository/origin, unknown fields, malformed/duplicate JSON fields and invalid issue references are refused before creating state.
+- Missing approval, wrong operator, ambiguous repository/origin, unknown fields, malformed/duplicate JSON fields and invalid issue references are refused before creating state. GitHub owner names cannot start/end with a hyphen or contain consecutive hyphens. JSON parser-limit failures are reported as `invalid_intake` without weakening Python's limits.
 - The first approved iteration is `active`. Further approved iterations are `paused`. A serialized SQLite transaction makes concurrent registration obey the same rule.
 - Identical registration returns the original record and identities. Changed scope, provenance or work-item reference for the same project/iteration is an `intake_conflict`, not a silent update.
 - Each record exposes project, iteration and stage, an optional work-item reference, an intake control-run ID and evidence ID. The control-run ID identifies local registration, **not** a worker or model invocation. `worker_run_id` is null; no worker is started.
@@ -57,6 +57,6 @@ PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s factory_v1/tests -v
 python -m compileall -q factory_v1
 ```
 
-Tests invoke the actual public CLI in fresh subprocesses against temporary SQLite files. They cover restart inspection, refused intake, idempotent/conflicting replay, concurrent one-active admission, persistent correlations, read-only missing-state inspection, malformed/missing request handling and private new-state permissions. They do not mock the controller or pretend to prove external/container/notification/spending boundaries.
+Tests invoke the actual public CLI in fresh subprocesses against temporary SQLite files. They cover restart inspection, refused intake, idempotent/conflicting replay, concurrent one-active admission, persistent correlations, read-only missing-state inspection, malformed/missing request handling, parser-limit failures, nonpersistent state refusal, exact GitHub owner boundaries and private new-state permissions. They do not mock the controller or pretend to prove external/container/notification/spending boundaries.
 
 The `Fresh factory v1` GitHub Actions workflow exercises these same tests on Python 3.11 and 3.13 using read-only repository permission and pinned action revisions. Independent requirement/security review and integrated-main verification are still required before issue #5 can close. This tracer bullet is not a functioning autonomous factory.

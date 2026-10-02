@@ -179,6 +179,26 @@ class IntakeLifecycleTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
 
 
+    def test_oversized_json_integer_has_a_structured_refusal_without_state(self):
+        path = self.root / 'oversized-integer.json'
+        path.write_text(json.dumps(self.request)[:-1] + ', "work_item_number": ' + '9' * 5000 + '}')
+        result = self.invoke('register', '--request', str(path))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(self.state.exists())
+
+
+    def test_deeply_nested_json_has_a_structured_refusal_without_state(self):
+        path = self.root / 'deeply-nested.json'
+        path.write_text('[' * 1200 + '0' + ']' * 1200)
+        result = self.invoke('register', '--request', str(path))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
+        self.assertEqual(result.stdout, '')
+        self.assertFalse(self.state.exists())
+
+
     def test_invalid_github_owner_syntax_is_refused_without_creating_state(self):
         for index, owner in enumerate(['owner-', 'owner--name', '-owner', 'x' * 40]):
             self.state = self.root / f'invalid-owner-{index}.sqlite'

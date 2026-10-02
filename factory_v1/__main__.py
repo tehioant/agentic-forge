@@ -116,7 +116,10 @@ def main():
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command == 'register':
         with open(args.request, encoding='utf-8') as source:
-            item = json.load(source, object_pairs_hook=unique_fields)
+            try:
+                item = json.load(source, object_pairs_hook=unique_fields)
+            except (ValueError, RecursionError) as error:
+                raise IntakeError('invalid_intake', 'Intake must be unambiguous UTF-8 JSON within parser limits.') from error
         validate_intake(item, args.operator_id)
         connection = sqlite3.connect(args.state)
         with closing(connection) as database, database:
