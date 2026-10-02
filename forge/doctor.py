@@ -30,8 +30,24 @@ def check_configuration(home: Path) -> dict:
         home_exists = False
     record("home", home_exists, "Supply an existing Forge home directory with --home.")
 
-    runtime_exists = home_exists and regular_file(home / "runtime.json")
-    record("runtime", runtime_exists, "Provide a readable runtime.json file in the Forge home.")
+    def safe_runtime() -> bool:
+        runtime = home / "runtime.json"
+        try:
+            # Reject symlinks before opening, including dangling credential aliases.
+            if not stat.S_ISREG(runtime.stat(follow_symlinks=False).st_mode):
+                return False
+            try:
+                # Device/inode comparison also catches hard links and a snapshot
+                # symlink pointing back to runtime. This inspects metadata only.
+                return not runtime.samefile(home / "secrets" / "codex-access.json")
+            except FileNotFoundError:
+                return True
+        except (OSError, ValueError):
+            return False
+
+    runtime_exists = home_exists and safe_runtime()
+    record("runtime", runtime_exists,
+           "Provide a readable, non-symlink runtime.json distinct from the inference snapshot.")
     settings = None
     if runtime_exists:
         try:

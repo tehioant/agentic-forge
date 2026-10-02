@@ -60,6 +60,30 @@ class DoctorTests(unittest.TestCase):
         self.runtime.unlink()
         self.assert_failed("runtime")
 
+    def test_runtime_aliases_never_open_credentials(self):
+        for alias in ("symlink", "hardlink", "snapshot_symlink"):
+            with self.subTest(alias=alias):
+                self.runtime.unlink()
+                if alias == "symlink":
+                    self.runtime.symlink_to(self.secret)
+                elif alias == "hardlink":
+                    self.runtime.hardlink_to(self.secret)
+                else:
+                    self.runtime.write_bytes(b"synthetic credential content")
+                    self.secret.unlink()
+                    self.secret.symlink_to(self.runtime)
+                with patch.object(Path, "open", side_effect=AssertionError("credential read forbidden")):
+                    report = self.assert_failed("runtime")
+                self.assertIs(report["checks"]["settings"], False)
+                self.assertNotIn("synthetic credential content", json.dumps(report))
+
+    def test_dangling_runtime_snapshot_alias_is_not_opened(self):
+        self.runtime.unlink()
+        self.secret.unlink()
+        self.runtime.symlink_to(self.secret)
+        with patch.object(Path, "open", side_effect=AssertionError("credential read forbidden")):
+            self.assert_failed("runtime")
+
     def test_malformed_settings(self):
         for content in (b"{", b"\xff", b"[]", b"null", b'"text"', b"42"):
             with self.subTest(content=content):
