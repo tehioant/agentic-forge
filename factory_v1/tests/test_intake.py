@@ -25,9 +25,9 @@ class IntakeLifecycleTests(unittest.TestCase):
             },
         }
 
-    def invoke(self, *arguments):
+    def invoke(self, *arguments, state=None):
         return subprocess.run(
-            [sys.executable, '-m', 'factory_v1', '--state', str(self.state),
+            [sys.executable, '-m', 'factory_v1', '--state', str(self.state if state is None else state),
              '--operator-id', '42', *arguments],
             text=True, capture_output=True, timeout=15,
             env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
@@ -177,6 +177,22 @@ class IntakeLifecycleTests(unittest.TestCase):
             os.umask(previous)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
+
+
+    def test_nonpersistent_state_targets_are_refused_without_creating_state(self):
+        request = self.root / 'request.json'
+        request.write_text(json.dumps(self.request))
+        for state in ['', ':memory:']:
+            for arguments in [
+                ('register', '--request', str(request)),
+                ('inspect', '--project', 'approved-product', '--iteration', 'milestone-1'),
+            ]:
+                with self.subTest(state=state, command=arguments[0]):
+                    result = self.invoke(*arguments, state=state)
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertEqual(json.loads(result.stderr)['error'], 'invalid_state')
+                    self.assertEqual(result.stdout, '')
+        self.assertEqual(list(self.root.iterdir()), [request])
 
 
     def test_adding_a_work_item_to_a_registered_intake_is_a_conflict_not_a_crash(self):

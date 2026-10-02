@@ -112,6 +112,8 @@ def main():
     inspect.add_argument('--project', required=True)
     inspect.add_argument('--iteration', required=True)
     args = parser.parse_args()
+    if args.state in {'', ':memory:'}:
+        raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command == 'register':
         with open(args.request, encoding='utf-8') as source:
             item = json.load(source, object_pairs_hook=unique_fields)

@@ -46,7 +46,7 @@ Successful commands print one JSON record and exit 0. Refusals and operational e
 - The first approved iteration is `active`. Further approved iterations are `paused`. A serialized SQLite transaction makes concurrent registration obey the same rule.
 - Identical registration returns the original record and identities. Changed scope, provenance or work-item reference for the same project/iteration is an `intake_conflict`, not a silent update.
 - Each record exposes project, iteration and stage, an optional work-item reference, an intake control-run ID and evidence ID. The control-run ID identifies local registration, **not** a worker or model invocation. `worker_run_id` is null; no worker is started.
-- State and approval/origin survive a fresh process. `inspect` is read-only and never creates missing state. No daemon is needed for this slice.
+- State and approval/origin survive a fresh process. `--state` must name a persistent SQLite file; empty arguments and the special `:memory:` target are refused as `invalid_state` by both commands. `inspect` is read-only and never creates missing state. No daemon is needed for this slice.
 - `execution_allowed` is always false, even for an active approved iteration: worker isolation, spending admission, repository access, scheduling and merge gates are not implemented here. Active means admitted intake, not runnable work.
 - No GitHub writes, notifications, charges, worker launches, merges or deployment occur. No pause/resume scheduler or crash reconciliation of external actions is claimed.
 
