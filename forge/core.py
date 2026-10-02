@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import fnmatch
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,10 @@ from .hermes import managed_command
 
 class ForgeError(RuntimeError):
     """Expected, user-facing Forge failure."""
+
+
+class ForgePaused(ForgeError):
+    """Cooperative stop requested at an execution boundary."""
 
 
 _SLUG = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -279,6 +284,22 @@ class Forge:
             self.runtime = DockerRuntime(self.forge_root)
         return self.runtime
 
+    def _check_pause(self, project: str) -> None:
+        state = _json_load(self.state_root / "projects" / project / "state.json", {})
+        if state.get("paused"):
+            raise ForgePaused("project paused at execution boundary")
+
+    def _candidate_fingerprint(self, workspace: Path) -> str:
+        digest = hashlib.sha256()
+        digest.update(_git(workspace, "diff", "--no-ext-diff", "--no-textconv", "--binary", "HEAD", "--").encode())
+        for name in self._changed(workspace):
+            digest.update(name.encode() + bytes([0]))
+            path = workspace / name
+            if path.is_file():
+                digest.update(str(path.lstat().st_mode).encode() + bytes([0]))
+                digest.update(path.read_bytes())
+        return digest.hexdigest()
+
     def _allowed(self, changed: list[str], globs: list[str]) -> bool:
         return all(any(fnmatch.fnmatchcase(name, pattern) for pattern in globs) for name in changed)
 
@@ -356,6 +377,7 @@ class Forge:
                 raise ForgeError("campaign ticket cap already reached")
             results = []
             for tid in selected:
+                self._check_pause(project)
                 if self.clock() >= state["deadline"]:
                     raise ForgeError("campaign deadline expired")
                 ticket = known.get(tid)
@@ -371,9 +393,11 @@ class Forge:
                 # Native Kanban owns card lifecycle; transition and verify before workers start.
                 running = self._show(project, tid)
                 if running.get("status") == "blocked" and ts.get("status") == "failed":
+                    self._check_pause(project)
                     self._cli("kanban", "--board", project, "unblock", tid)
                     running = self._show(project, tid)
                 if running.get("status") == "ready":
+                    self._check_pause(project)
                     self._cli("kanban", "--board", project, "claim", tid, "--ttl", "3600")
                     running = self._show(project, tid)
                 if running.get("status") != "running":
@@ -402,13 +426,33 @@ class Forge:
         if self._head(workspace) != ts.get("last_head", baseline):
             raise ForgeError("workspace HEAD drifted from persisted campaign state")
         try:
+            # A prior run may have validated review evidence and paused before
+            # the native handoff. Reuse that evidence without charging another
+            # reviewer attempt, but only while the reviewed workspace is exact.
+            saved_review = ts.get("review")
+            if (isinstance(saved_review, dict) and saved_review.get("passed") is True
+                    and saved_review.get("head") == self._head(workspace)
+                    and isinstance(saved_review.get("summary"), str)
+                    and saved_review["summary"].strip()
+                    and saved_review.get("workspace_fingerprint") == self._candidate_fingerprint(workspace)):
+                self._check_pause(project)
+                self._cli("kanban", "--board", project, "request-review", tid, "--force",
+                          "--summary", saved_review["summary"], "--metadata",
+                          json.dumps({"reviewed_head": saved_review["head"], "workspace": str(workspace)}))
+                reviewed = self._show(project, tid)
+                if str(reviewed.get("id")) != tid or reviewed.get("status") != "review":
+                    raise ForgeError("native card did not enter review state")
+                ts["status"] = "review"
+                registry = self._projects()
+                registry[project]["tickets"][tid]["status"] = "review"
+                _atomic_json(self.projects_path, registry)
+                _atomic_json(campaign_path, state)
+                return {"id": tid, "status": "review", "head": saved_review["head"]}
             runtime = self._get_runtime()
             for stage in ("builder", "simplifier"):
                 if stage in ts.get("completed_stages", []):
                     continue
-                current_project_state = _json_load(self.state_root / "projects" / project / "state.json", {})
-                if current_project_state.get("paused"):
-                    raise ForgeError("project paused between stages")
+                self._check_pause(project)
                 if ts["status"] == "review":
                     break
                 if ts["attempts"][stage] >= _MAX_ATTEMPTS:
@@ -416,11 +460,14 @@ class Forge:
                 ts["attempts"][stage] += 1  # Interrupted work still consumes an attempt.
                 _atomic_json(campaign_path, state)
                 prompt = self._worker_prompt(stage, project, tid, ticket, workspace, baseline)
+                if ts.get("review_feedback"):
+                    prompt += "\nIndependent review feedback (verify it; fix only within the approved specification/scope):\n" + ts["review_feedback"]
                 remaining = int(state["deadline"] - self.clock())
                 if remaining <= 0:
                     raise ForgeError("campaign deadline expired")
                 response = runtime.run(stage, workspace, prompt, timeout=min(900, remaining),
                                        log=self.state_root / "logs" / project / campaign / f"{tid}-{stage}-{ts['attempts'][stage]}.log")
+                self._check_pause(project)
                 if not isinstance(response, dict) or response.get("passed") is not True:
                     raise ForgeError(f"{stage} did not return passing evidence")
                 if response.get("head") != self._head(workspace):
@@ -429,13 +476,18 @@ class Forge:
                 if not self._allowed(changed, ticket["allow_path"]):
                     raise ForgeError("workspace scope drift outside allowed paths")
                 self._check_credentials(workspace, changed)
+                candidate = self._candidate_fingerprint(workspace)
                 remaining = int(state["deadline"] - self.clock())
                 if remaining <= 0:
                     raise ForgeError("campaign deadline expired")
                 runtime.verify(workspace, [proj["verify"]], timeout=min(600, remaining),
                                log=self.state_root / "logs" / project / campaign / f"{tid}-{stage}-verify-{ts['attempts'][stage]}.log")
+                self._check_pause(project)
                 if self._changed(workspace) != changed:
                     raise ForgeError("verification changed the proposed file set")
+                self._check_credentials(workspace, changed)
+                if self._candidate_fingerprint(workspace) != candidate:
+                    raise ForgeError("verification mutated candidate bytes or modes")
                 if stage == "builder" and changed:
                     _git(workspace, "add", "--", *changed)
                     _git(workspace, "-c", "core.hooksPath=/dev/null", "-c", "user.name=Agentic Forge", "-c", "user.email=forge@localhost", "commit", "--no-gpg-sign", "-m", f"forge: {tid}")
@@ -446,9 +498,11 @@ class Forge:
                 ts.setdefault("completed_stages", []).append(stage)
                 _atomic_json(campaign_path, state)
             # Reviewer examines the exact post-verify tree read-only.
+            self._check_pause(project)
             if ts["attempts"]["reviewer"] >= _MAX_ATTEMPTS:
                 raise ForgeError("reviewer attempt limit reached")
             before_head, before_changes = self._head(workspace), self._changed(workspace)
+            reviewed_fingerprint = self._candidate_fingerprint(workspace)
             ts["attempts"]["reviewer"] += 1
             _atomic_json(campaign_path, state)
             remaining = int(state["deadline"] - self.clock())
@@ -457,36 +511,51 @@ class Forge:
             response = runtime.run("reviewer", workspace,
                                    self._worker_prompt("reviewer", project, tid, ticket, workspace, baseline),
                                    timeout=min(900, remaining), log=self.state_root / "logs" / project / campaign / f"{tid}-reviewer-{ts['attempts']['reviewer']}.log", read_only=True)
-            if isinstance(response, dict) and response.get("passed") is False:
+            self._check_pause(project)
+            if (isinstance(response, dict) and response.get("passed") is False
+                    and response.get("head") == before_head
+                    and isinstance(response.get("summary"), str) and response["summary"].strip()
+                    and self._head(workspace) == before_head and self._changed(workspace) == before_changes):
                 ts["cycles"] = ts.get("cycles", 0) + 1
+                ts["review_feedback"] = response["summary"][:8192]
+                ts["completed_stages"] = []
                 _atomic_json(campaign_path, state)
                 if ts["cycles"] > _MAX_CYCLES:
                     raise ForgeError("review-fix cycle limit reached")
             if (not isinstance(response, dict) or response.get("passed") is not True
                     or not isinstance(response.get("summary"), str) or not response["summary"].strip()
                     or response.get("head") != before_head or self._head(workspace) != before_head
-                    or self._changed(workspace) != before_changes):
+                    or self._changed(workspace) != before_changes
+                    or self._candidate_fingerprint(workspace) != reviewed_fingerprint):
                 raise ForgeError("review evidence invalid, missing, or workspace mutated")
             remaining = int(state["deadline"] - self.clock())
             if remaining <= 0:
                 raise ForgeError("campaign deadline expired")
             runtime.verify(workspace, [proj["verify"]], timeout=min(600, remaining),
                            log=self.state_root / "logs" / project / f"{tid}-final-verify.log")
-            if self._head(workspace) != before_head or self._changed(workspace) != before_changes:
+            self._check_pause(project)
+            if (self._head(workspace) != before_head or self._changed(workspace) != before_changes
+                    or self._candidate_fingerprint(workspace) != reviewed_fingerprint):
                 raise ForgeError("verification mutated reviewed workspace")
-            ts["status"] = "review"
-            ts["review"] = {"passed": True, "summary": str(response.get("summary", "")), "head": before_head}
+            ts["review"] = {"passed": True, "summary": str(response.get("summary", "")),
+                             "head": before_head, "workspace_fingerprint": reviewed_fingerprint}
             _atomic_json(campaign_path, state)
             # Native lifecycle remains in review; never mark done or integrate.
+            self._check_pause(project)
             self._cli("kanban", "--board", project, "request-review", tid, "--force", "--summary", response["summary"], "--metadata", json.dumps({"reviewed_head": before_head, "workspace": str(workspace)}))
             reviewed = self._show(project, tid)
             if str(reviewed.get("id")) != tid or reviewed.get("status") != "review":
                 raise ForgeError("native card did not enter review state")
+            ts["status"] = "review"
             registry = self._projects()
             registry[project]["tickets"][tid]["status"] = "review"
             _atomic_json(self.projects_path, registry)
             _atomic_json(campaign_path, state)
             return {"id": tid, "status": "review", "head": before_head}
+        except ForgePaused:
+            # A cooperative pause preserves progress and budgets without changing lifecycle state.
+            _atomic_json(campaign_path, state)
+            raise
         except Exception as e:
             ts["status"] = "failed"
             ts["error"] = str(e)

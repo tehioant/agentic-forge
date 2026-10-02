@@ -45,7 +45,7 @@ HERMES_HOME=$HOME/.local/share/agentic-forge/hermes hermes kanban --board my-pro
 
 One global implementation writer initially, at most five distinct approved tickets per named campaign, a one-hour absolute campaign deadline, at most two attempts per stage and two review/fix cycles. Each agent attempt is capped at 15 minutes and 60 tool iterations. Reusing the campaign name resumes its remaining budget; it does not reset a failed stage's count. A new batch requires an explicit new campaign. Conflicts, credentials, scope changes, bad evidence and exhausted limits fail closed.
 
-Project pauses and failure state are separate. The shared writer lock can temporarily make another project busy; it is not a shared failure/paused flag. A paused project must be resumed explicitly. A killed controller may require cleanup of its named `forge-*` container before resuming; consult status/evidence rather than deleting workspaces.
+Project pauses and failure state are separate. Pause is cooperative: the active worker/check may finish, but the controller stops at the next boundary before another stage, candidate commit or review transition. It is not an immediate container cancellation. The shared writer lock can temporarily make another project busy; it is not a shared failure/paused flag. A paused project must be resumed explicitly. A killed controller may require cleanup of its named `forge-*` container before resuming; consult status/evidence rather than deleting workspaces.
 
 ## Boundaries
 

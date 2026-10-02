@@ -253,6 +253,176 @@ class ForgeTests(unittest.TestCase):
             self.forge.run("demo", campaign="credential", ticket_ids=[self.ticket])
         self.assertEqual(self.native.cards[self.ticket]["status"], "blocked")
 
+    def test_source_fsmonitor_is_disabled_during_registration(self):
+        marker=self.root/'source-monitor-ran'
+        monitor=self.root/'source-monitor.sh'
+        monitor.write_text(f'#!/bin/sh\nprintf invoked > {marker}\n')
+        monitor.chmod(0o755)
+        git(self.repo,'config','core.fsmonitor',str(monitor))
+        # Controlled fixture proves Git would invoke the source-local program.
+        git(self.repo,'status','--porcelain')
+        self.assertTrue(marker.exists())
+        marker.unlink()
+        self.forge.register('monitor-proof',self.repo,verify=['true'])
+        self.assertFalse(marker.exists(),'Trusted controller must override source-local fsmonitor')
+
+    def test_campaign_cannot_raise_initial_ticket_cap_on_resume(self):
+        self.forge.run('demo',campaign='single-ticket',max_tickets=1,ticket_ids=[])
+        second=self.forge.ticket('demo','Second',spec_file=self.spec,allow_path=['answer.txt'])['id']
+        self.forge.approve('demo',self.ticket)
+        self.forge.approve('demo',second)
+        with self.assertRaisesRegex(ForgeError,'campaign ticket cap'):
+            self.forge.run('demo',campaign='single-ticket',max_tickets=2,ticket_ids=[self.ticket,second])
+        self.assertEqual(self.runtime.calls,[])
+        saved=json.loads((self.root/'state/campaigns/demo/single-ticket.json').read_text())
+        self.assertEqual(saved['max_tickets'],1)
+
+    def test_pause_after_simplifier_stops_review_without_failing_or_blocking(self):
+        self.forge.approve('demo',self.ticket)
+        original=self.runtime.run
+        pause_once=[True]
+        def pause_at_simplifier(role,workspace,prompt,**kwargs):
+            result=original(role,workspace,prompt,**kwargs)
+            if role=='simplifier' and pause_once[0]:
+                pause_once[0]=False
+                self.forge.pause('demo')
+            return result
+        self.runtime.run=pause_at_simplifier
+        with self.assertRaisesRegex(ForgeError,'paused'):
+            self.forge.run('demo',campaign='pause-boundary',ticket_ids=[self.ticket])
+        self.assertNotIn(('reviewer',True),self.runtime.calls)
+        self.assertEqual(self.native.cards[self.ticket]['status'],'running')
+        self.assertTrue(self.forge.status('demo')['paused'])
+        self.assertFalse(self.forge.status('demo')['failed'])
+
+        campaign_path=self.root/'state/campaigns/demo/pause-boundary.json'
+        saved=json.loads(campaign_path.read_text())
+        deadline=saved['deadline']
+        self.assertEqual(saved['tickets'][self.ticket]['attempts'],
+                         {'builder':1,'simplifier':1,'reviewer':0})
+        self.assertEqual(saved['tickets'][self.ticket]['completed_stages'],['builder'])
+        self.assertNotEqual(saved['tickets'][self.ticket]['status'],'failed')
+
+        self.forge.resume('demo')
+        self.assertEqual(self.forge.run('demo',campaign='pause-boundary',ticket_ids=[self.ticket])
+                         ['tickets'][0]['status'],'review')
+        resumed=json.loads(campaign_path.read_text())
+        self.assertEqual(resumed['deadline'],deadline)
+        self.assertEqual(resumed['tickets'][self.ticket]['attempts'],
+                         {'builder':1,'simplifier':2,'reviewer':1})
+        self.assertEqual(self.native.cards[self.ticket]['status'],'review')
+
+    def test_pause_after_local_review_evidence_resumes_native_handoff_without_recharging(self):
+        self.forge.approve('demo',self.ticket)
+        campaign_path=self.root/'state/campaigns/demo/native-handoff.json'
+        original_check=self.forge._check_pause
+        paused=[False]
+        def pause_at_native_boundary(project):
+            saved=json.loads(campaign_path.read_text()) if campaign_path.exists() else {}
+            ts=saved.get('tickets',{}).get(self.ticket,{})
+            if (not paused[0] and ts.get('review',{}).get('passed') is True
+                    and ts.get('status') != 'review'
+                    and self.native.cards[self.ticket]['status'] == 'running'):
+                paused[0]=True
+                self.forge.pause(project)
+            original_check(project)
+        self.forge._check_pause=pause_at_native_boundary
+        with self.assertRaisesRegex(ForgeError,'paused'):
+            self.forge.run('demo',campaign='native-handoff',ticket_ids=[self.ticket])
+        self.assertTrue(paused[0])
+        saved=json.loads(campaign_path.read_text())
+        ts=saved['tickets'][self.ticket]
+        deadline=saved['deadline']
+        attempts=dict(ts['attempts'])
+        self.assertNotEqual(ts['status'],'review')
+        self.assertTrue(ts['review']['passed'])
+        self.assertEqual(self.native.cards[self.ticket]['status'],'running')
+        self.assertNotEqual(self.forge._projects()['demo']['tickets'][self.ticket]['status'],'review')
+        self.assertFalse(self.forge.status('demo')['failed'])
+        self.assertNotIn('block', [arg for cmd in self.native.commands for arg in cmd])
+
+        self.forge._check_pause=original_check
+        self.forge.resume('demo')
+        result=self.forge.run('demo',campaign='native-handoff',ticket_ids=[self.ticket])
+        self.assertEqual(result['tickets'][0]['status'],'review')
+        resumed=json.loads(campaign_path.read_text())
+        self.assertEqual(resumed['deadline'],deadline)
+        self.assertEqual(resumed['tickets'][self.ticket]['attempts'],attempts)
+        self.assertEqual(self.runtime.calls.count(('reviewer',True)),1)
+        self.assertEqual(self.native.cards[self.ticket]['status'],'review')
+        self.assertEqual(self.forge._projects()['demo']['tickets'][self.ticket]['status'],'review')
+        self.assertEqual(resumed['tickets'][self.ticket]['status'],'review')
+
+    def test_verification_cannot_mutate_candidate_bytes_before_host_commit(self):
+        self.forge.approve('demo',self.ticket)
+        original=self.runtime.verify
+        def mutate(workspace,commands,**kwargs):
+            original(workspace,commands,**kwargs)
+            (workspace/'answer.txt').write_text('tampered by checks\n')
+        self.runtime.verify=mutate
+        with self.assertRaisesRegex(ForgeError,'verification mutated candidate'):
+            self.forge.run('demo',campaign='mutating-check',ticket_ids=[self.ticket])
+        workspace=self.root/'state/workspaces/demo/mutating-check'/self.ticket
+        self.assertEqual(git(workspace,'rev-parse','HEAD'),git(self.repo,'rev-parse','HEAD'))
+
+    def _assert_final_verification_mutation_rejected(self, mutation):
+        self.forge.approve("demo", self.ticket)
+        original = self.runtime.verify
+        final_verify_calls = []
+        reviewed_heads = []
+
+        def mutate_during_final_verify(workspace, commands, **kwargs):
+            original(workspace, commands, **kwargs)
+            if self.runtime.verify_calls == 3:
+                final_verify_calls.append(True)
+                reviewed_heads.append(git(workspace, "rev-parse", "HEAD"))
+                mutation(workspace)
+
+        self.runtime.verify = mutate_during_final_verify
+        with self.assertRaisesRegex(ForgeError, "verification mutated reviewed workspace"):
+            self.forge.run("demo", campaign="final-verify-mutation", ticket_ids=[self.ticket])
+
+        workspace = self.root / "state/workspaces/demo/final-verify-mutation" / self.ticket
+        self.assertEqual(final_verify_calls, [True])
+        self.assertEqual(self.runtime.verify_calls, 3)
+        self.assertEqual(git(workspace, "rev-parse", "HEAD"), reviewed_heads[0])
+        self.assertEqual(self.forge._changed(workspace), ["answer.txt"])
+        self.assertFalse(any("request-review" in command for command in self.native.commands))
+        saved = json.loads((self.root / "state/campaigns/demo/final-verify-mutation.json").read_text())
+        self.assertNotIn("review", saved["tickets"][self.ticket])
+
+    def test_final_verification_content_mutation_fails_closed_before_native_review(self):
+        self._assert_final_verification_mutation_rejected(
+            lambda workspace: (workspace / "answer.txt").write_text("changed only during final verification\\n"))
+
+    def test_final_verification_mode_mutation_fails_closed_before_native_review(self):
+        self._assert_final_verification_mutation_rejected(
+            lambda workspace: (workspace / "answer.txt").chmod(0o755))
+
+    def test_review_rejection_resumes_modifying_stages_with_feedback_and_same_caps(self):
+        self.forge.approve('demo',self.ticket)
+        self.runtime.reviewer_pass=False
+        with self.assertRaisesRegex(ForgeError,'review evidence invalid'):
+            self.forge.run('demo',campaign='fix-review',ticket_ids=[self.ticket])
+        saved=json.loads((self.root/'state/campaigns/demo/fix-review.json').read_text())['tickets'][self.ticket]
+        self.assertEqual(saved.get('completed_stages'),[])
+        self.assertEqual(saved.get('review_feedback'),'looks good')
+        self.runtime.reviewer_pass=True
+        prompts=[]
+        run=self.runtime.run
+        def capture(role,workspace,prompt,**kwargs):
+            prompts.append((role,prompt))
+            return run(role,workspace,prompt,**kwargs)
+        self.runtime.run=capture
+        self.forge.resume('demo')
+        result=self.forge.run('demo',campaign='fix-review',ticket_ids=[self.ticket])
+        self.assertEqual(result['tickets'][0]['status'],'review')
+        self.assertEqual([role for role,_ in prompts],['builder','simplifier','reviewer'])
+        self.assertIn('Independent review feedback',prompts[0][1])
+        saved=json.loads((self.root/'state/campaigns/demo/fix-review.json').read_text())['tickets'][self.ticket]
+        self.assertEqual(saved['attempts'],{'builder':2,'simplifier':2,'reviewer':2})
+        self.assertEqual(saved['cycles'],1)
+
     def test_failed_runtime_marks_project_and_recovery_clears_it(self):
         self.forge.approve("demo", self.ticket)
         self.forge.runtime = FakeRuntime(reviewer_pass=False)
