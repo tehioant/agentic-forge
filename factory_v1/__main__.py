@@ -35,7 +35,7 @@ def validate_intake(item, operator_id):
     if 'work_item_number' in item and (type(item['work_item_number']) is not int or item['work_item_number'] <= 0):
         raise IntakeError('invalid_intake', 'Work-item number must be a positive GitHub issue number.')
     repository = item['repository']
-    if not matches(r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}', repository) or repository.split('/')[-1] in {'.', '..'}:
+    if not matches(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9_.-]{1,100}', repository) or repository.split('/')[-1] in {'.', '..'}:
         raise IntakeError('invalid_intake', 'Select an exact GitHub owner/repository identifier.')
     approval = item['approval']
     if not isinstance(approval, dict) or set(approval) != {'operator_id', 'reference'} or approval.get('operator_id') != operator_id or not text(approval.get('reference')):

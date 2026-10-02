@@ -179,6 +179,31 @@ class IntakeLifecycleTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
 
 
+    def test_invalid_github_owner_syntax_is_refused_without_creating_state(self):
+        for index, owner in enumerate(['owner-', 'owner--name', '-owner', 'x' * 40]):
+            self.state = self.root / f'invalid-owner-{index}.sqlite'
+            with self.subTest(owner=owner):
+                result = self.register(dict(self.request, repository=f'{owner}/product'))
+                self.assertEqual(result.returncode, 2, result.stdout)
+                self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
+                self.assertEqual(result.stdout, '')
+                self.assertFalse(self.state.exists())
+
+
+    def test_valid_github_owner_boundaries_preserve_the_exact_repository(self):
+        for index, owner in enumerate(['x', 'Owner-Name', 'a-b-c', 'x' * 39]):
+            with self.subTest(owner=owner):
+                request = dict(self.request, project_id=f'product-{index}', repository=f'{owner}/Product.Name_1')
+                result = self.register(request)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(result.stdout)
+                self.assertEqual(record['repository'], request['repository'])
+                inspected = self.invoke('inspect', '--project', request['project_id'],
+                                        '--iteration', request['iteration_id'])
+                self.assertEqual(inspected.returncode, 0, inspected.stderr)
+                self.assertEqual(json.loads(inspected.stdout), record)
+
+
     def test_nonpersistent_state_targets_are_refused_without_creating_state(self):
         request = self.root / 'request.json'
         request.write_text(json.dumps(self.request))
