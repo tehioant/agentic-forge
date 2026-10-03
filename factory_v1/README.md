@@ -1,4 +1,4 @@
-# Fresh factory v1 — intake, onboarding and conversational planning
+# Fresh factory v1 — intake, onboarding, planning and attention
 
 Standard-library Python controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, returns a same-conversation planning assignment, and verifies its GitHub handoff. It does not start workers, generate tickets or execute implementation.
 
@@ -187,6 +187,155 @@ This is an enforceable model-access seam, not full worker isolation: there is no
 
 `spend-reconcile` is trusted-controller-only and does not authorize another attempt; terminal idempotency keys stay terminal. A failed outcome releases unused reservation only after trusted confirmation. A successful receipt records actual units no greater than reservation and refunds only the difference. Uncertain outcomes block **all new keys** in the affected iteration until exact trusted reconciliation, not only retries of the same key. A subscription HTTP 429 persists quota exhaustion without fallback and freezes its reservation conservatively. After an exact billing/allowance receipt, `spend-resume --project ... --iteration ... --provider ... --model ... --operation ... --reference <verified-quota-restoration>` additionally requires the exact exhausted scope and an unexpired grant. Recording another grant alone cannot erase a quota block. Paused iterations cannot start a broker or admit operations; trusted reconciliation remains available while paused.
 
+## Attention delivery (#15)
+
+The trusted controller/operator CLI now provides `attention`, `notifications`,
+`deliver`, `attention-reconcile` and `respond`. These are **not worker broker
+routes**. Do not expose them, the state file, or transport configuration to workers.
+The existing trusted intake boundary verifies the actual origin; no new lookup is
+claimed. Every modifying attention operation reloads the iteration under the
+shared onboarding/planning/spending lock, validates operator provenance and exact
+Discord metadata, and retains the persisted destination. No destination override,
+channel-name resolution, origin-token repair or home-channel fallback exists.
+Missing/malformed origin and destination drift fail closed.
+
+Routine intake/onboarding/planning transitions remain chat-silent. Other slices
+supply justified attention content; this slice does not judge incidents or generate
+completion claims. Submit an event with exactly these fields (illustrative only):
+
+```json
+{
+  "event_id": "incident-episode-15", "kind": "incident",
+  "message": "Delivery is unhealthy; evidence is available.",
+  "issue_number": 15, "run_id": "run-15", "evidence_ids": ["evidence-15"]
+}
+```
+
+Kinds are `incident`, `decision` and `completion`; decisions additionally require
+`decision_id`. Use a stable event ID for repeated observations of the same episode;
+new episodes receive distinct IDs, even if symptoms match. Identical event replays
+reuse durable state; changed content conflicts. A decision ID cannot be rebound to
+another event. Records retain project/iteration, repository/issue, lifecycle stage,
+controller/worker run and evidence identities. A completion intent does not create
+another iteration or authorize its interview.
+
+All commands use the existing `--state` and `--operator-id` globals, and
+`--project`/`--iteration` selectors. `attention --request <event.json>` persists intent
+without sending. `notifications` inspects records read-only. Configure transport in
+a private controller-owned file outside source:
+
+```json
+{
+  "command": ["/absolute/path/to/hermes"],
+  "approved_destinations": [
+    {"platform": "discord", "chat_id": "123", "thread_id": "123", "parent_chat_id": "456", "scope_id": "789"}
+  ]
+}
+```
+
+`command` is a trusted executable prefix, not worker/request input. It must select
+an already reviewed **messaging-scoped** Hermes deployment/profile, whose messaging
+policy permits exactly the intended operator conversation. Do not use a broad
+personal profile, inject unrelated credentials or bypass its messaging policy.
+Profile/credential enforcement remains deployment responsibility; this adapter
+adds an exact-origin allowlist, not an OS sandbox. No credentials are read or stored
+by the controller adapter and no platform API is implemented.
+
+`deliver --event <event-id> --transport-config <file>` actually invokes the supported
+installed CLI contract:
+
+```text
+hermes send --to discord:<persisted-chat-id>:<persisted-thread-id> --file - --json
+```
+
+Only this explicit target is supplied; never `discord` alone or `--list`.
+The body contains event and correlation JSON. Native `@` mentions, `MEDIA:`
+attachment directives and `[[...]]` controls are rendered as literal JSON escapes;
+original content stays in state. This disables mention/attachment interpretation
+without inventing an unsupported Discord `allowed_mentions` CLI flag. No
+`--mention` is passed. Keep bodies human-readable and concise.
+
+Delivery states are truthful:
+
+- `pending`: persisted, eligible to send. Missing/unauthorized configuration does
+  not increment attempts. Failed process launch or installed CLI usage exit 2 is
+  known no-effect and remains retryable.
+- `uncertain`: committed **before** send, including crashes immediately before or
+  after the external effect. Timeout, backend exit 1, malformed/duplicate JSON,
+  unknown shapes and skipped results remain uncertain. Never retry these blindly.
+- `accepted`: exit 0 and JSON `success: true`, with neither error nor skipped. This
+  is a transport acknowledgement, **not verified external delivery**. Raw backend
+  output, notes and errors are not persisted because they may contain secrets.
+- `delivered`: an independently verified, exact-bound trusted receipt was supplied.
+
+Repeated `deliver` on uncertain/accepted/delivered records returns the recorded
+state without sending. Inspect `state`, not exit 0 alone, to determine outcome.
+The shared lock spans the durable-before-send commit and send/final commit;
+concurrent controllers cannot resend or overwrite a decision response. Process
+death releases the lock, but never erases uncertainty. This is recoverable,
+event-deduplicated delivery, **not an exactly-once network guarantee**.
+
+The staged installed CLI exposes acknowledgement but no authoritative lookup or
+receipt contract. None is invented here. If independent controller/operator
+observation is available, `attention-reconcile --request <receipt.json>` accepts
+exactly:
+
+```json
+{
+  "event_id": "incident-episode-15", "attempt": 1,
+  "delivery_key": ["approved-product", "milestone-1", "incident-episode-15"],
+  "destination": {"platform": "discord", "chat_id": "123", "thread_id": "123", "parent_chat_id": "456", "scope_id": "789"},
+  "content": {"event": "<exact persisted event object>", "correlation": "<exact persisted correlation object>"},
+  "outcome": "delivered", "message_id": "1001",
+  "reference": "<independently verified exact-target/content receipt evidence>"
+}
+```
+
+Replace the two illustrative content strings with actual persisted objects. The
+trusted caller must independently verify the exact rendered body, destination,
+message identity and attempt; JSON strings alone do not prove delivery. `not_sent`
+uses the same fields **without** `message_id` and requires positive evidence of
+no effect, not merely absence in a search. It may reopen only an uncertain attempt,
+not contradict a successful acknowledgement. Exact receipt replays are idempotent;
+wrong content/destination/key/attempt, malformed message IDs, extra fields and
+terminal receipt replacement are refused. A later send gets a new attempt;
+stale receipts cannot bind it. Without authoritative evidence, keep uncertainty.
+
+`respond --request <response.json>` is a separate trusted authenticated input
+boundary, not a transport ack, free-form chat listener or semantic approval parser:
+
+```json
+{
+  "event_id": "decision-event-15", "decision_id": "direction-15", "operator_id": "42",
+  "origin": {"platform": "discord", "chat_id": "123", "thread_id": "123", "parent_chat_id": "456", "scope_id": "789"},
+  "reference": "<verified operator message reference>", "response": "Investigate the outage"
+}
+```
+
+The caller must verify who spoke and that this is an explicit answer to that exact
+pending decision. Delivery, acknowledgement, unrelated chat and silence cannot
+populate it. Exact response replay is idempotent; changed responses conflict.
+Responses can arrive before notification delivery but do not change delivery
+state. Neither response nor receipt changes planning/spending authorization,
+`execution_allowed`, scheduling, merge gates or product scope.
+
+### #15 acceptance trace (mock-only amendment)
+
+| Criterion | Implementation and regression evidence |
+| --- | --- |
+| 1: exact verified origin, fail closed | `attention.lifecycle`/`get_record`; malformed origin/context, allowlist and origin-drift public CLI tests |
+| 2: routine silence, correlated attention | `enqueue`; intake/planning/onboarding silence, durable correlation tests |
+| 3: persisted intent, retry/restart/uncertainty | `deliver`/`reconcile`; actual mock subprocess death before/after effect, no-effect vs unknown tests, concurrent writes |
+| 4: duplicate vs distinct events | event/decision identity conflict checks; duplicate/conflicting/new incident and decision tests |
+| 5: exact pending replies, no unsolicited authority | `respond`; ack/silence/unrelated chat refusal and exact pre/post-delivery response tests |
+| 6: supported Hermes transport | `HermesTransport`; mock process command/JSON-result tests; sandbox `/scratch/verify_hermes_reference.py` executes `/inputs/hermes-reference/send_cmd.py` with labeled mock credential loader and message service |
+
+Antoine's amendment replaces **live verification only**. No live platform messages
+are authorized or sent. Mock fixtures prove the functional command/result path,
+not real Discord delivery, credentials, messaging-policy deployment or receipts.
+Independent review and host-controlled integration remain later gates; this
+sandbox implementation does not merge, close #15 or call any worker GitHub route.
+
 ## Verification and honest boundary
 
 ```bash
@@ -196,4 +345,4 @@ PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_
 
 Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
 
-Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. Live publication and controlled integration are supplied by the host parent. This slice implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher, Projects mutation, merge or notification service, and changes no existing gate.
+Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. Live publication and controlled integration are supplied by the host parent. This controller implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher, Projects mutation or merge service, and changes no existing gate. Attention delivery is the scoped supported Hermes CLI adapter described above, verified mock-only under the #15 amendment.

@@ -11,10 +11,9 @@ from contextlib import closing
 from pathlib import Path
 
 
-class IntakeError(Exception):
-    def __init__(self, code, message):
-        self.code = code
-        super().__init__(message)
+from .errors import IntakeError
+from .origin import validate_origin
+from .repositories import valid_repository
 
 
 def matches(pattern, value):
@@ -35,7 +34,7 @@ def validate_intake(item, operator_id):
     if 'work_item_number' in item and (type(item['work_item_number']) is not int or item['work_item_number'] <= 0):
         raise IntakeError('invalid_intake', 'Work-item number must be a positive GitHub issue number.')
     repository = item['repository']
-    if not matches(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9_.-]{1,100}', repository) or repository.split('/')[-1] in {'.', '..'}:
+    if not valid_repository(repository):
         raise IntakeError('invalid_intake', 'Select an exact GitHub owner/repository identifier.')
     if 'repository_intent' in item:
         intent = item['repository_intent']
@@ -46,12 +45,10 @@ def validate_intake(item, operator_id):
         raise IntakeError('invalid_intake', 'Explicit approval and provenance from the configured operator are required.')
     if not text(item['idea']):
         raise IntakeError('invalid_intake', 'An approved idea is required.')
-    origin = item['origin']
-    identifiers = ['chat_id', 'thread_id', 'parent_chat_id', 'scope_id']
-    if not isinstance(origin, dict) or set(origin) != {'platform', *identifiers} or origin.get('platform') != 'discord':
-        raise IntakeError('invalid_intake', 'Provide the verified originating Discord thread metadata.')
-    if any(not matches(r'[1-9][0-9]*', origin[key]) for key in identifiers) or origin['chat_id'] != origin['thread_id']:
-        raise IntakeError('invalid_intake', 'Originating thread identifiers must be exact and consistent.')
+    try:
+        validate_origin(item['origin'])
+    except ValueError as error:
+        raise IntakeError('invalid_intake', str(error)) from error
 
 
 def unique_fields(pairs):
@@ -170,9 +167,43 @@ def main():
     broker.add_argument('--max-calls', type=int, default=100)
     broker.add_argument('--worker-uid', type=int, default=os.getuid())
     broker.add_argument('--timeout', type=float, default=10)
+    for name in ['attention', 'notifications', 'deliver', 'respond', 'attention-reconcile']:
+        attention_command = commands.add_parser(name, help='Trusted exact-origin attention lifecycle.')
+        attention_command.add_argument('--project', required=True)
+        attention_command.add_argument('--iteration', required=True)
+        if name in {'attention', 'respond', 'attention-reconcile'}:
+            attention_command.add_argument('--request', required=True)
+        if name == 'deliver':
+            attention_command.add_argument('--event', required=True)
+            attention_command.add_argument('--transport-config')
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'attention', 'notifications', 'deliver', 'respond', 'attention-reconcile'}:
+        from .attention import lifecycle, records, load_iteration
+        request = None
+        if hasattr(args, 'request'):
+            with open(args.request, encoding='utf-8') as source:
+                try:
+                    request = json.load(source, object_pairs_hook=unique_fields)
+                except (ValueError, RecursionError, IntakeError) as error:
+                    raise IntakeError('invalid_decision' if args.command == 'respond' else
+                                      'invalid_receipt' if args.command == 'attention-reconcile' else
+                                      'invalid_attention', 'Provide unambiguous lifecycle JSON.') from error
+        uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command == 'notifications' else '?mode=rw')
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError as error:
+            raise IntakeError('not_found', 'Iteration state is unavailable.') from error
+        with closing(connection) as database:
+            if args.command == 'notifications':
+                item = load_iteration(database, args.project, args.iteration)
+                result = records(database, args.project, args.iteration, item)
+            else:
+                result = lifecycle(database, args.project, args.iteration, args.operator_id, args.command,
+                                   request, getattr(args, 'event', None), getattr(args, 'transport_config', None))
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command == 'model-call':
         from .spending import SpendingError, broker_call
         with open(args.request, encoding='utf-8') as source:
