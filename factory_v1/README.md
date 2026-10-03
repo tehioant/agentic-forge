@@ -1,6 +1,6 @@
 # Fresh factory v1 — approved intake and repository onboarding
 
-This standard-library Python controller implements issue #5 intake/inspection and issue #6 repository onboarding. Run from the repository root on Python 3.11 or 3.13; no installation or Hermes core changes are required. No beta implementation, contents, profiles or state are loaded.
+This standard-library Python controller implements issue #5 intake/inspection, issue #6 repository onboarding, and issue #7 interview/specification preparation and publication verification. Run from the repository root on Python 3.11 or 3.13; no installation or Hermes core changes are required. No beta implementation, contents, profiles or state are loaded. Issue #7's real documentation publication remains blocked until a reviewed controller capability is supplied; deterministic read-back tests are not live publication evidence.
 
 ## Trust boundary
 
@@ -79,6 +79,42 @@ If durable state is lost but the trusted controller has genuine prior creation e
 
 Exactly these fields are required. Restore needs a recorded approved new-product intake and binds the exact target, positive ID, approved marker, endpoint and nonempty provenance reference. It **never creates** an absent target. Live identity/privacy/marker/ID must match before the receipt and verified metadata are persisted. Receipt recovery cannot override blocked creation, endpoint pinning or previously verified ID continuity. Regular onboarding still refuses a colliding target without prior durable intent or explicit trusted creation evidence. Endpoint migration is not implemented; request controller review instead of modifying records silently.
 
+## Interview and pinned specification lifecycle (#7)
+
+After verified onboarding, a trusted conversation/agent integration supplies only the current fresh interview through `interview --request`. It must authenticate actual operator messages before handing them to this CLI; the controller cannot authenticate conversation messages from self-reported provenance. The agent supplies questions, assumption challenges, recommendations and its sufficiency judgment. The controller records that judgment, never invents operator answers, and refuses unrelated top-level context fields.
+
+The request has these exact fields:
+
+- `origin`: the registered originating-thread object, unchanged.
+- `expected_revision`: `0` for the first submission, otherwise the current integer interview revision from `inspect`. Identical retries are idempotent; changed stale submissions are conflicts.
+- `questions`: a nonempty list of `{id, question, challenge, recommendation, answer}`. An unanswered question uses JSON `null`. An actual answer is `{operator_id, reference, text}`, from the configured operator with its original message reference.
+- `decisions`: a list of `{id, category, value, question_id, scope}`. Each decision cites an answered question and retains its exact answer text. Scope is `current` or `future`. Categories are `vision`, `milestone`, `programming_language`, `user_facing_language`, `stack`, `requirements`, `constraints`, `non_goals`, `acceptance`, and `testing`.
+- `judgment`: `{sufficient, rationale, reference}` records the agent's boolean judgment and its provenance, not operator batch approval.
+- Optional `skills`: an explicit fresh pinned catalog and stage roots (below). It is mandatory before publication handoff.
+
+Missing answers/categories keep the interview pending even when the agent says clarification is sufficient. Distinct current answers for a language choice also keep that choice unresolved; the operator can explicitly settle a combined language choice in one answer where appropriate. All original answers, challenges, recommendations and earlier interview revisions remain inspectable. Future choices cannot substitute for current choices, except the whole-product vision.
+
+Sufficient clarification prepares three canonical JSON documents under `docs/factory/<iteration>/<sha256-revision>/`: `vision.json` retains the full vision and decisions; `milestone.json` contains only current decisions; `decisions.json` preserves the full fresh interview with provenance. Changing the interview removes any obsolete handoff and retains prior specifications in history. Specifications are not published by an assertion or by this worker's direct GitHub mutation.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  interview --project approved-product --iteration milestone-1 --request /scratch/operator/interview.json
+
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  export-spec --project approved-product --iteration milestone-1 --revision <exact-sha256-revision>
+
+# Only after authorized controller publication returns its actual immutable commit:
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  verify-spec --project approved-product --iteration milestone-1 --revision <exact-sha256-revision> \
+  --commit <exact-40-character-commit-sha> --api-base <reviewed-controller-endpoint>
+```
+
+`export-spec` is read-only and returns exact file paths/content plus the concrete publication capability request. The reviewed controller must restrict writes to these documentation paths in the selected repository and reconcile uncertain outcomes before retrying. `verify-spec` rechecks the recorded repository identity, reads the exact Git commit and documentation files at that commit, verifies UTF-8 bytes and Git blob hashes, and revalidates skill pins. Branch names, wrong files, symlinks, content/identity mismatches and missing skills cannot admit handoff. Successful verification automatically records `ticket_synthesis_ready`, with immutable repository/commit/path/spec-revision references and only current decision IDs. No extra batch-approval prompt occurs. It does not synthesize tickets or start execution; those are later slices.
+
+Skill configuration is `{catalog, stages}`. Catalog entries are `{name, path, sha256, dependencies, implicit_loops}` using explicit absolute regular files, exact names and SHA-256 pins. Stage roots name `grilling`, `specification`, `tickets`, `implementation`, `simplification`, and `review`. Missing or ambiguous names, cyclic transitive dependencies and changed content fail closed. Stage contracts adapt only `routine_spec_approval`, `routine_ticket_batch_approval`, and `nested_duplicate_review`; required tests, behavior preservation, independent requirement review and security gates remain authoritative. No ambient skill or memory discovery is performed. A descriptor is a trusted controller input, not permission to inspect unrelated files. These contracts are bounded handoff data, not proof of worker integration or skill execution.
+
+The supplied broker permits repository metadata only for this role. Consequently real documentation publication/read-back cannot be established here, and issue #7 remains blocked rather than reported delivered. Python 3.13 execution and alternate-`TMPDIR` tests pass locally; Python 3.11 is not installed in this sandbox and needs controller/CI execution.
+
 ## Verification and scope
 
 ```bash
@@ -88,6 +124,6 @@ PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_
 
 Tests invoke the actual CLI in fresh subprocesses with SQLite/HTTP fixtures under tempfile's configured temporary directory (`TMPDIR` in validation and CI), without requiring a `/scratch` mount. A portability regression selects a different temporary root, exercises both lifecycle fixtures through the CLI, and verifies cleanup. Deterministic tests cover previous intake, metadata-only reuse, exact private creation, name/identity conflicts, successful POST/GET immutable-ID continuity across restart, invalid creation IDs, lost responses, killed-process restart, concurrency, read-back outages, blocked permission/conflict cases, endpoint continuity, credential exclusion, ambiguous/deeply nested metadata and explicit receipt restoration. Those fixtures do not prove live external enforcement.
 
-For this continuation, `/inputs/live-receipts.json` provides prior creation/read-back evidence for `tehioant/agentic-forge-fresh-v1-validation`, ID `1402450718`, private, with description `fresh-forge-m1-validation:origin-1555635434036396065`. Do not recreate it. The current CLI restored from that explicit trusted receipt and independently read the exact live target back through the approved loopback broker. Validation scratch's parent/scope conversation IDs are local fixtures, **not** notification/routing evidence. Execution output, not this document, is the evidence authority.
+The supplied `/inputs/live-receipts.json` is empty in this continuation. No prior creation receipt was reconstructed or assumed, and the validation repository was not recreated. A current metadata-only read through the approved loopback broker observed `tehioant/agentic-forge-fresh-v1-validation`, ID `1402450718`, private, with description `fresh-forge-m1-validation:origin-1555635434036396065`. This is not evidence of creation, receipt recovery, documentation publication, or delivery. Execution output, not this document, is the evidence authority.
 
 `execution_allowed` remains false. This slice does not establish scheduling, worker isolation, spending admission, Projects/Issues/PR writes, checks, merge protection, deployment, notifications or a self-running factory. It does not change ticket #17's no-bypass gate. Independent review, controller publication/controlled merge and integrated-main evidence remain required before ticket closure. Future slices are not missing repository-onboarding behavior.

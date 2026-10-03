@@ -122,6 +122,22 @@ def main():
     onboarding.add_argument('--bearer', default='credential-blind-controller')
     onboarding.add_argument('--timeout', type=float, default=10)
     onboarding.add_argument('--creation-receipt', help='Trusted controller receipt for explicit lost-state recovery; never worker-supplied.')
+    grilling = commands.add_parser('interview')
+    grilling.add_argument('--project', required=True)
+    grilling.add_argument('--iteration', required=True)
+    grilling.add_argument('--request', required=True)
+    export = commands.add_parser('export-spec')
+    export.add_argument('--project', required=True)
+    export.add_argument('--iteration', required=True)
+    export.add_argument('--revision', required=True)
+    publication = commands.add_parser('verify-spec')
+    publication.add_argument('--project', required=True)
+    publication.add_argument('--iteration', required=True)
+    publication.add_argument('--revision', required=True)
+    publication.add_argument('--commit', required=True)
+    publication.add_argument('--api-base', required=True)
+    publication.add_argument('--bearer', default='credential-blind-controller')
+    publication.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -136,7 +152,7 @@ def main():
         with closing(connection) as database, database:
             result = register_iteration(database, item)
     else:
-        uri = Path(args.state).resolve().as_uri() + ('?mode=rw' if args.command == 'onboard' else '?mode=ro')
+        uri = Path(args.state).resolve().as_uri() + ('?' + ('mode=ro' if args.command in {'inspect', 'export-spec'} else 'mode=rw'))
         try:
             connection = sqlite3.connect(uri, uri=True)
         except sqlite3.OperationalError as error:
@@ -145,6 +161,36 @@ def main():
             result = read_iteration(database, args.project, args.iteration)
             if result is None:
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
+            if args.command != 'inspect':
+                if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
+                    raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
+            if args.command == 'verify-spec':
+                from .publication import verify_spec
+                from .repositories import GitHub, RepositoryError
+                try:
+                    with database:
+                        result = verify_spec(database, result, args.revision, args.commit,
+                                             GitHub(args.api_base, args.bearer, args.timeout))
+                except RepositoryError as error:
+                    raise IntakeError(error.code, str(error)) from error
+            if args.command == 'export-spec':
+                from .specifications import SpecificationError, export_spec
+                try:
+                    result = export_spec(result, args.revision)
+                except SpecificationError as error:
+                    raise IntakeError(error.code, str(error)) from error
+            if args.command == 'interview':
+                from .specifications import SpecificationError, interview
+                with open(args.request, encoding='utf-8') as source:
+                    try:
+                        record = json.load(source, object_pairs_hook=unique_fields)
+                    except (ValueError, RecursionError) as error:
+                        raise IntakeError('invalid_interview', 'Provide unambiguous interview JSON.') from error
+                try:
+                    with database:
+                        result = interview(database, result, record, args.operator_id)
+                except SpecificationError as error:
+                    raise IntakeError(error.code, str(error)) from error
             if args.command == 'onboard':
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required before repository access.')
