@@ -5,7 +5,7 @@ import re
 from .errors import IntakeError
 from .messaging import HermesTransport
 from .origin import validate_origin as validate_thread_origin
-from .repositories import state_lock
+from .repositories import state_lock, unambiguous_fields
 
 
 def identifier(value):
@@ -36,12 +36,53 @@ def validate_event(event):
         raise IntakeError('invalid_attention', 'Attention requires exact event, issue, run and evidence identities.')
 
 
+def load_record(payload, project, iteration, event_id):
+    """Validate durable notification shape and identities before any lifecycle use."""
+    required = {'project_id', 'iteration_id', 'event', 'destination', 'state',
+                'attempts', 'receipt', 'decision_response', 'correlation'}
+    try:
+        record = json.loads(payload, object_pairs_hook=unambiguous_fields)
+        if (not isinstance(record, dict) or not required <= record.keys()
+                or record.keys() - required - {'last_error', 'reconciliation'}
+                or record['project_id'] != project or record['iteration_id'] != iteration
+                or not isinstance(record['state'], str)
+                or record['state'] not in {'pending', 'uncertain', 'accepted', 'delivered'}
+                or type(record['attempts']) is not int or record['attempts'] < 0
+                or (record['state'] != 'pending' and record['attempts'] == 0)
+                or any(record[key] is not None and not isinstance(record[key], dict)
+                       for key in ['receipt', 'decision_response'])
+                or ('reconciliation' in record and not isinstance(record['reconciliation'], dict))
+                or (record.get('last_error') is not None and not isinstance(record['last_error'], str))):
+            raise ValueError('invalid record')
+        validate_event(record['event'])
+        validate_origin(record['destination'])
+        if record['event']['event_id'] != event_id:
+            raise ValueError('inconsistent event identity')
+        correlation = record['correlation']
+        if (not isinstance(correlation, dict) or correlation.get('project_id') != project
+                or correlation.get('iteration_id') != iteration
+                or any(not identifier(correlation.get(key))
+                       for key in ['control_run_id', 'evidence_id', 'stage'])
+                or not isinstance(correlation.get('work_item'), dict)
+                or not isinstance(correlation['work_item'].get('repository'), str)
+                or not correlation['work_item']['repository'].strip()
+                or type(correlation['work_item'].get('issue_number')) is not int
+                or correlation['work_item']['issue_number'] != record['event']['issue_number']
+                or correlation.get('worker_run_id') != record['event']['run_id']
+                or correlation.get('evidence_ids') != record['event']['evidence_ids']):
+            raise ValueError('invalid correlation')
+        return record
+    except (ValueError, TypeError, RecursionError, IntakeError):
+        raise IntakeError('state_error',
+                         'Persisted attention state is malformed or inconsistent; no delivery was attempted.') from None
+
+
 def records(database, project, iteration):
     exists = database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='notifications'").fetchone()
     if not exists:
         return []
-    return [json.loads(row[0]) for row in database.execute(
-        'SELECT payload FROM notifications WHERE project=? AND iteration=? ORDER BY rowid', (project, iteration))]
+    return [load_record(payload, project, iteration, event_id) for event_id, payload in database.execute(
+        'SELECT event_id, payload FROM notifications WHERE project=? AND iteration=? ORDER BY rowid', (project, iteration))]
 
 
 def save(database, record):

@@ -338,6 +338,53 @@ class AttentionTests(unittest.TestCase):
             self.assertIn(json.loads(result.stderr)['error'], {'invalid_context', 'approval_required'})
         self.assertEqual(self.calls(), [])
 
+    def test_malformed_persisted_notifications_refuse_all_lifecycle_operations(self):
+        self.event = dict(self.event, kind='decision', decision_id='direction-15')
+        original = json.loads(self.enqueue().stdout)
+        receipt = self.receipt()
+        response = self.response()
+        malformed = ['[', '[]', 'null', '"secret-persisted-diagnostic"',
+                     '[' * 1200 + '0' + ']' * 1200]
+        for key in original:
+            malformed.append(json.dumps({k: v for k, v in original.items() if k != key}))
+        for changes in [dict(event=[]), dict(event={}), dict(destination=[]),
+                        dict(destination=dict(original['destination'], chat_id=' 123')),
+                        dict(state=[]), dict(state='unknown'), dict(attempts=True),
+                        dict(attempts=-1), dict(attempts='1'), dict(project_id='other'),
+                        dict(iteration_id='other'), dict(event=dict(self.event, event_id='other')),
+                        dict(correlation=[]), dict(correlation={}),
+                        dict(correlation=dict(original['correlation'], worker_run_id='other')),
+                        dict(receipt=[]), dict(decision_response=[]), dict(last_error=[]),
+                        dict(reconciliation=[])]:
+            malformed.append(json.dumps(dict(original, **changes)))
+        malformed.append(json.dumps(original)[:-1] + ',"state":"accepted"}')
+        for raw in malformed:
+            with self.subTest(payload=raw[:120]):
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE notifications SET payload=?', (raw,))
+                    before = db.execute('SELECT * FROM notifications').fetchall()
+                    iteration_before = db.execute('SELECT * FROM iterations').fetchall()
+                results = [self.command('notifications'), self.deliver(), self.enqueue(),
+                           self.command('respond', response),
+                           self.command('attention-reconcile', receipt)]
+                for result in results:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(json.loads(result.stderr), {
+                        'error': 'state_error',
+                        'message': 'Persisted attention state is malformed or inconsistent; no delivery was attempted.'})
+                with closing(sqlite3.connect(self.state)) as db:
+                    self.assertEqual(db.execute('SELECT * FROM notifications').fetchall(), before)
+                    self.assertEqual(db.execute('SELECT * FROM iterations').fetchall(), iteration_before)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.calls('effects.jsonl'), [])
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE notifications SET payload=?', (json.dumps(original),))
+        self.assertEqual(self.notifications(), [original])
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(self.notifications()[0]['state'], 'accepted')
+        self.assertEqual(len(self.calls()), 1)
+
     def test_actual_process_death_before_and_after_effect_requires_reconciliation(self):
         self.enqueue()
         for mode in ['crash_before', 'crash_after']:
