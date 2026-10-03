@@ -392,16 +392,28 @@ class RepositoryLifecycleTests(unittest.TestCase):
 
     def test_deep_external_json_is_an_actionable_blocker(self):
         self.register()
-        self.raw_metadata = '[' * 10000 + '0' + ']' * 10000
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout, '')
-        blocker = json.loads(result.stderr)
-        self.assertEqual(blocker['error'], 'github_unavailable')
-        self.assertIn('configured capability', blocker['message'])
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
+        deep_json = '[' * 10000 + '0' + ']' * 10000
+        for raw in [deep_json, deep_json[:-1]]:
+            with self.subTest(complete=raw == deep_json):
+                # Python 3.14 can decode valid nesting that older versions reject.
+                try:
+                    json.loads(raw)
+                except (ValueError, RecursionError):
+                    expected_error = 'github_unavailable'
+                    expected_message = 'configured capability'
+                else:
+                    expected_error = 'repository_mismatch'
+                    expected_message = 'selected repository'
+                self.raw_metadata = raw
+                result = self.onboard()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, '')
+                blocker = json.loads(result.stderr)
+                self.assertEqual(blocker['error'], expected_error)
+                self.assertIn(expected_message, blocker['message'])
+                inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
+                self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
+                self.assertFalse(any(call[0] == 'POST' for call in self.calls))
 
     def test_invalid_adapter_configuration_is_refused_before_network(self):
         self.register()
