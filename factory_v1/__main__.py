@@ -11,10 +11,7 @@ from contextlib import closing
 from pathlib import Path
 
 
-class IntakeError(Exception):
-    def __init__(self, code, message):
-        self.code = code
-        super().__init__(message)
+from .errors import IntakeError
 
 
 def matches(pattern, value):
@@ -170,9 +167,44 @@ def main():
     broker.add_argument('--max-calls', type=int, default=100)
     broker.add_argument('--worker-uid', type=int, default=os.getuid())
     broker.add_argument('--timeout', type=float, default=10)
+    for name in ['attention', 'notifications', 'deliver', 'respond', 'attention-reconcile']:
+        attention_command = commands.add_parser(name, help='Trusted exact-origin attention lifecycle.')
+        attention_command.add_argument('--project', required=True)
+        attention_command.add_argument('--iteration', required=True)
+        if name in {'attention', 'respond', 'attention-reconcile'}:
+            attention_command.add_argument('--request', required=True)
+        if name == 'deliver':
+            attention_command.add_argument('--event', required=True)
+            attention_command.add_argument('--transport-config')
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'attention', 'notifications', 'deliver', 'respond', 'attention-reconcile'}:
+        from .attention import lifecycle, records
+        request = None
+        if hasattr(args, 'request'):
+            with open(args.request, encoding='utf-8') as source:
+                try:
+                    request = json.load(source, object_pairs_hook=unique_fields)
+                except (ValueError, RecursionError, IntakeError) as error:
+                    raise IntakeError('invalid_decision' if args.command == 'respond' else
+                                      'invalid_receipt' if args.command == 'attention-reconcile' else
+                                      'invalid_attention', 'Provide unambiguous lifecycle JSON.') from error
+        uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command == 'notifications' else '?mode=rw')
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+        except sqlite3.OperationalError as error:
+            raise IntakeError('not_found', 'Iteration state is unavailable.') from error
+        with closing(connection) as database:
+            if args.command == 'notifications':
+                if read_iteration(database, args.project, args.iteration) is None:
+                    raise IntakeError('not_found', 'No exact iteration exists.')
+                result = records(database, args.project, args.iteration)
+            else:
+                result = lifecycle(database, args.project, args.iteration, args.operator_id, args.command,
+                                   request, getattr(args, 'event', None), getattr(args, 'transport_config', None))
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command == 'model-call':
         from .spending import SpendingError, broker_call
         with open(args.request, encoding='utf-8') as source:
