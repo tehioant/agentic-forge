@@ -147,7 +147,7 @@ def main():
         with closing(connection) as database, database:
             result = register_iteration(database, item)
     else:
-        uri = Path(args.state).resolve().as_uri() + ('?' + ('mode=ro' if args.command == 'inspect' else 'mode=rw'))
+        uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command == 'inspect' else '?mode=rw')
         try:
             connection = sqlite3.connect(uri, uri=True)
         except sqlite3.OperationalError as error:
