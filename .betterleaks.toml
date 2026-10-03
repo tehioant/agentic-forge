@@ -1,0 +1,4 @@
+title = "Agentic Forge secret detection"
+
+[extend]
+useDefault = true

@@ -1,0 +1,61 @@
+output:
+  - meta
+  - summary
+  - success
+  - failure
+  - execution
+  - execution_out
+  - execution_info
+
+pre-commit:
+  commands:
+    monorepo-betterleaks:
+      priority: 2
+      run: betterleaks git --pre-commit --staged --config .betterleaks.toml --redact --verbose
+      fail_text: |
+        🚨 Potential secret detected in staged files!
+
+        Remove the secret and use environment variables / Azure Key Vault.
+        If it's a false positive, add an allowlist rule in the root .betterleaks.toml
+        or use an inline `betterleaks:allow` marker.
+    shellcheck-staged:
+      priority: 2
+      run: bash scripts/hooks/shellcheck-staged.sh
+      fail_text: |
+        ❌ shellcheck flagged a shell script staged in this commit.
+
+        Fix the finding, or — for a deliberate pattern — suppress it inline with
+        `# shellcheck disable=SCxxxx` plus a comment saying why.
+
+      skip:
+        - merge
+        - rebase
+    no-merge-commit-after-conflict:
+      only:
+        - merge
+      run: exit 1
+      fail_text: |
+        ❌ Merge commits are not allowed (you are finalizing a conflicted merge).
+
+        Abort this merge and rebase instead:
+          git merge --abort
+          git rebase <branch>
+
+commit-msg:
+  commands:
+    conventional-commit:
+      run: "head -n 1 {1} | grep -Eq '^(build|ci|chore|docs|feat|fix|ops|perf|refactor|revert|style|test)(!)?: [a-z].*'"
+      fail_text: |
+        Commit message doesn't follow Conventional Commits format.
+
+
+        Examples:
+          - feat: add new rating factor
+          - fix: correct premium calculation
+          - feat: add OAuth integration
+          - docs: clarify commit conventions
+          - build: update dependency rules
+          - feat!: remove deprecated endpoint  (breaking change)
+
+        Valid types: build, ci, chore, docs, feat, fix, ops, perf, refactor, revert, style, test
+        See:
