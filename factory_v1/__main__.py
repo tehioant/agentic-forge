@@ -12,6 +12,7 @@ from pathlib import Path
 
 
 from .errors import IntakeError
+from .origin import validate_origin
 
 
 def matches(pattern, value):
@@ -43,12 +44,10 @@ def validate_intake(item, operator_id):
         raise IntakeError('invalid_intake', 'Explicit approval and provenance from the configured operator are required.')
     if not text(item['idea']):
         raise IntakeError('invalid_intake', 'An approved idea is required.')
-    origin = item['origin']
-    identifiers = ['chat_id', 'thread_id', 'parent_chat_id', 'scope_id']
-    if not isinstance(origin, dict) or set(origin) != {'platform', *identifiers} or origin.get('platform') != 'discord':
-        raise IntakeError('invalid_intake', 'Provide the verified originating Discord thread metadata.')
-    if any(not matches(r'[1-9][0-9]*', origin[key]) for key in identifiers) or origin['chat_id'] != origin['thread_id']:
-        raise IntakeError('invalid_intake', 'Originating thread identifiers must be exact and consistent.')
+    try:
+        validate_origin(item['origin'])
+    except ValueError as error:
+        raise IntakeError('invalid_intake', str(error)) from error
 
 
 def unique_fields(pairs):

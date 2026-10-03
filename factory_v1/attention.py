@@ -4,6 +4,7 @@ import re
 
 from .errors import IntakeError
 from .messaging import HermesTransport
+from .origin import validate_origin as validate_thread_origin
 from .repositories import state_lock
 
 
@@ -12,11 +13,10 @@ def identifier(value):
 
 
 def validate_origin(origin):
-    fields = {'platform', 'chat_id', 'thread_id', 'parent_chat_id', 'scope_id'}
-    if (not isinstance(origin, dict) or set(origin) != fields or origin.get('platform') != 'discord'
-            or any(not isinstance(origin[k], str) or re.fullmatch(r'[1-9][0-9]*', origin[k]) is None
-                   for k in fields - {'platform'}) or origin['chat_id'] != origin['thread_id']):
-        raise IntakeError('invalid_origin', 'A verified exact originating Discord thread is required.')
+    try:
+        validate_thread_origin(origin)
+    except ValueError as error:
+        raise IntakeError('invalid_origin', 'A verified exact originating Discord thread is required.') from error
 
 
 def validate_event(event):

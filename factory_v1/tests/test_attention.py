@@ -165,6 +165,47 @@ class AttentionTests(unittest.TestCase):
         self.assertEqual(self.notifications(), [])
         self.assertEqual(self.calls(), [])
 
+    def test_origin_contract_preserves_intake_and_attention_errors_without_effects(self):
+        origin = self.request['origin']
+        metadata_message = 'Provide the verified originating Discord thread metadata.'
+        identifier_message = 'Originating thread identifiers must be exact and consistent.'
+        cases = [(None, metadata_message), ([], metadata_message),
+                 (dict(origin, platform='Discord'), metadata_message),
+                 (dict(origin, extra='123'), metadata_message)]
+        for key in origin:
+            cases.append(({k: v for k, v in origin.items() if k != key}, metadata_message))
+        for key in ['chat_id', 'thread_id', 'parent_chat_id', 'scope_id']:
+            for value in ['', '0', '0123', ' 123', '123\n', '-123', 123, True, None, []]:
+                cases.append((dict(origin, **{key: value}), identifier_message))
+        cases.append((dict(origin, thread_id='999'), identifier_message))
+        with closing(sqlite3.connect(self.state)) as db:
+            original = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+        for index, (invalid_origin, message) in enumerate(cases):
+            with self.subTest(origin=invalid_origin):
+                path = self.root / 'invalid-origin.json'
+                path.write_text(json.dumps(dict(self.request, origin=invalid_origin)))
+                absent_state = self.root / f'refused-{index}.sqlite'
+                result = self.invoke('register', '--request', str(path), state=absent_state)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(json.loads(result.stderr), {'error': 'invalid_intake', 'message': message})
+                self.assertFalse(absent_state.exists())
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?',
+                               (json.dumps(dict(original, origin=invalid_origin)),))
+                result = self.enqueue()
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(json.loads(result.stderr), {
+                    'error': 'invalid_origin',
+                    'message': 'A verified exact originating Discord thread is required.'})
+                self.assertEqual(self.notifications(), [])
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE iterations SET payload=?', (json.dumps(original),))
+        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.enqueue().returncode, 0)
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(self.notifications()[0]['destination'], origin)
+        self.assertEqual(len(self.calls()), 1)
+
     def test_exact_supported_command_inert_mentions_ack_is_not_receipt(self):
         self.event['message'] = '@everyone <@42> <@&99> MEDIA:/secret [[as_document]]'
         self.enqueue()
