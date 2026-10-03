@@ -215,15 +215,17 @@ def main():
             result = read_iteration(database, args.project, args.iteration)
             if result is None:
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
-            if args.command != 'inspect':
+            if args.command not in {'inspect', 'spend-grant', 'spend-reconcile', 'spend-resume'}:
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
             if args.command in {'spend-grant', 'spend-reconcile', 'spend-resume'}:
-                from .spending import SpendingError, add_grant, initialize, resume_quota, reconcile as reconcile_spend
+                from .spending import SpendingError, add_grant, initialize, record_refusal, resume_quota, reconcile as reconcile_spend
                 from .repositories import state_lock
                 try:
                     with state_lock(database), database:
                         initialize(database)
+                        if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
+                            raise SpendingError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
                         if args.command == 'spend-grant':
                             result = add_grant(database, args.project, args.iteration, args.provider,
                                                args.model, args.operation, args.kind, args.ceiling,
@@ -235,6 +237,7 @@ def main():
                                 args.provider, args.model, args.operation, args.operation_id,
                                 args.outcome, args.actual_units, args.reference)
                 except SpendingError as error:
+                    record_refusal(database, (args.project, args.iteration, args.provider, args.model, args.operation), getattr(args, 'operation_id', None), error)
                     raise IntakeError(error.code, str(error)) from error
             if args.command in {'plan', 'complete-planning'}:
                 from .planning import plan, complete

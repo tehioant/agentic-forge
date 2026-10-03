@@ -389,6 +389,30 @@ class ModelSpendingTests(unittest.TestCase):
         self.assertNotIn(marker.encode(), self.state.read_bytes())
         self.assertEqual(FixtureHandler.calls, [])
 
+    def test_controller_and_startup_refusals_are_durable_without_rejected_grant_data(self):
+        self.assertEqual(self.grant().returncode, 0)
+        marker = 'never-persist-rejected-grant-secret'
+        self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')
+        self.assertEqual(json.loads(self.grant(ceiling=0, reference=marker).stderr)['error'], 'invalid_grant')
+        startup = ['model-broker', '--socket', str(self.sock), '--project', 'product', '--iteration', 'm1',
+            '--provider', 'fixture-provider', '--model', 'fixture-model', '--operation', 'generate', '--fixture-url', self.fixture_url]
+        denied = self.invoke('--operator-id', 'other', *startup)
+        self.assertEqual(json.loads(denied.stderr)['error'], 'approval_required')
+        with closing(sqlite3.connect(self.state)) as db:
+            item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+            item['status'] = 'paused'
+            db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+            db.commit()
+        paused = self.invoke(*startup)
+        self.assertEqual(json.loads(paused.stderr)['error'], 'iteration_paused')
+        with closing(sqlite3.connect(self.state)) as db:
+            self.assertEqual(db.execute("SELECT reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall(),
+                [('grant_conflict',), ('invalid_grant',), ('approval_required',), ('iteration_paused',)])
+            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+        self.assertNotIn(marker.encode(), self.state.read_bytes())
+        self.assertFalse(self.sock.exists())
+        self.assertEqual(FixtureHandler.calls, [])
+
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
         self.assertEqual(self.grant().returncode, 0)
         self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')

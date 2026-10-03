@@ -111,7 +111,9 @@ def _decision(database, scope, operation_id, decision, reason, now):
                      (str(uuid.uuid4()), *scope, operation_id, decision, reason, now))
 
 
-def _record_refusal(database, scope, operation_id, error):
+def record_refusal(database, scope, operation_id, error):
+    """Persist only fixed scope, a validated operation key and a bounded refusal code."""
+    scope = _scope(*scope)
     if error.recorded:
         return
     if not isinstance(operation_id, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', operation_id) is None:
@@ -211,7 +213,7 @@ def execute_controlled(database, scope, operation_id, payload, reserve, fixture_
     try:
         return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline)
     except SpendingError as error:
-        _record_refusal(database, scope, operation_id, error)
+        record_refusal(database, scope, operation_id, error)
         raise
 
 
@@ -296,9 +298,9 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
     worker_uid = os.getuid() if worker_uid is None else worker_uid
     uri = Path(database_path).resolve().as_uri() + '?mode=rw'
     with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
-        _iteration(database, scope[0], scope[1], operator_id, require_active=True)
         initialize(database)
         try:
+            _iteration(database, scope[0], scope[1], operator_id, require_active=True)
             if (type(ttl) is not int or not 0 < ttl <= 3600 or type(max_calls) is not int or not 0 < max_calls <= 1000):
                 raise SpendingError('invalid_capability', 'Use a bounded capability TTL and request count.')
             if not os.path.isabs(path) or os.path.lexists(path):
@@ -312,7 +314,7 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
             except (ModelAccessError, OSError) as cause:
                 raise SpendingError('provider_unavailable', 'Paid/unknown routes are disabled; use the exact approved subscription capability or labeled fixture.') from cause
         except SpendingError as error:
-            _record_refusal(database, scope, None, error)
+            record_refusal(database, scope, None, error)
             raise
     deadline = time.monotonic() + ttl
     calls = 0
@@ -366,7 +368,7 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
 def _refusal_reply(uri, scope, error):
     try:
         with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
-            _record_refusal(database, scope, None, error)
+            record_refusal(database, scope, None, error)
         return {'error': error.code, 'message': str(error)}
     except (OSError, sqlite3.Error):
         return {'error': 'broker_unavailable', 'message': 'Refusal evidence could not be persisted; no fallback.'}
