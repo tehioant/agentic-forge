@@ -85,6 +85,10 @@ def plan(database, item, request):
                         'docs_path': f"docs/factory/{item['iteration_id']}/{assignment_id}",
                         'pending_questions': []}
     item.pop('handoff', None)
+    if item.get('ticket_work'):
+        item.setdefault('ticket_history', []).append(item.pop('ticket_work'))
+    if item.get('reservation'):
+        item['reservation']['status'] = 'invalidated'
     transition(item, 'planning_pending')
     save_iteration(database, item)
     return item

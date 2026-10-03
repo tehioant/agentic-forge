@@ -133,6 +133,17 @@ def main():
     completion.add_argument('--api-base', required=True)
     completion.add_argument('--bearer', default='credential-blind-controller')
     completion.add_argument('--timeout', type=float, default=10)
+    for name in ('synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket'):
+        control = commands.add_parser(name)
+        control.add_argument('--project', required=True)
+        control.add_argument('--iteration', required=True)
+        control.add_argument('--api-base', required=True)
+        control.add_argument('--bearer', default='credential-blind-controller')
+        control.add_argument('--timeout', type=float, default=10)
+        if name in {'synthesize-tickets', 'complete-tickets'}:
+            control.add_argument('--request', required=True)
+        if name == 'reserve-ticket':
+            control.add_argument('--issue', type=int, required=True)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -174,6 +185,31 @@ def main():
                         else:
                             result = complete(database, result, request,
                                               GitHub(args.api_base, args.bearer, args.timeout))
+                except RepositoryError as error:
+                    raise IntakeError(error.code, str(error)) from error
+            if args.command in {'synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket'}:
+                from . import tickets
+                from .repositories import GitHub, RepositoryError, state_lock
+                request = None
+                if args.command in {'synthesize-tickets', 'complete-tickets'}:
+                    with open(args.request, encoding='utf-8') as source:
+                        try:
+                            request = json.load(source, object_pairs_hook=unique_fields)
+                        except (ValueError, RecursionError) as error:
+                            raise IntakeError('invalid_tickets', 'Provide unambiguous ticket-stage JSON.') from error
+                try:
+                    github = GitHub(args.api_base, args.bearer, args.timeout)
+                    with state_lock(database), database:
+                        if args.command == 'synthesize-tickets':
+                            result = tickets.synthesize(database, result, request, github)
+                        elif args.command == 'complete-tickets':
+                            result = tickets.complete_synthesis(database, result, request, github)
+                        elif args.command == 'publish-tickets':
+                            result = tickets.publish(database, result, github)
+                        elif args.command == 'frontier':
+                            result = tickets.frontier(database, result, github)
+                        else:
+                            result = tickets.reserve(database, result, github, args.issue)
                 except RepositoryError as error:
                     raise IntakeError(error.code, str(error)) from error
             if args.command == 'onboard':

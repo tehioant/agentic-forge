@@ -1,0 +1,135 @@
+{
+  "kind": "actual-worker-skill-guided-synthesis; unpublished",
+  "assignment": "Agentic Forge issue #8",
+  "run_id": "20261003_124429_c567e3",
+  "stage": "to-tickets",
+  "skill": {
+    "source": "/inputs/skills/to-tickets/SKILL.md",
+    "sha256": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae",
+    "dependencies": [],
+    "load_evidence": "functions.read_file returned all 105 lines of the selected instructions; functions.terminal independently hashed selected bytes and returned MATCH"
+  },
+  "adaptation": "factory-to-tickets-v1:automatic-batch;controlled-publication;no-dispatch",
+  "adaptation_detail": "Follow context gathering, code exploration, complete tracer-bullet slices, dependency graph and tracker contract. Replace only the routine post-grilling quiz/batch approval with automatic progression. Preserve product-decision, spending, exact-readback and capability blockers. Publication is not authorized in this worker.",
+  "pinned_inputs": {
+    "repository": "tehioant/agentic-forge",
+    "revision": "cccb21e35cc989a1ecd5a3c88f0689a694d77d9c",
+    "milestone": "First implementation milestone",
+    "spec_source": "/inputs/spec.md",
+    "spec_sha256": "fd80a9650f507fb2791b6820ab16369d6c0f619eb7241c0c0bdd09a4cb480c8c",
+    "decisions_source": "/inputs/decisions.md",
+    "decisions_sha256": "8c5129e02dcf289dcc146efe5b3ef401ea5b3cb0d37bdbd2f37672f071d93625",
+    "load_evidence": "functions.read_file returned exact spec (298 lines), decisions (188 lines), issue (58 lines), comments ([]); terminal hash checks returned True for both pinned documents",
+    "handoff_limit": "The supplied published spec/interview snapshots are the planning context. No live factory_v1 completed-planning state or immutable GitHub handoff was supplied to this worker; no such state is fabricated. Public CLI tests separately exercise the completed-handoff path with explicitly labeled fixtures."
+  },
+  "decomposition": "I gathered the full pinned spec, issue and settled decisions and explored the existing intake/onboarding/planning CLI. The current milestone requires one full iteration, including safety and recovery demonstrations; it is not the long-term product backlog. No prefactoring ticket is necessary: the existing durable iteration record, shared lock and GitHub adapter provide the control seams. The following slices each expose an operator-observable complete lifecycle path with persistence, controlled adapters and verification. Security/admission precedes worker execution; gated delivery precedes incident recovery and completion. Pause/reconciliation is independently demonstrable once ticket control exists and is a prerequisite for dispatch. These are synthesis output, NOT additional implementation requirements for issue #8 and NOT published GitHub issues.",
+  "tracker": "GitHub Issues on the explicitly selected or unambiguous repository-linked Projects v2 board",
+  "triage_label": "ready-for-agent",
+  "publication_status": "blocked",
+  "publication_blockers": [
+    "The authorized private validation repository has no linked GitHub Projects board (operator-supplied live blocker in /inputs/manifest.json). Do not invent, create or link one.",
+    "The reviewed bootstrap capability allows metadata GET only; this worker is not authorized to mutate issues or Projects."
+  ],
+  "dependency_order": ["intake", "planning", "tickets", "pause-reconcile", "worker-admission", "engineering", "gated-delivery", "debug-decision", "main-recovery", "requirement-revision", "attention-delivery", "iteration-completion"],
+  "initial_frontier": ["intake"],
+  "tickets": [
+    {
+      "key": "intake",
+      "title": "Register an approved product iteration and verify its repository",
+      "desired_behavior": "An operator registers an explicitly approved idea and exact origin, then inspects durable, read-back-verified repository identity without starting work or creating an unrelated target.",
+      "requirements": ["US-1", "US-2", "US-3", "US-9", "US-34", "US-35"],
+      "acceptance_criteria": ["Register/onboard/inspect survive a fresh controller process and preserve exact approval, origin and immutable repository identity.", "Only one iteration is active; absent/colliding targets and uncertain creation outcomes fail closed without replacement or duplicate creation."],
+      "blockers": [], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "planning",
+      "title": "Turn the resolved same-origin interview into a pinned finite milestone",
+      "desired_behavior": "The conversational agent follows grill-me/grilling and to-spec, retaining actual operator decisions, whole-product vision and separate current-milestone prose in immutable repository documentation.",
+      "requirements": ["US-4", "US-5", "US-6", "US-7", "US-8", "US-9", "US-10"],
+      "acceptance_criteria": ["Unanswered product/technical/test choices remain pending in the exact origin; no silence-based approval is admitted.", "Actual selected instruction loads and skill-guided synthesis are retained; exact immutable docs and specification issue read back without editing the parent."],
+      "blockers": ["intake"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "tickets",
+      "title": "Publish milestone slices and reserve one authoritative eligible ticket",
+      "desired_behavior": "The completed pinned handoff runs selected to-tickets; the operator inspects GitHub-authoritative dependency eligibility and can reserve exactly one current ticket without dispatching workers.",
+      "requirements": ["US-11", "US-12", "US-13", "US-14", "US-15"],
+      "acceptance_criteria": ["Current-only vertical contracts and cycle-free blockers publish blockers first with native links, configured label and exact issue/linked-board/schema/scope/progress readbacks.", "Durable intents reconcile lost publication responses without duplicates; blocked/deferred/out-of-iteration work is refused, independent eligible work remains visible, and no routine batch quiz is required."],
+      "blockers": ["planning"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "pause-reconcile",
+      "title": "Pause and restart a reserved iteration without losing its safety state",
+      "desired_behavior": "The operator pauses a reserved iteration and restarts the controller; work remains checkpointed and no new admission or merge occurs until explicit safe reconciliation/resume.",
+      "requirements": ["US-35", "US-36", "US-37"],
+      "acceptance_criteria": ["Pause survives process restart, preserves artifacts and blocks admission and ordinary merge; emergency stop retains recoverable evidence.", "Resume observes exact GitHub/git/execution state first and recognizes already completed external actions without duplicate effects."],
+      "blockers": ["tickets"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "worker-admission",
+      "title": "Admit a fresh isolated role worker only within authorized capacity",
+      "desired_behavior": "A reserved assignment starts a fresh role process in a tested container with only its workspace, scratch and approved model capability; unauthorized filesystem, credential and spending operations are refused.",
+      "requirements": ["US-16", "US-39", "US-42", "US-43", "US-44"],
+      "acceptance_criteria": ["Real worker/container tests deny host credentials, Docker socket and deployment secrets; reviewer source is read-only and helper contexts cannot become uncontrolled writers.", "Exact role skills/dependencies/inputs are pinned and actually loaded; exhausted allowance or unapproved charge blocks admission without a paid fallback."],
+      "blockers": ["pause-reconcile"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "engineering",
+      "title": "Implement, simplify and independently review one pinned assignment",
+      "desired_behavior": "A fresh implement worker exercises meaningful agreed-seam tests, a separate simplifier follows simplify-code, and fresh read-only Standards/Spec reviewers independently evaluate the exact candidate.",
+      "requirements": ["US-16", "US-17", "US-18", "US-19", "US-40", "US-41"],
+      "acceptance_criteria": ["Actual implement/simplify-code/code-review instruction-load and execution results correlate to the pinned requirements and candidate; no hidden nested review substitutes for the independent axes.", "Rejection or omitted requirements return the candidate for correction; stale verdicts, weakened checks and branch-only passing tests never imply delivery."],
+      "blockers": ["worker-admission"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "gated-delivery",
+      "title": "Deliver a reviewed candidate through controlled merge and integrated observation",
+      "desired_behavior": "The controller autonomously merges only the exact independently reviewed and checked candidate, observes integrated main CI/CD/deployment, and closes work only after delivery verification.",
+      "requirements": ["US-20", "US-21", "US-22", "US-23", "US-40"],
+      "acceptance_criteria": ["Wrong repository/branch, stale head/review, failed/missing required checks or unsafe pause/freeze state deny the controlled mutation.", "Exact merge commit, main checks, deployment and issue/board state read back; an unmerged branch remains undelivered regardless of green tests."],
+      "blockers": ["engineering"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "debug-decision",
+      "title": "Investigate stuck work while independent current tickets remain eligible",
+      "desired_behavior": "Agent-declared stuckness invokes a fresh read-only diagnosing-bugs investigation; the report and real operator direction gate affected work while independent eligible work can continue.",
+      "requirements": ["US-28", "US-29", "US-30", "US-31", "US-32"],
+      "acceptance_criteria": ["Actual reproduction, hypotheses and tool observations accompany the selected-skill diagnostic report; silence is never a decision.", "Bugs use the common ticket contract and duplicate checks; current blockers enter this iteration, unrelated bugs stay deferred, and blocked dependents cannot be reserved."],
+      "blockers": ["engineering"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "main-recovery",
+      "title": "Restore unhealthy main through gated roll-forward or safe revert",
+      "desired_behavior": "An observed main incident freezes ordinary delivery, prioritizes a fresh diagnosing-bugs/implement repair, and resumes ordinary work only after healthy integrated evidence.",
+      "requirements": ["US-23", "US-24", "US-25", "US-26", "US-27"],
+      "acceptance_criteria": ["A real unhealthy CI/CD/deployment observation freezes ordinary merge but permits correctly scoped repair through unchanged tests, simplification and independent review gates.", "Roll-forward or revert reads back exact integrated health; reverted delivered behavior reopens its work item, and genuinely stuck repair waits for operator direction."],
+      "blockers": ["gated-delivery", "debug-decision"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "requirement-revision",
+      "title": "Pause affected work and resynthesize after an agreed material revision",
+      "desired_behavior": "A material product/requirement change pauses affected assignments, versions the agreed milestone and tickets, and invalidates obsolete claims/reviews before safe resumption.",
+      "requirements": ["US-38"],
+      "acceptance_criteria": ["A changed requirement cannot be merged under old assignment or verdict pins.", "Actual agreed revised specs and selected to-tickets resynthesis are retained; unaffected delivered work is preserved and no future milestone is invented."],
+      "blockers": ["engineering", "pause-reconcile"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "attention-delivery",
+      "title": "Deliver durable attention requests to the exact originating thread",
+      "desired_behavior": "Needed decisions and incidents reach the registered origin with persisted intent and retry/deduplication; routine successful transitions remain silent and message delivery is not approval.",
+      "requirements": ["US-33", "US-34"],
+      "acceptance_criteria": ["A transient delivery failure retains the exact destination and recoverable intent; restart retries without discarding attention or promising exactly-once network delivery.", "Only explicit actual operator input resolves a pending direction/spending boundary; normal stage successes do not create chat noise."],
+      "blockers": ["tickets"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    },
+    {
+      "key": "iteration-completion",
+      "title": "Verify a complete private validation iteration and invite the next interview",
+      "desired_behavior": "The operator receives an evidence-backed outcome for the finite delivered milestone, including deferred defects and delivery health, then the factory waits for input about the next iteration of the same product.",
+      "requirements": ["US-19", "US-45", "US-46"],
+      "acceptance_criteria": ["The public lifecycle demonstrates actual skill-guided planning/ticket/engineering stages, delivered main and agreed rejection, stuckness, recovery, pause and spending cases in the authorized private validation repository.", "The completion report cites integrated evidence and unresolved/deferred bugs; no next feature batch or unrelated product starts without operator input."],
+      "blockers": ["main-recovery", "requirement-revision", "attention-delivery"], "status": "ready", "iteration": "First implementation milestone", "triage_label": "ready-for-agent"
+    }
+  ],
+  "spec_reference": "https://github.com/tehioant/agentic-forge/blob/cccb21e35cc989a1ecd5a3c88f0689a694d77d9c/docs/specs/fresh-agentic-factory.md",
+  "execution_evidence_limit": "This is actual synthesis authored by the executing worker after tool-loading the selected skill and pinned inputs. It is not proof of a live product automatic handoff, publication, Projects writes, worker dispatch, independent review, merge or delivery. Those blocked/unexercised paths are not claimed."
+}
