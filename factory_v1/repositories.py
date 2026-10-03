@@ -4,9 +4,17 @@ from contextlib import contextmanager
 import http.client
 import json
 import math
+import re
 import urllib.parse
 import urllib.error
 import urllib.request
+
+
+def valid_repository(value):
+    """Match the exact intake owner/repository grammar without normalization."""
+    return (isinstance(value, str)
+            and re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9_.-]{1,100}', value) is not None
+            and value.split('/')[-1] not in {'.', '..'})
 
 
 class RepositoryError(Exception):
