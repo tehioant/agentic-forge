@@ -155,6 +155,38 @@ The verifier checks prose template structure and external equality; **it does no
 
 Success records `planning_complete` and `handoff` containing only GitHub repository, issue, immutable commit and document/blob references. #8 consumes those GitHub references and performs to-tickets later. `execution_allowed` remains false. This is planning completion, not delivered implementation or ticket closure.
 
+## Model spending admission (#9)
+
+This slice adds a durable controlled-operation boundary; it does **not** start a worker or change `execution_allowed` from `false`. The commands below are trusted controller/operator entry points. `--operator-id` is configuration, not authentication: the caller must verify the operator's actual allowance/approval provenance before recording it. Keep the state database, socket parent directory and broker process private as described above.
+
+Record a narrow allowance (or explicit scoped approval) for one exact project/iteration/provider/model/operation. `--ceiling` is an integer unit count with semantics owned by the fixed adapter: **subscription requests** for the approved Codex route, or **labeled fixture units** for deterministic charge/ceiling tests. Units never stand in for a monetary ceiling. Paid API calls, purchases and financial commitments have no adapter and remain refused even with an arbitrary grant. Adding one requires an explicitly reviewed currency/pricing/maximum-charge contract and operator approval, not a new URL or provider flag:
+
+```bash
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  spend-grant --project approved-product --iteration milestone-1 \
+  --provider fixture-provider --model fixture-model --operation generate \
+  --kind allowance --ceiling 100 --expires <future-unix-seconds> \
+  --reference <verified-allowance-or-approval-record>
+```
+
+Run a fixed-scope broker as the trusted host. It reserves the adapter-owned upper bound durably before the request leaves the process. `--fixture-url` permits only a labeled loopback test endpoint under `fixture-provider`; `--subscription-socket` permits only the approved `openai-codex/gpt-6.1-sol/responses` host capability. Live chargeable API routes are unavailable/fail-closed. The request cannot supply provider/model/operation/endpoint/credentials. Broker requests and model output are transient; durable rows contain only exact scope, idempotency key, request digest, reservation, decision, outcome, and trusted reconciliation reference. No credential is stored or passed to the worker. Known-iteration pre-admission request refusals and disabled-provider configuration attempts are also audited durably with the fixed host scope and bounded reason only; rejected request bodies and credentials are never retained. If durable refusal evidence cannot be written, the broker reports unavailable and still initiates no fallback.
+
+```bash
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  model-broker --socket /scratch/operator/model.sock --project approved-product \
+  --iteration milestone-1 --provider fixture-provider --model fixture-model \
+  --operation generate --fixture-url http://127.0.0.1:<fixture-port>/fixed-fixture --reservation 10
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  model-call --socket /scratch/operator/model.sock --operation-id <stable-idempotency-key> \
+  --reserve 10 --request /scratch/operator/model-request.json
+```
+
+The socket parent must be operator-owned mode `0700`. The socket is mode `0600` for the operator UID, or mode `0666` **inside that private directory only** for an explicitly selected container UID; Linux `SO_PEERCRED` enforces the exact `--worker-uid` on every connection. Bind-mount only that individual socket into its assigned container, never the parent directory. The broker pins scope/upstream, enforces `--ttl` (default 300 seconds, maximum 3600) and `--max-calls` (default 100, maximum 1000), rejects redirects/non-loopback fixture routes and ignores proxy environment settings. The worker's `--reserve` must match the host-owned adapter reservation (`--reservation`, default 3 for fixtures; always 1 for subscription calls), so a worker cannot under-reserve a charge. Admission requires a matching, unexpired grant with enough remaining units. Reservation is subtracted before outbound I/O. Quota denial/refusal and blocked state survive restart. Exact same-key replay never reissues a completed/failed operation; altered scope/request/reservation conflicts. Transport/protocol ambiguity leaves the operation pending and its reservation frozen. Only a trusted controller reconciliation with exact scope, outcome, bounded actual units, and evidence reference can resolve it; never retry an uncertain operation first.
+
+This is an enforceable model-access seam, not full worker isolation: there is no worker launcher/container policy in this slice. Before a later launcher uses it, run the entire worker in a network-disabled container with no provider credentials and mount only its assigned socket; expose no host route, provider SDK credential, or direct network capability. Grant the socket only to that worker identity, pin a per-assignment scope, and verify the boundary with real container tests. Current deterministic tests prove CLI → real Unix socket → fixed loopback fixture execution, not containment of arbitrary workers or live provider billing. The approved subscription route uses a host-owned UDS HTTP capability, not a worker's provider credential. The trusted capability must be fixed to `https://chatgpt.com/backend-api/codex/responses`, `gpt-6.1-sol` and the standard/default tier, with refresh grants retained on the host. The adapter sends only `/v1/responses`, pins model/tier/store/stream and validates a completed exact-model SSE response. It never connects directly to a provider URL, proxies an arbitrary path or selects fallback. The controller verifies this capability's deployment and ownership; merely naming a socket is not proof of that deployment. Configure it with `model-broker ... --provider openai-codex --model gpt-6.1-sol --operation responses --subscription-socket <verified-host-capability.sock> --worker-uid <assigned-uid>`. Subscription payloads contain `input` and only the supported inference fields; there are no secrets in the CLI request. Do not enable chargeable providers until a host-owned adapter provides trustworthy pre-call reservations, exact upstream/model pinning, and authoritative currency/billing reconciliation.
+
+`spend-reconcile` is trusted-controller-only and does not authorize another attempt; terminal idempotency keys stay terminal. A failed outcome releases unused reservation only after trusted confirmation. A successful receipt records actual units no greater than reservation and refunds only the difference. Uncertain outcomes block **all new keys** in the affected iteration until exact trusted reconciliation, not only retries of the same key. A subscription HTTP 429 persists quota exhaustion without fallback and freezes its reservation conservatively. After an exact billing/allowance receipt, `spend-resume --project ... --iteration ... --provider ... --model ... --operation ... --reference <verified-quota-restoration>` additionally requires the exact exhausted scope and an unexpired grant. Recording another grant alone cannot erase a quota block. Paused iterations cannot start a broker or admit operations; trusted reconciliation remains available while paused.
+
 ## Verification and honest boundary
 
 ```bash
@@ -164,7 +196,7 @@ PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_
 
 Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
 
-Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. This slice adds only ticket controls, not a worker launcher, spending admission, merge or notification service, and changes no existing gate.
+Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. Ticket controls and model spending admission remain separate capabilities. Neither starts workers or supplies merge, deployment or notification execution; no existing gate is changed.
 
 ## Tickets (#8): selected to-tickets → controlled publication → frontier → one reservation
 
@@ -190,14 +222,13 @@ The request has exactly `skill` and `tracker`:
   "tracker": {
     "project_id": null,
     "status_field": "Status",
-    "scope_field": "Iteration",
-    "statuses": {"ready": "Ready", "active": "In Progress", "blocked": "Blocked", "deferred": "Deferred", "done": "Done"},
+    "statuses": {"ready": "Todo", "active": "In Progress", "done": "Done"},
     "triage_label": "ready-for-agent"
   }
 }
 ```
 
-`project_id` is an explicit Projects v2 node ID or null for exactly one open repository-linked board. No name guessing, board creation/linking, optional-board fallback or missing-scope bypass exists. Both named fields must be unambiguous single-select fields; scope must have an option named exactly the registered `iteration_id`. All five distinct progress options must exist. Resolved project/field/option IDs are durably pinned and revalidated. An inaccessible/ambiguous/missing/changed schema blocks publication before any issue writes.
+`project_id` is an explicit Projects v2 node ID or null for exactly one open repository-linked board. No name guessing, board creation/linking, optional-board fallback or missing-scope bypass exists. The named Status field must be unambiguous and contain the three distinct configured progress options. Without `scope_field`, scope is the existing open repository milestone titled exactly the registered `iteration_id`; native milestone ID/number/title are pinned, assigned at issue creation and verified on readback. Missing, inaccessible, ambiguous or changed milestone identities fail closed. Blocked/deferred issue-body status keeps work ineligible without inventing extra board options. Legacy configurations with an explicit single-select `scope_field` and all five progress roles remain supported without changing their behavior. Resolved project/field/option and scope identities are durably pinned and revalidated. An inaccessible/ambiguous/missing/changed schema blocks publication before any issue writes.
 
 The controller re-reads the exact immutable planning documents and current spec issue and attaches their contents, SHA-256s, immutable pointers and input digest, plus actual selected instruction bytes, adaptation identity and assignment ID. `to-tickets` has no transitive skill dependencies. The bundled source is an unchanged selected snapshot, not a parallel factory-specific skill. The agent follows context gathering, complete tracer-bullet decomposition, verifiable acceptance and blocker graph drafting. Only the routine ticket quiz/batch confirmation is adapted away. Missing product decisions, capability and spending restrictions remain authoritative.
 
@@ -228,4 +259,3 @@ python -m factory_v1 --state <state> --operator-id 42 \
 Reservation first refreshes GitHub and refuses partial publication, paused iterations, existing active work (including foreign iteration work) and an existing different global reservation. It persists one pending reservation before setting the exact board progress to active, then verifies the exact eligible active issue. Lost responses preserve the reservation and reconcile the same run on retry. Competing commands are serialized. No release, dispatch, implementation worker, merge or issue-close operation is supplied here; `execution_allowed` stays false and worker-run correlation stays null.
 
 `evidence/issue8-synthesis.json` retains the actual implementing worker's selected-skill-guided decomposition of the supplied pinned first milestone. Its output is unpublished evidence, not new implementation requirements for #8. It explicitly separates actual instruction loads/synthesis from fixture-only public control tests and unavailable live handoff/publication. Live acceptance remains blocked: the operator-reported authorized private validation repository has no linked board, and the reviewed bootstrap capability is metadata-GET-only. No board/issue/PR/merge/closure mutation was attempted in validation.
-

@@ -110,11 +110,11 @@ def validate_contract(title, behavior, criteria, refs, inputs):
             for r in refs), 'Reference only the immutable current milestone and named requirements.')
     milestone = inputs['documents']['milestone.md']['content']
     story_section = milestone.split('## User Stories', 1)[-1].split('\n## ', 1)[0]
-    story_numbers = {int(n) for n in re.findall(r'^([1-9][0-9]*)\. ', story_section, re.MULTILINE)}
+    story_numbers = set(re.findall(r'^([1-9][0-9]*)\. ', story_section, re.MULTILINE))
     for reference in refs:
         requirement = reference['requirement']
         story = re.fullmatch(r'US-([1-9][0-9]*)', requirement)
-        require((story is not None and int(story[1]) in story_numbers) or
+        require((story is not None and story[1] in story_numbers) or
                 (story is None and requirement in milestone), 'Requirement reference is not defined in the pinned current milestone.')
 
 
@@ -170,19 +170,25 @@ def validate_batch(batch, inputs, iteration, label):
                 'Use unique blocking references.')
         known[ticket['key']] = ticket
     ordered, visiting, done = [], set(), set()
-    def visit(key):
-        require(key in known, 'Unknown blocker reference.')
-        require(key not in visiting, 'Ticket blocking graph contains a cycle.')
-        if key in done:
-            return
-        visiting.add(key)
-        for blocker in known[key]['blockers']:
-            visit(blocker)
-        visiting.remove(key)
-        done.add(key)
-        ordered.append(known[key])
-    for key in known:
-        visit(key)
+    for root in known:
+        if root in done:
+            continue
+        visiting.add(root)
+        stack = [(root, iter(known[root]['blockers']))]
+        while stack:
+            key, blockers = stack[-1]
+            blocker = next(blockers, None)
+            if blocker is None:
+                stack.pop()
+                visiting.remove(key)
+                done.add(key)
+                ordered.append(known[key])
+                continue
+            require(blocker in known, 'Unknown blocker reference.')
+            require(blocker not in visiting, 'Ticket blocking graph contains a cycle.')
+            if blocker not in done:
+                visiting.add(blocker)
+                stack.append((blocker, iter(known[blocker]['blockers'])))
     return ordered
 
 
@@ -242,7 +248,10 @@ def body(item, ticket, numbers):
 
 def verified_board(work, github, repository, iteration):
     board = gh.resolve_board(github, repository, work['request']['tracker'])
-    require(iteration in board['scope']['options'], 'Current iteration scope option missing.', 'projects_blocked')
+    if 'scope' in board:
+        require(iteration in board['scope']['options'], 'Current iteration scope option missing.', 'projects_blocked')
+    else:
+        board['milestone'] = gh.resolve_milestone(github, repository, iteration)
     require(work.get('board', board) == board, 'Pinned board/schema changed; controller review required.', 'projects_blocked')
     return board
 
@@ -280,8 +289,10 @@ def publish(database, item, github):
                 require(not intent.get('issue'), 'Lost issue response/absent readback: investigate before retry; never create a duplicate.', 'publication_uncertain')
                 intent['issue'] = {'title': ticket['title'], 'body': expected_body}
                 checkpoint(database, item)  # BEFORE mutation, including lost response/process death.
-                created = github.request('/repos/' + item['repository'] + '/issues',
-                                         {'title': ticket['title'], 'body': expected_body, 'labels': [ticket['triage_label']]})
+                payload = {'title': ticket['title'], 'body': expected_body, 'labels': [ticket['triage_label']]}
+                if 'milestone' in board:
+                    payload['milestone'] = board['milestone']['number']
+                created = github.request('/repos/' + item['repository'] + '/issues', payload)
                 created = gh.issue_identity(created, item['repository'])
                 intent['identity'] = {'number': created['number'], 'id': created['id'], 'node_id': created['node_id']}
                 checkpoint(database, item)
@@ -319,8 +330,12 @@ def publish(database, item, github):
                 gh.add_item(github, board['project_id'], issue['node_id'])
                 member = gh.membership(github, board, item['repository'], issue)
                 require(member is not None, 'Exact project membership missing after write.', 'publication_mismatch')
-            target = {'scope': board['scope']['options'][item['iteration_id']],
-                      'status': board['status']['options'][work['request']['tracker']['statuses']['ready']]}
+            target = {'status': board['status']['options'][work['request']['tracker']['statuses']['ready']]}
+            if 'milestone' in board:
+                require(gh.issue_scope(issue, board) == board['milestone']['id'],
+                        'Exact native milestone scope readback differs.', 'publication_mismatch')
+            else:
+                target = {'scope': board['scope']['options'][item['iteration_id']], **target}
             for role, option in target.items():
                 require(member[role] in {None, option}, 'Existing board progress/scope conflicts; do not overwrite external work.', 'publication_mismatch')
                 if member[role] != option:
@@ -362,11 +377,17 @@ def frontier(database, item, github):
         if not isinstance(content, dict) or content.get('repository', {}).get('nameWithOwner') != item['repository']:
             continue
         fields = gh.single_select_values(member)
-        if fields.get(board['scope']['id']) != board['scope']['options'][item['iteration_id']]:
+        if 'milestone' in board:
+            issue = gh.read_issue(github, item['repository'], content.get('number'))
+            current_scope = gh.issue_scope(issue, board) == board['milestone']['id']
+        else:
+            current_scope = fields.get(board['scope']['id']) == board['scope']['options'][item['iteration_id']]
+        if not current_scope:
             if status_options.get(fields.get(board['status']['id'])) == 'active':
                 foreign_active.append(content.get('number'))
             continue
-        issue = gh.read_issue(github, item['repository'], content.get('number'))
+        if 'milestone' not in board:
+            issue = gh.read_issue(github, item['repository'], content.get('number'))
         for pinned in work.get('published', {}).values():
             if pinned['number'] == issue['number']:
                 require(all(issue[k] == pinned[k] for k in ('number', 'id', 'node_id')),
@@ -386,36 +407,45 @@ def frontier(database, item, github):
             dep = gh.issue_identity(dep, item['repository'])
             blockers.append(dep['number'])
         require(len(blockers) == len(set(blockers)) and issue['number'] not in blockers, 'Invalid blocker references.', 'github_mismatch')
-        textual = {int(n) for n in re.findall(r'#([1-9][0-9]*)', issue['body'].split('## Blocked by\n', 1)[-1].split('\n## ', 1)[0])}
-        require(textual == set(blockers), 'Native/textual blockers disagree.', 'github_mismatch')
+        textual = set(re.findall(r'#([1-9][0-9]*)', issue['body'].split('## Blocked by\n', 1)[-1].split('\n## ', 1)[0]))
+        require(textual == {str(number) for number in blockers}, 'Native/textual blockers disagree.', 'github_mismatch')
         rows[issue['number']] = {'number': issue['number'], 'id': issue['id'], 'node_id': issue['node_id'],
                                 'membership_id': member['id'], 'status': state, 'issue_state': issue['state'],
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
-                                'contract_valid': bool(contract and triaged)}
+                                'contract_valid': bool(contract and triaged),
+                                'held': bool('milestone' in board and re.search(
+                                    r'^## Status\n\s*\n(?:blocked|deferred)\s*(?:\n## |\Z)', issue['body'], re.MULTILINE))}
     for dependencies in native_blockers.values():
         for dependency in dependencies:
             row = rows.get(dependency['number'])
             require(row is None or all(row[key] == dependency[key] for key in ('number', 'id', 'node_id')),
                     'Native blocker identity differs from the board issue observation; reconcile GitHub identities before retrying.', 'github_mismatch')
     visiting, visited = set(), set()
-    def visit(number):
-        require(number not in visiting, 'Authoritative blocker graph contains a cycle.', 'github_mismatch')
-        if number in visited:
-            return
-        visiting.add(number)
-        for dep in rows[number]['blockers']:
-            if dep in rows:
-                visit(dep)
-        visiting.remove(number)
-        visited.add(number)
-    for number in rows:
-        visit(number)
+    for root in rows:
+        if root in visited:
+            continue
+        visiting.add(root)
+        stack = [(root, iter(rows[root]['blockers']))]
+        while stack:
+            number, blockers = stack[-1]
+            dep = next(blockers, None)
+            if dep is None:
+                stack.pop()
+                visiting.remove(number)
+                visited.add(number)
+                continue
+            if dep not in rows:
+                continue
+            require(dep not in visiting, 'Authoritative blocker graph contains a cycle.', 'github_mismatch')
+            if dep not in visited:
+                visiting.add(dep)
+                stack.append((dep, iter(rows[dep]['blockers'])))
     def completed(number):
         row = rows.get(number)
         # Unknown/out-of-scope blockers cannot be asserted delivered.
         return row is not None and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
     for row in rows.values():
-        row['admissible'] = bool(row['contract_valid'] and row['issue_state'] == 'open' and
+        row['admissible'] = bool(row['contract_valid'] and not row['held'] and row['issue_state'] == 'open' and
                                  row['status'] in {'ready', 'active'} and all(completed(b) for b in row['blockers']))
     eligible = [n for n, r in rows.items() if r['admissible'] and r['status'] == 'ready']
     work['frontier'] = {'authority': 'github', 'items': list(rows.values()), 'eligible': sorted(eligible),

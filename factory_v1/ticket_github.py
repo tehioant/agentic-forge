@@ -1,6 +1,5 @@
 """Narrow Issues/dependency and Projects v2 seam; no board creation or worker API."""
 from .planning import require
-from .repositories import RepositoryError
 
 
 def graph(github, query, variables):
@@ -59,15 +58,18 @@ def project_fields(github, project):
 
 
 def resolve_board(github, repository, configuration):
-    require(isinstance(configuration, dict) and set(configuration) ==
-            {'project_id', 'status_field', 'scope_field', 'statuses', 'triage_label'},
-            'Configure explicit project selection (or null), status/scope fields, status names and triage label.')
+    keys = {'project_id', 'status_field', 'statuses', 'triage_label'}
+    require(isinstance(configuration, dict) and set(configuration) in (keys, keys | {'scope_field'}),
+            'Configure project selection (or null), progress names and triage label; native milestones define scope.')
+    legacy_scope = 'scope_field' in configuration
     names = configuration['statuses']
-    require(isinstance(names, dict) and set(names) == {'ready', 'active', 'blocked', 'deferred', 'done'} and
-            all(isinstance(v, str) and v.strip() for v in names.values()) and len(set(names.values())) == 5 and
+    roles = {'ready', 'active', 'done'} | ({'blocked', 'deferred'} if legacy_scope else set())
+    require(isinstance(names, dict) and set(names) == roles and
+            all(isinstance(v, str) and v.strip() for v in names.values()) and len(set(names.values())) == len(roles) and
             all(isinstance(configuration[k], str) and configuration[k].strip()
-                for k in ('status_field', 'scope_field', 'triage_label')) and
-            configuration['status_field'] != configuration['scope_field'] and
+                for k in ('status_field', 'triage_label')) and
+            (not legacy_scope or isinstance(configuration['scope_field'], str) and configuration['scope_field'].strip() and
+             configuration['status_field'] != configuration['scope_field']) and
             (configuration['project_id'] is None or isinstance(configuration['project_id'], str) and configuration['project_id']),
             'Use unambiguous field/option names and a configured triage label.')
     boards = linked_projects(github, repository)
@@ -80,7 +82,7 @@ def resolve_board(github, repository, configuration):
     project = selected[0]['id']
     fields = project_fields(github, project)
     resolved = {}
-    for role in ('status', 'scope'):
+    for role in (('status', 'scope') if legacy_scope else ('status',)):
         candidates = [f for f in fields if isinstance(f, dict) and f.get('name') == configuration[role + '_field']]
         require(len(candidates) == 1, 'Selected board field missing or ambiguous.', 'projects_blocked')
         field = candidates[0]
@@ -147,7 +149,37 @@ def membership(github, board, repository, issue):
             item['content'].get('repository', {}).get('nameWithOwner') == repository,
             'Project content identity differs from exact issue.', 'github_mismatch')
     values = single_select_values(item)
-    return {'id': item['id'], 'scope': values.get(board['scope']['id']), 'status': values.get(board['status']['id'])}
+    return {'id': item['id'], 'scope': issue_scope(issue, board) if 'milestone' in board else values.get(board['scope']['id']),
+            'status': values.get(board['status']['id'])}
+
+
+def milestone_identity(value):
+    require(isinstance(value, dict) and type(value.get('id')) is int and value['id'] > 0 and
+            type(value.get('number')) is int and value['number'] > 0 and
+            isinstance(value.get('title'), str) and value['title'].strip() and
+            value.get('state') in ('open', 'closed'),
+            'Exact native milestone scope is unavailable.', 'projects_blocked')
+    return {key: value[key] for key in ('id', 'number', 'title')}
+
+
+def resolve_milestone(github, repository, iteration):
+    values = rest_pages(github, '/repos/' + repository + '/milestones?state=all')
+    identities = [milestone_identity(value) for value in values]
+    require(len({m['id'] for m in identities}) == len(identities) and
+            len({m['number'] for m in identities}) == len(identities),
+            'Ambiguous native milestone identities.', 'projects_blocked')
+    matches = [m for m, value in zip(identities, values) if m['title'] == iteration and value['state'] == 'open']
+    require(len(matches) == 1, 'Current native milestone missing or ambiguous; no scope creation is permitted.', 'projects_blocked')
+    return matches[0]
+
+
+def issue_scope(issue, board):
+    observed = milestone_identity(issue.get('milestone'))
+    expected = board['milestone']
+    require(not (observed['number'] == expected['number'] or observed['id'] == expected['id'] or
+                 observed['title'] == expected['title']) or observed == expected,
+            'Native milestone identity changed or scope is ambiguous.', 'projects_blocked')
+    return observed['id']
 
 
 def add_item(github, project, issue):
