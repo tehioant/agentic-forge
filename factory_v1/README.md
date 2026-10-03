@@ -1,16 +1,18 @@
-# Fresh factory v1 — approved intake tracer bullet
+# Fresh factory v1 — approved intake and repository onboarding
 
-This independent, standard-library Python controller implements the local intake/inspection slice of issue #5. It uses only the fresh specification and interview; no previous factory implementation, profiles or state are loaded. Run from the repository root with Python 3.11 or later. No package installation, Hermes core changes or credentials are required.
+This standard-library Python controller implements issue #5 intake/inspection and issue #6 repository onboarding. Run from the repository root on Python 3.11 or 3.13; no installation or Hermes core changes are required. No beta implementation, contents, profiles or state are loaded.
 
 ## Trust boundary
 
-The CLI is a **trusted operator/controller interface**, not an unauthenticated API or a worker tool. The caller must already have authenticated the operator and verified the approval reference and gateway origin against the original conversation. `--operator-id` is administrator-supplied configuration, never a value taken from an untrusted intake. Matching a self-reported operator ID is not authentication. The CLI validates and durably records the trusted handoff; it does not independently verify a Discord message or GitHub permissions. Network-backed approval verification and controlled GitHub operations are not established by this slice.
+The CLI is a **trusted operator/controller interface**, not an unauthenticated API or a worker capability. The caller must authenticate the operator and verify approval provenance and conversation metadata before supplying them. `--operator-id` is trusted configuration; matching a self-reported ID is not authentication. The CLI durably records and validates that handoff, not Discord messages themselves.
 
-Place state in an operator-owned, private directory outside the checkout. The entire directory, including SQLite journals and backups, must be inaccessible to workers and other users. Do not use symlinked, attacker-writable, or shared state paths. New state files are created with owner-only permissions on POSIX; existing file and directory permissions remain the administrator's responsibility. Request files and stdout contain approval and routing metadata; protect them too. No secrets belong in the request.
+Keep state, SQLite journals/backups, request files, receipts and output in a private operator-owned directory outside source (use `/scratch` for validation). Do not use shared, attacker-writable or symlinked state paths. New files have owner-only POSIX permissions; administrators remain responsible for existing permissions and directories. No secrets belong in intake or receipts.
 
-## Public commands
+`onboard` uses an explicitly configured GitHub adapter/capability endpoint. Supply a credential-blind broker with narrow permissions, not a worker's personal token. The adapter does not implement OS isolation, role authentication or the trusted broker's authorization policy. HTTPS endpoints and loopback HTTP brokers are supported; URL credentials, query strings, fragments, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Creation/reconciliation is pinned to the recorded endpoint. There is no bootstrap GitHub bypass, fallback account, provider or paid plan purchase.
 
-Use a sanitized, operator-verified request file. These example identifiers are placeholders, not real approval or live verification evidence:
+## Public lifecycle
+
+An example request follows. IDs and approval references are placeholders, not evidence:
 
 ```json
 {
@@ -20,43 +22,72 @@ Use a sanitized, operator-verified request file. These example identifiers are p
   "idea": "The product explicitly requested by its operator",
   "approval": {"operator_id": "42", "reference": "operator-message-101"},
   "origin": {
-    "platform": "discord",
-    "chat_id": "123",
-    "thread_id": "123",
-    "parent_chat_id": "456",
-    "scope_id": "789"
+    "platform": "discord", "chat_id": "123", "thread_id": "123",
+    "parent_chat_id": "456", "scope_id": "789"
   },
   "work_item_number": 5
 }
 ```
 
-`work_item_number` is optional. When provided, its repository is the exact selected repository; it is a correlation reference, not proof that an issue exists or authority to claim it. Intake requires an exact `owner/repository` string, not a URL or guessed default. Identifiers are preserved, never repaired or normalized. This initial slice supports the verified Discord-thread origin shape; other origins are refused rather than guessed.
+`work_item_number` is optional and correlates the exact repository/issue number; it is not evidence an issue exists or is eligible. Repository selection is an exact `owner/repository`, never a URL, inferred unrelated target, repaired identifier or guessed platform. For a new approved product, add:
 
-```bash
-python -m factory_v1 --state /private/operator/state.sqlite --operator-id 42 \
-  register --request /private/operator/approved-intake.json
-
-python -m factory_v1 --state /private/operator/state.sqlite --operator-id 42 \
-  inspect --project approved-product --iteration milestone-1
+```json
+"repository_intent": {"mode": "new", "marker": "unique-controller-owned-creation-marker"}
 ```
 
-Successful commands print one JSON record and exit 0. Refusals and operational errors print a JSON error on stderr and exit 2; argument errors use argparse's stderr/help and exit 2.
+The trusted handoff must associate a unique ownership marker with this creation. Omitting `repository_intent` preserves prior intake semantics: explicitly selected **existing** repository, never authority to create a replacement. Intake approval also applies to the new-product intent; missing or wrong-operator approval is refused.
 
-- Missing approval, wrong operator, ambiguous repository/origin, unknown fields, malformed/duplicate JSON fields and invalid issue references are refused before creating state. GitHub owner names cannot start/end with a hyphen or contain consecutive hyphens. JSON parser-limit failures are reported as `invalid_intake` without weakening Python's limits.
-- The first approved iteration is `active`. Further approved iterations are `paused`. A serialized SQLite transaction makes concurrent registration obey the same rule.
-- Identical registration returns the original record and identities. Changed scope, provenance or work-item reference for the same project/iteration is an `intake_conflict`, not a silent update.
-- Each record exposes project, iteration and stage, an optional work-item reference, an intake control-run ID and evidence ID. The control-run ID identifies local registration, **not** a worker or model invocation. `worker_run_id` is null; no worker is started.
-- State and approval/origin survive a fresh process. `--state` must name a persistent SQLite file; empty arguments and the special `:memory:` target are refused as `invalid_state` by both commands. `inspect` is read-only and never creates missing state. No daemon is needed for this slice.
-- `execution_allowed` is always false, even for an active approved iteration: worker isolation, spending admission, repository access, scheduling and merge gates are not implemented here. Active means admitted intake, not runnable work.
-- No GitHub writes, notifications, charges, worker launches, merges or deployment occur. No pause/resume scheduler or crash reconciliation of external actions is claimed.
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  register --request /scratch/operator/approved-intake.json
 
-## Verification
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  inspect --project approved-product --iteration milestone-1
+
+PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  onboard --project approved-product --iteration milestone-1 \
+  --api-base http://127.0.0.1:8655/github --bearer harmless-dummy --timeout 10
+```
+
+Successful commands print one JSON record and exit 0. Refusals/operational failures print JSON on stderr and exit 2; argument errors use argparse help/stderr. `--timeout` must be finite and in `(0, 300]` seconds. A real token is unnecessary for the supplied credential-blind broker; never put genuine credentials in published evidence.
+
+### Durable behavior
+
+- Intake rejects unknown/duplicate fields, missing provenance, ambiguous origins, invalid owner syntax and parser-limit failures before state creation. Original approved intake behavior and exact identifiers are retained.
+- First intake is active; additional products are paused. Concurrent registration is serialized. Identical re-registration is idempotent; changed provenance, intent or work-item scope is a conflict.
+- `inspect` is read-only, does not create absent state, and exposes durable correlations. Empty and `:memory:` state targets are refused. Control-run IDs denote intake, not worker/model execution; worker ID remains null.
+- Existing onboarding requests only repository **metadata**, never contents, git clones or beta files. Exact owner/name/full-name, positive integer repository ID and boolean privacy must read back. Existing public repositories may be reused as explicitly selected; they are not made private silently. Missing/mismatched targets never trigger replacement creation.
+- New creation resolves `/user` against the exact selected owner. A different owner requires a reviewed account-scoped capability, not guessed organization endpoints. A pre-existing name is a collision even when its marker matches. The configured identity is the default GitHub account, but intake continues to require an explicit exact target.
+- Before POST, commit a durable `pending` intent with marker/endpoint. A POSIX advisory lock serializes onboarding for this state file across CLI processes, including the committed-pending crash window. Use one trusted durable state store per controller; separate unrelated stores are not a distributed creation lock.
+- POST `/user/repos` sets `private=true`, exact name/description and `auto_init=false` explicitly. A successful response must supply a positive integer immutable repository ID; that ID is durably committed before read-back. Invalid/missing IDs become persisted investigation blockers, never authority to adopt a later target. The response alone is not success evidence: GET of the exact target must verify the pinned ID, owner, name, full identity, privacy and marker, including on restart after unavailable read-back. Only allowlisted metadata is retained; unexpected credentials are excluded.
+- A timeout/lost response/process death reconciles the exact target before retry. A pending target that is absent stays `creation_uncertain`; 404 cannot prove a delayed write will never complete. No automatic second POST occurs. A definitive rejected POST is durably blocked and cannot adopt a subsequent collision. A successful POST followed by denied read-back stays pending/reconcilable, not falsely definitively rejected.
+- A verified repository ID cannot be replaced by the same name/marker. Wrong privacy/marker/identity or ambiguous JSON refuses verification. Successful JSON `null` is unavailable metadata, not proof of HTTP 404 absence, and cannot admit creation. HTTP protocol/framing failures produce structured actionable blockers; truncated creation/read-back responses preserve pending intent for exact reconciliation. Network, permission, conflict and plan/protection errors give actionable capability/investigation requests; no purchase, weakening or bypass is attempted.
+
+### Explicit trusted lost-state recovery
+
+If durable state is lost but the trusted controller has genuine prior creation evidence, it may provide `onboard --creation-receipt /scratch/operator/receipt.json`. This is **not** routine onboarding or authority for workers to adopt a collision. The caller must independently validate the receipt against actual controlled creation evidence. The interface trusts the administrator, not an unsigned worker assertion.
+
+```json
+{
+  "repository": "example/approved-product",
+  "repository_id": 123,
+  "marker": "unique-controller-owned-creation-marker",
+  "api_base": "http://127.0.0.1:8655/github",
+  "reference": "trusted-controller-creation-and-readback-evidence"
+}
+```
+
+Exactly these fields are required. Restore needs a recorded approved new-product intake and binds the exact target, positive ID, approved marker, endpoint and nonempty provenance reference. It **never creates** an absent target. Live identity/privacy/marker/ID must match before the receipt and verified metadata are persisted. Receipt recovery cannot override blocked creation, endpoint pinning or previously verified ID continuity. Regular onboarding still refuses a colliding target without prior durable intent or explicit trusted creation evidence. Endpoint migration is not implemented; request controller review instead of modifying records silently.
+
+## Verification and scope
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s factory_v1/tests -v
-python -m compileall -q factory_v1
+PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_v1
 ```
 
-Tests invoke the actual public CLI in fresh subprocesses against temporary SQLite files. They cover restart inspection, refused intake, idempotent/conflicting replay, concurrent one-active admission, persistent correlations, read-only missing-state inspection, malformed/missing request handling, parser-limit failures, nonpersistent state refusal, exact GitHub owner boundaries and private new-state permissions. They do not mock the controller or pretend to prove external/container/notification/spending boundaries.
+Tests invoke the actual CLI in fresh subprocesses with SQLite/HTTP fixtures under tempfile's configured temporary directory (`TMPDIR` in validation and CI), without requiring a `/scratch` mount. A portability regression selects a different temporary root, exercises both lifecycle fixtures through the CLI, and verifies cleanup. Deterministic tests cover previous intake, metadata-only reuse, exact private creation, name/identity conflicts, successful POST/GET immutable-ID continuity across restart, invalid creation IDs, lost responses, killed-process restart, concurrency, read-back outages, blocked permission/conflict cases, endpoint continuity, credential exclusion, ambiguous/deeply nested metadata and explicit receipt restoration. Those fixtures do not prove live external enforcement.
 
-The `Fresh factory v1` GitHub Actions workflow exercises these same tests on Python 3.11 and 3.13 using read-only repository permission and pinned action revisions. Independent requirement/security review and integrated-main verification are still required before issue #5 can close. This tracer bullet is not a functioning autonomous factory.
+For this continuation, `/inputs/live-receipts.json` provides prior creation/read-back evidence for `tehioant/agentic-forge-fresh-v1-validation`, ID `1402450718`, private, with description `fresh-forge-m1-validation:origin-1555635434036396065`. Do not recreate it. The current CLI restored from that explicit trusted receipt and independently read the exact live target back through the approved loopback broker. Validation scratch's parent/scope conversation IDs are local fixtures, **not** notification/routing evidence. Execution output, not this document, is the evidence authority.
+
+`execution_allowed` remains false. This slice does not establish scheduling, worker isolation, spending admission, Projects/Issues/PR writes, checks, merge protection, deployment, notifications or a self-running factory. It does not change ticket #17's no-bypass gate. Independent review, controller publication/controlled merge and integrated-main evidence remain required before ticket closure. Future slices are not missing repository-onboarding behavior.
