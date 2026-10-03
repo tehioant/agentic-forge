@@ -122,22 +122,17 @@ def main():
     onboarding.add_argument('--bearer', default='credential-blind-controller')
     onboarding.add_argument('--timeout', type=float, default=10)
     onboarding.add_argument('--creation-receipt', help='Trusted controller receipt for explicit lost-state recovery; never worker-supplied.')
-    grilling = commands.add_parser('interview')
-    grilling.add_argument('--project', required=True)
-    grilling.add_argument('--iteration', required=True)
-    grilling.add_argument('--request', required=True)
-    export = commands.add_parser('export-spec')
-    export.add_argument('--project', required=True)
-    export.add_argument('--iteration', required=True)
-    export.add_argument('--revision', required=True)
-    publication = commands.add_parser('verify-spec')
-    publication.add_argument('--project', required=True)
-    publication.add_argument('--iteration', required=True)
-    publication.add_argument('--revision', required=True)
-    publication.add_argument('--commit', required=True)
-    publication.add_argument('--api-base', required=True)
-    publication.add_argument('--bearer', default='credential-blind-controller')
-    publication.add_argument('--timeout', type=float, default=10)
+    planning = commands.add_parser('plan')
+    planning.add_argument('--project', required=True)
+    planning.add_argument('--iteration', required=True)
+    planning.add_argument('--request', required=True)
+    completion = commands.add_parser('complete-planning')
+    completion.add_argument('--project', required=True)
+    completion.add_argument('--iteration', required=True)
+    completion.add_argument('--request', required=True)
+    completion.add_argument('--api-base', required=True)
+    completion.add_argument('--bearer', default='credential-blind-controller')
+    completion.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -152,7 +147,7 @@ def main():
         with closing(connection) as database, database:
             result = register_iteration(database, item)
     else:
-        uri = Path(args.state).resolve().as_uri() + ('?' + ('mode=ro' if args.command in {'inspect', 'export-spec'} else 'mode=rw'))
+        uri = Path(args.state).resolve().as_uri() + ('?' + ('mode=ro' if args.command == 'inspect' else 'mode=rw'))
         try:
             connection = sqlite3.connect(uri, uri=True)
         except sqlite3.OperationalError as error:
@@ -164,32 +159,22 @@ def main():
             if args.command != 'inspect':
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
-            if args.command == 'verify-spec':
-                from .publication import verify_spec
+            if args.command in {'plan', 'complete-planning'}:
+                from .planning import plan, complete
                 from .repositories import GitHub, RepositoryError
-                try:
-                    with database:
-                        result = verify_spec(database, result, args.revision, args.commit,
-                                             GitHub(args.api_base, args.bearer, args.timeout))
-                except RepositoryError as error:
-                    raise IntakeError(error.code, str(error)) from error
-            if args.command == 'export-spec':
-                from .specifications import SpecificationError, export_spec
-                try:
-                    result = export_spec(result, args.revision)
-                except SpecificationError as error:
-                    raise IntakeError(error.code, str(error)) from error
-            if args.command == 'interview':
-                from .specifications import SpecificationError, interview
                 with open(args.request, encoding='utf-8') as source:
                     try:
-                        record = json.load(source, object_pairs_hook=unique_fields)
+                        request = json.load(source, object_pairs_hook=unique_fields)
                     except (ValueError, RecursionError) as error:
-                        raise IntakeError('invalid_interview', 'Provide unambiguous interview JSON.') from error
+                        raise IntakeError('invalid_planning', 'Provide unambiguous planning JSON within parser limits.') from error
                 try:
                     with database:
-                        result = interview(database, result, record, args.operator_id)
-                except SpecificationError as error:
+                        if args.command == 'plan':
+                            result = plan(database, result, request)
+                        else:
+                            result = complete(database, result, request,
+                                              GitHub(args.api_base, args.bearer, args.timeout))
+                except RepositoryError as error:
                     raise IntakeError(error.code, str(error)) from error
             if args.command == 'onboard':
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):

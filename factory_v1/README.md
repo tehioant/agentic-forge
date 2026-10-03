@@ -1,18 +1,18 @@
-# Fresh factory v1 — approved intake and repository onboarding
+# Fresh factory v1 — intake, onboarding and conversational planning
 
-This standard-library Python controller implements issue #5 intake/inspection, issue #6 repository onboarding, and issue #7 interview/specification preparation and publication verification. Run from the repository root on Python 3.11 or 3.13; no installation or Hermes core changes are required. No beta implementation, contents, profiles or state are loaded. Issue #7's real documentation publication remains blocked until a reviewed controller capability is supplied; deterministic read-back tests are not live publication evidence.
+Standard-library Python controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, returns a same-conversation planning assignment, and verifies its GitHub handoff. It does not start workers, generate tickets or execute implementation.
 
-## Trust boundary
+## Trust and safety boundary
 
-The CLI is a **trusted operator/controller interface**, not an unauthenticated API or a worker capability. The caller must authenticate the operator and verify approval provenance and conversation metadata before supplying them. `--operator-id` is trusted configuration; matching a self-reported ID is not authentication. The CLI durably records and validates that handoff, not Discord messages themselves.
+This is a **trusted operator/controller CLI**, not an unauthenticated worker API. The caller authenticates the operator and verifies actual approval/message provenance and originating conversation before supplying inputs. `--operator-id` is trusted configuration, not authentication. Neither JSON actor IDs nor Markdown provenance prove an actual user spoke; that verification belongs to the originating conversational integration.
 
-Keep state, SQLite journals/backups, request files, receipts and output in a private operator-owned directory outside source (use `/scratch` for validation). Do not use shared, attacker-writable or symlinked state paths. New files have owner-only POSIX permissions; administrators remain responsible for existing permissions and directories. No secrets belong in intake or receipts.
+Keep SQLite state, journals/backups, request files, receipts and output in a private operator-owned directory outside source (`/scratch` during sandbox validation). Do not use shared, attacker-writable or symlinked state paths. New state files are owner-only; existing permissions and directory ownership remain administrator responsibilities. No secrets belong in requests or evidence.
 
-`onboard` uses an explicitly configured GitHub adapter/capability endpoint. Supply a credential-blind broker with narrow permissions, not a worker's personal token. The adapter does not implement OS isolation, role authentication or the trusted broker's authorization policy. HTTPS endpoints and loopback HTTP brokers are supported; URL credentials, query strings, fragments, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Creation/reconciliation is pinned to the recorded endpoint. There is no bootstrap GitHub bypass, fallback account, provider or paid plan purchase.
+The configured GitHub endpoint must be an approved narrow controller capability. Use a credential-blind broker, not a worker's personal token. HTTPS and loopback HTTP endpoints are supported. URL credentials, query/fragment, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Endpoint and immutable repository identity are pinned by onboarding. The adapter does not itself prove OS isolation or broker authorization. No publisher, credential bridge, paid fallback, protection bypass or gate weakening is introduced here. Host-side publication, independent review, required security/CI checks, controlled integration and integrated-main verification remain mandatory.
 
-## Public lifecycle
+## Intake and repository onboarding
 
-An example request follows. IDs and approval references are placeholders, not evidence:
+Example placeholders are not evidence:
 
 ```json
 {
@@ -29,101 +29,139 @@ An example request follows. IDs and approval references are placeholders, not ev
 }
 ```
 
-`work_item_number` is optional and correlates the exact repository/issue number; it is not evidence an issue exists or is eligible. Repository selection is an exact `owner/repository`, never a URL, inferred unrelated target, repaired identifier or guessed platform. For a new approved product, add:
-
-```json
-"repository_intent": {"mode": "new", "marker": "unique-controller-owned-creation-marker"}
-```
-
-The trusted handoff must associate a unique ownership marker with this creation. Omitting `repository_intent` preserves prior intake semantics: explicitly selected **existing** repository, never authority to create a replacement. Intake approval also applies to the new-product intent; missing or wrong-operator approval is refused.
+`work_item_number` is optional: it correlates the unchanged parent work/spec issue and is not evidence the issue exists. A planning spec must use a different issue. Select an exact `owner/repository`, never an inferred target or repaired identifier. The default intent is an explicitly selected **existing** repository. An approved new product additionally supplies `"repository_intent": {"mode": "new", "marker": "unique-controller-owned-creation-marker"}`.
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
-  register --request /scratch/operator/approved-intake.json
-
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
-  inspect --project approved-product --iteration milestone-1
-
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  register --request /scratch/operator/intake.json
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
   onboard --project approved-product --iteration milestone-1 \
-  --api-base http://127.0.0.1:8655/github --bearer harmless-dummy --timeout 10
+  --api-base <approved-endpoint> --timeout 10
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  inspect --project approved-product --iteration milestone-1
 ```
 
-Successful commands print one JSON record and exit 0. Refusals/operational failures print JSON on stderr and exit 2; argument errors use argparse help/stderr. `--timeout` must be finite and in `(0, 300]` seconds. A real token is unnecessary for the supplied credential-blind broker; never put genuine credentials in published evidence.
+Success prints JSON and exits 0. Refusals/operational failures print JSON to stderr and exit 2; argument errors use argparse help. Timeout must be finite in `(0, 300]`. Empty and `:memory:` state targets are refused. `inspect` is read-only and does not create absent state.
 
-### Durable behavior
+Intake rejects unknown/duplicate fields, invalid identities/origins, missing approval and parser-limit failures before creating state. Identical registration is idempotent; changed provenance/scope is a conflict. First product is active, others paused. Concurrency is serialized. Execution remains disabled and worker-run correlation stays null.
 
-- Intake rejects unknown/duplicate fields, missing provenance, ambiguous origins, invalid owner syntax and parser-limit failures before state creation. Original approved intake behavior and exact identifiers are retained.
-- First intake is active; additional products are paused. Concurrent registration is serialized. Identical re-registration is idempotent; changed provenance, intent or work-item scope is a conflict.
-- `inspect` is read-only, does not create absent state, and exposes durable correlations. Empty and `:memory:` state targets are refused. Control-run IDs denote intake, not worker/model execution; worker ID remains null.
-- Existing onboarding requests only repository **metadata**, never contents, git clones or beta files. Exact owner/name/full-name, positive integer repository ID and boolean privacy must read back. Existing public repositories may be reused as explicitly selected; they are not made private silently. Missing/mismatched targets never trigger replacement creation.
-- New creation resolves `/user` against the exact selected owner. A different owner requires a reviewed account-scoped capability, not guessed organization endpoints. A pre-existing name is a collision even when its marker matches. The configured identity is the default GitHub account, but intake continues to require an explicit exact target.
-- Before POST, commit a durable `pending` intent with marker/endpoint. A POSIX advisory lock serializes onboarding for this state file across CLI processes, including the committed-pending crash window. Use one trusted durable state store per controller; separate unrelated stores are not a distributed creation lock.
-- POST `/user/repos` sets `private=true`, exact name/description and `auto_init=false` explicitly. A successful response must supply a positive integer immutable repository ID; that ID is durably committed before read-back. Invalid/missing IDs become persisted investigation blockers, never authority to adopt a later target. The response alone is not success evidence: GET of the exact target must verify the pinned ID, owner, name, full identity, privacy and marker, including on restart after unavailable read-back. Only allowlisted metadata is retained; unexpected credentials are excluded.
-- A timeout/lost response/process death reconciles the exact target before retry. A pending target that is absent stays `creation_uncertain`; 404 cannot prove a delayed write will never complete. No automatic second POST occurs. A definitive rejected POST is durably blocked and cannot adopt a subsequent collision. A successful POST followed by denied read-back stays pending/reconcilable, not falsely definitively rejected.
-- A verified repository ID cannot be replaced by the same name/marker. Wrong privacy/marker/identity or ambiguous JSON refuses verification. Successful JSON `null` is unavailable metadata, not proof of HTTP 404 absence, and cannot admit creation. HTTP protocol/framing failures produce structured actionable blockers; truncated creation/read-back responses preserve pending intent for exact reconciliation. Network, permission, conflict and plan/protection errors give actionable capability/investigation requests; no purchase, weakening or bypass is attempted.
+Existing onboarding reads metadata only. Exact owner/name/full-name, positive repository ID and boolean privacy must read back. Missing targets never authorize replacement creation. New creation checks `/user` against the selected owner, refuses pre-existing collisions, commits pending intent before POST and serializes the creation boundary with a POSIX advisory lock. POST explicitly sets private repository, name, marker description and `auto_init=false`. Returned immutable ID is durably pinned before exact readback. Unexpected metadata/credentials are not retained.
 
-### Explicit trusted lost-state recovery
+Lost responses and process death reconcile the exact target without another POST. An absent pending target stays uncertain. Definitive rejected creation remains blocked; invalid returned IDs cannot authorize later adoption. A successful POST with unavailable readback remains reconcilable. Verified repository ID cannot be replaced by the same name/marker. Endpoint migration requires controller review.
 
-If durable state is lost but the trusted controller has genuine prior creation evidence, it may provide `onboard --creation-receipt /scratch/operator/receipt.json`. This is **not** routine onboarding or authority for workers to adopt a collision. The caller must independently validate the receipt against actual controlled creation evidence. The interface trusts the administrator, not an unsigned worker assertion.
+For genuine lost-state recovery only, `onboard --creation-receipt /scratch/operator/receipt.json` accepts exactly:
 
 ```json
 {
   "repository": "example/approved-product",
   "repository_id": 123,
   "marker": "unique-controller-owned-creation-marker",
-  "api_base": "http://127.0.0.1:8655/github",
+  "api_base": "https://approved-capability.example/github",
   "reference": "trusted-controller-creation-and-readback-evidence"
 }
 ```
 
-Exactly these fields are required. Restore needs a recorded approved new-product intake and binds the exact target, positive ID, approved marker, endpoint and nonempty provenance reference. It **never creates** an absent target. Live identity/privacy/marker/ID must match before the receipt and verified metadata are persisted. Receipt recovery cannot override blocked creation, endpoint pinning or previously verified ID continuity. Regular onboarding still refuses a colliding target without prior durable intent or explicit trusted creation evidence. Endpoint migration is not implemented; request controller review instead of modifying records silently.
+The administrator must independently validate this trusted receipt. It is not a worker assertion or authority to create/adopt an absent target, override blocked creation, change endpoint or replace a pinned identity. It requires approved new-product intent and exact live identity/privacy/marker readback.
 
-## Interview and pinned specification lifecycle (#7)
+## Planning (#7): grill-me → grilling → to-spec
 
-After verified onboarding, a trusted conversation/agent integration supplies only the current fresh interview through `interview --request`. It must authenticate actual operator messages before handing them to this CLI; the controller cannot authenticate conversation messages from self-reported provenance. The agent supplies questions, assumption challenges, recommendations and its sufficiency judgment. The controller records that judgment, never invents operator answers, and refuses unrelated top-level context fields.
+### 1. Assign work to the agent in the originating conversation
 
-The request has these exact fields:
+After onboarding, supply `/scratch/operator/plan.json`:
 
-- `origin`: the registered originating-thread object, unchanged.
-- `expected_revision`: `0` for the first submission, otherwise the current integer interview revision from `inspect`. Identical retries are idempotent; changed stale submissions are conflicts.
-- `questions`: a nonempty list of `{id, question, challenge, recommendation, answer}`. An unanswered question uses JSON `null`. An actual answer is `{operator_id, reference, text}`, from the configured operator with its original message reference.
-- `decisions`: a list of `{id, category, value, question_id, scope}`. Each decision cites an answered question and retains its exact answer text. Scope is `current` or `future`. Categories are `vision`, `milestone`, `programming_language`, `user_facing_language`, `stack`, `requirements`, `constraints`, `non_goals`, `acceptance`, and `testing`.
-- `judgment`: `{sufficient, rationale, reference}` records the agent's boolean judgment and its provenance, not operator batch approval.
-- Optional `skills`: an explicit fresh pinned catalog and stage roots (below). It is mandatory before publication handoff.
-
-Missing answers/categories keep the interview pending even when the agent says clarification is sufficient. Distinct current answers for a language choice also keep that choice unresolved; the operator can explicitly settle a combined language choice in one answer where appropriate. All original answers, challenges, recommendations and earlier interview revisions remain inspectable. Future choices cannot substitute for current choices, except the whole-product vision.
-
-Sufficient clarification prepares three canonical JSON documents under `docs/factory/<iteration>/<sha256-revision>/`: `vision.json` retains the full vision and decisions; `milestone.json` contains only current decisions; `decisions.json` preserves the full fresh interview with provenance. Changing the interview removes any obsolete handoff and retains prior specifications in history. Specifications are not published by an assertion or by this worker's direct GitHub mutation.
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
-  interview --project approved-product --iteration milestone-1 --request /scratch/operator/interview.json
-
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
-  export-spec --project approved-product --iteration milestone-1 --revision <exact-sha256-revision>
-
-# Only after authorized controller publication returns its actual immutable commit:
-PYTHONDONTWRITEBYTECODE=1 python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
-  verify-spec --project approved-product --iteration milestone-1 --revision <exact-sha256-revision> \
-  --commit <exact-40-character-commit-sha> --api-base <reviewed-controller-endpoint>
+```json
+{
+  "origin": {
+    "platform": "discord", "chat_id": "123", "thread_id": "123",
+    "parent_chat_id": "456", "scope_id": "789"
+  },
+  "expected_revision": 0,
+  "skills": [
+    {"name": "grill-me", "path": "/absolute/path/factory_v1/planning_skills/grill-me.md", "sha256": "caaf8b8de1684f96e26b28f3c29189db5c89cce4b73e1c93d86164f66ef88637"},
+    {"name": "grilling", "path": "/absolute/path/factory_v1/planning_skills/grilling.md", "sha256": "10ff989e7498b23b5acb49d5048f11dcd906757d2f79c5cdf8a00001381296f2"},
+    {"name": "to-spec", "path": "/absolute/path/factory_v1/planning_skills/to-spec.md", "sha256": "43ad9cf318e5e7d3d1fa360253a37021796dc87a0c2e595ad262661a10f85088"}
+  ]
+}
 ```
 
-`export-spec` is read-only and returns exact file paths/content plus the concrete publication capability request. The reviewed controller must restrict writes to these documentation paths in the selected repository and reconcile uncertain outcomes before retrying. `verify-spec` rechecks the recorded repository identity, reads the exact Git commit and documentation files at that commit, verifies UTF-8 bytes and Git blob hashes, and revalidates skill pins. Branch names, wrong files, symlinks, content/identity mismatches and missing skills cannot admit handoff. Successful verification automatically records `ticket_synthesis_ready`, with immutable repository/commit/path/spec-revision references and only current decision IDs. No extra batch-approval prompt occurs. It does not synthesize tickets or start execution; those are later slices.
+Replace the paths with explicit absolute regular files. The bundled files are exact copies of the selected `/inputs/skills/{grill-me,grilling,to-spec}/SKILL.md` snapshots; those original paths may also be used in this sandbox. Supplied-byte pins are fixed, not caller-selected arbitrary skill versions. There is no ambient discovery or future ticket/implementation/review catalog. Exactly these three unique skills must resolve; grill-me's sole dependency is grilling.
 
-Skill configuration is `{catalog, stages}`. Catalog entries are `{name, path, sha256, dependencies, implicit_loops}` using explicit absolute regular files, exact names and SHA-256 pins. Stage roots name `grilling`, `specification`, `tickets`, `implementation`, `simplification`, and `review`. Missing or ambiguous names, cyclic transitive dependencies and changed content fail closed. Stage contracts adapt only `routine_spec_approval`, `routine_ticket_batch_approval`, and `nested_duplicate_review`; required tests, behavior preservation, independent requirement review and security gates remain authoritative. No ambient skill or memory discovery is performed. A descriptor is a trusted controller input, not permission to inspect unrelated files. These contracts are bounded handoff data, not proof of worker integration or skill execution.
+```bash
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  plan --project approved-product --iteration milestone-1 \
+  --request /scratch/operator/plan.json
+```
 
-The supplied broker permits repository metadata only for this role. Consequently real documentation publication/read-back cannot be established here, and issue #7 remains blocked rather than reported delivered. Python 3.13 execution and alternate-`TMPDIR` tests pass locally; Python 3.11 is not installed in this sandbox and needs controller/CI execution.
+Use the returned approved idea, origin and `planning` assignment **in that same conversational agent context**. The agent loads the attached exact instructions: grill-me calls grilling; grilling maps the design tree, asks numbered frontier questions with recommendations, and waits for actual user decisions before dependent rounds. It does not launch a noninteractive interview worker. The user owns product/technical choices; the agent owns sufficiency judgment. Preserve original question/recommendation/answer references and decision rationale in Markdown, not a custom settlement or categorized answer schema.
 
-## Verification and scope
+Local assignment instructions adapt upstream routine shared-understanding/spec/test-seam confirmation only: no additional routine approval after sufficient clarification. Actual unresolved test/technology choices are discussed during grilling. Existing required security, spending, independent review and CI gates are not adapted away.
+
+Identical `plan` retries return the existing assignment, including pending/completed state. Material new conversation requirements require an explicit new assignment with the current `planning.revision` as `expected_revision`; prior assignment remains in history, any old handoff is removed, and old completions are refused. Do not silently reuse stale documents for changed requirements.
+
+### 2. Leave unanswered questions pending
+
+`complete-planning` accepts a pending update with exactly these fields:
+
+```json
+{
+  "assignment_id": "<returned-assignment-id>",
+  "origin": {"platform": "discord", "chat_id": "123", "thread_id": "123", "parent_chat_id": "456", "scope_id": "789"},
+  "sufficient": false,
+  "rationale": "The user has not selected the storage approach.",
+  "reference": "agent-message-reference",
+  "pending_questions": ["Q3: local files or SQLite?"]
+}
+```
+
+Pending updates persist locally without GitHub reads, issue creation or execution. They are idempotent and survive fresh CLI processes. Silence never becomes an answer. If publication is unavailable after synthesis, retain pending status and its actual blocker/question; host publication can resume later.
+
+### 3. Synthesize prose and publish through the host
+
+When the frontier is empty, the **conversational agent actually follows to-spec**, using the existing conversation and authorized repository context. It produces three adjacent Markdown documents under the returned `planning.docs_path`:
+
+- `milestone.md`: real prose using to-spec's seven sections, finite scope, requirements, acceptance, technical/testing decisions, non-goals and definition of done.
+- `vision.md`: whole-product intent and future capabilities clearly separated from this finite milestone.
+- `provenance.md`: original questions, challenges/recommendations, actual answers with operator/message references, interpreted decisions, clarification and agent sufficiency provenance.
+
+The host's controlled publication path publishes those exact snapshots in the onboarded repository and creates an open GitHub specification issue whose body equals `milestone.md` byte-for-byte and has `ready-for-agent`. Leave the parent spec issue unchanged. No to-tickets execution or ticket generation belongs to #7. The CLI never publishes externally; a returned assignment is not evidence an interview or publication occurred.
+
+### 4. Verify completion and record GitHub handoff
+
+Completion JSON uses the same six pending fields, with `sufficient: true`, an empty `pending_questions` list, and additionally:
+
+```json
+{
+  "documents": {
+    "milestone.md": "<exact synthesized Markdown snapshot>",
+    "vision.md": "<exact vision Markdown snapshot>",
+    "provenance.md": "<exact original conversation/decision Markdown snapshot>"
+  },
+  "commit": "<actual full 40-character lowercase Git commit SHA>",
+  "issue_number": 123
+}
+```
+
+These three extra fields are combined with the six identity/judgment fields, not submitted alone. No transcript/decision schema or routine approval receipt is required.
+
+```bash
+python -m factory_v1 --state /scratch/operator/state.sqlite --operator-id 42 \
+  complete-planning --project approved-product --iteration milestone-1 \
+  --request /scratch/operator/completion.json --api-base <same-approved-endpoint>
+```
+
+Verification rechecks skill bytes, endpoint and repository identity, exact immutable commit, file paths/types, base64 encoding, UTF-8 snapshot bytes and Git blob hashes. It reads the exact open issue, verifies repository/number/immutable ID/URL, excludes PRs, checks the label and matches the issue body to the immutable milestone snapshot. A stale/mismatched file, issue or assignment cannot complete. Completed retries re-read external targets; issue edits and identity replacement are refused. Different completion snapshots require explicit reassignment, not silent replacement.
+
+The verifier checks prose template structure and external equality; **it does not pretend to prove natural-language sufficiency, truth, or user authorization**. Those require the trusted same-origin conversational agent and actual provenance review, not another deterministic semantic engine. The stored completion digest binds the supplied snapshots without creating a hidden transcript for #8.
+
+Success records `planning_complete` and `handoff` containing only GitHub repository, issue, immutable commit and document/blob references. #8 consumes those GitHub references and performs to-tickets later. `execution_allowed` remains false. This is planning completion, not delivered implementation or ticket closure.
+
+## Verification and honest boundary
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s factory_v1/tests -v
 PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_v1
 ```
 
-Tests invoke the actual CLI in fresh subprocesses with SQLite/HTTP fixtures under tempfile's configured temporary directory (`TMPDIR` in validation and CI), without requiring a `/scratch` mount. A portability regression selects a different temporary root, exercises both lifecycle fixtures through the CLI, and verifies cleanup. Deterministic tests cover previous intake, metadata-only reuse, exact private creation, name/identity conflicts, successful POST/GET immutable-ID continuity across restart, invalid creation IDs, lost responses, killed-process restart, concurrency, read-back outages, blocked permission/conflict cases, endpoint continuity, credential exclusion, ambiguous/deeply nested metadata and explicit receipt restoration. Those fixtures do not prove live external enforcement.
+Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
 
-The supplied `/inputs/live-receipts.json` is empty in this continuation. No prior creation receipt was reconstructed or assumed, and the validation repository was not recreated. A current metadata-only read through the approved loopback broker observed `tehioant/agentic-forge-fresh-v1-validation`, ID `1402450718`, private, with description `fresh-forge-m1-validation:origin-1555635434036396065`. This is not evidence of creation, receipt recovery, documentation publication, or delivery. Execution output, not this document, is the evidence authority.
-
-`execution_allowed` remains false. This slice does not establish scheduling, worker isolation, spending admission, Projects/Issues/PR writes, checks, merge protection, deployment, notifications or a self-running factory. It does not change ticket #17's no-bypass gate. Independent review, controller publication/controlled merge and integrated-main evidence remain required before ticket closure. Future slices are not missing repository-onboarding behavior.
+Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. Live publication and controlled integration are supplied by the host parent. This slice implements no scheduler, worker launcher, spending admission, generalized publisher, Projects mutation, merge or notification service, and changes no existing gate.
