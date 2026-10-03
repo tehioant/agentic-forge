@@ -179,7 +179,7 @@ def main():
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command in {'attention', 'notifications', 'deliver', 'respond', 'attention-reconcile'}:
-        from .attention import lifecycle, records
+        from .attention import lifecycle, records, load_iteration
         request = None
         if hasattr(args, 'request'):
             with open(args.request, encoding='utf-8') as source:
@@ -196,9 +196,8 @@ def main():
             raise IntakeError('not_found', 'Iteration state is unavailable.') from error
         with closing(connection) as database:
             if args.command == 'notifications':
-                if read_iteration(database, args.project, args.iteration) is None:
-                    raise IntakeError('not_found', 'No exact iteration exists.')
-                result = records(database, args.project, args.iteration)
+                item = load_iteration(database, args.project, args.iteration)
+                result = records(database, args.project, args.iteration, item)
             else:
                 result = lifecycle(database, args.project, args.iteration, args.operator_id, args.command,
                                    request, getattr(args, 'event', None), getattr(args, 'transport_config', None))

@@ -385,6 +385,116 @@ class AttentionTests(unittest.TestCase):
         self.assertEqual(self.notifications()[0]['state'], 'accepted')
         self.assertEqual(len(self.calls()), 1)
 
+    def test_ambiguous_and_parser_limit_iteration_json_refuse_all_attention_actions(self):
+        self.event = dict(self.event, kind='decision', decision_id='direction-15')
+        self.enqueue()
+        receipt, response = self.receipt(), self.response()
+        with closing(sqlite3.connect(self.state)) as db:
+            original = db.execute('SELECT payload FROM iterations').fetchone()[0]
+        item = json.loads(original)
+        malformed = ['[', '[' * 10000 + '0' + ']' * 10000,
+                     original[:-1] + ',"origin":null,"origin":' + json.dumps(item['origin']) + '}',
+                     original.replace('"chat_id": "123"', '"chat_id":"999","chat_id":"123"'),
+                     original.replace('"operator_id": "42"', '"operator_id":"99","operator_id":"42"'),
+                     original.replace('"control_run_id":', '"control_run_id":"other","control_run_id":')]
+        for raw in malformed:
+            with self.subTest(payload=raw[:100]):
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?', (raw,))
+                    before = db.execute('SELECT * FROM notifications').fetchall()
+                results = [self.enqueue(), self.deliver(), self.command('notifications'),
+                           self.command('respond', response), self.command('attention-reconcile', receipt)]
+                for result in results:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(json.loads(result.stderr)['error'], 'invalid_context')
+                with closing(sqlite3.connect(self.state)) as db:
+                    self.assertEqual(db.execute('SELECT payload FROM iterations').fetchone()[0], raw)
+                    self.assertEqual(db.execute('SELECT * FROM notifications').fetchall(), before)
+                self.assertEqual(self.calls(), [])
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE iterations SET payload=?', (original,))
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_inconsistent_persisted_receipts_and_responses_refuse_all_actions(self):
+        self.event = dict(self.event, kind='decision', decision_id='direction-15')
+        original = json.loads(self.enqueue().stdout)
+        receipt = dict(self.receipt(), attempt=1)
+        response = self.response()
+        delivered = dict(original, state='delivered', attempts=1,
+                         receipt=receipt, reconciliation=receipt)
+        malformed = [dict(original, state='delivered', attempts=1, receipt=value)
+                     for value in [None, {}]]
+        malformed += [dict(original, receipt=receipt), dict(delivered, reconciliation={}),
+                      dict(delivered, reconciliation=None), dict(delivered, receipt=None),
+                      dict(delivered, state='accepted'), dict(delivered, attempts=2),
+                      dict(delivered, last_error='transport_uncertain')]
+        for key, value in [('attempt', True), ('attempt', 0), ('event_id', 'other'),
+                           ('delivery_key', ['other']), ('destination', {}), ('content', {}),
+                           ('message_id', ' 1001'), ('reference', ''), ('extra', True)]:
+            changed = dict(receipt, **{key: value})
+            malformed.append(dict(delivered, receipt=changed, reconciliation=changed))
+        not_sent = dict(receipt, outcome='not_sent')
+        not_sent.pop('message_id')
+        malformed += [dict(original, reconciliation=not_sent),
+                      dict(original, state='accepted', attempts=1, reconciliation=not_sent),
+                      dict(original, state='uncertain', attempts=1, reconciliation=not_sent)]
+        for changed in [{}, {'operator_id': '99', 'decision_id': 'unrelated', 'origin': {}},
+                        dict(response, operator_id='99'), dict(response, operator_id=42),
+                        dict(response, decision_id='other'), dict(response, event_id='other'),
+                        dict(response, origin={}), dict(response, reference=''),
+                        dict(response, response=''), dict(response, acknowledgement=True)]:
+            malformed.append(dict(original, decision_response=changed))
+        incident = dict(self.event, kind='incident')
+        incident.pop('decision_id')
+        malformed.append(dict(original, event=incident, decision_response=response))
+        for record in malformed:
+            with self.subTest(record=record):
+                raw = json.dumps(record)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE notifications SET payload=?', (raw,))
+                    iteration_before = db.execute('SELECT * FROM iterations').fetchall()
+                results = [self.command('notifications'), self.deliver(), self.enqueue(),
+                           self.command('respond', response), self.command('attention-reconcile', receipt)]
+                for result in results:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(json.loads(result.stderr)['error'], 'state_error')
+                with closing(sqlite3.connect(self.state)) as db:
+                    self.assertEqual(db.execute('SELECT payload FROM notifications').fetchone()[0], raw)
+                    self.assertEqual(db.execute('SELECT * FROM iterations').fetchall(), iteration_before)
+                self.assertEqual(self.calls(), [])
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE notifications SET payload=?', (json.dumps(original),))
+        self.assertEqual(self.command('respond', response).returncode, 0)
+        self.assertEqual(self.notifications()[0]['decision_response'], response)
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(self.command('attention-reconcile', self.receipt()).returncode, 0)
+        self.assertEqual(self.notifications()[0]['state'], 'delivered')
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_no_effect_reconciliation_survives_retry_with_new_attempt(self):
+        self.enqueue()
+        self.mode('unknown')
+        self.assertEqual(self.deliver().returncode, 2)
+        receipt = self.receipt('not_sent')
+        self.assertEqual(self.command('attention-reconcile', receipt).returncode, 0)
+        self.assertEqual(self.notifications()[0]['state'], 'pending')
+        self.mode('success')
+        self.assertEqual(self.deliver().returncode, 0)
+        record = self.notifications()[0]
+        self.assertEqual(record['attempts'], 2)
+        self.assertEqual(record['state'], 'accepted')
+        self.assertEqual(record['reconciliation'], receipt)
+        self.assertIsNone(record['receipt'])
+        self.assertEqual(self.command('attention-reconcile', receipt).returncode, 2)
+        self.assertEqual(self.command('attention-reconcile', self.receipt()).returncode, 0)
+        self.assertEqual(self.notifications()[0]['state'], 'delivered')
+        self.assertEqual(self.deliver().returncode, 0)
+        self.assertEqual(len(self.calls()), 2)
+
     def test_actual_process_death_before_and_after_effect_requires_reconciliation(self):
         self.enqueue()
         for mode in ['crash_before', 'crash_after']:
