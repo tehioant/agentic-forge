@@ -5,7 +5,7 @@ import re
 from .errors import IntakeError
 from .messaging import HermesTransport
 from .origin import validate_origin as validate_thread_origin
-from .repositories import state_lock, unambiguous_fields
+from .repositories import state_lock, unambiguous_fields, valid_repository
 
 
 def identifier(value):
@@ -112,8 +112,7 @@ def load_record(payload, project, iteration, event_id, item=None):
                 or any(not identifier(correlation.get(key))
                        for key in ['control_run_id', 'evidence_id', 'stage'])
                 or not isinstance(correlation.get('work_item'), dict)
-                or not isinstance(correlation['work_item'].get('repository'), str)
-                or not correlation['work_item']['repository'].strip()
+                or not valid_repository(correlation['work_item'].get('repository'))
                 or type(correlation['work_item'].get('issue_number')) is not int
                 or correlation['work_item']['issue_number'] != record['event']['issue_number']
                 or correlation.get('worker_run_id') != record['event']['run_id']
@@ -174,6 +173,14 @@ def get_record(database, item, event_id):
 
 def enqueue(database, item, event):
     validate_event(event)
+    if not valid_repository(item.get('repository')):
+        raise IntakeError('invalid_context', 'Recorded repository must be an exact GitHub owner/repository identifier.')
+    correlation = item.get('correlation')
+    if (not isinstance(correlation, dict) or correlation.get('project_id') != item['project_id']
+            or correlation.get('iteration_id') != item['iteration_id']
+            or not identifier(correlation.get('control_run_id'))
+            or not identifier(correlation.get('evidence_id')) or not identifier(correlation.get('stage'))):
+        raise IntakeError('invalid_context', 'Recorded lifecycle correlation is missing or inconsistent.')
     existing_records = records(database, item['project_id'], item['iteration_id'], item)
     for existing in existing_records:
         if existing['event']['event_id'] == event['event_id']:
@@ -183,18 +190,13 @@ def enqueue(database, item, event):
         if (event['kind'] == 'decision' and existing['event']['kind'] == 'decision'
                 and existing['event']['decision_id'] == event['decision_id']):
             raise IntakeError('attention_conflict', 'A decision identity cannot be rebound to another event.')
-    correlation = item.get('correlation')
-    if (not isinstance(correlation, dict) or correlation.get('project_id') != item['project_id']
-            or correlation.get('iteration_id') != item['iteration_id']
-            or not identifier(correlation.get('control_run_id'))
-            or not identifier(correlation.get('evidence_id')) or not identifier(correlation.get('stage'))):
-        raise IntakeError('invalid_context', 'Recorded lifecycle correlation is missing or inconsistent.')
     record = {'project_id': item['project_id'], 'iteration_id': item['iteration_id'],
               'event': event, 'destination': item['origin'], 'state': 'pending', 'attempts': 0,
               'receipt': None, 'decision_response': None,
               'correlation': {**correlation,
                   'work_item': {'repository': item['repository'], 'issue_number': event['issue_number']},
                   'worker_run_id': event['run_id'], 'evidence_ids': event['evidence_ids']}}
+    load_record(json.dumps(record), item['project_id'], item['iteration_id'], event['event_id'], item)
     save(database, record)
     return record
 

@@ -165,6 +165,88 @@ class AttentionTests(unittest.TestCase):
         self.assertEqual(self.notifications(), [])
         self.assertEqual(self.calls(), [])
 
+    def assert_invalid_repository_refused(self, values):
+        original_record = json.loads(self.enqueue().stdout)
+        with closing(sqlite3.connect(self.state)) as db:
+            original = db.execute('SELECT payload FROM iterations').fetchone()[0]
+            before = db.execute('SELECT * FROM notifications').fetchall()
+        for index, (present, value) in enumerate(values):
+            with self.subTest(present=present, repository=value):
+                item = json.loads(original)
+                if present:
+                    item['repository'] = value
+                else:
+                    item.pop('repository')
+                raw = json.dumps(item)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?', (raw,))
+                event = dict(self.event, event_id=f'refused-repository-{index}')
+                for candidate in [event, self.event]:
+                    result = self.enqueue(candidate)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(result.stdout, '')
+                    self.assertEqual(json.loads(result.stderr), {
+                        'error': 'invalid_context',
+                        'message': 'Recorded repository must be an exact GitHub owner/repository identifier.'})
+                result = self.command('deliver', None, '--event', event['event_id'],
+                                      '--transport-config', str(self.config))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(json.loads(result.stderr)['error'], 'not_found')
+                with closing(sqlite3.connect(self.state)) as db:
+                    self.assertEqual(db.execute('SELECT * FROM notifications').fetchall(), before)
+                    self.assertEqual(db.execute('SELECT payload FROM iterations').fetchone()[0], raw)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(self.calls('effects.jsonl'), [])
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?', (original,))
+        self.assertEqual(self.notifications(), [original_record])
+        recovered = dict(self.event, event_id='valid-repository-recovery')
+        result = self.enqueue(recovered)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = json.loads(result.stdout)
+        self.assertEqual(record['correlation']['work_item']['repository'], self.request['repository'])
+        self.assertEqual(record['state'], 'pending')
+        self.assertEqual(record['attempts'], 0)
+        self.assertEqual(self.notifications(), [original_record, record])
+        self.assertEqual(self.calls(), [])
+
+    def test_missing_persisted_repository_refused_and_valid_context_recovers(self):
+        self.assert_invalid_repository_refused([(False, None)])
+
+    def test_null_persisted_repository_refused_and_valid_context_recovers(self):
+        self.assert_invalid_repository_refused([(True, None)])
+
+    def test_non_string_empty_and_malformed_persisted_repository_refused(self):
+        values = [42, True, [], {}, '', ' ', 'example', 'example/repo/other',
+                  'https://github.com/example/repo', ' example/repo', 'example/repo ',
+                  'example/repo\n', '-owner/repo', 'owner-/repo', 'a--b/repo',
+                  'owner_name/repo', 'owner/.', 'owner/..', 'owner/', '/repo',
+                  'a' * 40 + '/repo', 'owner/' + 'r' * 101]
+        self.assert_invalid_repository_refused([(True, value) for value in values])
+
+    def test_valid_repository_grammar_is_shared_by_intake_and_attention(self):
+        with closing(sqlite3.connect(self.state)) as db:
+            original = db.execute('SELECT payload FROM iterations').fetchone()[0]
+        values = ['A/.repo_name-1', 'a-b/repo.', 'a' * 39 + '/' + 'r' * 100]
+        for index, repository in enumerate(values):
+            with self.subTest(repository=repository):
+                request = dict(self.request, repository=repository)
+                path = self.root / 'valid-repository.json'
+                path.write_text(json.dumps(request))
+                registered = self.invoke('register', '--request', str(path),
+                                         state=self.root / f'valid-repository-{index}.sqlite')
+                self.assertEqual(registered.returncode, 0, registered.stderr)
+                item = dict(json.loads(original), repository=repository)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+                event = dict(self.event, event_id=f'valid-repository-{index}')
+                result = self.enqueue(event)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                record = json.loads(result.stdout)
+                self.assertEqual(record['correlation']['work_item']['repository'], repository)
+                self.assertEqual(self.notifications()[-1], record)
+        self.assertEqual(self.calls(), [])
+
     def test_origin_contract_preserves_intake_and_attention_errors_without_effects(self):
         origin = self.request['origin']
         metadata_message = 'Provide the verified originating Discord thread metadata.'

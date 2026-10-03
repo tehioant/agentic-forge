@@ -13,6 +13,7 @@ from pathlib import Path
 
 from .errors import IntakeError
 from .origin import validate_origin
+from .repositories import valid_repository
 
 
 def matches(pattern, value):
@@ -33,7 +34,7 @@ def validate_intake(item, operator_id):
     if 'work_item_number' in item and (type(item['work_item_number']) is not int or item['work_item_number'] <= 0):
         raise IntakeError('invalid_intake', 'Work-item number must be a positive GitHub issue number.')
     repository = item['repository']
-    if not matches(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9_.-]{1,100}', repository) or repository.split('/')[-1] in {'.', '..'}:
+    if not valid_repository(repository):
         raise IntakeError('invalid_intake', 'Select an exact GitHub owner/repository identifier.')
     if 'repository_intent' in item:
         intent = item['repository_intent']
