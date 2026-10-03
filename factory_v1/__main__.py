@@ -122,6 +122,17 @@ def main():
     onboarding.add_argument('--bearer', default='credential-blind-controller')
     onboarding.add_argument('--timeout', type=float, default=10)
     onboarding.add_argument('--creation-receipt', help='Trusted controller receipt for explicit lost-state recovery; never worker-supplied.')
+    planning = commands.add_parser('plan')
+    planning.add_argument('--project', required=True)
+    planning.add_argument('--iteration', required=True)
+    planning.add_argument('--request', required=True)
+    completion = commands.add_parser('complete-planning')
+    completion.add_argument('--project', required=True)
+    completion.add_argument('--iteration', required=True)
+    completion.add_argument('--request', required=True)
+    completion.add_argument('--api-base', required=True)
+    completion.add_argument('--bearer', default='credential-blind-controller')
+    completion.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -136,7 +147,7 @@ def main():
         with closing(connection) as database, database:
             result = register_iteration(database, item)
     else:
-        uri = Path(args.state).resolve().as_uri() + ('?mode=rw' if args.command == 'onboard' else '?mode=ro')
+        uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command == 'inspect' else '?mode=rw')
         try:
             connection = sqlite3.connect(uri, uri=True)
         except sqlite3.OperationalError as error:
@@ -145,6 +156,26 @@ def main():
             result = read_iteration(database, args.project, args.iteration)
             if result is None:
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
+            if args.command != 'inspect':
+                if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
+                    raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
+            if args.command in {'plan', 'complete-planning'}:
+                from .planning import plan, complete
+                from .repositories import GitHub, RepositoryError, state_lock
+                with open(args.request, encoding='utf-8') as source:
+                    try:
+                        request = json.load(source, object_pairs_hook=unique_fields)
+                    except (ValueError, RecursionError) as error:
+                        raise IntakeError('invalid_planning', 'Provide unambiguous planning JSON within parser limits.') from error
+                try:
+                    with state_lock(database), database:
+                        if args.command == 'plan':
+                            result = plan(database, result, request)
+                        else:
+                            result = complete(database, result, request,
+                                              GitHub(args.api_base, args.bearer, args.timeout))
+                except RepositoryError as error:
+                    raise IntakeError(error.code, str(error)) from error
             if args.command == 'onboard':
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required before repository access.')

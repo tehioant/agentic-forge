@@ -1,5 +1,6 @@
 """Metadata-only GitHub onboarding through a configured controller capability."""
 import fcntl
+from contextlib import contextmanager
 import http.client
 import json
 import math
@@ -67,12 +68,20 @@ class GitHub:
             raise RepositoryError('github_unavailable', 'GitHub metadata unavailable; restore the configured capability and retry.') from error
 
 
-def onboard(database, item, github, receipt=None):
-    # Independent of SQLite transactions: the pending intent must commit while
-    # concurrent controllers remain excluded. Process death releases this lock.
+@contextmanager
+def state_lock(database):
+    """Share onboarding's lock; acquire before SQLite reads/transactions."""
     state_path = database.execute('PRAGMA database_list').fetchone()[2]
     with open(state_path + '.onboarding.lock', 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def onboard(database, item, github, receipt=None):
+    # Independent of SQLite transactions: the pending intent must commit while
+    # concurrent controllers remain excluded. Process death releases this lock.
+    # Commit the final payload before releasing it as well.
+    with state_lock(database), database:
         row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
                                (item['project_id'], item['iteration_id'])).fetchone()
         return reconcile(database, json.loads(row[0]), github, receipt)
