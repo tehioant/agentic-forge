@@ -1,6 +1,6 @@
-# Fresh factory v1 — intake, onboarding, planning and attention
+# Fresh factory v1 — intake, onboarding, planning, ticket control and attention
 
-Standard-library Python controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, returns a same-conversation planning assignment, and verifies its GitHub handoff. It does not start workers, generate tickets or execute implementation.
+Standard-library Python controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, and controls ticket publication/frontier/reservation. It never dispatches implementation workers.
 
 ## Trust and safety boundary
 
@@ -8,7 +8,7 @@ This is a **trusted operator/controller CLI**, not an unauthenticated worker API
 
 Keep SQLite state, journals/backups, request files, receipts and output in a private operator-owned directory outside source (`/scratch` during sandbox validation). Do not use shared, attacker-writable or symlinked state paths. New state files are owner-only; existing permissions and directory ownership remain administrator responsibilities. No secrets belong in requests or evidence.
 
-The configured GitHub endpoint must be an approved narrow controller capability. Use a credential-blind broker, not a worker's personal token. HTTPS and loopback HTTP endpoints are supported. URL credentials, query/fragment, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Endpoint and immutable repository identity are pinned by onboarding. The adapter does not itself prove OS isolation or broker authorization. No publisher, credential bridge, paid fallback, protection bypass or gate weakening is introduced here. Host-side publication, independent review, required security/CI checks, controlled integration and integrated-main verification remain mandatory.
+The configured GitHub endpoint must be an approved narrow controller capability. Use a credential-blind broker, not a worker's personal token. HTTPS and loopback HTTP endpoints are supported. URL credentials, query/fragment, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Endpoint and immutable repository identity are pinned by onboarding. The adapter does not itself prove OS isolation or broker authorization. Ticket publication requires a separately authorized Issues/dependencies/Projects capability at that same endpoint; metadata-only bootstrap access does not grant mutation authority. No credential bridge, paid fallback, protection bypass or gate weakening is introduced here. Independent review, required security/CI checks, controlled integration and integrated-main verification remain mandatory.
 
 ## Intake and repository onboarding
 
@@ -345,4 +345,66 @@ PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_
 
 Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
 
-Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**. Live publication and controlled integration are supplied by the host parent. This controller implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher, Projects mutation or merge service, and changes no existing gate. Attention delivery is the scoped supported Hermes CLI adapter described above, verified mock-only under the #15 amendment.
+Verification is **operator-selected mock-only** in the existing credential-blind whole-process sandbox: network access and GitHub broker routes are denied; no host credentials, spending or fallback are authorized. No disposable live repository or board is required for this verification. Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**, and passing them does not establish live compatibility. Ticket controls and model spending admission remain separate capabilities; neither starts workers or supplies merge or deployment execution. This controller implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher or merge service, and changes no existing gate. Attention delivery is the scoped supported Hermes CLI adapter described above, verified mock-only under the #15 amendment. Controlled integration remains host-owned; functional ticket requirements, including the linked board and exact readback, remain unchanged.
+
+## Tickets (#8): selected to-tickets → controlled publication → frontier → one reservation
+
+The same trusted conversational/stage integration used for planning executes ticket synthesis. The deterministic controller is not an LLM and does not replace the installed skill with templated decomposition or spawn implementation workers. A returned assignment is not proof of synthesis. An authenticated trusted integration must attach actual load-tool references and skill-guided results; a JSON assertion cannot independently authenticate tool logs. Fixtures are labeled `fixture:*`, not live execution.
+
+After `complete-planning`, run:
+
+```bash
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  synthesize-tickets --project <project> --iteration <iteration> \
+  --api-base <same-approved-endpoint> --request <synthesis-request.json>
+```
+
+The request has exactly `skill` and `tracker`:
+
+```json
+{
+  "skill": {
+    "name": "to-tickets",
+    "path": "/absolute/path/factory_v1/ticket_skills/to-tickets.md",
+    "sha256": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae"
+  },
+  "tracker": {
+    "project_id": null,
+    "status_field": "Status",
+    "statuses": {"ready": "Todo", "active": "In Progress", "done": "Done"},
+    "triage_label": "ready-for-agent"
+  }
+}
+```
+
+`project_id` is an explicit Projects v2 node ID or null for exactly one open repository-linked board. No name guessing, board creation/linking, optional-board fallback or missing-scope bypass exists. The named Status field must be unambiguous and contain the three distinct configured progress options. Without `scope_field`, scope is the existing open repository milestone titled exactly the registered `iteration_id`; native milestone ID/number/title are pinned, assigned at issue creation and verified on readback. Missing, inaccessible, ambiguous or changed milestone identities fail closed. Blocked/deferred issue-body status keeps work ineligible without inventing extra board options. Legacy configurations with an explicit single-select `scope_field` and all five progress roles remain supported without changing their behavior. Resolved project/field/option and scope identities are durably pinned and revalidated. An inaccessible/ambiguous/missing/changed schema blocks publication before any issue writes.
+
+The controller re-reads the exact immutable planning documents and current spec issue and attaches their contents, SHA-256s, immutable pointers and input digest, plus actual selected instruction bytes, adaptation identity and assignment ID. `to-tickets` has no transitive skill dependencies. The bundled source is an unchanged selected snapshot, not a parallel factory-specific skill. The agent follows context gathering, complete tracer-bullet decomposition, verifiable acceptance and blocker graph drafting. Only the routine ticket quiz/batch confirmation is adapted away. Missing product decisions, capability and spending restrictions remain authoritative.
+
+Return `complete-tickets --request <result.json>` with the same project/iteration/endpoint. The result contains exactly:
+
+- `assignment_id`, `input_digest`, `adaptation`: exact returned stage identities.
+- `execution`: `run_id`, `loads`, `decomposition`, `result_digest`. `loads` contains one `{source, sha256, tool_reference}` per selected skill path and immutable document URL. Each tool reference points to an actual trusted execution log. `decomposition` retains how the agent produced the vertical slices and genuine blocker edges. `result_digest` is SHA-256 of UTF-8 `json.dumps(tickets, sort_keys=True, ensure_ascii=False)`.
+- `tickets`: nonempty generated contracts, each with exactly `key`, `title`, `desired_behavior`, `references`, `acceptance_criteria`, `blockers`, `status`, `iteration`, `triage_label`. Keys are unique lowercase identifiers; blockers reference keys in this batch. `references` is a nonempty list of `{spec, requirement}`, where spec is the exact returned immutable milestone URL and requirement is a defined `US-N` or exact named text from that milestone. Criteria are nonempty strings. Initial status is `ready`; iteration/label match configuration. Future/deferred executable output, cycles and unknown references are refused.
+
+A supplied batch without a correlated stage, actual selected-source/input load references, substantive execution rationale and matching result digest is refused. Material planning reassignment archives ticket evidence, removes the old handoff and invalidates any existing reservation; it never silently releases active work or admits a replacement under old requirements.
+
+`complete-tickets` persists synthesis and **immediately attempts controlled publication**, without a batch-approval command. `ticket_work.status=blocked` and its exact `blocker` are durable JSON outcomes (exit 0 for an inspectable blocked transition). Input/refusal errors exit 2. Restore authorized access, then use `publish-tickets` to reconcile, not inject another batch. A missing board retains generated slices and evidence rather than dropping the board requirement.
+
+Publication uses GitHub REST `/repos/<exact-repository>/issues` and native `/issues/<number>/dependencies/blocked_by`, plus GraphQL Projects v2 linked-board/schema/item reads and scoped add-item/field-value mutations. It creates blockers first, renders readable blocker numbers and current spec/criteria/status/label/iteration in issue bodies, and never modifies the parent. Every created issue identity/title/body/label/state, native edge, exact membership and scope/progress option is read back. GitHub list connections are paginated; truncated or ambiguous metadata fails closed.
+
+A shared POSIX state lock serializes onboarding, planning and ticket controls across durable commits. Intent is committed before each issue, edge, membership and progress mutation. Stable assignment/key markers plus full repository issue reads reconcile lost issue responses. Returned immutable issue identity is pinned before readback. Lost membership/edge responses reconcile exact targets first. An absent target after an uncertain issue/edge/member write blocks rather than blindly retrying. Absolute field updates are safely reconciled by exact current readback. Repeating completed publication observes current authoritative progress and does not reset externally progressed/closed work.
+
+```bash
+python -m factory_v1 --state <state> --operator-id 42 \
+  frontier --project <project> --iteration <iteration> --api-base <same-endpoint>
+python -m factory_v1 --state <state> --operator-id 42 \
+  reserve-ticket --project <project> --iteration <iteration> \
+  --api-base <same-endpoint> --issue <eligible-number>
+```
+
+`frontier` refreshes exact repository-linked board membership, iteration, native/textual blockers, issue identity/contract/label and progress from GitHub. It is not the local generated batch as a competing backlog: independently added current contracted issues are considered too. A blocker is complete only when its issue is closed for `completed` and its authoritative board status is Done in this scope; unknown/out-of-scope blockers remain blocking. Cycles, mismatched native/textual references and malformed metadata fail closed. Ready/open/contracted/current work with complete blockers is eligible; deferred/blocked/foreign work is not. `inspect` is only a durable local snapshot of the last observation, **not a fresh GitHub claim**.
+
+Reservation first refreshes GitHub and refuses partial publication, paused iterations, existing active work (including foreign iteration work) and an existing different global reservation. It persists one pending reservation before setting the exact board progress to active, then verifies the exact eligible active issue. Lost responses preserve the reservation and reconcile the same run on retry. Competing commands are serialized. No release, dispatch, implementation worker, merge or issue-close operation is supplied here; `execution_allowed` stays false and worker-run correlation stays null.
+
+`evidence/issue8-synthesis.json` retains the actual implementing worker's selected-skill-guided decomposition of the supplied pinned first milestone. Its output is unpublished evidence, not new implementation requirements for #8. It explicitly separates actual instruction loads/synthesis from fixture-only public control tests and unavailable live handoff/publication. Its historical live-validation limitations are not prerequisites for the operator-selected mock-only verification above. No board/issue/PR/merge/closure mutation is authorized in this validation; live compatibility is not claimed.
