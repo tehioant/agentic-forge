@@ -362,6 +362,33 @@ class ModelSpendingTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 20)
             self.assertEqual(db.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
 
+    def test_pre_admission_and_disabled_route_refusals_survive_restart_without_secrets(self):
+        self.assertEqual(self.grant().returncode, 0)
+        process = self.broker()
+        marker = 'never-persist-request-secret'
+        override = self.call('override', request={'provider': marker, 'prompt': marker})
+        self.assertEqual(json.loads(override.stderr)['error'], 'invalid_request')
+        reservation = self.call('under-reserve', reserve=1)
+        self.assertEqual(json.loads(reservation.stderr)['error'], 'invalid_reservation')
+        self.stop_broker(process)
+        self.sock.unlink(missing_ok=True)
+        disabled = self.invoke('model-broker', '--socket', str(self.sock), '--project', 'product',
+            '--iteration', 'm1', '--provider', 'paid-provider', '--model', 'paid-model',
+            '--operation', 'generate', '--fixture-url', self.fixture_url)
+        self.assertEqual(json.loads(disabled.stderr)['error'], 'provider_unavailable')
+        self.assertFalse(self.sock.exists())
+        self.broker()
+        with closing(sqlite3.connect(self.state)) as db:
+            refusals = db.execute("SELECT provider,model,operation,operation_id,reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall()
+            self.assertEqual(refusals, [
+                ('fixture-provider', 'fixture-model', 'generate', 'override', 'invalid_request'),
+                ('fixture-provider', 'fixture-model', 'generate', 'under-reserve', 'invalid_reservation'),
+                ('paid-provider', 'paid-model', 'generate', None, 'provider_unavailable')])
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
+            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+        self.assertNotIn(marker.encode(), self.state.read_bytes())
+        self.assertEqual(FixtureHandler.calls, [])
+
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
         self.assertEqual(self.grant().returncode, 0)
         self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')

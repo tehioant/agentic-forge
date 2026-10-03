@@ -20,8 +20,9 @@ MAX_UNITS = 2**63 - 1
 
 
 class SpendingError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, recorded=False):
         self.code = code
+        self.recorded = recorded
         super().__init__(message)
 
 
@@ -110,6 +111,18 @@ def _decision(database, scope, operation_id, decision, reason, now):
                      (str(uuid.uuid4()), *scope, operation_id, decision, reason, now))
 
 
+def _record_refusal(database, scope, operation_id, error):
+    if error.recorded:
+        return
+    if not isinstance(operation_id, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', operation_id) is None:
+        operation_id = None
+    with state_lock(database), database:
+        database.execute('BEGIN IMMEDIATE')
+        _iteration(database, scope[0], scope[1])
+        _decision(database, scope, operation_id, 'refused', error.code, int(time.time()))
+    error.recorded = True
+
+
 def _block(database, item, reason, scope):
     if item.get('model_access', {}).get('reason') == 'quota_exhausted':
         return
@@ -128,27 +141,27 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
     if deadline is not None and time.monotonic() >= deadline:
         _decision(database, scope, operation_id, 'refused', 'capability_exhausted', now)
         database.commit()
-        raise SpendingError('capability_exhausted', 'Attempt capability expired before admission.')
+        raise SpendingError('capability_exhausted', 'Attempt capability expired before admission.', recorded=True)
     item = _iteration(database, scope[0], scope[1], require_active=True)
     old = database.execute('SELECT * FROM model_operations WHERE operation_id=?', (operation_id,)).fetchone()
     if old:
         if old[1:6] != scope or old[9] != digest or old[7] != reserve:
             _decision(database, scope, operation_id, 'refused', 'idempotency_conflict', now)
             database.commit()
-            raise SpendingError('idempotency_conflict', 'Operation key already has a different scope, request or reservation.')
+            raise SpendingError('idempotency_conflict', 'Operation key already has a different scope, request or reservation.', recorded=True)
         if old[8] in {'complete', 'failed'}:
             return {'status': old[8], 'actual_units': old[10], 'replay': True}
         _block(database, item, 'outcome_uncertain', scope)
         _decision(database, scope, operation_id, 'refused', 'outcome_uncertain', now)
         database.commit()
-        raise SpendingError('outcome_uncertain', 'Reconcile the exact pending operation before any retry.')
+        raise SpendingError('outcome_uncertain', 'Reconcile the exact pending operation before any retry.', recorded=True)
     pending = database.execute("SELECT 1 FROM model_operations WHERE project=? AND iteration=? AND status='pending' LIMIT 1", scope[:2]).fetchone()
     if pending or item.get('model_access', {}).get('reason') == 'quota_exhausted':
         reason = 'outcome_uncertain' if pending else 'quota_exhausted'
         _block(database, item, reason, scope)
         _decision(database, scope, operation_id, 'refused', reason, now)
         database.commit()
-        raise SpendingError(reason, 'Model access is blocked; exact trusted reconciliation or quota-resume evidence is required.')
+        raise SpendingError(reason, 'Model access is blocked; exact trusted reconciliation or quota-resume evidence is required.', recorded=True)
     grant = database.execute('''SELECT grant_id, expires FROM model_grants
       WHERE project=? AND iteration=? AND provider=? AND model=? AND operation=?
       AND remaining>=? AND expires>? AND (?=0 OR kind='allowance') ORDER BY expires, grant_id LIMIT 1''',
@@ -157,7 +170,7 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
         _decision(database, scope, operation_id, 'refused', 'authorization_unavailable_or_exhausted', now)
         _block(database, item, 'authorization_unavailable_or_exhausted', scope)
         database.commit()
-        raise SpendingError('spending_blocked', 'No unexpired exact-scope grant covers the controlled reservation.')
+        raise SpendingError('spending_blocked', 'No unexpired exact-scope grant covers the controlled reservation.', recorded=True)
     database.execute('UPDATE model_grants SET remaining=remaining-? WHERE grant_id=?', (reserve, grant[0]))
     database.execute('INSERT INTO model_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                      (operation_id, *scope, grant[0], reserve, 'pending', digest, None, now, None))
@@ -195,6 +208,14 @@ def _finish(database, operation_id, status, actual_units, receipt):
 def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None):
     """Reserve before outbound I/O; uncertain outcomes freeze the whole iteration."""
     scope = _scope(*scope)
+    try:
+        return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline)
+    except SpendingError as error:
+        _record_refusal(database, scope, operation_id, error)
+        raise
+
+
+def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline):
     if not isinstance(payload, dict):
         raise SpendingError('invalid_request', 'Request must be a bounded JSON object.')
     if set(payload) & {'provider', 'model', 'operation', 'url', 'endpoint', 'authorization', 'api_key', 'service_tier', 'stream', 'store'}:
@@ -222,7 +243,7 @@ def execute_controlled(database, scope, operation_id, payload, reserve, fixture_
             or (int(time.time()) if now is None else now) >= admitted['grant_expires']):
         with state_lock(database), database:
             _finish(database, operation_id, 'failed', 0, 'expired_before_outbound_io')
-        raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O; no operation was initiated.')
+        raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O; no operation was initiated.', recorded=True)
     try:
         units, result = adapter.call(payload)
         if type(units) is not int or not 0 <= units <= reserve:
@@ -234,7 +255,7 @@ def execute_controlled(database, scope, operation_id, payload, reserve, fixture_
             item = _iteration(database, scope[0], scope[1])
             _block(database, item, reason, scope)
             _decision(database, scope, operation_id, 'blocked', reason, int(time.time()))
-        raise SpendingError(reason, 'Model access blocked; reservation stays frozen until exact trusted billing reconciliation. No fallback.') from error
+        raise SpendingError(reason, 'Model access blocked; reservation stays frozen until exact trusted billing reconciliation. No fallback.', recorded=True) from error
     with state_lock(database), database:
         _finish(database, operation_id, 'complete', units, 'model_response')
     return {'status': 'complete', 'actual_units': units, 'result': result}
@@ -272,23 +293,27 @@ def resume_quota(database, scope, reference):
 def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, operator_id=None, subscription_socket=None, reservation=3, ttl=300, max_calls=100, worker_uid=None):
     """Fixed per-attempt capability; host state/upstream never enter the worker mount."""
     scope = _scope(*scope)
-    if (type(ttl) is not int or not 0 < ttl <= 3600 or type(max_calls) is not int or not 0 < max_calls <= 1000):
-        raise SpendingError('invalid_capability', 'Use a bounded capability TTL and request count.')
-    if not os.path.isabs(path) or os.path.lexists(path):
-        raise SpendingError('socket_exists', 'Use an absent absolute socket path in a private operator-owned directory.')
-    try:
-        adapter = transport(scope, timeout, fixture_url, subscription_socket, reservation)
-    except (ModelAccessError, OSError) as error:
-        raise SpendingError('provider_unavailable', 'Paid/unknown routes are disabled; use the exact approved subscription capability or labeled fixture.') from error
     worker_uid = os.getuid() if worker_uid is None else worker_uid
-    parent = Path(path).parent.lstat()
-    if (type(worker_uid) is not int or worker_uid < 0 or not stat.S_ISDIR(parent.st_mode)
-            or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700):
-        raise SpendingError('invalid_capability', 'Socket parent must be private operator-owned mode 0700; select one exact worker UID.')
     uri = Path(database_path).resolve().as_uri() + '?mode=rw'
     with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
         _iteration(database, scope[0], scope[1], operator_id, require_active=True)
         initialize(database)
+        try:
+            if (type(ttl) is not int or not 0 < ttl <= 3600 or type(max_calls) is not int or not 0 < max_calls <= 1000):
+                raise SpendingError('invalid_capability', 'Use a bounded capability TTL and request count.')
+            if not os.path.isabs(path) or os.path.lexists(path):
+                raise SpendingError('socket_exists', 'Use an absent absolute socket path in a private operator-owned directory.')
+            parent = Path(path).parent.lstat()
+            if (type(worker_uid) is not int or worker_uid < 0 or not stat.S_ISDIR(parent.st_mode)
+                    or parent.st_uid != os.getuid() or stat.S_IMODE(parent.st_mode) != 0o700):
+                raise SpendingError('invalid_capability', 'Socket parent must be private operator-owned mode 0700; select one exact worker UID.')
+            try:
+                adapter = transport(scope, timeout, fixture_url, subscription_socket, reservation)
+            except (ModelAccessError, OSError) as cause:
+                raise SpendingError('provider_unavailable', 'Paid/unknown routes are disabled; use the exact approved subscription capability or labeled fixture.') from cause
+        except SpendingError as error:
+            _record_refusal(database, scope, None, error)
+            raise
     deadline = time.monotonic() + ttl
     calls = 0
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
@@ -327,15 +352,24 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
                             result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline)
                         reply = {'result': result}
                     except SpendingError as error:
-                        reply = {'error': error.code, 'message': str(error)}
+                        reply = _refusal_reply(uri, scope, error)
                     except (ValueError, UnicodeError, RecursionError, OSError, sqlite3.Error):
-                        reply = {'error': 'broker_unavailable', 'message': 'Broker request/state unavailable; no fallback or unchecked retry.'}
+                        reply = _refusal_reply(uri, scope, SpendingError('broker_unavailable', 'Broker request/state unavailable; no fallback or unchecked retry.'))
                     try:
                         connection.sendall(json.dumps(reply).encode() + b'\n')
                     except OSError:
                         pass  # Disconnected clients cannot cause a second upstream operation.
         finally:
             os.unlink(path)
+
+
+def _refusal_reply(uri, scope, error):
+    try:
+        with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
+            _record_refusal(database, scope, None, error)
+        return {'error': error.code, 'message': str(error)}
+    except (OSError, sqlite3.Error):
+        return {'error': 'broker_unavailable', 'message': 'Refusal evidence could not be persisted; no fallback.'}
 
 
 def broker_call(path, operation_id, reserve, payload):
