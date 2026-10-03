@@ -125,6 +125,35 @@ Only one product iteration and one implementation ticket are active initially. I
 - Resolve and validate skill names and transitive dependencies at startup. Installing a skill does not prove it is unambiguous, available to a worker profile, or adapted to the factory's automation contract.
 - Simplification is a scoped quality pass, not permission to redesign the product or alter public requirements. Behavior-affecting or out-of-scope decisions return to the appropriate review/operator path.
 
+### Required execution of installed skills
+
+The factory automates the skills already installed on the existing server, rather than replacing them with a custom workflow that merely produces similar artifacts. The following bindings are mandatory for the corresponding stages:
+
+- **Grilling:** run Matt Pocock's `grill-me` entry point and its `grilling` dependency in the originating conversation. Challenge assumptions, recommend options, preserve actual answers and resolve the decision frontier before synthesis. Invoke the same binding for the next iteration only after Antoine supplies input.
+- **Specification synthesis:** run Matt Pocock's `to-spec` on the resolved interview to synthesize the whole-product vision, finite milestone and traceable decision record. Merely storing categorized answers or accepting externally prepared specification documents does not demonstrate this stage.
+- **Ticket synthesis:** run Matt Pocock's `to-tickets` on the pinned current milestone to produce verifiable vertical slices and their blocking graph. Apply its work-item contract to discovered bugs and run it when affected tickets need resynthesis after an agreed material revision. Controlled adapters perform publication and exact read-back.
+- **Implementation and corrective work:** the fresh implementation worker must run Matt Pocock's `implement` for its assigned ticket or correction, including meaningful tests at the agreed seams. Do not substitute a generic coding prompt. The deterministic controller, not `implement-spec`, owns eligible-frontier scheduling and per-ticket integration.
+- **Simplification:** the separate fresh simplifier must run the installed `simplify-code` skill. This is an existing server skill inspired by Claude Code's simplify workflow, not a Matt Pocock skill. Cover reuse, quality, efficiency and altitude, preserve behavior, and accept an evidence-backed no-op.
+- **Independent review:** run Matt Pocock's `code-review` against the pinned baseline and exact candidate. Execute its **Standards** and **Spec** axes in separate fresh read-only contexts, parallel where permitted by enforced isolation, and preserve separate findings and verdicts. Both axes must pass before the candidate can advance.
+- **Stuck-work investigation and incident diagnosis:** the dedicated debug or repair worker must run Matt Pocock's `diagnosing-bugs`. Retain the actual reproduction/feedback-loop evidence, hypotheses, diagnostic commands and conclusions, or honestly report the missing capability. Diagnosis is not permission for an otherwise read-only debug worker to edit the candidate.
+- **Main repair:** use `diagnosing-bugs` for diagnosis and `implement` for modifying repair work; send the repair candidate through the same `simplify-code` and two-axis `code-review` stages and unchanged gates as ordinary work.
+
+**Source selection and worker availability:** reuse the installed sources; do not rewrite these skills as parallel factory-specific copies or install another skill framework. The current explicit source selection for Matt's bindings is the local Hermes skill directory (`$HOME/.hermes/skills/<skill>/SKILL.md` for `grill-me`, `grilling`, `to-spec`, `to-tickets`, `implement`, `code-review` and `diagnosing-bugs`); `simplify-code` is selected from `$HOME/.hermes/skills/software-development/simplify-code/SKILL.md`. These are deployment source identities, not worker host mounts. Resolve each exact source and its real transitive dependencies/supporting inputs, record content hashes and the factory adaptation in the assignment manifest, and stage only those immutable snapshots in the appropriate worker context. Duplicate bare names in external directories do not authorize silently selecting another copy. Missing, ambiguous, altered or unavailable required skill inputs block admission or invalidate affected stage evidence. A reviewed explicit source update gets a new pin; unrelated installed skills are not modified.
+
+**Factory adaptations:** load and follow the selected skill's substantive method, with a small explicit stage contract for these established policies:
+
+- Resolve genuine product, technical and testing decisions with Antoine during grilling; remove only routine post-grilling spec/ticket-batch confirmation prompts. Unresolved choices remain pending, and silence never becomes approval.
+- Move `implement`'s nested review to the dedicated post-simplification `code-review` stage instead of running a duplicate hidden review. Testing is mandatory; TDD/test-first ordering is not a factory-wide requirement and is used where appropriate at agreed seams.
+- Run `simplify-code` in one dedicated simplifier context covering all four angles rather than automatically launching four additional cleanup agents. This does not collapse the independent Standards/Spec acceptance review.
+- Supply exact tracker, standards, spec and baseline pointers through the handoff. Keep controller-owned commits/publication/merge operations within the existing capability boundaries; a skill's ordinary CLI instructions do not grant broad credentials or direct mutation authority.
+- Keep routine diagnostic hypotheses/progress in evidence rather than emitting stage-success chat. Request missing capabilities and genuinely needed operator decisions through the existing exact-origin attention path. A read-only diagnostic run stops before modifying phases; authorized repair runs perform them within scope and retain regression/cleanup evidence.
+
+**Execution evidence and automatic handoff:** each applicable completed stage must retain the resolved skill identity and hashes, adaptation identity, correlated stage/run and pinned inputs, evidence that the executing agent loaded the actual selected skill instructions, and observable work/results from following them. A catalog entry, supplied handoff, skill name in final prose or successful process exit alone is insufficient. The controller verifies this evidence and the required behavior/tests before advancing. Deterministic tests may use labeled fixtures; live acceptance must exercise actual skill-guided conversation/workers and cannot substitute fixture artifacts or manually supplied specs/ticket batches for synthesis.
+
+After sufficient interview clarification, the controller automatically progresses through `to-spec`, `to-tickets`, eligible assignments, `implement`, `simplify-code`, two-axis `code-review`, controlled delivery verification and completion reporting. The live acceptance trace must demonstrate this without operator commands to advance each stage or manual injection of intermediate synthesis artifacts. Agreed decision, spending, stuckness and incident boundaries may still pause the affected work.
+
+Scheduling, claims, polling, persistence, publication, merge validation, health observation and notification delivery remain deterministic controlled operations; they do not require gratuitous skill/LLM calls. This clarification binds the existing stages to the installed skills and adds execution proof; it does not authorize new spending, worker execution, protection changes or beta reuse.
+
 ### Ticket delivery and definition of done
 
 - The delivery order is implementation/testing, simplification, independent review, corrective iterations, validated merge, and observation of integrated delivery.
@@ -197,7 +226,7 @@ Use narrower integration seams only where necessary to verify a real trust bound
 
 - Specification/ticket synthesis: whole-product vision and current-milestone separation, requirements and technical decisions, common feature/bug format, dependencies, interview traceability, and no extra approval loop after grilling.
 - Scheduler/controller: one active product iteration and one implementation ticket, dependency eligibility, ordered stages, rejection/rework, genuine blocked states, and evidence-driven completion.
-- Worker setup: fresh contexts, explicit role profiles, required skills available without ambiguity, pinned assignment inputs, and no unrelated memory/context.
+- Worker setup: fresh contexts, explicit role profiles, exact installed skill sources/dependencies/adaptations pinned and loaded in the executing context, observable skill-guided execution evidence, and no unrelated memory/context. Test refusals for missing/ambiguous/changed inputs and claims based only on catalog entries or externally supplied artifacts.
 - Merge verifier: wrong repository/branch refusal, stale review/head refusal, missing/failed checks refusal, main-freeze refusal for ordinary work, authorized repair exception, and exact merged-commit read-back.
 - Main watcher/recovery: failed CI/CD and unhealthy deployment detection, freeze behavior, repair priority, roll-forward/revert outcomes, reopened removed requirements, and verified return to healthy state.
 - Bug/debug handling: duplicate avoidance, current-vs-future bug scope, agent-declared stuck work, independent debug evidence/report, operator decision admission, blocked dependents, and continued independent work when healthy.
@@ -209,7 +238,7 @@ Use narrower integration seams only where necessary to verify a real trust bound
 
 ### Acceptance scenarios
 
-1. A milestone work item is implemented, simplified, independently reviewed, merged into `main`, and closed only after verified delivery evidence; healthy CI/CD is observed and the iteration report is emitted.
+1. A sufficiently resolved interview runs `grill-me`/`grilling`, then the factory automatically runs `to-spec`, `to-tickets`, ticket `implement`, `simplify-code` and independent Standards/Spec `code-review`, retaining actual skill-execution evidence without manually injected synthesis artifacts or per-stage operator advancement. A milestone work item is merged into `main` and closed only after verified delivery evidence; healthy CI/CD is observed and the iteration report is emitted.
 2. Reviewer rejection returns work for corrections; the rejected candidate cannot merge using stale approval.
 3. An unmerged branch with passing tests is never reported as a completed ticket.
 4. A requirement omitted despite green tests is rejected by independent review.

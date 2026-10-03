@@ -173,3 +173,16 @@ This is a normalized question-and-answer record of the fresh interview in the or
 ## Unselected engineering details
 
 Exact controller storage/schema, supervisor configuration, GitHub Projects board identity/permissions, worker image/mount/credential wiring, role model overrides, supported notification integration, and product-specific CI/CD targets remain implementation verification/design details. They must satisfy the decisions above. No existing beta solution was selected by implication.
+
+## Subsequent operator clarification — Installed-skill execution
+
+**Source:** Originating Discord review thread `1555860658455846964`; explicit operator instruction following the specs/tickets alignment review.
+
+**Operator wording:**
+
+> Add into the relevant specs that the steps in the loop are linked to skills that we already have on the server.
+> For relevant tickets, specify the skill must be ran
+
+**Settled clarification:** The factory must run the existing server skills for their corresponding stages, not merely reproduce similar outcomes or validate their availability. Bind grilling to `grill-me`/`grilling`, specification synthesis to `to-spec`, ticket synthesis to `to-tickets`, implementation/corrections to `implement`, simplification to the installed non-Matt `simplify-code`, independent Standards/Spec review to `code-review`, and diagnosis to `diagnosing-bugs`. Repair uses these same diagnosis and engineering stages. Select exact installed sources/dependencies, retain pinned inputs and actual execution evidence, and apply the explicit factory stage adaptations in the specification.
+
+**Scope:** Update the specification and relevant ticket acceptance requirements. This instruction does not resume workers, merge implementation PRs, close delivery tickets, modify shared skill files, authorize spending or weaken gates. Original Q1–Q39 answers are preserved.
