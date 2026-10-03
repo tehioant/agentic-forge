@@ -133,9 +133,68 @@ def main():
     completion.add_argument('--api-base', required=True)
     completion.add_argument('--bearer', default='credential-blind-controller')
     completion.add_argument('--timeout', type=float, default=10)
+    grant = commands.add_parser('spend-grant', help='Record trusted scoped model allowance or approval.')
+    grant.add_argument('--project', required=True)
+    grant.add_argument('--iteration', required=True)
+    grant.add_argument('--provider', required=True)
+    grant.add_argument('--model', required=True)
+    grant.add_argument('--operation', required=True)
+    grant.add_argument('--kind', choices=['allowance', 'approval'], required=True)
+    grant.add_argument('--ceiling', type=int, required=True)
+    grant.add_argument('--expires', type=int, required=True, help='Unix epoch seconds.')
+    grant.add_argument('--reference', required=True)
+    call = commands.add_parser('model-call', help='Call the credential-blind fixed-scope Unix-socket broker.')
+    call.add_argument('--socket', required=True)
+    call.add_argument('--operation-id', required=True)
+    call.add_argument('--reserve', type=int, required=True)
+    call.add_argument('--request', required=True)
+    reconcile_cmd = commands.add_parser('spend-reconcile', help='Trusted controller reconciliation for an uncertain operation.')
+    for option in ['project', 'iteration', 'provider', 'model', 'operation', 'operation-id', 'outcome', 'reference']:
+        reconcile_cmd.add_argument('--' + option, required=True, choices=['complete', 'failed'] if option == 'outcome' else None)
+    reconcile_cmd.add_argument('--actual-units', type=int)
+    resume_cmd = commands.add_parser('spend-resume', help='Resume quota only with trusted restoration evidence, never purchase capacity.')
+    for option in ['project', 'iteration', 'provider', 'model', 'operation', 'reference']:
+        resume_cmd.add_argument('--' + option, required=True)
+    broker = commands.add_parser('model-broker', help='Run a bounded fixed-scope credential-blind model capability.')
+    broker.add_argument('--socket', required=True)
+    broker.add_argument('--project', required=True)
+    broker.add_argument('--iteration', required=True)
+    broker.add_argument('--provider', required=True)
+    broker.add_argument('--model', required=True)
+    broker.add_argument('--operation', required=True)
+    route = broker.add_mutually_exclusive_group(required=True)
+    route.add_argument('--fixture-url')
+    route.add_argument('--subscription-socket')
+    broker.add_argument('--reservation', type=int, default=3, help='Trusted fixture upper bound; subscription requests always reserve 1.')
+    broker.add_argument('--ttl', type=int, default=300)
+    broker.add_argument('--max-calls', type=int, default=100)
+    broker.add_argument('--worker-uid', type=int, default=os.getuid())
+    broker.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command == 'model-call':
+        from .spending import SpendingError, broker_call
+        with open(args.request, encoding='utf-8') as source:
+            try:
+                request = json.load(source, object_pairs_hook=unique_fields)
+            except (ValueError, RecursionError) as error:
+                raise IntakeError('invalid_request', 'Model request must be unambiguous UTF-8 JSON.') from error
+        if not isinstance(request, dict):
+            raise IntakeError('invalid_request', 'Model request must be a JSON object.')
+        try:
+            result = broker_call(args.socket, args.operation_id, args.reserve, request)
+        except SpendingError as error:
+            raise IntakeError(error.code, str(error)) from error
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.command == 'model-broker':
+        from .spending import SpendingError, serve_unix_socket
+        try:
+            serve_unix_socket(args.socket, args.state, (args.project, args.iteration, args.provider, args.model, args.operation), args.fixture_url, args.timeout, args.operator_id, args.subscription_socket, args.reservation, args.ttl, args.max_calls, args.worker_uid)
+        except SpendingError as error:
+            raise IntakeError(error.code, str(error)) from error
+        return
     if args.command == 'register':
         with open(args.request, encoding='utf-8') as source:
             try:
@@ -159,6 +218,24 @@ def main():
             if args.command != 'inspect':
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
+            if args.command in {'spend-grant', 'spend-reconcile', 'spend-resume'}:
+                from .spending import SpendingError, add_grant, initialize, resume_quota, reconcile as reconcile_spend
+                from .repositories import state_lock
+                try:
+                    with state_lock(database), database:
+                        initialize(database)
+                        if args.command == 'spend-grant':
+                            result = add_grant(database, args.project, args.iteration, args.provider,
+                                               args.model, args.operation, args.kind, args.ceiling,
+                                               args.expires, args.reference)
+                        elif args.command == 'spend-resume':
+                            result = resume_quota(database, (args.project, args.iteration, args.provider, args.model, args.operation), args.reference)
+                        else:
+                            result = reconcile_spend(database, args.project, args.iteration,
+                                args.provider, args.model, args.operation, args.operation_id,
+                                args.outcome, args.actual_units, args.reference)
+                except SpendingError as error:
+                    raise IntakeError(error.code, str(error)) from error
             if args.command in {'plan', 'complete-planning'}:
                 from .planning import plan, complete
                 from .repositories import GitHub, RepositoryError, state_lock
