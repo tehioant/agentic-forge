@@ -129,6 +129,9 @@ def external_contract(issue, inputs):
         sections[name] = issue['body'][heading.end():end].strip()
     if not all(sections.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Blocked by', 'Status')):
         return False
+    status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', sections['Status'])
+    if status is None:
+        return False
     refs = []
     for line in sections['Requirement references'].splitlines():
         if not line.strip():
@@ -151,7 +154,7 @@ def external_contract(issue, inputs):
         validate_contract(issue['title'], sections['What to build'], criteria, refs, inputs)
     except RepositoryError:
         return False
-    return True
+    return status[1]
 
 
 def validate_batch(batch, inputs, iteration, label):
@@ -413,8 +416,7 @@ def frontier(database, item, github):
                                 'membership_id': member['id'], 'status': state, 'issue_state': issue['state'],
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
                                 'contract_valid': bool(contract and triaged),
-                                'held': bool('milestone' in board and re.search(
-                                    r'^## Status\n\s*\n(?:blocked|deferred)\s*(?:\n## |\Z)', issue['body'], re.MULTILINE))}
+                                'held': contract in {'blocked', 'deferred'}}
     for dependencies in native_blockers.values():
         for dependency in dependencies:
             row = rows.get(dependency['number'])
