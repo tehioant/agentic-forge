@@ -161,14 +161,14 @@ def main():
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')
             if args.command in {'plan', 'complete-planning'}:
                 from .planning import plan, complete
-                from .repositories import GitHub, RepositoryError
+                from .repositories import GitHub, RepositoryError, state_lock
                 with open(args.request, encoding='utf-8') as source:
                     try:
                         request = json.load(source, object_pairs_hook=unique_fields)
                     except (ValueError, RecursionError) as error:
                         raise IntakeError('invalid_planning', 'Provide unambiguous planning JSON within parser limits.') from error
                 try:
-                    with database:
+                    with state_lock(database), database:
                         if args.command == 'plan':
                             result = plan(database, result, request)
                         else:

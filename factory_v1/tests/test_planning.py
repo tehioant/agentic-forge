@@ -195,6 +195,71 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.command('complete-planning', request).returncode, 2)
         self.assertEqual(self.inspect(), item)
 
+    def during_delayed_onboarding(self, command, request):
+        """Overlap public commands at the external metadata-read seam."""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+        parent = self.fixture.server.RequestHandlerClass
+
+        class Handler(parent):
+            def do_GET(self):
+                if self.path == '/repos/example/product' and not entered.is_set():
+                    entered.set()
+                    release.wait(timeout=10)
+                super().do_GET()
+
+        self.fixture.server.RequestHandlerClass = Handler
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            onboarding = pool.submit(self.fixture.onboard, '10')
+            try:
+                self.assertTrue(entered.wait(timeout=5), 'Onboarding did not reach metadata read')
+                operation = pool.submit(self.command, command, request)
+                try:
+                    operation.result(timeout=1)
+                except TimeoutError:
+                    pass  # A serialized operation may wait for onboarding.
+            finally:
+                release.set()
+            onboarded = onboarding.result(timeout=15)
+            acknowledged = operation.result(timeout=15)
+        self.assertEqual(onboarded.returncode, 0, onboarded.stderr)
+        self.assertEqual(acknowledged.returncode, 0, acknowledged.stderr)
+        return json.loads(acknowledged.stdout)
+
+    def test_concurrent_onboarding_cannot_restore_superseded_assignment_or_handoff(self):
+        request = self.completion()
+        self.publication(request)
+        self.assertEqual(self.command('complete-planning', request).returncode, 0)
+        replacement = dict(self.plan_request, expected_revision=1)
+        acknowledged = self.during_delayed_onboarding('plan', replacement)
+        persisted = self.inspect()
+        self.assertEqual(persisted, acknowledged)
+        self.assertEqual(persisted['planning']['revision'], 2)
+        self.assertEqual(persisted['planning_history'][0]['status'], 'complete')
+        self.assertNotIn('handoff', persisted)
+        self.assertFalse(persisted['execution_allowed'])
+        self.assertEqual(json.loads(self.command('plan', replacement).stdout), persisted)
+        self.assertEqual(self.command('complete-planning', request).returncode, 2)
+        self.assertEqual(self.inspect(), persisted)
+
+    def test_concurrent_onboarding_cannot_discard_acknowledged_completion(self):
+        request = self.completion()
+        self.publication(request)
+        acknowledged = self.during_delayed_onboarding('complete-planning', request)
+        persisted = self.inspect()
+        self.assertEqual(persisted, acknowledged)
+        self.assertEqual(persisted['planning']['status'], 'complete')
+        self.assertEqual(persisted['stage'], 'planning_complete')
+        self.assertEqual(persisted['correlation']['stage'], 'planning_complete')
+        self.assertEqual(persisted['handoff']['commit'], request['commit'])
+        self.assertEqual(persisted['handoff']['issue']['number'], 7)
+        self.assertFalse(persisted['execution_allowed'])
+        self.assertEqual(json.loads(self.command('complete-planning', request).stdout), persisted)
+        self.assertEqual(self.inspect(), persisted)
+
     def test_identity_endpoint_and_completed_issue_continuity(self):
         request = self.completion()
         self.publication(request)
