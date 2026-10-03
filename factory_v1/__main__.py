@@ -27,7 +27,7 @@ def text(value):
 
 def validate_intake(item, operator_id):
     required = {'project_id', 'iteration_id', 'repository', 'idea', 'approval', 'origin'}
-    if not isinstance(item, dict) or not required <= item.keys() or item.keys() - required - {'work_item_number'}:
+    if not isinstance(item, dict) or not required <= item.keys() or item.keys() - required - {'work_item_number', 'repository_intent'}:
         raise IntakeError('invalid_intake', 'Provide an explicit approved project and iteration.')
     for field in ['project_id', 'iteration_id']:
         if not matches(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', item[field]):
@@ -37,6 +37,10 @@ def validate_intake(item, operator_id):
     repository = item['repository']
     if not matches(r'[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}/[A-Za-z0-9_.-]{1,100}', repository) or repository.split('/')[-1] in {'.', '..'}:
         raise IntakeError('invalid_intake', 'Select an exact GitHub owner/repository identifier.')
+    if 'repository_intent' in item:
+        intent = item['repository_intent']
+        if not isinstance(intent, dict) or set(intent) != {'mode', 'marker'} or intent.get('mode') != 'new' or not text(intent.get('marker')):
+            raise IntakeError('invalid_intake', 'New-product intent requires an explicit ownership marker.')
     approval = item['approval']
     if not isinstance(approval, dict) or set(approval) != {'operator_id', 'reference'} or approval.get('operator_id') != operator_id or not text(approval.get('reference')):
         raise IntakeError('invalid_intake', 'Explicit approval and provenance from the configured operator are required.')
@@ -75,7 +79,7 @@ def register_iteration(database, item):
     )
     existing = read_iteration(database, item['project_id'], item['iteration_id'])
     if existing is not None:
-        if existing.get('work_item_number') != item.get('work_item_number') or any(existing.get(key) != value for key, value in item.items()):
+        if any(existing.get(key) != item.get(key) for key in ['work_item_number', 'repository_intent']) or any(existing.get(key) != value for key, value in item.items()):
             raise IntakeError('intake_conflict', 'This iteration is already registered with different provenance or scope.')
         return existing
     active = database.execute(
@@ -111,6 +115,13 @@ def main():
     inspect = commands.add_parser('inspect')
     inspect.add_argument('--project', required=True)
     inspect.add_argument('--iteration', required=True)
+    onboarding = commands.add_parser('onboard')
+    onboarding.add_argument('--project', required=True)
+    onboarding.add_argument('--iteration', required=True)
+    onboarding.add_argument('--api-base', required=True)
+    onboarding.add_argument('--bearer', default='credential-blind-controller')
+    onboarding.add_argument('--timeout', type=float, default=10)
+    onboarding.add_argument('--creation-receipt', help='Trusted controller receipt for explicit lost-state recovery; never worker-supplied.')
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -125,7 +136,7 @@ def main():
         with closing(connection) as database, database:
             result = register_iteration(database, item)
     else:
-        uri = Path(args.state).resolve().as_uri() + '?mode=ro'
+        uri = Path(args.state).resolve().as_uri() + ('?mode=rw' if args.command == 'onboard' else '?mode=ro')
         try:
             connection = sqlite3.connect(uri, uri=True)
         except sqlite3.OperationalError as error:
@@ -134,6 +145,22 @@ def main():
             result = read_iteration(database, args.project, args.iteration)
             if result is None:
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
+            if args.command == 'onboard':
+                if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
+                    raise IntakeError('approval_required', 'Recorded approval from the configured operator is required before repository access.')
+                receipt = None
+                if args.creation_receipt:
+                    with open(args.creation_receipt, encoding='utf-8') as source:
+                        try:
+                            receipt = json.load(source, object_pairs_hook=unique_fields)
+                        except (ValueError, RecursionError) as error:
+                            raise IntakeError('invalid_receipt', 'Provide an unambiguous trusted controller creation receipt.') from error
+                from .repositories import GitHub, RepositoryError, onboard
+                try:
+                    with database:
+                        result = onboard(database, result, GitHub(args.api_base, args.bearer, args.timeout), receipt)
+                except RepositoryError as error:
+                    raise IntakeError(error.code, str(error)) from error
     print(json.dumps(result, sort_keys=True))
 
 
