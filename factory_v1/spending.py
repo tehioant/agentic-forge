@@ -117,13 +117,18 @@ def _block(database, item, reason, scope):
     _save(database, item)
 
 
-def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowance_only=False):
+def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowance_only=False, deadline=None):
     if not isinstance(operation_id, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', operation_id) is None:
         raise SpendingError('invalid_operation_id', 'A bounded stable idempotency key is required.')
     if type(reserve) is not int or not 0 < reserve <= MAX_UNITS:
         raise SpendingError('invalid_reservation', 'Reservation must be a bounded positive integer.')
     digest = hashlib.sha256(request_bytes).hexdigest()
     database.execute('BEGIN IMMEDIATE')
+    now = int(time.time()) if now is None else now
+    if deadline is not None and time.monotonic() >= deadline:
+        _decision(database, scope, operation_id, 'refused', 'capability_exhausted', now)
+        database.commit()
+        raise SpendingError('capability_exhausted', 'Attempt capability expired before admission.')
     item = _iteration(database, scope[0], scope[1], require_active=True)
     old = database.execute('SELECT * FROM model_operations WHERE operation_id=?', (operation_id,)).fetchone()
     if old:
@@ -144,7 +149,7 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
         _decision(database, scope, operation_id, 'refused', reason, now)
         database.commit()
         raise SpendingError(reason, 'Model access is blocked; exact trusted reconciliation or quota-resume evidence is required.')
-    grant = database.execute('''SELECT grant_id FROM model_grants
+    grant = database.execute('''SELECT grant_id, expires FROM model_grants
       WHERE project=? AND iteration=? AND provider=? AND model=? AND operation=?
       AND remaining>=? AND expires>? AND (?=0 OR kind='allowance') ORDER BY expires, grant_id LIMIT 1''',
       (*scope, reserve, now, int(allowance_only))).fetchone()
@@ -159,7 +164,7 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
     item['model_access'] = {'status': 'admitted', 'operation_id': operation_id}
     _save(database, item)
     _decision(database, scope, operation_id, 'admitted', 'scoped_reservation', now)
-    return {'status': 'pending'}
+    return {'status': 'pending', 'grant_expires': grant[1]}
 
 
 def _finish(database, operation_id, status, actual_units, receipt):
@@ -187,7 +192,7 @@ def _finish(database, operation_id, status, actual_units, receipt):
     return {'status': status, 'actual_units': actual_units}
 
 
-def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None):
+def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None):
     """Reserve before outbound I/O; uncertain outcomes freeze the whole iteration."""
     scope = _scope(*scope)
     if not isinstance(payload, dict):
@@ -210,9 +215,14 @@ def execute_controlled(database, scope, operation_id, payload, reserve, fixture_
         raise SpendingError('invalid_request', 'Subscription payload has unsupported fields or no input.')
     allowance_only = scope[2] != 'fixture-provider'
     with state_lock(database), database:
-        admitted = _prepare(database, scope, operation_id, body, reserve, int(time.time()) if now is None else now, allowance_only)
+        admitted = _prepare(database, scope, operation_id, body, reserve, now, allowance_only, deadline)
     if admitted['status'] in {'complete', 'failed'}:
         return admitted
+    if ((deadline is not None and time.monotonic() >= deadline)
+            or (int(time.time()) if now is None else now) >= admitted['grant_expires']):
+        with state_lock(database), database:
+            _finish(database, operation_id, 'failed', 0, 'expired_before_outbound_io')
+        raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O; no operation was initiated.')
     try:
         units, result = adapter.call(payload)
         if type(units) is not int or not 0 <= units <= reserve:
@@ -314,7 +324,7 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
                         calls += 1
                         with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
                             _iteration(database, scope[0], scope[1], operator_id, require_active=True)
-                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter)
+                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline)
                         reply = {'result': result}
                     except SpendingError as error:
                         reply = {'error': error.code, 'message': str(error)}

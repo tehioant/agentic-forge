@@ -107,17 +107,29 @@ class SubscriptionTransport:
             if len(raw) > MAX_RESPONSE:
                 raise ModelAccessError('outcome_uncertain')
             completed = None
+            output_items = {}
             for event in raw.decode('utf-8').replace('\r\n', '\n').split('\n\n'):
                 lines = [line[5:].lstrip() for line in event.splitlines() if line.startswith('data:')]
                 if not lines or lines == ['[DONE]']:
                     continue
                 item = json.loads('\n'.join(lines))
+                if item.get('type') == 'response.output_item.done':
+                    index, output_item = item.get('output_index'), item.get('item')
+                    if type(index) is not int or not 0 <= index < 1000 or not isinstance(output_item, dict) or index in output_items:
+                        raise ModelAccessError('outcome_uncertain')
+                    output_items[index] = output_item
                 if item.get('type') == 'response.completed':
                     completed = item.get('response')
                 if item.get('type') in {'error', 'response.failed', 'response.incomplete'}:
                     raise ModelAccessError('outcome_uncertain')
             if (not isinstance(completed, dict) or completed.get('status') != 'completed'
                     or completed.get('model') != SUBSCRIPTION_SCOPE[1]):
+                raise ModelAccessError('outcome_uncertain')
+            if output_items:
+                if sorted(output_items) != list(range(len(output_items))):
+                    raise ModelAccessError('outcome_uncertain')
+                completed['output'] = [output_items[index] for index in sorted(output_items)]
+            elif not isinstance(completed.get('output'), list) or not completed['output']:
                 raise ModelAccessError('outcome_uncertain')
             return 1, completed
         finally:

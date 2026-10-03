@@ -202,8 +202,9 @@ class ModelSpendingTests(unittest.TestCase):
                 self.send_response(case.upstream_status)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.end_headers()
-                body = {'type': 'response.completed', 'response': {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': 'labeled-fixture'}}
-                self.wfile.write(('data: ' + json.dumps(body) + '\n\n').encode())
+                done = {'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'content': [{'type': 'output_text', 'text': 'labeled-fixture'}]}}
+                body = {'type': 'response.completed', 'response': {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': []}}
+                self.wfile.write(('data: ' + json.dumps(done) + '\n\ndata: ' + json.dumps(body) + '\n\n').encode())
         path = self.root / 'upstream.sock'
         server = socketserver.UnixStreamServer(str(path), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -269,6 +270,7 @@ class ModelSpendingTests(unittest.TestCase):
         payload = {'input': [{'role': 'user', 'content': 'labeled fixture request'}]}
         result = self.call(reserve=1, request=payload)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['result']['output'][0]['content'][0]['text'], 'labeled-fixture')
         path, upstream = self.upstream_calls[0]
         self.assertEqual(path, '/v1/responses')
         self.assertEqual(upstream['model'], 'gpt-6.1-sol')
@@ -339,6 +341,26 @@ class ModelSpendingTests(unittest.TestCase):
             serve_unix_socket(str(self.sock), str(self.state), ('product', 'm1', 'fixture-provider', 'fixture-model', 'generate'), self.fixture_url, operator_id='42')
         self.assertEqual(error.exception.code, 'iteration_paused')
         self.assertEqual(FixtureHandler.calls, [])
+
+    def test_capability_expiry_is_rechecked_after_controller_lock_wait(self):
+        import fcntl
+        self.assertEqual(self.grant(ceiling=20).returncode, 0)
+        process = self.broker(extra=['--ttl', '1'])
+        results = []
+        with open(str(self.state) + '.onboarding.lock', 'a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            caller = threading.Thread(target=lambda: results.append(self.call()))
+            caller.start()
+            time.sleep(1.3)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        caller.join(timeout=10)
+        self.assertFalse(caller.is_alive())
+        self.assertEqual(json.loads(results[0].stderr)['error'], 'capability_exhausted')
+        self.assertEqual(FixtureHandler.calls, [])
+        process.wait(timeout=5)
+        with closing(sqlite3.connect(self.state)) as db:
+            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 20)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
 
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
         self.assertEqual(self.grant().returncode, 0)
