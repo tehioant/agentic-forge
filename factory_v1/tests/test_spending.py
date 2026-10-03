@@ -416,6 +416,7 @@ class ModelSpendingTests(unittest.TestCase):
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
         self.assertEqual(self.grant().returncode, 0)
         self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')
+        self.assertEqual(json.loads(self.grant(provider='bad/value').stderr)['error'], 'invalid_scope')
         for ceiling in [0, -1, 2**63]:
             self.assertEqual(json.loads(self.grant(ceiling=ceiling, reference='invalid-' + str(ceiling)).stderr)['error'], 'invalid_grant')
         self.broker()

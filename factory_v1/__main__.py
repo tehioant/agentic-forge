@@ -237,7 +237,8 @@ def main():
                                 args.provider, args.model, args.operation, args.operation_id,
                                 args.outcome, args.actual_units, args.reference)
                 except SpendingError as error:
-                    record_refusal(database, (args.project, args.iteration, args.provider, args.model, args.operation), getattr(args, 'operation_id', None), error)
+                    if error.code != 'invalid_scope':
+                        record_refusal(database, (args.project, args.iteration, args.provider, args.model, args.operation), getattr(args, 'operation_id', None), error)
                     raise IntakeError(error.code, str(error)) from error
             if args.command in {'plan', 'complete-planning'}:
                 from .planning import plan, complete
