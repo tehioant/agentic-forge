@@ -27,8 +27,11 @@ def run_fixture(container):
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
         connection.settimeout(10)
         connection.connect(str(mounts['/model/capability.sock']))
+        mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+        tools = [{'type': 'web_search'}] if mode == 'server-tool' else []
+        text = 'Labeled deterministic Docker fixture only' + ('X' * 50000 if mode == 'large-request' else '')
         connection.sendall(json.dumps({'operation_id': envelope['run_id'] + '-fixture-call', 'reserve': 1,
-            'payload': {'input': 'Labeled deterministic Docker fixture only', 'tools': [], 'reasoning': {'effort': 'high'}}}).encode() + b'\n')
+            'payload': {'input': text, 'tools': tools, 'reasoning': {'effort': 'high'}}}).encode() + b'\n')
         response = bytearray()
         while not response.endswith(b'\n'):
             part = connection.recv(4096)

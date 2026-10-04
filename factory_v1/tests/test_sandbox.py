@@ -128,6 +128,47 @@ class SandboxTests(unittest.TestCase):
         self.assertFalse((self.bin / 'container.json').exists())
         self.assignment.assert_no_external_writes()
 
+    def test_large_engineering_request_is_bounded_and_admitted_without_route_change(self):
+        self.mode('large-request')
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'complete', launched)
+        self.assertGreater(len(self.model_calls[0][1]['input']), 32768)
+        self.assertEqual(self.model_calls[0][1]['service_tier'], 'default')
+        self.assertFalse(self.model_calls[0][1]['store'])
+
+    def test_provider_executed_network_tools_are_denied_at_admission(self):
+        self.mode('server-tool')
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'failed')
+        self.assertEqual(launched['runtime']['error'], 'worker_failed')
+        self.assertEqual(self.model_calls, [])
+        self.assertNotIn('submitted_result', launched)
+
+    def test_pause_of_running_attempt_stops_it_and_preserves_scratch(self):
+        self.mode('hang')
+        prepared = self.assignment.ok(self.assignment.command())
+        process = self.started(prepared)
+        running = self.wait_running(prepared)
+        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, error)
+        result = json.loads(output)
+        self.assertEqual(result['runtime']['error'], 'iteration_paused')
+        self.assertFalse((self.bin / 'container.json').exists())
+        self.assertTrue(Path(running['runtime']['artifacts']).is_dir())
+
+    def test_role_mount_files_are_readable_by_different_nonroot_identity(self):
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        root = Path(launched['runtime']['artifacts'])
+        self.assertEqual((root / 'inputs').stat().st_mode & 0o007, 0o005)
+        self.assertEqual((root / 'inputs/worker.py').stat().st_mode & 0o004, 0o004)
+        self.assertEqual((root / 'inputs/baseline/hello.py').stat().st_mode & 0o004, 0o004)
+        self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o002, 0o002)
+        self.assertEqual(root.stat().st_mode & 0o077, 0)
+
     def test_review_mount_is_read_only_and_returns_unchanged_candidate(self):
         self.assignment.request = self.assignment.configuration(stage='review-standards')
         head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.source, text=True).strip()

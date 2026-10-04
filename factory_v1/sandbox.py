@@ -66,20 +66,19 @@ def inputs_for(assignment, root):
 
 
 def authorize(database, project, iteration, operator, assignment_id, run_id, request):
-    with state_lock(database):
-        assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
-        assignments.current(database, project, iteration, operator)
-        assignments.claims(database, original(assignment), assignment['ticket_scope'], assignment_id)
-        if assignment['runtime']['status'] != 'running' or (Path(assignment['runtime']['artifacts']) / 'stop').exists():
-            raise spending.SpendingError('capability_exhausted', 'Stopped run cannot admit operations.')
-        payload = request.get('payload')
-        if not isinstance(payload, dict):
-            raise spending.SpendingError('invalid_request', 'Only bounded function-tool Responses input is supported.')
-        tools = payload.get('tools', [])
-        if (not isinstance(tools, list) or len(tools) > len(TOOLS) or
-                any(not isinstance(tool, dict) or tool.get('type') != 'function' or tool.get('name') not in TOOLS for tool in tools) or
-                payload.get('reasoning') != {'effort': assignment['handoff']['profile']['reasoning']}):
-            raise spending.SpendingError('invalid_request', 'Server-side tools and reasoning/model changes are not admitted.')
+    assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
+    assignments.current(database, project, iteration, operator)
+    assignments.claims(database, original(assignment), assignment['ticket_scope'], assignment_id)
+    if assignment['runtime']['status'] != 'running' or (Path(assignment['runtime']['artifacts']) / 'stop').exists():
+        raise spending.SpendingError('capability_exhausted', 'Stopped run cannot admit operations.')
+    payload = request.get('payload')
+    if not isinstance(payload, dict):
+        raise spending.SpendingError('invalid_request', 'Only bounded function-tool Responses input is supported.')
+    tools = payload.get('tools', [])
+    if (not isinstance(tools, list) or len(tools) > len(TOOLS) or
+            any(not isinstance(tool, dict) or tool.get('type') != 'function' or tool.get('name') not in TOOLS for tool in tools) or
+            payload.get('reasoning') != {'effort': assignment['handoff']['profile']['reasoning']}):
+        raise spending.SpendingError('invalid_request', 'Server-side tools and reasoning/model changes are not admitted.')
 
 
 def check_worker_evidence(assignment, root, inputs):
@@ -190,12 +189,15 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         scratch.chmod(0o777)
         # Only assignment-scoped scratch and sanitized source become writable; enclosing artifacts stay private.
         writable = 'write_workspace' in assignment['handoff']['capabilities']
-        if writable:
-            for parent, directories, files in os.walk(root / 'workspace'):
-                Path(parent).chmod(0o777)
+        # Controller umask is 077; explicitly make only these scoped mounts readable
+        # by the reviewed nonroot worker UID (which need not equal the host UID).
+        for tree, mutable in ((root / 'workspace', writable), (inputs, False)):
+            for parent, directories, files in os.walk(tree):
+                Path(parent).chmod(0o777 if mutable else 0o755)
                 for name in files:
                     path = Path(parent) / name
-                    path.chmod(0o777 if path.stat().st_mode & 0o111 else 0o666)
+                    executable = bool(path.stat().st_mode & 0o111)
+                    path.chmod((0o777 if executable else 0o666) if mutable else (0o755 if executable else 0o644))
         capability = Path(tempfile.mkdtemp(prefix='f1-'))
         require(len(str(capability / 'capability.sock').encode()) < 108, 'Unix capability path is too long.', 'unsafe_path')
         (root / 'capability-path.json').write_text(json.dumps(str(capability)))

@@ -225,17 +225,17 @@ def _finish(database, operation_id, status, actual_units, receipt):
     return {'status': status, 'actual_units': actual_units}
 
 
-def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None, max_request=MAX_REQUEST):
+def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None, max_request=MAX_REQUEST, admission_check=None):
     """Reserve before outbound I/O; uncertain outcomes freeze the whole iteration."""
     scope = _scope(*scope)
     try:
-        return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request)
+        return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request, admission_check)
     except SpendingError as error:
         record_refusal(database, scope, operation_id, error)
         raise
 
 
-def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request):
+def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request, admission_check):
     if not isinstance(payload, dict):
         raise SpendingError('invalid_request', 'Request must be a bounded JSON object.')
     if set(payload) & {'provider', 'model', 'operation', 'url', 'endpoint', 'authorization', 'api_key', 'service_tier', 'stream', 'store'}:
@@ -256,6 +256,8 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
         raise SpendingError('invalid_request', 'Subscription payload has unsupported fields or no input.')
     allowance_only = scope[2] != 'fixture-provider'
     with state_lock(database), database:
+        if admission_check:
+            admission_check(database)
         admitted = _prepare(database, scope, operation_id, body, reserve, now, allowance_only, deadline)
     if admitted['status'] in {'complete', 'failed'}:
         return admitted
@@ -369,11 +371,9 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
                         calls += 1
                         with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
                             _iteration(database, scope[0], scope[1], operator_id, require_active=True)
-                            if authorize:
-                                authorize(database, request)
                             if observe:
                                 observe('request', calls, request)
-                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline, max_request=max_request)
+                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline, max_request=max_request, admission_check=(lambda db: authorize(db, request)) if authorize else None)
                             if observe:
                                 observe('response', calls, result)
                         reply = {'result': result}
