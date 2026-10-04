@@ -135,6 +135,75 @@ class BugTests(unittest.TestCase):
         self.assertEqual(len(self.case.issues), 5)
         self.assertEqual(self.case.deps, {11: [10]})
 
+    def test_held_bug_scope_whitespace_and_crlf_never_allow_public_reservation(self):
+        for scope in ('recovery', 'deferred'):
+            request = self.completion(self.discovery(scope=scope, discovery_id=scope))
+            work = self.work(self.complete(request), request['assignment_id'])
+            number = work['identity']['number']
+            issue = self.case.issues[number]
+            issue['milestone'] = copy.deepcopy(self.native.milestones[0])
+            original = issue['body'].replace('## Status\n\ndeferred ', '## Status\n\nready ')
+            section = '## Bug scope\n\n' + scope + '\n'
+            variants = {
+                'canonical': original,
+                'heading': original.replace('## Bug scope\n', '## Bug scope \t\n'),
+                'heading-leading': original.replace('## Bug scope\n', '##  Bug scope\n'),
+                'content': original.replace(section, '## Bug scope\n \n\t' + scope + ' \t\n'),
+                'scope-crlf': original.replace(section, section.replace('\n', '\r\n')),
+                'body-crlf': original.replace('\n', '\r\n'),
+            }
+            for variant, body in variants.items():
+                with self.subTest(scope=scope, variant=variant):
+                    issue['body'] = body
+                    before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+                    frontier = self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']
+                    self.assertEqual(frontier['eligible'], [10, 12])
+                    row = next(row for row in frontier['items'] if row['number'] == number)
+                    self.assertTrue(row['contract_valid'])
+                    self.assertTrue(row['held'])
+                    refused = self.case.control('reserve-ticket', issue=number)
+                    self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                    self.assertEqual(json.loads(refused.stderr)['error'], 'ticket_ineligible')
+                    self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+            issue['body'] = original
+        self.assertEqual(self.case.ok(self.case.control('reserve-ticket', issue=12))['reservation']['status'], 'reserved')
+
+    def test_malformed_bug_scope_never_allows_public_reservation(self):
+        request = self.completion(self.discovery(scope='recovery'))
+        number = self.work(self.complete(request))['identity']['number']
+        issue = self.case.issues[number]
+        issue['milestone'] = copy.deepcopy(self.native.milestones[0])
+        original = issue['body']
+        for value in ('', 'unknown', 'recovery\ncurrent'):
+            with self.subTest(scope=value):
+                issue['body'] = original.replace('## Bug scope\n\nrecovery', '## Bug scope\n\n' + value)
+                before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+                self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [10, 12])
+                refused = self.case.control('reserve-ticket', issue=number)
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertEqual(json.loads(refused.stderr)['error'], 'ticket_ineligible')
+                self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+
+    def test_duplicate_normalized_bug_scope_fails_closed_through_public_cli(self):
+        request = self.completion(self.discovery(scope='recovery'))
+        number = self.work(self.complete(request))['identity']['number']
+        issue = self.case.issues[number]
+        issue['milestone'] = copy.deepcopy(self.native.milestones[0])
+        original = issue['body']
+        for heading in ('Bug scope', 'Bug scope \t', ' Bug scope'):
+            with self.subTest(heading=heading):
+                issue['body'] = original + '\n## ' + heading + '\n\ncurrent\n'
+                before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+                frontier = self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']
+                self.assertEqual(frontier['eligible'], [10, 12])
+                row = next(row for row in frontier['items'] if row['number'] == number)
+                self.assertFalse(row['contract_valid'])
+                result = self.case.control('reserve-ticket', issue=number)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(json.loads(result.stderr)['error'], 'ticket_ineligible')
+                self.assertNotIn('Traceback', result.stderr)
+                self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+
     def test_repeat_and_new_discovery_ids_use_same_assignment_and_no_duplicate(self):
         request = self.completion()
         first = self.complete(request)

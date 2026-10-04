@@ -29,12 +29,9 @@ def numbers(value):
 
 
 def sections(body):
-    matches = list(re.finditer(r'^## ([^\n]+)\n', body, re.MULTILINE))
-    result = {}
-    for index, match in enumerate(matches):
-        require(match[1] not in result, 'Ambiguous issue sections.', 'github_mismatch')
-        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
-        result[match[1]] = body[match.end():end].strip()
+    result = tickets.sections(body)
+    if result is None:
+        raise RepositoryError('github_mismatch', 'Ambiguous issue sections.')
     return result
 
 

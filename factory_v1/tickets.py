@@ -119,22 +119,29 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
                 (story is None and requirement in milestone), 'Requirement reference is not defined in the pinned assigned scope.')
 
 
-def external_contract(issue, inputs, document_names=('milestone.md',)):
-    headings = list(re.finditer(r'^## ([^\n]+)\n', issue['body'], re.MULTILINE))
-    sections = {}
+def sections(body):
+    headings = list(re.finditer(r'^## ([^\n]+)\n', body, re.MULTILINE))
+    result = {}
     for index, heading in enumerate(headings):
         name = heading[1].strip()
-        if name in sections:
-            return False
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(issue['body'])
-        sections[name] = issue['body'][heading.end():end].strip()
-    if not all(sections.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Blocked by', 'Status')):
+        if name in result:
+            return None
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+        result[name] = body[heading.end():end].strip()
+    return result
+
+
+def external_contract(issue, inputs, document_names=('milestone.md',)):
+    parts = sections(issue['body'])
+    if parts is None:
         return False
-    status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', sections['Status'])
+    if not all(parts.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Blocked by', 'Status')):
+        return False
+    status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', parts['Status'])
     if status is None:
         return False
     refs = []
-    for line in sections['Requirement references'].splitlines():
+    for line in parts['Requirement references'].splitlines():
         if not line.strip():
             continue
         reference = re.fullmatch(r'- (.+) — (.+)', line)
@@ -144,7 +151,7 @@ def external_contract(issue, inputs, document_names=('milestone.md',)):
         link = re.fullmatch(r'\[[^\]]+\]\(([^)]+)\)', spec)
         refs.append({'spec': link[1] if link else spec, 'requirement': requirement})
     criteria = []
-    for line in sections['Acceptance criteria'].splitlines():
+    for line in parts['Acceptance criteria'].splitlines():
         if not line.strip():
             continue
         criterion = re.fullmatch(r'- \[[ xX]\] (.*)', line)
@@ -152,7 +159,7 @@ def external_contract(issue, inputs, document_names=('milestone.md',)):
             return False
         criteria.append(criterion[1])
     try:
-        validate_contract(issue['title'], sections['What to build'], criteria, refs, inputs, document_names)
+        validate_contract(issue['title'], parts['What to build'], criteria, refs, inputs, document_names)
     except RepositoryError:
         return False
     return status[1]
@@ -407,6 +414,7 @@ def frontier(database, item, github):
         state = status_options.get(fields.get(board['status']['id']))
         require(state is not None, 'Unknown authoritative progress option.', 'projects_blocked')
         contract = external_contract(issue, work['inputs'])
+        parts = sections(issue['body']) or {}
         triaged = any(isinstance(l, dict) and l.get('name') == work['request']['tracker']['triage_label'] for l in issue['labels'])
         deps = gh.dependencies(github, item['repository'], issue['number'])
         native_blockers[issue['number']] = deps
@@ -415,14 +423,14 @@ def frontier(database, item, github):
             dep = gh.issue_identity(dep, item['repository'])
             blockers.append(dep['number'])
         require(len(blockers) == len(set(blockers)) and issue['number'] not in blockers, 'Invalid blocker references.', 'github_mismatch')
-        textual = set(re.findall(r'#([1-9][0-9]*)', issue['body'].split('## Blocked by\n', 1)[-1].split('\n## ', 1)[0]))
+        textual = set(re.findall(r'#([1-9][0-9]*)', parts.get('Blocked by', '')))
         require(textual == {str(number) for number in blockers}, 'Native/textual blockers disagree.', 'github_mismatch')
         rows[issue['number']] = {'number': issue['number'], 'id': issue['id'], 'node_id': issue['node_id'],
                                 'membership_id': member['id'], 'status': state, 'issue_state': issue['state'],
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
                                 'contract_valid': bool(contract and triaged),
-                                'held': contract in {'blocked', 'deferred'} or bool(re.search(
-                                    r'^## Bug scope\n\n(?:deferred|recovery)\n', issue['body'], re.MULTILINE)) or any(
+                                'held': contract in {'blocked', 'deferred'} or
+                                    parts.get('Bug scope') not in {None, 'current'} or any(
                                     bug['discovery']['scope'] == 'current' and bug['status'] not in {'published', 'duplicate'} and
                                     (issue['number'] in bug['discovery']['affected'] or
                                      bug.get('identity', {}).get('number') == issue['number'])
