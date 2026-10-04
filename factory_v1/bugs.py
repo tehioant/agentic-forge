@@ -308,8 +308,8 @@ def verify_observation(item, work, observation):
     current_scope = board['milestone']['id'] if 'milestone' in board else board['scope']['options'][item['iteration_id']]
     require(observation['scope'] == (current_scope if work['bug']['scope'] == 'current' else None),
             'Bug scope changed.', 'publication_mismatch')
-    textual = {int(n) for n in re.findall(r'#([1-9][0-9]*)', parts['Blocked by'])}
-    require(textual == {d['number'] for d in observation['dependencies']},
+    textual = set(re.findall(r'#([1-9][0-9]*)', parts['Blocked by']))
+    require(textual == {str(d['number']) for d in observation['dependencies']},
             'Native/textual bug blockers disagree.', 'publication_mismatch')
     if work.get('observation'):
         previous = sections(work['observation']['issue']['body'])

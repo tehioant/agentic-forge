@@ -339,6 +339,37 @@ class BugTests(unittest.TestCase):
                 self.case.deps[10] = [13]
                 self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
 
+    def test_oversized_numeric_blocker_readback_blocks_and_recovers_without_writes(self):
+        request = self.completion()
+        request['bug']['blockers'] = [12]
+        published = self.work(self.complete(self.signed(request)))
+        number = published['identity']['number']
+        original_body = self.case.issues[number]['body']
+        malformed_body = original_body.replace('- #12', '- #' + '9' * 5000)
+        self.assertNotEqual(malformed_body, original_body)
+        for body, status in ((malformed_body, 'blocked'), (original_body, 'published')):
+            with self.subTest(status=status):
+                self.case.issues[number]['body'] = body
+                before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+                self.case.fixture.calls.clear()
+                result = self.case.control('publish-bug', {'assignment_id': request['assignment_id']})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(result.stderr, '')
+                self.assertNotIn('Traceback', result.stdout)
+                work = self.work(json.loads(result.stdout))
+                self.assertEqual(work['status'], status)
+                self.assertTrue(work['publication_complete'])
+                if status == 'blocked':
+                    self.assertEqual(work['blocker']['code'], 'publication_mismatch')
+                    self.assertEqual(work['observation'], published['observation'])
+                else:
+                    self.assertNotIn('blocker', work)
+                    self.assertEqual(work['observation']['issue']['body'], original_body)
+                self.assertEqual(self.work(self.case.inspect()), work)
+                self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+                self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and c[1] != '/graphql' for c in self.case.fixture.calls))
+                self.assertFalse(any(c[0] == 'POST' and c[1] == '/graphql' and 'mutation' in c[2]['query'] for c in self.case.fixture.calls))
+
     def test_evidence_only_unknown_environment_and_future_vision_reference(self):
         discovery = self.discovery(scope='deferred')
         discovery['discovery'].update(reproduction=[], environment=None)
