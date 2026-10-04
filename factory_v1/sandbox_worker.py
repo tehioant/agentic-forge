@@ -116,6 +116,19 @@ def main():
                   'stage': handoff['stage'], 'adaptation': handoff['adaptation'],
                   'stage_rules': handoff['stage_rules'], 'support_policy': handoff['support_policy'],
                   'entry_points': handoff['skill_entry_points'], 'instructions': instructions}))
+    if handoff['stage'] == 'simplify':
+        prompt += ('\nSIMPLIFICATION RESULT CONTRACT: retain stage-evidence AND simplification-result artifacts. '
+                   'The latter content must be a JSON object with exactly result_fields below. '
+                   'contract and adaptation must match this handoff; input_candidate_sha256 is fixed, '
+                   'candidate_sha256 must be computed on resulting /workspace. angles maps each of the four '
+                   'angle names to nonempty concrete search/work evidence. findings is an array of objects '
+                   'with finding_fields, using only finding_kinds. outcome is cleanup, no-op or findings. '
+                   'behavior_preservation is preserved or not-established. Never silently apply behavior, '
+                   'correctness or out-of-scope proposals: return findings with unchanged source instead. '
+                   'Only paths in scope may change. Do not weaken tests or checks. Run verification_commands '
+                   'on the final candidate. No-op must include four-angle work and actual tests. '
+                   'Native execution claims remain untrusted; do not assert approval.\n' +
+                   json.dumps({'adaptation': handoff['adaptation'], **handoff['simplification']}))
     result = agent.run_conversation(prompt, conversation_history=[], task_id=run_id)
     Path('/scratch/conversation.json').write_text(json.dumps(result, default=str))
     final = json.loads(result['final_response'])

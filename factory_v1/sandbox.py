@@ -132,6 +132,13 @@ def check_worker_evidence(assignment, root, inputs):
 
 def launch(state, project, iteration, operator, assignment_id, config_path, github):
     config = load_config(config_path)
+    with closing(sqlite3.connect(state)) as database, state_lock(database):
+        prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
+        assert prepared is not None
+        if prepared['handoff']['stage'] == 'simplify':
+            assignments.prepare(database, project, iteration, operator, original(prepared), github, dry_run=True)
+            require(config.get('verification_commands', []) == prepared['handoff']['simplification']['verification_commands'],
+                    'Simplification must rerun the exact implementation checks; no weakened or absent commands.', 'verification_required')
     docker = Docker()
     image_id = docker.image()
     # Validate fixed host route before claiming any runtime; never mount this upstream socket.
@@ -176,10 +183,15 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     for signum in (signal.SIGTERM, signal.SIGINT):
         signals[signum] = signal.signal(signum, cancel)
     try:
+        assert assignment is not None
         inputs = root / 'inputs'
         inputs.mkdir(mode=0o755)
         pins = snapshot(workspace, {'baseline': assignment['handoff']['baseline'],
                                    'workspace': assignment['handoff']['candidate'] or assignment['handoff']['baseline']}, root)
+        if assignment['handoff']['stage'] == 'simplify':
+            from .simplification import copy_candidate
+            with closing(sqlite3.connect(state)) as database, state_lock(database):
+                copy_candidate(database, project, iteration, operator, assignment, root, pins)
         shutil.move(root / 'baseline', inputs / 'baseline')
         (root / 'initial-source.json').write_text(json.dumps(pins))
         selected_inputs = inputs_for(assignment, inputs)
@@ -293,6 +305,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github)
                 assert assignment is not None
                 assignments.require_result_active(assignment)
+                assignment['runtime']['candidate_sha256'] = assignments.digest(source)
+                assignment['runtime']['baseline_sha256'] = assignments.digest(pins['baseline'])
+                if checks_verified:
+                    assignment['runtime']['checks_sha256'] = hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest()
                 assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
                     checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
                     reason='worker_reports_untrusted_require_controller_checks_and_separate_review')

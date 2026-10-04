@@ -368,6 +368,10 @@ class AssignmentTests(unittest.TestCase):
                     'diagnosis': ['diagnosing-bugs'], 'repair': ['diagnosing-bugs', 'implement']}
         for stage, entry in expected.items():
             request = self.configuration(stage=stage)
+            if stage == 'simplify':
+                request['preceding'].append(artifact('implementation-diff', 'Labeled unverified diff'))
+                self.refused(self.command(request=request, dry_run=True), 'implementation_unverified')
+                continue
             prepared = self.ok(self.command(request=request, dry_run=True))
             self.assertEqual(prepared['handoff']['skill_entry_points'], entry)
             if stage in {'review-standards', 'review-spec', 'diagnosis'}:

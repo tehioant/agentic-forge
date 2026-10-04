@@ -19,7 +19,7 @@ ROLES = {
 }
 PRECEDING = {
     'implementation': set(), 'corrections': {'candidate', 'findings'},
-    'simplify': {'candidate', 'implementation-evidence'},
+    'simplify': {'candidate', 'implementation-evidence', 'implementation-diff'},
     'review-standards': {'candidate', 'simplification-evidence'},
     'review-spec': {'candidate', 'simplification-evidence'},
     'diagnosis': {'failure-evidence'}, 'repair': {'incident-evidence'},
@@ -164,6 +164,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     """Validate startup before read-only frontier queries, and persist only local assignments."""
     selected = validate(request)
     item = current(database, project, iteration, operator)
+    simplification = None
+    if request['stage'] == 'simplify':
+        from .simplification import handoff as simplify_handoff
+        simplification = simplify_handoff(database, project, iteration, operator, request)
     require(request['repository'] == item['repository'] and request['spec_commit'] == item.get('handoff', {}).get('commit'),
             'Wrong repository or stale specification pin.', 'scope_mismatch')
     require(item.get('repository_onboarding', {}).get('status') == 'verified' and
@@ -221,6 +225,8 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                    'required_evidence': ['actual-selected-instruction-loads', 'observable-skill-guided-work',
                                          'artifacts', 'tests', 'trusted-whole-process-execution'],
                    'advancement': 'disabled-without-trusted-whole-process-evidence'}}
+    if simplification is not None:
+        handoff['simplification'] = simplification
     result = {'assignment_id': assignment_id, 'claim_id': request['claim_id'], 'ticket_scope': scope,
               'handoff': handoff, 'handoff_digest': digest(handoff), 'assignment_ready': True,
               'launchable': False, 'execution_allowed': False, 'status': 'prepared',
@@ -287,12 +293,19 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     original = {key: handoff[key] for key in REQUEST_FIELDS}
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
+    simplification_result = None
+    if handoff['stage'] == 'simplify':
+        from .simplification import validate_result
+        simplification_result = validate_result(assignment, request)
     old = assignment.get('submitted_result')
     require(old is None or old == request, 'Result replay cannot replace previously stored evidence.', 'result_conflict')
     assignment['submitted_result'] = request
     assignment['result_disposition'] = {'structurally_valid': True, 'trusted_execution': False,
                                        'advance_allowed': False, 'close_allowed': False,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
+    if simplification_result is not None:
+        assert assignment is not None
+        assignment['simplification_result'] = simplification_result
     with database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
