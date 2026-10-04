@@ -194,6 +194,10 @@ def main():
             control.add_argument('--dry-run', action='store_true')
         if name == 'launch-assignment':
             control.add_argument('--isolated', action='store_true', help='Untrusted assertion; never enables launch.')
+            control.add_argument('--launcher-config', help='Private trusted controller configuration, not worker input.')
+            control.add_argument('--api-base')
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
     for name in ['attention', 'notifications', 'deliver', 'respond', 'attention-reconcile']:
         attention_command = commands.add_parser(name, help='Trusted exact-origin attention lifecycle.')
         attention_command.add_argument('--project', required=True)
@@ -212,6 +216,9 @@ def main():
         import fcntl
         try:
             if args.command == 'launch-assignment':
+                if args.launcher_config:
+                    from .sandbox_policy import load_config
+                    load_config(args.launcher_config)
                 assignments.launch()
             request = None
             if hasattr(args, 'request'):
