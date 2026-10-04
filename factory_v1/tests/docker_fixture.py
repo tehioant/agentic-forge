@@ -90,7 +90,6 @@ elif args[0] == 'create':
         if value == '--tmpfs':
             target, flags = args[i + 1].split(':', 1)
             tmpfs[target] = flags
-            mounts.append({'Type': 'tmpfs', 'Destination': target, 'RW': True})
     env = [args[i + 1] for i, value in enumerate(args) if value == '--env']
     container = {'Id': 'fixture-container', 'Image': 'sha256:fixture-image', 'Mounts': mounts,
         'Config': {'Image': IMAGE, 'User': option('--user'), 'Entrypoint': [option('--entrypoint')],
@@ -108,6 +107,7 @@ elif args[0] == 'create':
     print('fixture-container')
 elif args[0] == 'inspect':
     if not STATE.exists():
+        print('Error: No such object: fixture-container', file=sys.stderr)
         sys.exit(1)
     container = json.loads(STATE.read_text())
     if container['State']['Running'] and not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'hang'):

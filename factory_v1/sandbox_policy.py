@@ -48,8 +48,10 @@ def load_config(path):
 
 class Docker:
     def __init__(self):
-        self.binary = shutil.which('docker')
-        require(self.binary is not None, 'Docker is required for whole-process isolation.', 'isolation_unavailable')
+        binary = shutil.which('docker')
+        if binary is None:
+            raise RepositoryError('isolation_unavailable', 'Docker is required for whole-process isolation.')
+        self.binary = binary
         self.env = {key: os.environ[key] for key in ('PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR') if key in os.environ}
 
     def call(self, *args, optional=False, timeout=30):
@@ -63,9 +65,15 @@ class Docker:
         return response.stdout
 
     def inspect(self, name, optional=False):
-        raw = self.call('inspect', name, optional=optional)
-        if raw is None:
-            return None
+        try:
+            response = subprocess.run([self.binary, 'inspect', name], env=self.env, capture_output=True, timeout=30)
+        except subprocess.SubprocessError as error:
+            raise RepositoryError('container_unavailable', 'Docker inspection timed out; stop is unconfirmed.') from error
+        if response.returncode:
+            if optional and (b'no such object' in response.stderr.lower() or b'no such container' in response.stderr.lower()):
+                return None
+            raise RepositoryError('container_unavailable', 'Docker inspection failed; absence was not verified.')
+        raw = response.stdout
         try:
             result = json.loads(raw)
             require(isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict),
@@ -142,16 +150,18 @@ def verify(container, config, name, image_id, mounts):
         for mount in container['Mounts']:
             require(mount['Destination'] not in seen, 'Duplicate mount target.', 'isolation_unavailable')
             seen[mount['Destination']] = mount
-        require(set(seen) == set(mounts) | {'/opt/data', '/tmp'},
+        # Docker reports --tmpfs separately in HostConfig, not in Mounts. Inspect both;
+        # an image's anonymous volume would still appear in Mounts and must be refused.
+        require(set(seen) == set(mounts),
                 'Unexpected mount, including anonymous image volumes.', 'isolation_unavailable')
         for target, (source, writable) in mounts.items():
             mount = seen[target]
             require(mount['Type'] == 'bind' and mount['Source'] == source and mount['RW'] is writable and
                     mount.get('Propagation') in ('rprivate', ''), 'Mount identity/permission mismatch.', 'isolation_unavailable')
-        for target in ('/opt/data', '/tmp'):
-            require(seen[target]['Type'] == 'tmpfs' and seen[target]['RW'] is True and target in host['Tmpfs'],
-                    'Image data must use bounded tmpfs, never an anonymous volume.', 'isolation_unavailable')
         expected = command(config, name, mounts)
+        expected_tmpfs = dict(expected[i + 1].split(':', 1) for i, value in enumerate(expected) if value == '--tmpfs')
+        require(host['Tmpfs'] == expected_tmpfs,
+                'Image data must use exact bounded tmpfs, never an anonymous volume.', 'isolation_unavailable')
         environment = {expected[i + 1] for i, value in enumerate(expected) if value == '--env'}
         require(environment <= set(actual['Env']) and not any(value.split('=', 1)[0].endswith(('TOKEN', 'API_KEY', 'SECRET')) for value in actual['Env']),
                 'Unexpected credential propagation.', 'isolation_unavailable')

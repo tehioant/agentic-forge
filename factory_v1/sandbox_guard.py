@@ -12,7 +12,8 @@ from .sandbox_policy import Docker
 def process_identity(pid):
     try:
         # Field 22 is starttime; account for parentheses/spaces in comm.
-        return Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return None if fields[0] == 'Z' else fields[19]
     except (OSError, IndexError):
         return None
 
