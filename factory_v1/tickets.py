@@ -100,25 +100,26 @@ def synthesize(database, item, request, github):
     return item
 
 
-def validate_contract(title, behavior, criteria, refs, inputs):
+def validate_contract(title, behavior, criteria, refs, inputs, document_names=('milestone.md',)):
     require(all(isinstance(value, str) and value.strip() for value in (title, behavior)),
             'Provide a substantive work-item title and desired behavior.')
     require(isinstance(criteria, list) and criteria and all(isinstance(c, str) and c.strip() for c in criteria),
             'Verifiable acceptance criteria required.')
+    documents = {inputs['documents'][name]['url']: inputs['documents'][name]['content'] for name in document_names}
     require(isinstance(refs, list) and refs and all(isinstance(r, dict) and set(r) == {'spec', 'requirement'} and
-            r['spec'] == inputs['documents']['milestone.md']['url'] and isinstance(r['requirement'], str) and r['requirement'].strip()
-            for r in refs), 'Reference only the immutable current milestone and named requirements.')
-    milestone = inputs['documents']['milestone.md']['content']
-    story_section = milestone.split('## User Stories', 1)[-1].split('\n## ', 1)[0]
-    story_numbers = set(re.findall(r'^([1-9][0-9]*)\. ', story_section, re.MULTILINE))
+            isinstance(r['spec'], str) and r['spec'] in documents and isinstance(r['requirement'], str) and r['requirement'].strip()
+            for r in refs), 'Reference only immutable assigned scope and named requirements.')
     for reference in refs:
+        milestone = documents[reference['spec']]
+        story_section = milestone.split('## User Stories', 1)[-1].split('\n## ', 1)[0]
+        story_numbers = set(re.findall(r'^([1-9][0-9]*)\. ', story_section, re.MULTILINE))
         requirement = reference['requirement']
         story = re.fullmatch(r'US-([1-9][0-9]*)', requirement)
         require((story is not None and story[1] in story_numbers) or
-                (story is None and requirement in milestone), 'Requirement reference is not defined in the pinned current milestone.')
+                (story is None and requirement in milestone), 'Requirement reference is not defined in the pinned assigned scope.')
 
 
-def external_contract(issue, inputs):
+def external_contract(issue, inputs, document_names=('milestone.md',)):
     headings = list(re.finditer(r'^## ([^\n]+)\n', issue['body'], re.MULTILINE))
     sections = {}
     for index, heading in enumerate(headings):
@@ -151,7 +152,7 @@ def external_contract(issue, inputs):
             return False
         criteria.append(criterion[1])
     try:
-        validate_contract(issue['title'], sections['What to build'], criteria, refs, inputs)
+        validate_contract(issue['title'], sections['What to build'], criteria, refs, inputs, document_names)
     except RepositoryError:
         return False
     return status[1]
@@ -205,20 +206,7 @@ def complete_synthesis(database, item, request, github):
             request['adaptation'] == ADAPTATION, 'Synthesis result is stale or uncorrelated.', 'ticket_conflict')
     skill(work['request']['skill'])
     require(pinned_inputs(database, item, github) == work['inputs'], 'Pinned synthesis inputs changed.', 'ticket_conflict')
-    evidence = request['execution']
-    require(isinstance(evidence, dict) and set(evidence) == {'run_id', 'loads', 'decomposition', 'result_digest'} and
-            isinstance(evidence['run_id'], str) and evidence['run_id'].strip() and
-            isinstance(evidence['decomposition'], str) and evidence['decomposition'].strip() and
-            evidence['result_digest'] == digest(request['tickets']), 'Actual correlated synthesis execution evidence required.', 'execution_evidence_required')
-    expected = {work['skill']['path']: PIN, **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()}}
-    loads = evidence['loads']
-    require(isinstance(loads, list) and len(loads) == len(expected) and
-            all(isinstance(l, dict) and set(l) == {'source', 'sha256', 'tool_reference'} and
-                isinstance(l.get('source'), str) and isinstance(l.get('sha256'), str) and
-                l['source'] in expected and l['sha256'] == expected[l['source']] and
-                isinstance(l.get('tool_reference'), str) and l['tool_reference'].strip() for l in loads) and
-            {l['source'] for l in loads} == set(expected),
-            'Catalogs or externally prepared batches do not prove selected instruction/input loads.', 'execution_evidence_required')
+    evidence = validate_execution(work, request['execution'], request['tickets'])
     batch = validate_batch(request['tickets'], work['inputs'], item['iteration_id'], work['request']['tracker'].get('triage_label'))
     completion_digest = digest(request)
     require(work.get('completion_digest', completion_digest) == completion_digest, 'Completed synthesis cannot be replaced.', 'ticket_conflict')
@@ -228,8 +216,25 @@ def complete_synthesis(database, item, request, github):
         work['status'] = 'publication_pending'
     transition(item, 'ticket_publication_pending')
     checkpoint(database, item)
-    # No routine quiz/batch approval. Missing Projects becomes a durable blocker.
     return publish(database, item, github)
+
+
+def validate_execution(work, evidence, result):
+    require(isinstance(evidence, dict) and set(evidence) == {'run_id', 'loads', 'decomposition', 'result_digest'} and
+            isinstance(evidence['run_id'], str) and evidence['run_id'].strip() and
+            isinstance(evidence['decomposition'], str) and evidence['decomposition'].strip() and
+            evidence['result_digest'] == digest(result), 'Actual correlated synthesis execution evidence required.', 'execution_evidence_required')
+    expected = {work['skill']['path']: PIN, **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()},
+                **work.get('load_sources', {})}
+    loads = evidence['loads']
+    require(isinstance(loads, list) and len(loads) == len(expected) and
+            all(isinstance(l, dict) and set(l) == {'source', 'sha256', 'tool_reference'} and
+                isinstance(l.get('source'), str) and isinstance(l.get('sha256'), str) and
+                l['source'] in expected and l['sha256'] == expected[l['source']] and
+                isinstance(l.get('tool_reference'), str) and l['tool_reference'].strip() for l in loads) and
+            {l['source'] for l in loads} == set(expected),
+            'Catalogs or externally prepared batches do not prove selected instruction/input loads.', 'execution_evidence_required')
+    return evidence
 
 
 def checkpoint(database, item):
@@ -245,7 +250,7 @@ def body(item, ticket, numbers):
     criteria = '\n'.join('- [ ] ' + c for c in ticket['acceptance_criteria'])
     return (f"## Parent\n\n#{work['inputs']['handoff']['issue']['number']}\n\n## What to build\n\n{ticket['desired_behavior']}"
             f"\n\n## Requirement references\n\n{refs}\n\n## Acceptance criteria\n\n{criteria}\n\n## Blocked by\n\n{blockers}"
-            f"\n\n## Status\n\nready (GitHub Projects is authoritative for current progress)."
+            f"\n\n## Status\n\n{ticket.get('status', 'ready')} (GitHub Projects is authoritative for current progress)."
             f"\n\n## Iteration\n\n{item['iteration_id']}\n\n## Triage\n\n{ticket['triage_label']}\n\n{marker}\n")
 
 
@@ -416,7 +421,12 @@ def frontier(database, item, github):
                                 'membership_id': member['id'], 'status': state, 'issue_state': issue['state'],
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
                                 'contract_valid': bool(contract and triaged),
-                                'held': contract in {'blocked', 'deferred'}}
+                                'held': contract in {'blocked', 'deferred'} or bool(re.search(
+                                    r'^## Bug scope\n\n(?:deferred|recovery)\n', issue['body'], re.MULTILINE)) or any(
+                                    bug['discovery']['scope'] == 'current' and bug['status'] not in {'published', 'duplicate'} and
+                                    (issue['number'] in bug['discovery']['affected'] or
+                                     bug.get('identity', {}).get('number') == issue['number'])
+                                    for bug in item.get('bug_work', {}).values())}
     for dependencies in native_blockers.values():
         for dependency in dependencies:
             row = rows.get(dependency['number'])

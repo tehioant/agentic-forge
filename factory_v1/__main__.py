@@ -167,14 +167,15 @@ def main():
     broker.add_argument('--max-calls', type=int, default=100)
     broker.add_argument('--worker-uid', type=int, default=os.getuid())
     broker.add_argument('--timeout', type=float, default=10)
-    for name in ('synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket'):
+    for name in ('synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket',
+                 'synthesize-bug', 'complete-bug', 'publish-bug'):
         control = commands.add_parser(name)
         control.add_argument('--project', required=True)
         control.add_argument('--iteration', required=True)
         control.add_argument('--api-base', required=True)
         control.add_argument('--bearer', default='credential-blind-controller')
         control.add_argument('--timeout', type=float, default=10)
-        if name in {'synthesize-tickets', 'complete-tickets'}:
+        if name in {'synthesize-tickets', 'complete-tickets', 'synthesize-bug', 'complete-bug', 'publish-bug'}:
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
@@ -299,11 +300,12 @@ def main():
                                               GitHub(args.api_base, args.bearer, args.timeout))
                 except RepositoryError as error:
                     raise IntakeError(error.code, str(error)) from error
-            if args.command in {'synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket'}:
+            if args.command in {'synthesize-tickets', 'complete-tickets', 'publish-tickets', 'frontier', 'reserve-ticket',
+                                'synthesize-bug', 'complete-bug', 'publish-bug'}:
                 from . import tickets
                 from .repositories import GitHub, RepositoryError, state_lock
                 request = None
-                if args.command in {'synthesize-tickets', 'complete-tickets'}:
+                if args.command in {'synthesize-tickets', 'complete-tickets', 'synthesize-bug', 'complete-bug', 'publish-bug'}:
                     with open(args.request, encoding='utf-8') as source:
                         try:
                             request = json.load(source, object_pairs_hook=unique_fields)
@@ -312,7 +314,11 @@ def main():
                 try:
                     github = GitHub(args.api_base, args.bearer, args.timeout)
                     with state_lock(database), database:
-                        if args.command == 'synthesize-tickets':
+                        if args.command in {'synthesize-bug', 'complete-bug', 'publish-bug'}:
+                            from . import bugs
+                            operation = {'synthesize-bug': bugs.synthesize, 'complete-bug': bugs.complete, 'publish-bug': bugs.publish}
+                            result = operation[args.command](database, result, request, github)
+                        elif args.command == 'synthesize-tickets':
                             result = tickets.synthesize(database, result, request, github)
                         elif args.command == 'complete-tickets':
                             result = tickets.complete_synthesis(database, result, request, github)
