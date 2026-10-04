@@ -55,8 +55,8 @@ class GitHub:
         self.timeout = timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
-    def request(self, path, body=None):
-        request = urllib.request.Request(self.base + path,
+    def request(self, path, body=None, method=None):
+        request = urllib.request.Request(self.base + path, method=method,
             data=None if body is None else json.dumps(body).encode(), headers={
             'Content-Type': 'application/json',
             'Authorization': 'Bearer ' + self.bearer, 'Accept': 'application/vnd.github+json'})

@@ -1,0 +1,118 @@
+{
+  "kind": "actual-host-builder-skill-guided-synthesis;unpublished;not-merge-qualifying",
+  "run_id": "issue19-host-builder-unscoped-frontier",
+  "selected_skill": {
+    "name": "to-tickets",
+    "path": "factory_v1/ticket_skills/to-tickets.md",
+    "sha256": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae",
+    "dependencies": []
+  },
+  "adaptation": "factory-to-tickets-bug-v1:one-defect;compare-symptoms-and-scope;no-new-milestone;no-dispatch",
+  "loads": [
+    {
+      "source": "/home/ops/projects/agentic-forge-19/factory_v1/ticket_skills/to-tickets.md",
+      "sha256": "5c9fba69845c2519b9b35b9af42ae5142c21f8ca15ac2123dc2722002c8058ae",
+      "tool_reference": "functions.read_file:selected bundled to-tickets instructions"
+    },
+    {
+      "source": "/home/ops/projects/agentic-forge-19/docs/specs/fresh-agentic-factory.md",
+      "sha256": "fd80a9650f507fb2791b6820ab16369d6c0f619eb7241c0c0bdd09a4cb480c8c",
+      "tool_reference": "functions.read_file:current fresh specification/interview decisions"
+    },
+    {
+      "source": "/home/ops/projects/agentic-forge-19/docs/specs/fresh-agentic-factory-interview-decisions.md",
+      "sha256": "8c5129e02dcf289dcc146efe5b3ef401ea5b3cb0d37bdbd2f37672f071d93625",
+      "tool_reference": "functions.read_file:current fresh specification/interview decisions"
+    }
+  ],
+  "adaptation_load": "functions.read_file:factory_v1/bugs.py scoped INSTRUCTIONS; selected substantive method followed by this host builder",
+  "discovery": {
+    "symptoms": "Public frontier fails on a repository-linked issue with no milestone, suppressing independent current work.",
+    "reproduction": [
+      "Extract only factory_v1 from the exact fresh base into TMPDIR scratch.",
+      "Run NativeScopeTests fixture setup and public ticket publication.",
+      "Set fixture issue 12 milestone to null; invoke the public frontier command in a fresh process."
+    ],
+    "evidence": [
+      "functions.terminal:actual fresh-base public probe; exit 2, projects_blocked, Exact native milestone scope is unavailable."
+    ],
+    "expected": "Independent current fixture issue 10 remains eligible; unscoped issue 12 is excluded.",
+    "actual": "Exit 2 with projects_blocked rather than a frontier result.",
+    "environment": "Python 3.14.8, base 9142a1ffb19390c35c9b26981166e94f923e091d; labeled loopback HTTP/native-scope fixture, not live GitHub.",
+    "scope": "current",
+    "scope_reason": "Required for #19 deferred/recovery tracking and US-32 independent work selection.",
+    "affected": [
+      19
+    ]
+  },
+  "duplicate_observations": [
+    {
+      "number": 10,
+      "title": "Retain a note",
+      "milestone_id": 501
+    },
+    {
+      "number": 11,
+      "title": "Reopen a retained note",
+      "milestone_id": 501
+    },
+    {
+      "number": 12,
+      "title": "Refuse unsafe note paths",
+      "milestone_id": null
+    }
+  ],
+  "decomposition": "Following selected to-tickets context gathering, compare observable failure and factory scope with the actual observed fixture contracts, then draft one complete public-frontier regression slice. No prefactor ticket, new milestone or batch is needed. The bug is included within existing #19, not published as another issue. Verification uses the public CLI/native scope seam; preserving malformed non-null identity refusal prevents a scope bypass.",
+  "bug": {
+    "title": "Keep unscoped discovered bugs outside the ordinary milestone frontier",
+    "desired_behavior": "The public controller can observe unscoped deferred/recovery bugs without failing the current frontier; independent current work remains selectable.",
+    "references": [
+      {
+        "spec": "https://github.com/tehioant/agentic-forge/blob/9142a1ffb19390c35c9b26981166e94f923e091d/docs/specs/fresh-agentic-factory.md",
+        "requirement": "US-13"
+      },
+      {
+        "spec": "https://github.com/tehioant/agentic-forge/blob/9142a1ffb19390c35c9b26981166e94f923e091d/docs/specs/fresh-agentic-factory.md",
+        "requirement": "US-29"
+      },
+      {
+        "spec": "https://github.com/tehioant/agentic-forge/blob/9142a1ffb19390c35c9b26981166e94f923e091d/docs/specs/fresh-agentic-factory.md",
+        "requirement": "US-32"
+      }
+    ],
+    "acceptance_criteria": [
+      "Public frontier returns independent eligible current work when a linked-board issue has milestone null.",
+      "Deferred and immediate-recovery bugs never become ordinary reservations, even if externally moved into current scope.",
+      "Malformed or replaced non-null milestone identities still fail closed."
+    ],
+    "blockers": [],
+    "status": "ready",
+    "scope": "current",
+    "affected": [
+      19
+    ],
+    "triage_label": "ready-for-agent",
+    "comparisons": [
+      {
+        "number": 10,
+        "symptoms_match": false,
+        "scope_match": false,
+        "rationale": "Labeled fixture note feature contract does not describe a controller-wide failure while observing unscoped GitHub issues; its note-product scope differs from this factory requirement."
+      },
+      {
+        "number": 11,
+        "symptoms_match": false,
+        "scope_match": false,
+        "rationale": "Labeled fixture note feature contract does not describe a controller-wide failure while observing unscoped GitHub issues; its note-product scope differs from this factory requirement."
+      },
+      {
+        "number": 12,
+        "symptoms_match": false,
+        "scope_match": false,
+        "rationale": "Labeled fixture note feature contract does not describe a controller-wide failure while observing unscoped GitHub issues; its note-product scope differs from this factory requirement."
+      }
+    ]
+  },
+  "result_digest": "2cfaba66d502f22167dda19960c24dbd0b662af8683739b7a7d204a714e2c888",
+  "boundary": "Actual builder instruction loading and synthesis are retained; duplicate observations/publication/board tests are labeled fixtures. No live GitHub duplicate search/publication, isolated synthesis/review or worker dispatch is claimed. Parent owns merge qualification."
+}

@@ -127,7 +127,7 @@ class NativeScopeTests(unittest.TestCase):
         self.scope_inaccessible = False
         self.assertEqual(self.case.ok(self.case.control('publish-tickets'))['ticket_work']['status'], 'published')
         self.case.issues[12]['milestone'] = None
-        self.assertEqual(self.case.control('frontier').returncode, 2)
+        self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [10])
 
     def test_missing_ambiguous_inaccessible_board_preserves_synthesis(self):
         self.case.test_missing_ambiguous_inaccessible_or_changed_board_is_durable_blocker()

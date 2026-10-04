@@ -174,7 +174,9 @@ def resolve_milestone(github, repository, iteration):
 
 
 def issue_scope(issue, board):
-    observed = milestone_identity(issue.get('milestone'))
+    if issue.get('milestone') is None:
+        return None
+    observed = milestone_identity(issue['milestone'])
     expected = board['milestone']
     require(not (observed['number'] == expected['number'] or observed['id'] == expected['id'] or
                  observed['title'] == expected['title']) or observed == expected,

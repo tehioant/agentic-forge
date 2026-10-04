@@ -408,3 +408,100 @@ python -m factory_v1 --state <state> --operator-id 42 \
 Reservation first refreshes GitHub and refuses partial publication, paused iterations, existing active work (including foreign iteration work) and an existing different global reservation. It persists one pending reservation before setting the exact board progress to active, then verifies the exact eligible active issue. Lost responses preserve the reservation and reconcile the same run on retry. Competing commands are serialized. No release, dispatch, implementation worker, merge or issue-close operation is supplied here; `execution_allowed` stays false and worker-run correlation stays null.
 
 `evidence/issue8-synthesis.json` retains the actual implementing worker's selected-skill-guided decomposition of the supplied pinned first milestone. Its output is unpublished evidence, not new implementation requirements for #8. It explicitly separates actual instruction loads/synthesis from fixture-only public control tests and unavailable live handoff/publication. Its historical live-validation limitations are not prerequisites for the operator-selected mock-only verification above. No board/issue/PR/merge/closure mutation is authorized in this validation; live compatibility is not claimed.
+
+## Discovered bugs (#19): trusted synthesis → scoped tracking
+
+After verified #8 publication, use `synthesize-bug`, `complete-bug` and `publish-bug`
+with the same project/iteration/API options as ticket controls. These are trusted
+controller commands, not incident detectors, repair agents or worker-launch APIs.
+The selected skill and tracker are inherited from the current ticket assignment.
+
+`synthesize-bug --request <discovery.json>` accepts exactly `discovery_id`, `skill`
+(the same pinned descriptor as #8), and `discovery`. Discovery contains:
+
+```json
+{
+  "symptoms": "Saved notes lose accents when reopened",
+  "reproduction": ["Save café", "Reopen it"],
+  "evidence": ["verified-public-CLI-output-reference"],
+  "expected": "café is retained", "actual": "caf is displayed",
+  "environment": null,
+  "scope": "current", "scope_reason": "Prevents the pinned round-trip requirement",
+  "affected": [123]
+}
+```
+
+Examples are illustrative, not live observations. Provide reproduction or evidence;
+unknown environment is explicitly recorded as unavailable. Scope is `current`,
+`deferred` or `recovery`, justified by trusted defect assessment, not controller
+semantic inference. Current scope names open contracted milestone issues in
+`affected`; deferred/recovery cannot introduce ordinary downstream work.
+
+The returned `bug_work` assignment attaches selected instruction bytes, empty
+transitive dependency list, scoped adaptation/instructions, pinned documents,
+discovery, full paginated exact-repository issue/dependency/board observations,
+input digest and `load_sources`. The trusted synthesis agent actually follows
+`to-tickets`: context gathering, symptom **and** scope comparison, one verifiable
+complete defect slice and genuine blocker/affected edges. Only routine batch
+approval is removed. No new milestone, product or executable future batch exists.
+
+`complete-bug --request <result.json>` has exactly `assignment_id`, `input_digest`,
+`adaptation`, `execution`, `bug`. Execution uses #8's `run_id`, `loads`,
+`decomposition`, `result_digest`; additionally load every returned `load_sources`
+entry with its exact digest and actual tool-log reference. Those entries cover
+JSON snapshots of discovery, comparisons and `{adaptation, instructions}`. Hash
+these with #8's canonical JSON digest, not a prose assertion. Bug has exactly:
+
+- `title`, `desired_behavior`, `references`, `acceptance_criteria`, `triage_label`:
+  the common ticket contract. Current references use the immutable milestone;
+  deferred/recovery may also reference existing pinned vision requirements.
+- `blockers`: unique observed current issue numbers; cycles are refused.
+- `scope`, `affected`: unchanged from discovery.
+- `status`: `ready`/`blocked` for current/recovery, `deferred` for deferred.
+- `comparisons`: one `{number, symptoms_match, scope_match, rationale}` per exact
+  observed issue. Same title alone is not duplicate evidence. The result digest
+  binds this entire `bug` object.
+
+The deterministic publisher consumes verified trusted-stage evidence, rather than
+claiming JSON independently authenticates agent execution. It reads back exact
+body/refs/triage/identity, native blockers, scope and linked board status. Current
+bugs enter the existing milestone and add native **and textual** blocking edges
+on named affected issues; only their Blocked-by section is patched. Deferred bugs
+remain unscoped for next grilling. Recovery is unscoped with immediate-recovery
+priority. Neither can be reserved through the ordinary frontier, even if someone
+places it in the current milestone. No detection, merge freeze, repair dispatch,
+recovery reservation or worker containment is established by this tracking slice.
+
+Repeat discovery IDs cannot change content. New IDs with normalized equal symptoms,
+expected/actual behavior and scope reuse the assignment. Reworded duplicates use
+retained trusted symptom/scope comparisons; existing contracted issues are adopted,
+not overwritten. Durable issue/edge/membership intent precedes every write. Lost
+responses/process death reconcile exact targets; an absent uncertain target never
+causes another creation. A pending uncertain bug creation also blocks new issue
+creation under reworded discovery. Independent already eligible work remains
+selectable. Pending current tracking holds affected work until verified native
+edges exist; blocked bugs then hold dependents through GitHub authority.
+
+`publish-bug --request <retry.json>` accepts only `{"assignment_id":"<exact-id>"}`.
+Completed retries re-read evidence, scope, progress and affected edges without
+resetting external progress. Operational publication failures persist `status:
+blocked`/`blocker` and return inspectable JSON; validation/stale context errors exit
+2. Restore exact authoritative observations before retry. Changed candidate scope,
+additional affected edges, multiple duplicates or unresolved absent mutations need
+explicit controller investigation; this slice supplies no automatic reassignment
+or uncertainty override. It does not silently discard new affected work.
+
+### Scoped #19 live-verification amendment
+
+Antoine explicitly selected **mock-only GitHub verification** for #19: no test issue
+creation or board mutations. Functional requirements remain unchanged. Public CLI
+subprocess tests use real adapter calls to labeled loopback HTTP/Projects fixtures,
+including crash/lost-response/restart and native/textual dependency readbacks. They
+are not live GitHub compatibility or isolated-worker evidence. The builder is a
+host worktree implementation; merge-qualifying credential-blind whole-process
+isolated synthesis/review is parent-owned, not established by delegation. Required
+independent review/integration gates remain in force. No push, PR, merge, external
+bug publication, closure or new product/milestone is authorized by these tests.
+`evidence/issue19-synthesis.json` retains this host builder's actual selected-skill
+synthesis of the reproduced base frontier defect; it is unpublished, not isolated
+or merge-qualifying execution evidence.
