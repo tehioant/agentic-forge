@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -485,3 +486,162 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaises(RepositoryError):
             api.read('/actions/secrets')
         self.assertEqual(self.calls, [])
+
+    def test_gate_configurations_and_tooling_require_operator_path(self):
+        original = copy.deepcopy(self.config)
+        for name in ('lefthook.yml', '.mise.toml', '.betterleaks.toml',
+                     '.githooks/pre-commit', 'scripts/security/check.sh', 'tools/gate.py'):
+            with self.subTest(path=name):
+                path = self.source / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('gate configuration fixture\n')
+                self.refresh_source()
+                self.config = copy.deepcopy(original)
+                self.config['manifest'] = manifest(self.source)
+                self.config['paths'].append(name)
+                self.write_config()
+                self.deny('policy_held')
+                path.unlink()
+        for name in ('factory_v1/sandbox_policy.py', 'factory_v1/tests/test_security.py',
+                     'test_behavior.py', 'scripts/build_product.py'):
+            self.assertFalse(publication.policy_path(name), name)
+
+    def test_legitimate_behavior_and_test_delta_can_publish(self):
+        (self.source / 'test_behavior.py').write_text('new requirement tests\n')
+        self.refresh_source()
+        self.config['manifest'] = manifest(self.source)
+        self.config['paths'].append('test_behavior.py')
+        self.write_config()
+        self.plan = self.ok(self.cli('--plan-only'))
+        self.config['candidate'] = self.plan['candidate']
+        self.write_config()
+        self.ok(self.cli())
+
+    def test_malformed_config_fields_and_json_refuse_without_state_changes(self):
+        before = self.fixture.state.read_bytes()
+        original = copy.deepcopy(self.config)
+        for field, value in (('api_base', 123), ('api_base', {}), ('commit_date', None),
+                             ('paths', [None]), ('paths', [{}]), ('paths', ['x'] * 201),
+                             ('policy_paths', [{}]), ('manifest', []), ('binding', [])):
+            with self.subTest(field=field, value=value):
+                self.config = copy.deepcopy(original)
+                self.config[field] = value
+                self.write_config()
+                self.deny()
+                self.assertEqual(self.fixture.state.read_bytes(), before)
+        self.config = original
+        for data in (b'{', b'\xff', b'{"operator_id":"42","operator_id":"42"}',
+                     b' ' * (8 * 1024 * 1024 + 1)):
+            self.config_path.write_bytes(data)
+            self.deny()
+            self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_invalid_state_never_creates_sqlite_or_lock(self):
+        import sys
+        missing = self.root / 'missing.sqlite'
+        corrupt = self.root / 'corrupt.sqlite'
+        corrupt.write_bytes(b'not a SQLite database')
+        empty = self.root / 'empty.sqlite'
+        empty.touch()
+        before = set(self.root.iterdir())
+        for state in ('', ':memory:', str(missing), str(corrupt), str(empty)):
+            with self.subTest(state=state):
+                result = subprocess.run([sys.executable, '-m', 'factory_v1', '--state', state,
+                    '--operator-id', '42', 'publish-candidate', '--project', 'product',
+                    '--iteration', 'm1', '--assignment', self.assignment['assignment_id'],
+                    '--publication-config', str(self.config_path)], capture_output=True, text=True, timeout=15)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertIn('error', json.loads(result.stderr))
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(set(self.root.iterdir()), before)
+        self.assertEqual(corrupt.read_bytes(), b'not a SQLite database')
+        self.assertEqual(empty.stat().st_size, 0)
+        self.assertEqual(self.calls, [])
+
+    def test_malformed_persistent_json_and_shapes_refuse_without_mutations(self):
+        original = json.dumps(self.assignment)
+        for payload in ('{', '[]', '{"assignment_id":null}',
+                        '{"assignment_id":"x","assignment_id":"y"}'):
+            with self.subTest(payload=payload):
+                with closing(sqlite3.connect(self.fixture.state)) as database, database:
+                    database.execute('UPDATE role_assignments SET payload=?', (payload,))
+                before = self.fixture.state.read_bytes()
+                self.deny()
+                self.assertEqual(self.fixture.state.read_bytes(), before)
+        with closing(sqlite3.connect(self.fixture.state)) as database, database:
+            database.execute('UPDATE role_assignments SET payload=?', (original,))
+            database.execute('UPDATE iterations SET payload=?', ('[]',))
+        before = self.fixture.state.read_bytes()
+        self.deny()
+        self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_source_and_json_bounds_refuse_before_remote_writes(self):
+        path = self.source / 'factory_v1/behavior.py'
+        with path.open('wb') as stream:
+            stream.truncate(100 * 1024 * 1024 + 1)
+        self.deny('source_blocked')
+        path.write_text('new behavior\n')
+        metadata = self.artifacts / 'source-artifacts.json'
+        metadata.write_bytes(b' ' * (8 * 1024 * 1024 + 1))
+        self.deny('invalid_publication')
+
+    def test_complete_runtime_flags_do_not_replace_private_execution_attestation(self):
+        self.assignment['submitted_result'] = {'status': 'done', 'execution_reference': 'worker assertion',
+                                               'trusted_execution': True}
+        self.persist_assignment()
+        self.config['execution_reference'] = ''
+        self.write_config()
+        self.deny('approval_required')
+        self.config['execution_reference'] = 'fixture independently authenticated host attestation'
+        self.write_config()
+        self.ok(self.cli())
+        self.assertFalse(self.stored()['result_disposition']['trusted_execution'])
+        self.assertFalse(self.stored()['result_disposition']['advance_allowed'])
+
+    def test_journal_candidate_and_pr_identity_drift_are_held_without_rewrite(self):
+        self.ok(self.cli())
+        self.calls.clear()
+        saved = self.stored()
+        for field, value in (('candidate', 'c' * 40), ('status', 'unknown'), ('pr_number', 21)):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(saved)
+                changed['publication'][field] = value
+                with closing(sqlite3.connect(self.fixture.state)) as database, database:
+                    database.execute('UPDATE role_assignments SET payload=?', (json.dumps(changed),))
+                before = self.fixture.state.read_bytes()
+                self.deny('publication_conflict')
+                self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_published_branch_and_commit_drift_are_not_replayed(self):
+        result = self.ok(self.cli())
+        self.calls.clear()
+        before = self.fixture.state.read_bytes()
+        for head in (None, self.config['expected_head']):
+            if head is None:
+                del self.refs[self.config['branch']]
+            else:
+                self.refs[self.config['branch']] = head
+            self.deny('publication_conflict')
+            self.assertEqual(self.fixture.state.read_bytes(), before)
+        self.refs[self.config['branch']] = result['candidate']
+        commit = self.commits[result['candidate']]
+        for field, value in (('tree', None), ('parents', [None]), ('message', 'drift')):
+            old = commit[field]
+            commit[field] = value
+            self.deny()
+            self.assertEqual(self.fixture.state.read_bytes(), before)
+            commit[field] = old
+
+    def test_pr_nested_malformed_metadata_and_base_sha_drift_are_refused(self):
+        self.ok(self.cli())
+        self.calls.clear()
+        original = self.read_prs()
+        before = self.fixture.state.read_bytes()
+        for side, value in (('head', None), ('base', []),
+                            ('head', {'ref': self.config['branch'], 'repo': None}),
+                            ('base', dict(original[0]['base'], sha='c' * 40))):
+            observed = copy.deepcopy(original)
+            observed[0][side] = value
+            with mock.patch.object(self, 'read_prs', return_value=observed):
+                self.deny()
+                self.assertEqual(self.fixture.state.read_bytes(), before)

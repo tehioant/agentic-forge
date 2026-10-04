@@ -1,6 +1,7 @@
 """Exact candidate publication by an authenticated, host-only controller operator."""
 import base64
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -11,8 +12,8 @@ from pathlib import Path
 
 from . import assignments
 from .planning import require
-from .repositories import GitHub, RepositoryError, state_lock, unambiguous_fields, valid_repository
-from .sandbox_source import manifest, physical, relative, MAX_FILES, MAX_SOURCE_BYTES
+from .repositories import GitHub, RepositoryError, unambiguous_fields, valid_repository
+from .sandbox_source import manifest, physical, relative, MAX_FILES
 
 
 def object_sha(kind, content):
@@ -27,7 +28,10 @@ def binding(assignment):
 
 
 def read_json(path):
-    return json.loads(physical(path).read_text(), object_pairs_hook=unambiguous_fields)
+    with physical(path).open('rb') as stream:
+        data = stream.read(8 * 1024 * 1024 + 1)
+    require(len(data) <= 8 * 1024 * 1024, 'Publication JSON exceeds its bound.', 'invalid_publication')
+    return json.loads(data, object_pairs_hook=unambiguous_fields)
 
 
 def policy_path(path):
@@ -37,8 +41,14 @@ def policy_path(path):
                          '.gitattributes', '.gitconfig', '.pre-commit-config.yaml', 'security.md',
                          'pyproject.toml', 'tox.ini', 'pytest.ini', 'setup.cfg', 'package.json',
                          'makefile', 'dockerfile', '.gitlab-ci.yml', 'jenkinsfile', '.coveragerc',
-                         'mypy.ini', 'ruff.toml', '.ruff.toml', '.flake8'} for part in parts) or
-            any(part in {'policy', 'policies', 'rules', 'credentials', 'secrets'} for part in parts))
+                         'mypy.ini', 'ruff.toml', '.ruff.toml', '.flake8', 'lefthook.yml',
+                         'lefthook.yaml', '.lefthook.yml', '.lefthook.yaml', '.mise.toml',
+                         'mise.toml', '.betterleaks.toml', '.gitleaks.toml'} for part in parts) or
+            any(part in {'policy', 'policies', 'rules', 'credentials', 'secrets',
+                         'hooks', '.hooks', '.githooks', '.husky'} for part in parts) or
+            (parts[0] in {'scripts', 'tools', 'tooling'} and
+             any(re.search(r'(?:^|[._-])(?:hook|hooks|security|gate|gates|check|checks|lint|leaks)(?:$|[._-])', part)
+                 for part in parts[1:])))
 
 
 def load_config(path, operator):
@@ -56,7 +66,7 @@ def load_config(path, operator):
                 'Authenticated operator provenance and independent execution verification required.', 'approval_required')
         require(valid_repository(config['repository']) and type(config['repository_id']) is int and config['repository_id'] > 0 and
                 type(config['issue']) is int and config['issue'] > 0 and assignments.commit(config['expected_head']) and
-                assignments.commit(config['candidate']) and
+                assignments.commit(config['candidate']) and isinstance(config['commit_date'], str) and
                 re.fullmatch(r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z', config['commit_date']) is not None,
                 'Exact publication identity and deterministic commit pins required.', 'invalid_publication')
         datetime.datetime.strptime(config['commit_date'], '%Y-%m-%dT%H:%M:%SZ')
@@ -66,11 +76,15 @@ def load_config(path, operator):
                     '..' not in config[key] and '@{' not in config[key], 'Unsafe fixed ref.', 'scope_mismatch')
         require(config['branch'] not in {'main', 'master', config['base']}, 'No main/base writes.', 'scope_mismatch')
         require(isinstance(config['paths'], list) and 0 < len(config['paths']) <= 200 and
+                all(isinstance(p, str) for p in config['paths']) and
                 len(set(config['paths'])) == len(config['paths']) and
-                isinstance(config['policy_paths'], list) and set(config['policy_paths']) <= set(config['paths']),
+                isinstance(config['policy_paths'], list) and all(isinstance(p, str) for p in config['policy_paths']) and
+                len(set(config['policy_paths'])) == len(config['policy_paths']) and
+                set(config['policy_paths']) <= set(config['paths']),
                 'Bounded exact approved paths required.', 'scope_mismatch')
         for name in config['paths']:
             relative(name)
+        require(isinstance(config['api_base'], str), 'Explicit publication endpoint required.', 'invalid_publication')
         url = urllib.parse.urlsplit(config['api_base'])
         require(config['api_base'] == 'https://api.github.com' or
                 (url.scheme == 'http' and url.hostname in {'127.0.0.1', 'localhost', '::1'} and url.path == ''),
@@ -144,7 +158,8 @@ def assemble(api, config, assignment, root):
     require(sensitive <= set(config['policy_paths']), 'Policy changes require the explicit operator path.', 'policy_held')
     content = {}
     for path in actual:
-        data = physical(source / path).read_bytes()
+        with physical(source / path).open('rb') as stream:
+            data = stream.read(actual[path]['bytes'] + 1)
         require(len(data) == actual[path]['bytes'] and hashlib.sha256(data).hexdigest() == actual[path]['sha256'],
                 'Source changed during validation.', 'manifest_mismatch')
         if path in changed:
@@ -174,8 +189,10 @@ def assemble(api, config, assignment, root):
     regular = {p for p, e in entries.items() if e['mode'] in {'100644', '100755'}}
     require(regular == set(baseline), 'Baseline manifest does not describe every regular source file.', 'manifest_mismatch')
     for path in baseline:
-        data = physical(baseline_root / path).read_bytes()
-        require(entries[path]['sha'] == object_sha('blob', data) and
+        with physical(baseline_root / path).open('rb') as stream:
+            data = stream.read(baseline[path]['bytes'] + 1)
+        require(len(data) == baseline[path]['bytes'] and hashlib.sha256(data).hexdigest() == baseline[path]['sha256'] and
+                entries[path]['sha'] == object_sha('blob', data) and
                 entries[path]['mode'] == ('100755' if baseline[path]['executable'] else '100644'),
                 'Baseline bytes/modes disagree with pinned repository.', 'manifest_mismatch')
     changes = []
@@ -216,7 +233,12 @@ def assemble(api, config, assignment, root):
 
 def publish(database, project, iteration, operator, assignment_id, config_path, plan_only=False):
     config = load_config(config_path, operator)
-    with state_lock(database):
+    state_path = database.execute('PRAGMA database_list').fetchone()[2]
+    with open(state_path + '.onboarding.lock', 'r') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        for table in ('iterations', 'role_assignments'):
+            for row in database.execute('SELECT payload FROM ' + table):
+                json.loads(row[0], object_pairs_hook=unambiguous_fields)
         item = assignments.current(database, project, iteration, operator)
         assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
         handoff = assignment['handoff']
@@ -261,6 +283,15 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(plan['candidate'] == config['candidate'], 'Candidate differs from exact approval.', 'scope_mismatch')
         approval = {k: v for k, v in config.items() if k != 'bearer'}
         old = assignment.get('publication')
+        if old is not None:
+            require(isinstance(old, dict) and set(old) == {'status', 'approval', 'candidate', 'pr_number'} and
+                    old['status'] in ('pending', 'published') and isinstance(old['approval'], dict) and
+                    assignments.commit(old['candidate']) and old['approval'].get('candidate') == old['candidate'] and
+                    (old['pr_number'] is None or type(old['pr_number']) is int and old['pr_number'] > 0) and
+                    (old['status'] != 'published' or old['pr_number'] is not None),
+                    'Malformed publication journal requires reconciliation.', 'publication_conflict')
+            require(old['approval'] != approval or old['candidate'] == plan['candidate'],
+                    'Journal candidate differs from approved plan.', 'publication_conflict')
         require(old is not None or config['expected_head'] == handoff['baseline'],
                 'First publication must descend directly from its approved baseline.', 'scope_mismatch')
         if old and old['approval'] != approval:
@@ -280,10 +311,17 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(head in {None, config['expected_head'], plan['candidate']} and
                 (old is not None or head != plan['candidate']), 'Unexpected branch replacement/collision.', 'publication_conflict')
         require(head is not None or config['expected_head'] == handoff['baseline'], 'Lost fixed branch cannot be recreated.', 'publication_conflict')
+        require(old is None or old['status'] != 'published' or head == plan['candidate'],
+                'Published branch disappeared or drifted.', 'publication_conflict')
+        if head == plan['candidate']:
+            verify_commit(api, plan, config)
         query = pr_query(config)
         prs = api.read(query)
         require(isinstance(prs, list) and len(prs) <= 1, 'Ambiguous fixed PR target.', 'github_mismatch')
         if prs:
+            require(isinstance(prs[0], dict) and type(prs[0].get('number')) is int and prs[0]['number'] > 0 and
+                    (publication['pr_number'] is None or publication['pr_number'] == prs[0]['number']),
+                    'Fixed PR identity drifted.', 'publication_conflict')
             require(old is not None or publication['pr_number'] == prs[0].get('number'),
                     'Unowned PR collision.', 'publication_conflict')
             verify_pr(prs[0], config, dict(plan, candidate=head), title, body)
@@ -341,6 +379,8 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         issue_after = api.read('/issues/' + str(config['issue']))
         require(issue_after == issue, 'Assigned issue changed during publication.', 'github_mismatch')
         require(ref_sha(api.read(ref_path), config['branch']) == plan['candidate'], 'Ref moved during PR verification.', 'github_mismatch')
+        require(ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == handoff['baseline'],
+                'Base moved during publication.', 'github_mismatch')
         publication['status'] = 'published'
         save(database, assignment)
         return {k: publication[k] for k in ('status', 'candidate', 'pr_number')} | {'close_allowed': False, 'merge_allowed': False}
@@ -379,4 +419,5 @@ def verify_pr(value, config, plan, title, body):
         observed = value.get(side, {})
         require(observed.get('ref') == branch and observed.get('repo', {}).get('id') == config['repository_id'] and
                 observed['repo'].get('full_name') == config['repository'], 'Wrong PR repository/head/base.', 'github_mismatch')
+    require(value['base'].get('sha') == config['binding']['baseline'], 'Wrong PR base commit.', 'github_mismatch')
     require(value['head'].get('sha') == plan['candidate'], 'Wrong PR candidate.', 'github_mismatch')

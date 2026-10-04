@@ -212,6 +212,8 @@ def main():
         publication.add_argument('--' + option, required=True)
     publication.add_argument('--plan-only', action='store_true', help='Read-only deterministic candidate plan, not publication approval.')
     args = parser.parse_args()
+    if args.state in {'', ':memory:'}:
+        raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command == 'publish-candidate':
         from .publication import publish
         from .repositories import RepositoryError
@@ -222,10 +224,10 @@ def main():
                                  args.publication_config, args.plan_only)
         except RepositoryError as error:
             raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_publication', 'Malformed publication inputs or persistent state; reconcile with the operator.') from error
         print(json.dumps(result, sort_keys=True))
         return
-    if args.state in {'', ':memory:'}:
-        raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
         from . import assignments
         from .repositories import GitHub, RepositoryError
