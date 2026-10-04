@@ -12,6 +12,7 @@ from sandbox_relay import ResponsesRelay
 
 
 def main():
+    os.umask(0o022)
     envelope = json.loads(Path('/inputs/assignment.json').read_text())
     assignment = envelope['assignment']
     handoff = assignment['handoff']
@@ -34,17 +35,30 @@ def main():
         result = handle_function_call(name, args, task_id=run_id)
         return result, record(name, args, result)
 
+    def denied(result):
+        parsed = json.loads(result)
+        if not parsed.get('error') and not parsed.get('not_found'):
+            raise RuntimeError('isolation_probe_failed')
+
     # Probe denial BEFORE constructing the agent so file-mutation warnings cannot enter its context.
     probes = {}
     for path in ('/home/ops/.hermes/auth.json', '/var/run/docker.sock', '/root/.ssh/id_rsa', '/inputs/assignment.json'):
         if path.startswith('/inputs'):
             result, _ = tool('write_file', {'path': path, 'content': 'DENIED'})
+            denied(result)
             probes['immutable-input-write'] = result
         else:
             result, _ = tool('read_file', {'path': path})
+            denied(result)
             probes[path] = result
+    try:
+        Path('/inputs/.factory-denied-shell-write').write_text('DENIED')
+        probes['immutable-shell-write'] = 'UNEXPECTED_SUCCESS'
+    except OSError as error:
+        probes['immutable-shell-write'] = type(error).__name__
     if 'write_workspace' not in handoff['capabilities']:
         result, _ = tool('write_file', {'path': '/workspace/.factory-denied-write', 'content': 'DENIED'})
+        denied(result)
         probes['review-file-write'] = result
         try:
             Path('/workspace/.factory-denied-shell-write').write_text('DENIED')

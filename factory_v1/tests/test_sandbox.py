@@ -128,6 +128,20 @@ class SandboxTests(unittest.TestCase):
         self.assertFalse((self.bin / 'container.json').exists())
         self.assignment.assert_no_external_writes()
 
+    def test_packed_source_ignores_repository_configuration_and_untracked_secrets(self):
+        subprocess.run(['git', 'gc', '--prune=now'], cwd=self.source, check=True, capture_output=True)
+        marker = self.root / 'untrusted-host-command-ran'
+        with (self.source / '.git/config').open('a') as stream:
+            stream.write('\n[core]\n\tfsmonitor = touch ' + str(marker) + '\n')
+        (self.source / '.env').write_text('UNTRACKED_SECRET_FIXTURE=not-real\n')
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'complete', launched)
+        root = Path(launched['runtime']['artifacts'])
+        self.assertFalse((root / 'workspace/.env').exists())
+        self.assertFalse((root / 'inputs/baseline/.git').exists())
+        self.assertFalse(marker.exists())
+
     def test_large_engineering_request_is_bounded_and_admitted_without_route_change(self):
         self.mode('large-request')
         prepared = self.assignment.ok(self.assignment.command())

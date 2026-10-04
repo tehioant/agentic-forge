@@ -149,8 +149,9 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             require(not home.exists() and not home.is_symlink(), 'Role home must be fresh; no ambient profile is mounted or copied.', 'profile_blocked')
             artifact_root = Path(config['artifacts_root'])
             workspace = Path(assignment['handoff']['workspace'])
-            require(not artifact_root.is_relative_to(workspace) and not workspace.is_relative_to(artifact_root),
-                    'Artifacts and source scopes must be disjoint.', 'unsafe_path')
+            require(not artifact_root.is_relative_to(workspace) and not workspace.is_relative_to(artifact_root) and
+                    not Path(config_path).is_relative_to(workspace) and not Path(state).is_relative_to(workspace),
+                    'Controller state/config, artifacts and source scopes must be disjoint.', 'unsafe_path')
             run_id = 'run-' + uuid.uuid4().hex
             root = artifact_root / run_id
             root.mkdir(mode=0o700)
@@ -291,7 +292,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         error_code = error.code
         if status != 'stopped':
             status = 'failed'
-    except (OSError, ValueError, TypeError, KeyError, RecursionError, subprocess.SubprocessError, sqlite3.Error):
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, subprocess.SubprocessError, sqlite3.Error):
         error_code = 'recoverable_run_error'
         if status != 'stopped':
             status = 'failed'
@@ -315,16 +316,26 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         for signum, handler in signals.items():
             signal.signal(signum, handler)
         with closing(sqlite3.connect(state)) as database, state_lock(database):
-            assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
-            assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json'),
+            assignment = owned_assignment(database, project, iteration, operator, assignment_id)
+            require(assignment['runtime']['run_id'] == run_id, 'Run changed during cleanup.', 'run_conflict')
+            assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                          container_removed=status != 'unconfirmed', recoverable=status != 'complete')
             save(database, assignment)
     return assignment
 
 
+def owned_assignment(database, project, iteration, operator, assignment_id):
+    # Termination must remain possible after requirement drift; it never admits work.
+    assignments.current(database, project, iteration, operator, require_active=False)
+    assignment = next((row for row in assignments.rows(database) if row['assignment_id'] == assignment_id), None)
+    require(assignment is not None and assignment['ticket_scope']['project'] == project and
+            assignment['ticket_scope']['iteration'] == iteration, 'Exact assignment ownership required.', 'not_found')
+    return assignment
+
+
 def stop_assignment(database, project, iteration, operator, assignment_id):
     with state_lock(database):
-        assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
+        assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         runtime = assignment.get('runtime')
         require(runtime is not None, 'Assignment has no running attempt.', 'not_found')
         root = physical(runtime['artifacts'], directory=True)
@@ -335,7 +346,8 @@ def stop_assignment(database, project, iteration, operator, assignment_id):
         (root / 'container.log').write_bytes(logs)
     docker.remove(runtime['container'])
     with state_lock(database):
-        assignment = correlated(database, project, iteration, operator, assignment_id, runtime['run_id'])
+        assignment = owned_assignment(database, project, iteration, operator, assignment_id)
+        require(assignment['runtime']['run_id'] == runtime['run_id'], 'Run changed during stop.', 'run_conflict')
         assignment['runtime'].update(status='stopped', error='cancelled', container_removed=True, recoverable=True)
         save(database, assignment)
     return assignment
@@ -343,7 +355,7 @@ def stop_assignment(database, project, iteration, operator, assignment_id):
 
 def reconcile(database, project, iteration, operator, assignment_id):
     with state_lock(database):
-        assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
+        assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         runtime = assignment.get('runtime')
         require(runtime is not None, 'Assignment has no attempt to reconcile.', 'not_found')
         require(process_identity(runtime['controller_pid']) != runtime['controller_start'],

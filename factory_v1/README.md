@@ -339,9 +339,10 @@ A successful prepare means `assignment_ready=true`, **not** launch authorization
 `launchable=false`, `execution_allowed=false`, with refusal
 `whole_process_isolation_unavailable`. Snapshot availability does not prove mounting,
 credential policy, filesystem-tool restrictions or whole-process isolation.
-`launch-assignment --project ... --iteration ... --assignment ...` always exits 2
-with `isolation_unavailable`, even with `--isolated`, and never launches anything.
-No caller-provided evidence can enable execution in this slice.
+`launch-assignment` still exits 2 with `isolation_unavailable` without a private
+trusted launcher configuration, even with `--isolated`. The separately configured
+full-process launch lifecycle below revalidates admission; no caller-provided
+isolation assertion or worker result enables execution.
 
 ### Result input is retained, never accepted as delivery
 
@@ -390,6 +391,129 @@ actual worker skill execution, container isolation or integrated delivery. No
 isolation denial probes are repeated by these assignment tests. Dedicated
 simplification, independent review, CI and host-controlled delivery remain later
 gates, not permissions granted by this interface.
+
+## Full-process sandbox lifecycle (#11)
+
+Only the trusted operator/controller supplies `--launcher-config`. It is a
+controller-owned mode-0600 regular JSON file outside the assignment workspace,
+with exactly these fields (the artifact root must already exist, be mode 0700,
+and belong to the controller):
+
+```json
+{
+  "image": "nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db",
+  "uid": 10000,
+  "subscription_socket": "/absolute/private/approved-subscription.sock",
+  "artifacts_root": "/absolute/private/factory-artifacts",
+  "limits": {
+    "seconds": 1800,
+    "max_calls": 100,
+    "memory_mb": 2048,
+    "cpus": 2,
+    "pids": 128,
+    "scratch_mb": 128
+  }
+}
+```
+
+There are no configurable worker commands, mounts, providers, fallback models,
+credentials or arbitrary network routes. Docker must already have the exact
+inspected digest. The launcher checks image identity, the known original image
+entrypoint/working directory and its declared volume; it deliberately bypasses
+that root-oriented bootstrap with the image's Python running the immutable worker
+harness. The entire `AIAgent` runs inside the container, not just its terminal.
+
+```bash
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  launch-assignment --project <project> --iteration <iteration> \
+  --assignment <persisted-assignment-id> --launcher-config <private-launcher.json> \
+  --api-base <same-approved-read-only-tracker-route>
+
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  inspect-assignment --project <project> --iteration <iteration> \
+  --assignment <persisted-assignment-id>
+
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  stop-assignment --project <project> --iteration <iteration> \
+  --assignment <persisted-assignment-id>
+
+# After controller death only; never steals a live controller's ownership.
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  reconcile-assignment --project <project> --iteration <iteration> \
+  --assignment <persisted-assignment-id>
+```
+
+Launch is foreground and returns the assignment with structured runtime status;
+run failure is a recoverable runtime result, not delivered work. The parent
+supervisor may background this CLI. A separate guard monitors the controller's
+PID/start identity and TTL; controller death removes the actual container and
+retains logs. Stop and reconciliation read back container absence; an unavailable
+Docker daemon is **not** treated as proof of removal. Claims remain held, including
+failed, stopped and stale runs: retry/release/scheduling are not introduced here.
+
+Launch consumes only the persisted handoff and rechecks operator/iteration,
+spending allowance, frontier, exact ticket body/IDs, spec/input revisions, skills
+and claims. Pinned baseline/candidate source is independently read from physical
+Git objects in a clean bare reader containing no repository config, hooks,
+alternates, credential files or inherited Git environment. No repository code
+runs on the host. Loose and packed objects are supported; submodules, source
+symlinks, symlink path aliases, missing objects and oversized source fail closed.
+Only committed source is admitted: untracked secrets and the worktree's `.git`
+file/directory never enter the worker. `/workspace` is an assignment-scoped
+sanitized snapshot under the artifact root, **not** the original checkout; source
+artifacts are returned for later controlled integration, never worker commits.
+
+The complete inspected mount set is `/workspace`, writable isolated `/scratch`,
+read-only `/inputs` (including exact baseline, handoff and installed-skill closure),
+and a single per-attempt model socket. Review/diagnosis source is read-only;
+engineering source is scoped writable. The worker home is freshly created under
+that attempt's scratch, bound to the dedicated profile claim rather than copied
+from the declared host home. An existing host profile home is refused. The image's
+`/opt/data` volume is replaced by exact bounded tmpfs; `/tmp` is bounded tmpfs too.
+All Docker binds **and** `HostConfig.Tmpfs` are inspected before start, rejecting
+anonymous/unexpected volumes. The process is nonroot with network `none`, read-only
+root, init, no added capabilities, all capabilities dropped, no-new-privileges,
+no devices/port publishing, and explicit CPU/memory/PID/time/request bounds.
+
+The container-local stdlib HTTP relay exposes only pinned-model `/v1/responses`.
+It connects through the per-attempt UDS to the outside spending controller, never
+to the approved host subscription socket directly. Admission rechecks the active
+run, claims, revision and pause state atomically with each existing spending
+reservation. Function-only tools are limited to terminal/file operations;
+provider-executed network tools and model/route/credential/tier overrides are
+refused. The sandbox request bound is 2 MB end-to-end (normal broker clients retain
+their original 32 KB default); counts/TTL and the approved allowance remain
+mandatory. Pending upstream work gets SSE keepalives, not fabricated model output.
+Only actual approved completed response items are forwarded. No paid fallback.
+The state lock is released during upstream I/O.
+
+The harness probes shell/file/mount/network denials before constructing the agent,
+loads every selected pinned skill/support/input using actual executing-process
+Hermes `read_file` tools, and supplies those tool results plus the precise stage
+adaptation to the fresh conversation. It retains `events.jsonl`, `loads.json`,
+`probes.json`, the conversation, structured result and actual command outputs in
+scratch. Durable artifacts additionally include exact input/skill/dependency
+identities, initial and returned source manifests, model request/response evidence,
+Docker command/inspection and crash/container logs. Result verification correlates
+tool reads with exact pinned bytes and reported tests with retained actual
+terminal calls. Worker-created symlinks/devices and malformed/oversized evidence
+are recoverable refusals, never accepted work.
+
+Even verified isolated execution leaves `execution_allowed=false`,
+`advance_allowed=false` and `close_allowed=false`. It neither schedules a next
+stage nor authorizes publication/merges. Separate simplification, independent
+Standards/Spec review and controlled integration remain authoritative.
+
+Default CI tests exercise the public lifecycle using **labeled deterministic
+Docker, model and tracker fixtures**, plus real local HTTP/UDS protocol seams.
+They cover pinned source, packed objects/config exclusion, fresh homes, scoped
+permissions, admission/large request bounds, forbidden upstream tools, launch
+replay, pause, cancellation/controller death, read-only review, bad mounts and
+malformed/forged artifacts. They do **not** establish live container, approved
+model or GitHub acceptance. A real pinned image `docker create` inspection has
+been checked, but real Hermes/model/tool denial journeys remain a separate live
+acceptance obligation; retain exact run artifact handles rather than claiming
+fixture output proves isolation or delivery.
 
 ## Attention delivery (#15)
 
