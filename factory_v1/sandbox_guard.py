@@ -6,7 +6,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .sandbox_policy import Docker
+from .sandbox_policy import Docker, retain_logs
 
 
 def process_identity(pid):
@@ -38,9 +38,7 @@ def main():
         time.sleep(0.2)
     try:
         # Keep crash logs before removing the actual container/helper tree.
-        logs = docker.call('logs', record['container'], optional=True)
-        if logs is not None:
-            (root / 'container.log').write_bytes(logs)
+        retain_logs(docker, record['container'], root)
         docker.remove(record['container'])
         if reason == 'controller_lost':
             shutil.rmtree(record['capability'], ignore_errors=True)

@@ -19,7 +19,7 @@ from . import assignments, spending
 from .planning import require
 from .repositories import RepositoryError, state_lock
 from .sandbox_guard import process_identity
-from .sandbox_policy import Docker, command, load_config, verify
+from .sandbox_policy import Docker, command, load_config, retain_logs, verify
 from .sandbox_source import manifest, physical, snapshot
 
 TOOLS = {'terminal', 'process_manage', 'read_file', 'write_file', 'patch', 'search_files'}
@@ -270,9 +270,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             time.sleep(.1)
         # Stop helpers/container BEFORE inspecting worker-controlled artifacts.
         stop.set()
-        logs = docker.call('logs', runtime['container'], optional=True)
-        if logs is not None:
-            (root / 'container.log').write_bytes(logs)
+        retain_logs(docker, runtime['container'], root)
         docker.remove(runtime['container'])
         if status == 'exited':
             source = manifest(root / 'workspace')
@@ -300,7 +298,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         stop.set()
         try:
             docker.remove(runtime['container'])
-        except RepositoryError:
+        except (RepositoryError, OSError):
             error_code, status = 'stop_unconfirmed', 'unconfirmed'
         (root / 'guard-finish').touch()
         if guard:
@@ -341,9 +339,7 @@ def stop_assignment(database, project, iteration, operator, assignment_id):
         root = physical(runtime['artifacts'], directory=True)
         (root / 'stop').touch()
     docker = Docker()
-    logs = docker.call('logs', runtime['container'], optional=True)
-    if logs is not None:
-        (root / 'container.log').write_bytes(logs)
+    retain_logs(docker, runtime['container'], root)
     docker.remove(runtime['container'])
     with state_lock(database):
         assignment = owned_assignment(database, project, iteration, operator, assignment_id)

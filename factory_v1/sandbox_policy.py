@@ -58,8 +58,8 @@ class Docker:
     def call(self, *args, optional=False, timeout=30):
         try:
             response = subprocess.run([self.binary, *args], env=self.env, capture_output=True, timeout=timeout)
-        except subprocess.SubprocessError as error:
-            raise RepositoryError('container_unavailable', 'Docker operation timed out; reconcile the exact container.') from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RepositoryError('container_unavailable', 'Docker operation unavailable; reconcile the exact container.') from error
         if optional and response.returncode:
             return None
         require(response.returncode == 0, 'Docker operation failed; no unsafe fallback.', 'container_unavailable')
@@ -68,8 +68,8 @@ class Docker:
     def inspect(self, name, optional=False):
         try:
             response = subprocess.run([self.binary, 'inspect', name], env=self.env, capture_output=True, timeout=30)
-        except subprocess.SubprocessError as error:
-            raise RepositoryError('container_unavailable', 'Docker inspection timed out; stop is unconfirmed.') from error
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RepositoryError('container_unavailable', 'Docker inspection unavailable; stop is unconfirmed.') from error
         if response.returncode:
             if optional and (b'no such object' in response.stderr.lower() or b'no such container' in response.stderr.lower()):
                 return None
@@ -100,6 +100,20 @@ class Docker:
             require(time.monotonic() < deadline,
                     'Container removal was not verified; ownership remains held.', 'stop_unconfirmed')
             time.sleep(.1)
+
+
+def retain_logs(docker, name, root):
+    """Diagnostic failures must never prevent independent container removal."""
+    try:
+        logs = docker.call('logs', name, optional=True)
+        if logs is not None:
+            (root / 'container.log').write_bytes(logs)
+    except (RepositoryError, OSError) as error:
+        try:
+            (root / 'container-log-error.json').write_text(json.dumps(
+                {'error': 'log_unavailable', 'type': type(error).__name__}))
+        except OSError:
+            pass  # Even an unwritable artifact root cannot prevent termination.
 
 
 def mount_args(mounts):
