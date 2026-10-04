@@ -84,7 +84,8 @@ class RepositoryLifecycleTests(unittest.TestCase):
                 self.wfile.write(encoded.encode())
 
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                       kwargs={'poll_interval': 0.01}, daemon=True)
         self.thread.start()
         self.addCleanup(self.stop_server)
         self.base = f'http://127.0.0.1:{self.server.server_port}'

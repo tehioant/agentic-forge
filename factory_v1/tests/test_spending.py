@@ -43,7 +43,8 @@ class ModelSpendingTests(unittest.TestCase):
         FixtureHandler.uncertain = False
         self.http = HTTPServer(('127.0.0.1', 0), FixtureHandler)
         self.fixture_url = f'http://127.0.0.1:{self.http.server_port}/fixed-fixture'
-        self.http_thread = threading.Thread(target=self.http.serve_forever, daemon=True)
+        self.http_thread = threading.Thread(target=self.http.serve_forever,
+                                            kwargs={'poll_interval': 0.01}, daemon=True)
         self.http_thread.start()
         self.addCleanup(self.http.shutdown)
         self.addCleanup(self.http.server_close)
@@ -207,7 +208,8 @@ class ModelSpendingTests(unittest.TestCase):
                 self.wfile.write(('data: ' + json.dumps(done) + '\n\ndata: ' + json.dumps(body) + '\n\n').encode())
         path = self.root / 'upstream.sock'
         server = socketserver.UnixStreamServer(str(path), Handler)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=server.serve_forever,
+                         kwargs={'poll_interval': 0.01}, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return path

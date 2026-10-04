@@ -1,6 +1,6 @@
-# Fresh factory v1 — intake, onboarding, planning, ticket control and attention
+# Fresh factory v1 — intake, onboarding, planning, tickets, assignments and attention
 
-Standard-library Python controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, and controls ticket publication/frontier/reservation. It never dispatches implementation workers.
+Standard-library Python 3.11+ controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, controls ticket publication/frontier/reservation, and prepares bounded role handoffs. It never dispatches implementation workers.
 
 ## Trust and safety boundary
 
@@ -186,6 +186,210 @@ The socket parent must be operator-owned mode `0700`. The socket is mode `0600` 
 This is an enforceable model-access seam, not full worker isolation: there is no worker launcher/container policy in this slice. Before a later launcher uses it, run the entire worker in a network-disabled container with no provider credentials and mount only its assigned socket; expose no host route, provider SDK credential, or direct network capability. Grant the socket only to that worker identity, pin a per-assignment scope, and verify the boundary with real container tests. Current deterministic tests prove CLI → real Unix socket → fixed loopback fixture execution, not containment of arbitrary workers or live provider billing. The approved subscription route uses a host-owned UDS HTTP capability, not a worker's provider credential. The trusted capability must be fixed to `https://chatgpt.com/backend-api/codex/responses`, `gpt-6.1-sol` and the standard/default tier, with refresh grants retained on the host. The adapter sends only `/v1/responses`, pins model/tier/store/stream and validates a completed exact-model SSE response. It never connects directly to a provider URL, proxies an arbitrary path or selects fallback. The controller verifies this capability's deployment and ownership; merely naming a socket is not proof of that deployment. Configure it with `model-broker ... --provider openai-codex --model gpt-6.1-sol --operation responses --subscription-socket <verified-host-capability.sock> --worker-uid <assigned-uid>`. Subscription payloads contain `input` and only the supported inference fields; there are no secrets in the CLI request. Do not enable chargeable providers until a host-owned adapter provides trustworthy pre-call reservations, exact upstream/model pinning, and authoritative currency/billing reconciliation.
 
 `spend-reconcile` is trusted-controller-only and does not authorize another attempt; terminal idempotency keys stay terminal. A failed outcome releases unused reservation only after trusted confirmation. A successful receipt records actual units no greater than reservation and refunds only the difference. Uncertain outcomes block **all new keys** in the affected iteration until exact trusted reconciliation, not only retries of the same key. A subscription HTTP 429 persists quota exhaustion without fallback and freezes its reservation conservatively. After an exact billing/allowance receipt, `spend-resume --project ... --iteration ... --provider ... --model ... --operation ... --reference <verified-quota-restoration>` additionally requires the exact exhausted scope and an unexpired grant. Recording another grant alone cannot erase a quota block. Paused iterations cannot start a broker or admit operations; trusted reconciliation remains available while paused.
+
+## Bounded role assignments (#10)
+
+These trusted controller commands prepare and inspect immutable handoffs, **not
+workers**. Prerequisites are an active approved iteration, verified onboarding,
+current pinned planning/ticket synthesis, complete publication, an eligible
+GitHub frontier and a durable unexpired subscription allowance for the exact
+`openai-codex/gpt-6.1-sol/responses` scope. No paid approval, fixture provider or
+alternate model can authorize an assignment. Quota exhaustion and uncertain model
+operations block admission; preparation never consumes or reserves allowance.
+Admission must be checked again at any future actual model-call boundary.
+
+```bash
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  prepare-assignment --project <project> --iteration <iteration> \
+  --request <assignment-request.json> --api-base <same-approved-endpoint> --dry-run
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  prepare-assignment --project <project> --iteration <iteration> \
+  --request <assignment-request.json> --api-base <same-approved-endpoint>
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  inspect-assignment --project <project> --iteration <iteration> \
+  --assignment <returned-assignment-id>
+```
+
+### Exact request contract
+
+The JSON object accepts **only** the fields below. Pins are full lowercase hashes,
+not branches, abbreviated commits or caller assertions. Examples are placeholders,
+not execution evidence.
+
+| Field | Required value |
+| --- | --- |
+| `stage` | One exact stage from the binding table below |
+| `repository`, `repository_id` | Exact onboarded `owner/repository` and positive immutable numeric ID |
+| `workspace` | Explicit normalized absolute path, not `/`, distinct from profile home; no repository process is run to verify its contents |
+| `issue` | Exactly `{number, id, node_id, body_sha256}`; positive numeric identities and SHA-256 of the exact current UTF-8 issue body |
+| `spec_commit`, `baseline` | Full 40-character spec and code baseline commits; spec must match current lifecycle handoff |
+| `candidate` | Full candidate commit for corrections/simplification/review; otherwise null or an explicit full commit |
+| `standards` | Artifact list containing `AGENTS.md`, with relevant actual project conventions |
+| `preceding` | Artifact list containing all stage-required inputs below |
+| `profile` | Exactly `{name, home, role, provider, model, operation, reasoning}`; dedicated identifier (not `default`/`personal`), normalized absolute home, exact stage role, approved subscription scope, explicit `low`/`medium`/`high`/`xhigh` reasoning |
+| `skills` | Exactly the selected stage closure, with descriptors as described below |
+| `capabilities` | Ordered `['read_workspace', 'scratch', 'model']`, plus `'write_workspace'` only for implementation, corrections, simplify and repair |
+| `result_contract` | `factory-bounded-result-v1` |
+| `claim_id` | Stable unique identifier correlated with the exact bounded assignment |
+
+Artifacts have exactly `{name, content, sha256}`. Names are unique identifiers
+(`AGENTS.md` is permitted); content is nonempty UTF-8 text and the hash must match
+its actual bytes. A preceding `candidate` artifact contains exactly the candidate
+commit. Artifacts are snapshots, not paths to implicitly read or commands to run.
+No ambient memory, sessions, credentials, unknown fields or broader capabilities
+are accepted. Profile configuration binds identity and policy; it neither reads
+nor validates a real Hermes profile home or proves isolation.
+
+### Installed source bindings and adaptations
+
+| Stage | Profile role | Entry points | Required preceding artifacts |
+| --- | --- | --- | --- |
+| `implementation` | `implementation` | `implement` | None |
+| `corrections` | `implementation` | `implement` | `candidate`, `findings` |
+| `simplify` | `simplification` | `simplify-code` | `candidate`, `implementation-evidence` |
+| `review-standards` | `review` | `code-review` (Standards only) | `candidate`, `simplification-evidence` |
+| `review-spec` | `review` | `code-review` (Spec only) | `candidate`, `simplification-evidence` |
+| `diagnosis` | `debug` | `diagnosing-bugs` | `failure-evidence` |
+| `repair` | `repair` | `diagnosing-bugs`, then `implement` | `incident-evidence` |
+
+Each skill descriptor has exactly `{name, source, path, sha256, dependencies}`.
+`source` is the reviewed installed identity; `path` is an explicit absolute regular
+non-symlink local source/snapshot file. The entire path ancestry must be non-symlink.
+The file's actual bytes must match the reviewed SHA-256 in `role_skills.SELECTED`;
+caller-selected new pins are not accepted. For example, the implementation entry:
+
+```json
+{
+  "name": "implement",
+  "source": "/home/ops/.hermes/skills/implement/SKILL.md",
+  "path": "/absolute/selected-snapshots/implement/SKILL.md",
+  "sha256": "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3",
+  "dependencies": ["tdd"]
+}
+```
+
+Supply the complete closure, not just this entry. `implement` requires `tdd`;
+`tdd` requires `codebase-design`, `tdd/tests.md` and `tdd/mocking.md` (in that
+order). Other selected entries and support files have empty dependency lists.
+Engineering stages use those five inputs; repair additionally uses diagnosis;
+simplification, each review axis and diagnosis use only their own entry.
+Matt's installed identities are `/home/ops/.hermes/skills/<name>/SKILL.md`, with
+the two support files under `tdd/`; the non-Matt simplifier is
+`/home/ops/.hermes/skills/software-development/simplify-code/SKILL.md`.
+`role_skills.py` retains all exact reviewed pins and dependency lists from the
+selected sources; test snapshots retain those bytes unchanged. Unknown, duplicate,
+unneeded, missing, changed or differently selected dependencies fail closed before
+frontier queries or claims. There is no installed-directory scan or bare-name
+fallback, no new framework and no change to shared installed skills. Reviewed
+source updates require a new code/pin review; this slice has no dynamic updater.
+
+The handoff retains actual instructions, content hashes, entry points, stage rules,
+adaptation identity and selected support policy. `implement` keeps mandatory
+meaningful tests at agreed seams; test-first ordering is optional, nested review
+moves to later dedicated review, and the controller owns commits/publication.
+`simplify-code` covers reuse, quality, efficiency and altitude inline in one fresh
+context without fan-out, preserving behavior or retaining evidence-backed no-op.
+Standards and Spec receive separate fresh read-only assignments and separate
+verdicts; they cannot share a top-level profile name or home. Diagnosis is read-only
+and stops before modifying phases. Repair diagnoses then implements within incident
+scope and still requires later simplification, both review axes and unchanged gates.
+Optional codebase-design deepening/design-it-twice workflows and the unavailable
+HITL diagnostic template are not silently substituted; they require a reviewed
+closure or an honest missing-capability report. Related-skill metadata is not an
+implicit dependency or permission to launch helpers.
+
+### Persistence, dry-run and fail-closed execution
+
+Startup validates explicit configuration and skill bytes before GitHub reads and
+claim persistence. Preparation reuses the authoritative eligible-frontier verifier
+against an in-memory copy of state, allowing only metadata GETs and GraphQL reads.
+It checks current issue identity/body, repository ID, requirements, publication,
+blockers and conflicting active work. It does not execute git, tests, repository
+subprocesses, model requests, workers or GitHub mutations. Baseline/candidate and
+workspace are bound declared identities, **not verified checkout evidence**.
+Workspace and profile home must be lexically canonical absolute paths: embedded
+NULs and double-leading-slash aliases are refused before tracker reads or claims,
+not silently normalized. This validation does not access or resolve those paths;
+physical aliases through symlinks or mounts remain a later isolation/controller
+verification concern, not a capability established by preparation.
+
+Dry-run opens existing state read-only, uses the existing onboarding lock and writes
+no schema, lock file, lifecycle checkpoint, spending reservation or assignment claim.
+Configured read-only GitHub lookups are allowed. The state and its existing
+`.onboarding.lock` must already be available; an absent state is not bootstrapped.
+Its deterministic assignment/handoff identities match later unchanged preparation;
+policy observations remain subject to current grant expiry and external revisions.
+
+Non-dry preparation adds only local `role_assignments` storage, leaving concurrent
+attention, spending and ticket lifecycle payloads unchanged. The shared lock
+serializes claims: one ticket scope globally and one top-level assignment per
+profile name/home. Ticket reservation checks the same durable assignment ownership
+before frontier checkpoints, reservation persistence or tracker status mutations;
+compatible same-ticket reservations remain allowed in either admission order.
+Exact replay returns the original identity and retained result;
+changed claim scope, profile collision or changed handoff conflicts. Claims survive
+restart and are never silently stolen, released or replaced, including stale
+requirements. There is deliberately no release/reconciliation command here; a
+later reviewed controller lifecycle must resolve stale claims. Inspect is a local
+immutable snapshot, not fresh GitHub/spending eligibility; it refuses changed local
+spec/ticket revisions but remains available during pause or source-file changes.
+Preparation and result submission revalidate live scope and selected source bytes.
+
+A successful prepare means `assignment_ready=true`, **not** launch authorization:
+`launchable=false`, `execution_allowed=false`, with refusal
+`whole_process_isolation_unavailable`. Snapshot availability does not prove mounting,
+credential policy, filesystem-tool restrictions or whole-process isolation.
+`launch-assignment --project ... --iteration ... --assignment ...` always exits 2
+with `isolation_unavailable`, even with `--isolated`, and never launches anything.
+No caller-provided evidence can enable execution in this slice.
+
+### Result input is retained, never accepted as delivery
+
+```bash
+python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
+  assignment-result --project <project> --iteration <iteration> \
+  --assignment <assignment-id> --request <result.json> \
+  --api-base <same-approved-endpoint>
+```
+
+Result JSON has exactly `assignment_id`, `handoff_digest`, `claim_id`, `run_id`,
+`status`, `loads`, `work`, `artifacts`, `tests`. Identities match the assignment;
+`run_id` is an identifier and status is `done`, `blocked` or `stuck`. `loads` has
+exactly one `{source, sha256, tool_reference}` for each selected skill source and
+each returned `handoff.input_loads` source (issue, immutable documents, standards
+and preceding artifacts). References must point to actual selected-instruction/input
+loads, not just names/catalog entries. `work` is a nonempty list of observable
+skill-guided work references/descriptions; `artifacts` includes a hashed
+`stage-evidence` artifact; `tests` is a nonempty list of `{command, result}` with
+actual outcomes or an explicit unavailable-capability explanation. A success
+assertion alone, missing evidence, wrong scope/load hashes or stale inputs is
+refused. Identical result replay is allowed; replacing retained evidence conflicts.
+
+Structural validation cannot authenticate these references or prove execution.
+Even a structurally valid `done` is only `submitted_result`: disposition stays
+`trusted_execution=false`, `advance_allowed=false`, `close_allowed=false` because
+trusted whole-process execution evidence is unavailable. It neither moves stages,
+releases claims, closes issues, publishes, merges nor authorizes another model call.
+The required later verifier must establish actual skill execution and behavior,
+not infer them from worker prose or successful exit.
+
+### Verification scope
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python -m unittest factory_v1.tests.test_assignments -v
+```
+
+Fresh CLI process tests cover prepare/inspect/replay, deterministic non-writing
+dry-run, exact source bytes and closures, startup/model/scope/capability/refusal,
+frontier blockers and conflicting work, spending exhaustion/expiry/uncertainty,
+concurrent ticket/profile claims, pause/stale revisions, result evidence/replay and
+non-advancement, disabled launch including isolation assertions, and concurrent
+attention preservation. Tests use portable `tempfile` defaults and labeled GitHub
+and stage-evidence fixtures. They do **not** prove live GitHub/model behavior,
+actual worker skill execution, container isolation or integrated delivery. No
+isolation denial probes are repeated by these assignment tests. Dedicated
+simplification, independent review, CI and host-controlled delivery remain later
+gates, not permissions granted by this interface.
 
 ## Attention delivery (#15)
 
