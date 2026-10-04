@@ -263,15 +263,17 @@ caller-selected new pins are not accepted. For example, the implementation entry
   "name": "implement",
   "source": "/home/ops/.hermes/skills/implement/SKILL.md",
   "path": "/absolute/selected-snapshots/implement/SKILL.md",
-  "sha256": "6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3",
-  "dependencies": ["tdd"]
+  "sha256": "6b13bcb6119df090c97be3c8a90560071a26f21f4fc6ad0facde97b25ecb1da0",
+  "dependencies": []
 }
 ```
 
-Supply the complete closure, not just this entry. `implement` requires `tdd`;
-`tdd` requires `codebase-design`, `tdd/tests.md` and `tdd/mocking.md` (in that
-order). Other selected entries and support files have empty dependency lists.
-Engineering stages use those five inputs; repair additionally uses diagnosis;
+The operator-authorized updated `implement` has no inline skill dependencies;
+engineering stages use that one input, without forcing the previous `tdd` closure.
+Its `/code-simplifier` instruction maps explicitly to the existing later
+`simplify-code` assignment, then separate Standards and Spec assignments.
+Those are controller-sequenced stages, not nested worker dependencies.
+Repair additionally uses diagnosis;
 simplification, each review axis and diagnosis use only their own entry.
 Matt's installed identities are `/home/ops/.hermes/skills/<name>/SKILL.md`, with
 the two support files under `tdd/`; the non-Matt simplifier is
@@ -285,8 +287,8 @@ source updates require a new code/pin review; this slice has no dynamic updater.
 
 The handoff retains actual instructions, content hashes, entry points, stage rules,
 adaptation identity and selected support policy. `implement` keeps mandatory
-meaningful tests at agreed seams; test-first ordering is optional, nested review
-moves to later dedicated review, and the controller owns commits/publication.
+meaningful tests at agreed seams; test-first ordering is optional, simplification and review
+move to later dedicated assignments, and the controller owns commits/publication.
 `simplify-code` covers reuse, quality, efficiency and altitude inline in one fresh
 context without fan-out, preserving behavior or retaining evidence-backed no-op.
 Standards and Spec receive separate fresh read-only assignments and separate
