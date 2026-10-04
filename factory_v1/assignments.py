@@ -45,7 +45,8 @@ def identifier(value):
 
 
 def absolute(value):
-    return isinstance(value, str) and Path(value).is_absolute() and str(Path(value)) == value and '..' not in Path(value).parts
+    return (isinstance(value, str) and '\x00' not in value and not value.startswith('//') and
+            Path(value).is_absolute() and str(Path(value)) == value and '..' not in Path(value).parts)
 
 
 def artifacts(values, required, code='invalid_assignment'):

@@ -307,6 +307,11 @@ It checks current issue identity/body, repository ID, requirements, publication,
 blockers and conflicting active work. It does not execute git, tests, repository
 subprocesses, model requests, workers or GitHub mutations. Baseline/candidate and
 workspace are bound declared identities, **not verified checkout evidence**.
+Workspace and profile home must be lexically canonical absolute paths: embedded
+NULs and double-leading-slash aliases are refused before tracker reads or claims,
+not silently normalized. This validation does not access or resolve those paths;
+physical aliases through symlinks or mounts remain a later isolation/controller
+verification concern, not a capability established by preparation.
 
 Dry-run opens existing state read-only, uses the existing onboarding lock and writes
 no schema, lock file, lifecycle checkpoint, spending reservation or assignment claim.

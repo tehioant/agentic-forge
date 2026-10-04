@@ -191,6 +191,35 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(self.fixture.calls, [])
         self.ok(self.command())
 
+    def test_unusable_workspace_and_profile_paths_refuse_before_tracker_or_claim(self):
+        for existing_claim in (False, True):
+            if existing_claim:
+                prepared = self.ok(self.command())
+            for field in ('workspace', 'profile-home'):
+                for invalid in ('nul', 'double-leading-slash'):
+                    for dry_run in (True, False):
+                        with self.subTest(existing_claim=existing_claim, field=field,
+                                          invalid=invalid, dry_run=dry_run):
+                            request = copy.deepcopy(self.request)
+                            path = request['workspace'] if field == 'workspace' else request['profile']['home']
+                            malformed = path + '\x00suffix' if invalid == 'nul' else '/' + path
+                            if field == 'workspace':
+                                request['workspace'] = malformed
+                                code = 'invalid_assignment'
+                            else:
+                                request['profile']['home'] = malformed
+                                request['profile']['name'] = 'different-name-same-home'
+                                request['claim_id'] = 'aliased-profile-claim'
+                                code = 'profile_blocked'
+                            before = self.fixture.state.read_bytes()
+                            self.fixture.calls.clear()
+                            self.refused(self.command(request=request, dry_run=dry_run), code)
+                            self.assertEqual(self.fixture.calls, [])
+                            self.assertEqual(self.fixture.state.read_bytes(), before)
+            if existing_claim:
+                self.assertEqual(self.ok(self.inspect(prepared))['handoff_digest'], prepared['handoff_digest'])
+                self.assertEqual(self.ok(self.command())['assignment_id'], prepared['assignment_id'])
+
     def test_selected_skill_closure_missing_ambiguous_unknown_or_changed_is_refused(self):
         for change in ('missing', 'duplicate', 'unknown', 'pin', 'source', 'dependencies', 'relative', 'absent'):
             request = copy.deepcopy(self.request)
