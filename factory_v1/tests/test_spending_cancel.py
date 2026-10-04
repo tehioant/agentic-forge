@@ -80,7 +80,14 @@ class SpendingCancellationTests(unittest.TestCase):
 
     def assert_stopped(self):
         assert self.broker is not None
-        helpers = [thread for thread in threading.enumerate() if thread.name == 'model-broker-canceller']
+        helpers = []
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            helpers = [thread for thread in threading.enumerate() if thread.name == 'model-broker-canceller']
+            if helpers and helpers[0].is_alive():
+                break
+            self.assertTrue(self.broker.is_alive(), self.errors)
+            time.sleep(.005)
         self.assertEqual(len(helpers), 1)
         self.assertFalse(helpers[0].daemon)
         started = time.monotonic()

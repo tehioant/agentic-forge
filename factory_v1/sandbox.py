@@ -289,9 +289,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 result = check_worker_evidence(assignment, root, selected_inputs)
-                require(not (root / 'stop').exists(), 'Attempt cancelled before result admission.', 'cancelled')
+                assignments.require_result_active(assignment)
                 assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github)
                 assert assignment is not None
+                assignments.require_result_active(assignment)
                 assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
                     checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
                     reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
@@ -331,6 +332,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         with closing(sqlite3.connect(state)) as database, state_lock(database):
             assignment = owned_assignment(database, project, iteration, operator, assignment_id)
             require(assignment['runtime']['run_id'] == run_id, 'Run changed during cleanup.', 'run_conflict')
+            if status != 'unconfirmed' and (root / 'stop').exists():
+                status, error_code = 'stopped', 'cancelled'
             assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                          container_removed=status != 'unconfirmed', recoverable=status != 'complete')
             save(database, assignment)

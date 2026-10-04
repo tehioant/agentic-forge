@@ -221,6 +221,130 @@ class ProvenanceTests(unittest.TestCase):
         self.assertNotIn('submitted_result', result)
         self.assertFalse((self.case.bin / 'container.json').exists())
 
+    def signal_during_result_revalidation(self, signum):
+        import inspect
+        import signal
+        from factory_v1 import assignments
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = assignments.prepare
+        injected = []
+
+        def cancelled_revalidation(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if any(frame.function == 'store_result' for frame in inspect.stack()):
+                signal.raise_signal(signum)
+                injected.append(True)
+            return result
+
+        with patch.object(assignments, 'prepare', cancelled_revalidation):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertTrue(injected)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertTrue(result['runtime']['container_removed'])
+        self.assertNotIn('submitted_result', result)
+        root = Path(result['runtime']['artifacts'])
+        self.assertTrue((root / 'stop').exists())
+        self.assertTrue((root / 'scratch/result.json').is_file())
+        observed = self.case.assignment.ok(self.case.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], result['runtime'])
+        self.assertNotIn('submitted_result', observed)
+        self.assertFalse((self.case.bin / 'container.json').exists())
+
+    def test_sigterm_during_final_result_revalidation_is_not_admitted(self):
+        import signal
+        self.signal_during_result_revalidation(signal.SIGTERM)
+
+    def test_sigint_during_final_result_revalidation_is_not_admitted(self):
+        import signal
+        self.signal_during_result_revalidation(signal.SIGINT)
+
+    def test_signal_after_result_commit_cannot_report_complete(self):
+        import signal
+        from factory_v1 import assignments
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = assignments.store_result
+
+        def cancelled_after_commit(*args, **kwargs):
+            result = original(*args, **kwargs)
+            signal.raise_signal(signal.SIGTERM)
+            return result
+
+        with patch.object(assignments, 'store_result', cancelled_after_commit):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertFalse(result['result_disposition']['trusted_execution'])
+        self.assertFalse(result['result_disposition']['advance_allowed'])
+        self.assertFalse(result['result_disposition']['close_allowed'])
+        observed = self.case.assignment.ok(self.case.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], result['runtime'])
+
+    def test_signal_before_result_commit_rolls_back_submission(self):
+        import inspect
+        import signal
+        import sqlite3
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        connect = sqlite3.connect
+        injected = []
+
+        class CancelledCommit(sqlite3.Connection):
+            def execute(connection, sql, parameters=()):
+                cursor = super().execute(sql, parameters)
+                if sql.startswith('UPDATE role_assignments') and any(
+                        frame.function == 'store_result' for frame in inspect.stack()):
+                    signal.raise_signal(signal.SIGTERM)
+                    injected.append(True)
+                return cursor
+
+        def connect_with_cancel(*args, **kwargs):
+            return connect(*args, **kwargs, factory=CancelledCommit)
+
+        with patch.object(sqlite3, 'connect', connect_with_cancel):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertTrue(injected)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertNotIn('submitted_result', result)
+        observed = self.case.assignment.ok(self.case.assignment.inspect(prepared))
+        self.assertNotIn('submitted_result', observed)
+        self.assertEqual(observed['runtime'], result['runtime'])
+
+    def test_signal_during_final_cleanup_cannot_report_complete(self):
+        import signal
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = Docker.remove
+        injected = []
+
+        def cancelled_cleanup(docker, name):
+            result = original(docker, name)
+            roots = list(self.case.artifacts.iterdir())
+            if roots and (roots[0] / 'worker-reported-tests.json').exists():
+                signal.raise_signal(signal.SIGTERM)
+                injected.append(True)
+            return result
+
+        with patch.object(Docker, 'remove', cancelled_cleanup):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertTrue(injected)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertFalse(result['result_disposition']['advance_allowed'])
+        self.assertFalse(result['result_disposition']['close_allowed'])
+        observed = self.case.assignment.ok(self.case.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], result['runtime'])
+
     def test_controller_checks_share_original_attempt_deadline(self):
         self.set_checks(['python -m unittest discover -v'])
         config = json.loads(self.case.config.read_text())
