@@ -107,8 +107,11 @@ def main():
               'No nested review, delegation, commits, publication, merge, fallback or new spending. '
               'Run meaningful tests through the agreed public seams. Review/diagnosis may copy source to /scratch to test. '
               'Retain work, test commands and actual outputs. Return ONLY JSON with status (done/blocked/stuck), '
-              'work (nonempty strings), tests (objects command/result), and artifacts (objects name/content/sha256, '
-              'including stage-evidence). Do not claim delivery.\n' + json.dumps({
+              'work (nonempty strings), tests (nonempty objects with command and result strings), and artifacts '
+              '(objects name/content/sha256, including stage-evidence). Each tests.command must match the complete '
+              'native terminal command verbatim, including compound shell commands; do not split or shorten it. '
+              'Each tests.result must be a nonempty string containing actual output and exit status, not an object. '
+              'Compute each artifact sha256 from the exact UTF-8 content with a terminal tool. Do not claim delivery.\n' + json.dumps({
                   'assignment_id': assignment['assignment_id'], 'ticket': handoff['issue'],
                   'stage': handoff['stage'], 'adaptation': handoff['adaptation'],
                   'stage_rules': handoff['stage_rules'], 'support_policy': handoff['support_policy'],
