@@ -15,7 +15,7 @@ from factory_v1.tests import test_tickets
 
 SOURCE_ROOT = Path(os.environ.get('FACTORY_ROLE_SKILL_FIXTURES', str(Path(__file__).parent / 'role_skill_snapshots')))
 PINS = {
-    'implement': '6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3',
+    'implement': '6b13bcb6119df090c97be3c8a90560071a26f21f4fc6ad0facde97b25ecb1da0',
     'tdd': '93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc',
     'codebase-design': '2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2',
     'code-review': '47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50',
@@ -24,7 +24,7 @@ PINS = {
     'tdd/tests.md': '859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a',
     'tdd/mocking.md': '3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef',
 }
-ENGINEERING = ['codebase-design', 'implement', 'tdd', 'tdd/mocking.md', 'tdd/tests.md']
+ENGINEERING = ['implement']
 
 
 def artifact(name, content):
@@ -65,7 +65,7 @@ class AssignmentTests(unittest.TestCase):
             source_suffix = 'software-development/' + suffix if name == 'simplify-code' else suffix
             result.append({'name': name, 'source': '/home/ops/.hermes/skills/' + source_suffix,
                            'path': str(self.skills / suffix), 'sha256': PINS[name],
-                           'dependencies': {'implement': ['tdd'], 'tdd': ['codebase-design', 'tdd/tests.md', 'tdd/mocking.md']}.get(name, [])})
+                           'dependencies': {'tdd': ['codebase-design', 'tdd/tests.md', 'tdd/mocking.md']}.get(name, [])})
         return result
 
     def configuration(self, number=10, stage='implementation'):
@@ -224,7 +224,7 @@ class AssignmentTests(unittest.TestCase):
         for change in ('missing', 'duplicate', 'unknown', 'pin', 'source', 'dependencies', 'relative', 'absent'):
             request = copy.deepcopy(self.request)
             if change == 'missing': request['skills'].pop()
-            if change == 'duplicate': request['skills'][0] = copy.deepcopy(request['skills'][1])
+            if change == 'duplicate': request['skills'].append(copy.deepcopy(request['skills'][0]))
             if change == 'unknown': request['skills'][0]['name'] = 'beta-role'
             if change == 'pin': request['skills'][0]['sha256'] = '0' * 64
             if change == 'source': request['skills'][0]['source'] = '/other/duplicate/SKILL.md'
@@ -232,7 +232,7 @@ class AssignmentTests(unittest.TestCase):
             if change == 'relative': request['skills'][0]['path'] = 'SKILL.md'
             if change == 'absent': request['skills'][0]['path'] = str(self.root / 'absent.md')
             self.refused(self.command(request=request), 'skill_blocked')
-        dependency = self.skills / 'tdd/tests.md'
+        dependency = self.skills / 'implement/SKILL.md'
         raw = dependency.read_bytes()
         dependency.write_bytes(raw + b'\nchanged')
         self.refused(self.command(), 'skill_blocked')
@@ -421,7 +421,7 @@ class AssignmentTests(unittest.TestCase):
         request = self.result(assignment)
         self.tracker.issues[10]['body'] += '\nChanged scope'
         self.refused(self.command('assignment-result', request, assignment['assignment_id']), 'scope_mismatch')
-        dependency = self.skills / 'tdd/mocking.md'
+        dependency = self.skills / 'implement/SKILL.md'
         dependency.write_text('changed source input')
         self.refused(self.command('assignment-result', request, assignment['assignment_id']), 'skill_blocked')
         # The immutable handoff remains inspectable even when installed sources change.

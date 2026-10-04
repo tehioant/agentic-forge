@@ -7,15 +7,17 @@ import socket
 import sqlite3
 import stat
 import struct
+import threading
 import time
 import uuid
 from contextlib import closing
 from pathlib import Path
 
-from .model_access import MAX_RESPONSE, ModelAccessError, transport
+from .model_access import MAX_RESPONSE, ModelAccessError, SocketCancellation, transport
 from .repositories import state_lock
 
 MAX_REQUEST = 32768
+SANDBOX_MAX_REQUEST = 2_000_000
 MAX_UNITS = 2**63 - 1
 
 
@@ -156,7 +158,7 @@ def admission_preview(database, scope, reserve=1, now=None, allowance_only=True)
             'reservation': reserve, 'reserved': False, 'recheck_at_call': True}
 
 
-def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowance_only=False, deadline=None):
+def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowance_only=False, deadline=None, stop_event=None):
     if not isinstance(operation_id, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', operation_id) is None:
         raise SpendingError('invalid_operation_id', 'A bounded stable idempotency key is required.')
     if type(reserve) is not int or not 0 < reserve <= MAX_UNITS:
@@ -164,7 +166,7 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
     digest = hashlib.sha256(request_bytes).hexdigest()
     database.execute('BEGIN IMMEDIATE')
     now = int(time.time()) if now is None else now
-    if deadline is not None and time.monotonic() >= deadline:
+    if (stop_event is not None and stop_event.is_set()) or (deadline is not None and time.monotonic() >= deadline):
         _decision(database, scope, operation_id, 'refused', 'capability_exhausted', now)
         database.commit()
         raise SpendingError('capability_exhausted', 'Attempt capability expired before admission.', recorded=True)
@@ -224,17 +226,17 @@ def _finish(database, operation_id, status, actual_units, receipt):
     return {'status': status, 'actual_units': actual_units}
 
 
-def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None):
+def execute_controlled(database, scope, operation_id, payload, reserve, fixture_url=None, timeout=10, now=None, adapter=None, deadline=None, max_request=MAX_REQUEST, admission_check=None, stop_event=None):
     """Reserve before outbound I/O; uncertain outcomes freeze the whole iteration."""
     scope = _scope(*scope)
     try:
-        return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline)
+        return _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request, admission_check, stop_event)
     except SpendingError as error:
         record_refusal(database, scope, operation_id, error)
         raise
 
 
-def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline):
+def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_url, timeout, now, adapter, deadline, max_request, admission_check, stop_event):
     if not isinstance(payload, dict):
         raise SpendingError('invalid_request', 'Request must be a bounded JSON object.')
     if set(payload) & {'provider', 'model', 'operation', 'url', 'endpoint', 'authorization', 'api_key', 'service_tier', 'stream', 'store'}:
@@ -243,7 +245,7 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
         body = json.dumps(payload, separators=(',', ':'), sort_keys=True, allow_nan=False).encode()
     except (ValueError, RecursionError):
         raise SpendingError('invalid_request', 'Request must be finite JSON within parser limits.')
-    if len(body) > MAX_REQUEST:
+    if max_request not in (MAX_REQUEST, SANDBOX_MAX_REQUEST) or len(body) > max_request:
         raise SpendingError('invalid_request', 'Model request exceeds the fixed limit.')
     try:
         adapter = adapter or transport(scope, timeout, fixture_url=fixture_url, reservation=reserve)
@@ -255,16 +257,22 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
         raise SpendingError('invalid_request', 'Subscription payload has unsupported fields or no input.')
     allowance_only = scope[2] != 'fixture-provider'
     with state_lock(database), database:
-        admitted = _prepare(database, scope, operation_id, body, reserve, now, allowance_only, deadline)
+        if admission_check:
+            admission_check(database)
+        admitted = _prepare(database, scope, operation_id, body, reserve, now, allowance_only, deadline, stop_event)
     if admitted['status'] in {'complete', 'failed'}:
         return admitted
-    if ((deadline is not None and time.monotonic() >= deadline)
+    if ((stop_event is not None and stop_event.is_set())
+            or (deadline is not None and time.monotonic() >= deadline)
             or (int(time.time()) if now is None else now) >= admitted['grant_expires']):
         with state_lock(database), database:
             _finish(database, operation_id, 'failed', 0, 'expired_before_outbound_io')
         raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O; no operation was initiated.', recorded=True)
     try:
         units, result = adapter.call(payload)
+        if ((stop_event is not None and stop_event.is_set())
+                or (deadline is not None and time.monotonic() >= deadline)):
+            raise ModelAccessError('outcome_uncertain')
         if type(units) is not int or not 0 <= units <= reserve:
             raise ModelAccessError('outcome_uncertain')
     except Exception as error:
@@ -309,7 +317,7 @@ def resume_quota(database, scope, reference):
     return {'status': 'ready'}
 
 
-def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, operator_id=None, subscription_socket=None, reservation=3, ttl=300, max_calls=100, worker_uid=None):
+def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, operator_id=None, subscription_socket=None, reservation=3, ttl=300, max_calls=100, worker_uid=None, max_request=MAX_REQUEST, stop_event=None, authorize=None, observe=None):
     """Fixed per-attempt capability; host state/upstream never enter the worker mount."""
     scope = _scope(*scope)
     worker_uid = os.getuid() if worker_uid is None else worker_uid
@@ -318,7 +326,7 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
         initialize(database)
         try:
             _iteration(database, scope[0], scope[1], operator_id, require_active=True)
-            if (type(ttl) is not int or not 0 < ttl <= 3600 or type(max_calls) is not int or not 0 < max_calls <= 1000):
+            if (max_request not in (MAX_REQUEST, SANDBOX_MAX_REQUEST) or type(ttl) is not int or not 0 < ttl <= 3600 or type(max_calls) is not int or not 0 < max_calls <= 1000):
                 raise SpendingError('invalid_capability', 'Use a bounded capability TTL and request count.')
             if not os.path.isabs(path) or os.path.lexists(path):
                 raise SpendingError('socket_exists', 'Use an absent absolute socket path in a private operator-owned directory.')
@@ -335,40 +343,65 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
             raise
     deadline = time.monotonic() + ttl
     calls = 0
+    stop_event = stop_event if stop_event is not None else threading.Event()
+    cancellation = SocketCancellation()
+    finished = threading.Event()
+
+    def cancel_io():
+        while not finished.is_set():
+            if stop_event.is_set() or time.monotonic() >= deadline:
+                cancellation.cancel()
+                adapter.cancel()
+                return
+            finished.wait(min(.02, max(0, deadline - time.monotonic())))
+
+    canceller = threading.Thread(target=cancel_io, name='model-broker-canceller', daemon=False)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
         server.bind(path)
-        os.chmod(path, 0o600 if worker_uid == os.getuid() else 0o666)
-        server.listen(8)
         try:
-            while time.monotonic() < deadline:
+            os.chmod(path, 0o600 if worker_uid == os.getuid() else 0o666)
+            server.listen(8)
+            cancellation.add(server)
+            canceller.start()
+            while time.monotonic() < deadline and not stop_event.is_set():
                 server.settimeout(min(1, max(.001, deadline - time.monotonic())))
                 try:
                     connection, _ = server.accept()
                 except socket.timeout:
                     continue
+                except OSError:
+                    if cancellation.cancelled.is_set():
+                        break
+                    raise
                 with connection:
                     connection.settimeout(min(5, max(.001, deadline - time.monotonic())))
                     try:
+                        # Interrupt request reads while preserving small refusal replies.
+                        cancellation.add(connection, socket.SHUT_RD)
                         _, peer_uid, _ = struct.unpack('3i', connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
                         if peer_uid != worker_uid:
                             raise SpendingError('worker_identity_mismatch', 'This socket capability belongs to one exact worker UID.')
                         data = bytearray()
-                        while b'\n' not in data and len(data) <= MAX_REQUEST:
-                            part = connection.recv(min(4096, MAX_REQUEST + 1 - len(data)))
+                        while b'\n' not in data and len(data) <= max_request:
+                            part = connection.recv(min(4096, max_request + 1 - len(data)))
                             if not part:
                                 break
                             data.extend(part)
-                        if len(data) > MAX_REQUEST or not data.endswith(b'\n'):
+                        if len(data) > max_request or not data.endswith(b'\n'):
                             raise SpendingError('invalid_request', 'Request exceeds the fixed broker protocol limit.')
                         request = json.loads(data, object_pairs_hook=_json)
                         if not isinstance(request, dict) or set(request) != {'operation_id', 'reserve', 'payload'}:
                             raise SpendingError('invalid_request', 'Broker protocol fields are exact and limited.')
-                        if time.monotonic() >= deadline or calls >= max_calls:
-                            raise SpendingError('capability_exhausted', 'This attempt capability expired or exhausted its request count.')
+                        if stop_event.is_set() or time.monotonic() >= deadline or calls >= max_calls:
+                            raise SpendingError('capability_exhausted', 'This attempt capability stopped, expired or exhausted its request count.')
                         calls += 1
                         with closing(sqlite3.connect(uri, uri=True, timeout=30)) as database:
                             _iteration(database, scope[0], scope[1], operator_id, require_active=True)
-                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline)
+                            if observe:
+                                observe('request', calls, request)
+                            result = execute_controlled(database, scope, request['operation_id'], request['payload'], request['reserve'], adapter=adapter, deadline=deadline, max_request=max_request, admission_check=(lambda db: authorize(db, request)) if authorize else None, stop_event=stop_event)
+                            if observe:
+                                observe('response', calls, result)
                         reply = {'result': result}
                     except SpendingError as error:
                         reply = _refusal_reply(uri, scope, error)
@@ -378,7 +411,13 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
                         connection.sendall(json.dumps(reply).encode() + b'\n')
                     except OSError:
                         pass  # Disconnected clients cannot cause a second upstream operation.
+                    finally:
+                        cancellation.remove(connection)
         finally:
+            finished.set()
+            if canceller.ident is not None:
+                canceller.join()
+            cancellation.remove(server)
             os.unlink(path)
 
 
@@ -391,12 +430,12 @@ def _refusal_reply(uri, scope, error):
         return {'error': 'broker_unavailable', 'message': 'Refusal evidence could not be persisted; no fallback.'}
 
 
-def broker_call(path, operation_id, reserve, payload):
+def broker_call(path, operation_id, reserve, payload, max_request=MAX_REQUEST):
     try:
         request = json.dumps({'operation_id': operation_id, 'reserve': reserve, 'payload': payload}, separators=(',', ':'), allow_nan=False).encode() + b'\n'
     except (ValueError, RecursionError) as error:
         raise SpendingError('invalid_request', 'Broker request must be finite JSON within parser limits.') from error
-    if len(request) > MAX_REQUEST:
+    if max_request not in (MAX_REQUEST, SANDBOX_MAX_REQUEST) or len(request) > max_request:
         raise SpendingError('invalid_request', 'Broker request is too large.')
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
         client.settimeout(180)

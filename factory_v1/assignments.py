@@ -256,6 +256,12 @@ def inspect(database, project, iteration, operator, assignment_id):
     return assignment
 
 
+def require_result_active(assignment):
+    runtime = assignment.get('runtime')
+    require(not runtime or not (Path(runtime['artifacts']) / 'stop').exists(),
+            'Attempt cancelled before result admission.', 'cancelled')
+
+
 def store_result(database, project, iteration, operator, assignment_id, request, github):
     assignment = inspect(database, project, iteration, operator, assignment_id)
     keys = {'assignment_id', 'handoff_digest', 'claim_id', 'run_id', 'status', 'loads', 'work', 'artifacts', 'tests'}
@@ -287,9 +293,11 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     assignment['result_disposition'] = {'structurally_valid': True, 'trusted_execution': False,
                                        'advance_allowed': False, 'close_allowed': False,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
-    database.execute('BEGIN IMMEDIATE')
-    database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))
-    database.commit()
+    with database:
+        database.execute('BEGIN IMMEDIATE')
+        require_result_active(assignment)
+        database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))
+        require_result_active(assignment)
     return assignment
 
 

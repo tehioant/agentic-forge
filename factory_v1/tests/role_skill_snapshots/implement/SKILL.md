@@ -6,10 +6,10 @@ disable-model-invocation: true
 
 Implement the work described by the user in the spec or tickets.
 
-Use /tdd where possible, at pre-agreed seams.
-
 Run typechecking regularly, single test files regularly, and the full test suite once at the end.
 
-Once done, use /code-review to review the work.
+Keep it simple and commit often on pull request.
 
-Commit your work to the current branch.
+Once done, use /code-simplifier to make the code as simple as possible and then use /code-review to review the work.
+
+Push the code and ship or show or ask.

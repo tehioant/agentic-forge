@@ -6,7 +6,7 @@ from .planning import require
 from .repositories import RepositoryError
 
 SELECTED = {
-    'implement': ('/home/ops/.hermes/skills/implement/SKILL.md', '6d3fd9e83b8f36e5213854779db49b256a457a7ebb4a503e53fa7dcff696adc3'),
+    'implement': ('/home/ops/.hermes/skills/implement/SKILL.md', '6b13bcb6119df090c97be3c8a90560071a26f21f4fc6ad0facde97b25ecb1da0'),
     'tdd': ('/home/ops/.hermes/skills/tdd/SKILL.md', '93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc'),
     'codebase-design': ('/home/ops/.hermes/skills/codebase-design/SKILL.md', '2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2'),
     'code-review': ('/home/ops/.hermes/skills/code-review/SKILL.md', '47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50'),
@@ -16,7 +16,6 @@ SELECTED = {
     'tdd/mocking.md': ('/home/ops/.hermes/skills/tdd/mocking.md', '3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef'),
 }
 DEPENDENCIES = {
-    'implement': ['tdd'],
     'tdd': ['codebase-design', 'tdd/tests.md', 'tdd/mocking.md'],
 }
 STAGES = {
@@ -41,7 +40,7 @@ ADAPTATIONS = {
 
 SUPPORT_POLICY = {
     'required': 'Only the reviewed transitive closure; no ambient bare-name discovery.',
-    'implement-review': 'Nested code-review is moved to separate later Standards and Spec assignments, not silently invoked.',
+    'implement-review': 'The updated implement /code-simplifier instruction maps explicitly to the existing later simplify-code stage, followed by separate Standards and Spec reviews. No nested simplification/review; controller owns commits, push and shipping.',
     'codebase-design': 'Vocabulary reference only. DEEPENING.md and DESIGN-IT-TWICE.md are optional unselected workflows; request a new reviewed closure before using them.',
     'simplify-code': 'Related-skill metadata and optional delegation are not dependencies; substantive four-angle cleanup runs inline. Acceptance review is separate.',
     'diagnosing-bugs': 'No HITL template was supplied. That optional branch must report unavailable capability, not invent or execute a replacement.',

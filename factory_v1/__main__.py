@@ -179,8 +179,8 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
-    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment']:
-        control = commands.add_parser(name, help='Bounded role handoff; worker launch remains disabled.')
+    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment']:
+        control = commands.add_parser(name, help='Bounded role assignment and trusted full-process sandbox lifecycle.')
         control.add_argument('--project', required=True)
         control.add_argument('--iteration', required=True)
         if name in {'prepare-assignment', 'assignment-result'}:
@@ -194,6 +194,10 @@ def main():
             control.add_argument('--dry-run', action='store_true')
         if name == 'launch-assignment':
             control.add_argument('--isolated', action='store_true', help='Untrusted assertion; never enables launch.')
+            control.add_argument('--launcher-config', help='Private trusted controller configuration, not worker input.')
+            control.add_argument('--api-base')
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
     for name in ['attention', 'notifications', 'deliver', 'respond', 'attention-reconcile']:
         attention_command = commands.add_parser(name, help='Trusted exact-origin attention lifecycle.')
         attention_command.add_argument('--project', required=True)
@@ -206,13 +210,29 @@ def main():
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
-    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment'}:
+    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
         from . import assignments
         from .repositories import GitHub, RepositoryError
         import fcntl
         try:
             if args.command == 'launch-assignment':
-                assignments.launch()
+                if not args.launcher_config:
+                    assignments.launch()
+                from .sandbox import launch
+                if not args.api_base:
+                    raise IntakeError('invalid_launcher', 'Launch requires the trusted read-only tracker route.')
+                result = launch(str(Path(args.state).resolve()), args.project, args.iteration, args.operator_id,
+                                args.assignment, args.launcher_config, GitHub(args.api_base, args.bearer, args.timeout))
+                print(json.dumps(result, sort_keys=True))
+                return
+            if args.command in {'stop-assignment', 'reconcile-assignment'}:
+                from .sandbox import stop_assignment, reconcile
+                uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+                with closing(sqlite3.connect(uri, uri=True)) as database:
+                    operation = stop_assignment if args.command == 'stop-assignment' else reconcile
+                    result = operation(database, args.project, args.iteration, args.operator_id, args.assignment)
+                print(json.dumps(result, sort_keys=True))
+                return
             request = None
             if hasattr(args, 'request'):
                 with open(args.request, encoding='utf-8') as source:

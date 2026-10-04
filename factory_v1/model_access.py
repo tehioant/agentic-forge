@@ -6,8 +6,8 @@ import math
 import os
 import socket
 import stat
+import threading
 import urllib.parse
-import urllib.request
 
 MAX_RESPONSE = 2_000_000
 SUBSCRIPTION_SCOPE = ('openai-codex', 'gpt-6.1-sol', 'responses')
@@ -19,9 +19,60 @@ class ModelAccessError(Exception):
         super().__init__(code)
 
 
-class NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+class SocketCancellation:
+    """Interrupt owned sockets without racing their registration or owner cleanup."""
+    def __init__(self):
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
+        self.sockets = {}
+
+    def add(self, sock, how=socket.SHUT_RDWR):
+        with self.lock:
+            if self.cancelled.is_set():
+                raise OSError('Socket capability cancelled.')
+            self.sockets[sock] = how
+
+    def remove(self, sock):
+        with self.lock:
+            self.sockets.pop(sock, None)
+
+    def cancel(self):
+        with self.lock:
+            self.cancelled.set()
+            for sock, how in self.sockets.items():
+                try:
+                    sock.shutdown(how)
+                except OSError:
+                    pass  # Already closed/unconnected sockets have no blocked I/O.
+
+
+class CancellableHTTPConnection(http.client.HTTPConnection):
+    """Retain the socket even when HTTPConnection hands an EOF-framed body off."""
+    def __init__(self, host, port=None, timeout=10, cancellation=None):
+        super().__init__(host, port=port, timeout=timeout)
+        self.cancellation = cancellation or SocketCancellation()
+        self._socket = None
+
+    def _connect(self, family, address):
+        self._socket = self.sock = socket.socket(family, socket.SOCK_STREAM)
+        self.cancellation.add(self._socket)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(address)
+        if self.cancellation.cancelled.is_set():
+            raise OSError('Socket capability cancelled.')
+
+    def connect(self):
+        self._connect(socket.AF_INET6 if ':' in self.host else socket.AF_INET,
+                      (self.host, self.port))
+
+    def release(self):
+        try:
+            self.close()
+        finally:
+            if self._socket is not None:
+                self.cancellation.remove(self._socket)
+                self._socket.close()
+                self._socket = None
 
 
 def bounded_json(response):
@@ -50,27 +101,35 @@ class FixtureTransport:
         self.url = url
         self.timeout = timeout
         self.reservation = reservation
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
+        self.cancellation = SocketCancellation()
+
+    def cancel(self):
+        self.cancellation.cancel()
 
     def call(self, payload):
-        request = urllib.request.Request(self.url, data=json.dumps(payload).encode(),
-                                         method='POST', headers={'Content-Type': 'application/json'})
-        with self.opener.open(request, timeout=self.timeout) as response:
-            result = bounded_json(response)
+        parsed = urllib.parse.urlsplit(self.url)
+        connection = CancellableHTTPConnection(parsed.hostname, parsed.port, self.timeout, self.cancellation)
+        try:
+            connection.request('POST', parsed.path, json.dumps(payload).encode(),
+                               {'Content-Type': 'application/json'})
+            with connection.getresponse() as response:
+                if not 200 <= response.status < 300:
+                    raise ModelAccessError('outcome_uncertain')
+                result = bounded_json(response)
+        finally:
+            connection.release()
         if not isinstance(result, dict):
             raise ModelAccessError('outcome_uncertain')
         return result.get('actual_units'), result.get('output')
 
 
-class UnixHTTPConnection(http.client.HTTPConnection):
-    def __init__(self, path, timeout):
-        super().__init__('host-subscription-capability', timeout=timeout)
+class UnixHTTPConnection(CancellableHTTPConnection):
+    def __init__(self, path, timeout, cancellation=None):
+        super().__init__('host-subscription-capability', timeout=timeout, cancellation=cancellation)
         self.path = path
 
     def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(self.path)
+        self._connect(socket.AF_UNIX, self.path)
 
 
 class SubscriptionTransport:
@@ -88,22 +147,26 @@ class SubscriptionTransport:
             raise ModelAccessError('provider_unavailable')
         self.path = path
         self.timeout = timeout
+        self.cancellation = SocketCancellation()
+
+    def cancel(self):
+        self.cancellation.cancel()
 
     def call(self, payload):
         if set(payload) - self.payload_fields or 'input' not in payload:
             raise ModelAccessError('invalid_request')
         body = {**payload, 'model': SUBSCRIPTION_SCOPE[1], 'store': False,
                 'stream': True, 'service_tier': 'default'}
-        connection = UnixHTTPConnection(self.path, self.timeout)
+        connection = UnixHTTPConnection(self.path, self.timeout, self.cancellation)
         try:
             connection.request('POST', '/v1/responses', json.dumps(body).encode(),
                                {'Content-Type': 'application/json'})
-            response = connection.getresponse()
-            if response.status == 429:
-                raise ModelAccessError('quota_exhausted')
-            if response.status != 200:
-                raise ModelAccessError('outcome_uncertain')
-            raw = response.read(MAX_RESPONSE + 1)
+            with connection.getresponse() as response:
+                if response.status == 429:
+                    raise ModelAccessError('quota_exhausted')
+                if response.status != 200:
+                    raise ModelAccessError('outcome_uncertain')
+                raw = response.read(MAX_RESPONSE + 1)
             if len(raw) > MAX_RESPONSE:
                 raise ModelAccessError('outcome_uncertain')
             completed = None
@@ -133,7 +196,7 @@ class SubscriptionTransport:
                 raise ModelAccessError('outcome_uncertain')
             return 1, completed
         finally:
-            connection.close()
+            connection.release()
 
 
 def transport(scope, timeout, fixture_url=None, subscription_socket=None, reservation=3):
