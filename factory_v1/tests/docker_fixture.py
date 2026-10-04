@@ -123,6 +123,8 @@ def run_fixture(container):
         content = json.dumps(report, sort_keys=True)
         if mode == 'malformed-stage':
             content = '{not JSON'
+        if mode == 'nested-stage':
+            content = '{"nested":' + '[' * 2000 + '0' + ']' * 2000 + '}'
         if mode == 'duplicate-stage':
             content = content[:-1] + ', "outcome": "no-op"}'
         result['artifacts'].append({'name': 'simplification-result', 'content': content,

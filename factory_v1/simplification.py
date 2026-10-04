@@ -3,7 +3,6 @@ import difflib
 import hashlib
 import json
 import shutil
-from pathlib import Path
 
 from . import assignments
 from .planning import require, text

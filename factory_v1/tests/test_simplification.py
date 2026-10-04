@@ -1,6 +1,5 @@
 """Public stage/launcher regressions; Docker/model doubles are NOT live skill evidence."""
 import copy
-import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -56,7 +55,7 @@ class SimplificationTests(unittest.TestCase):
         self.assignment.refused(self.assignment.command(request=generic), 'implementation_unverified')
         self.assertEqual(self.case.model_calls, [])
 
-    def test_no_checks_and_failed_implementation_cannot_prepare_simplification(self):
+    def test_no_checks_cannot_prepare_simplification(self):
         self.set_checks([])
         prior = self.implementation()
         self.assignment.refused(self.prepare(self.request(prior)), 'implementation_unverified')
@@ -132,7 +131,7 @@ class SimplificationTests(unittest.TestCase):
                 self.assertTrue((Path(result['runtime']['artifacts']) / 'scratch/result.json').is_file())
 
     def test_wrong_pins_malformed_results_and_missing_four_angle_work_are_refused(self):
-        self.assert_failed_modes(('wrong-revision', 'wrong-input', 'wrong-adaptation', 'missing-angle', 'malformed-stage', 'duplicate-stage'))
+        self.assert_failed_modes(('wrong-revision', 'wrong-input', 'wrong-adaptation', 'missing-angle', 'malformed-stage', 'duplicate-stage', 'nested-stage'))
 
     def test_scope_behavior_changes_false_no_op_and_applied_findings_are_refused(self):
         self.assert_failed_modes(('scope-violation', 'behavior-not-preserved', 'false-no-op', 'applied-finding', 'false-approval'))
@@ -171,6 +170,85 @@ class SimplificationTests(unittest.TestCase):
         self.assignment.refused(self.case.launch(prepared), 'implementation_unverified')
         self.assertNotIn('runtime', self.assignment.ok(self.assignment.inspect(prepared)))
         self.assertEqual(len(self.case.model_calls), 1)
+
+    def test_failed_implementation_cannot_start_simplification(self):
+        self.case.mode('checks-fail')
+        prior = self.assignment.ok(self.case.launch(self.prepared))
+        self.assertEqual(prior['runtime']['status'], 'failed')
+        self.assignment.refused(self.prepare(self.request(prior)), 'implementation_unverified')
+
+    def test_empty_ticket_diff_accepts_evidence_backed_no_op(self):
+        self.case.mode('implementation-no-op')
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior)))
+        self.assertEqual(prepared['handoff']['simplification']['scope'], [])
+        self.case.mode('')
+        result = self.assignment.ok(self.case.launch(prepared))
+        self.assertEqual(result['runtime']['status'], 'complete', result)
+        self.assertEqual(result['simplification_result']['outcome'], 'no-op')
+        self.assertEqual(result['simplification_result']['changed_paths'], [])
+
+    def test_skill_drift_wrong_pin_and_reused_profiles_refuse_without_new_model_calls(self):
+        prior = self.implementation()
+        request = self.request(prior)
+        wrong_pin = copy.deepcopy(request)
+        wrong_pin['skills'][0]['sha256'] = '0' * 64
+        self.assignment.refused(self.prepare(wrong_pin), 'skill_blocked')
+        reused = copy.deepcopy(request)
+        reused['profile']['home'] = prior['handoff']['profile']['home']
+        self.assignment.refused(self.prepare(reused), 'profile_claim_conflict')
+        prepared = self.assignment.ok(self.prepare(request))
+        skill = Path(request['skills'][0]['path'])
+        skill.write_text(skill.read_text() + '\nUnreviewed instruction drift.\n')
+        self.assignment.refused(self.case.launch(prepared), 'skill_blocked')
+        self.assertNotIn('runtime', self.assignment.ok(self.assignment.inspect(prepared)))
+        self.assertEqual(len(self.case.model_calls), 1)
+
+    def test_caller_result_without_whole_process_launch_cannot_create_candidate(self):
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior)))
+        report = self.assignment.result(prepared)
+        self.assignment.refused(self.assignment.command('assignment-result', report, prepared['assignment_id']), 'invalid_result')
+        observed = self.assignment.ok(self.assignment.inspect(prepared))
+        self.assertNotIn('submitted_result', observed)
+        self.assertNotIn('simplification_result', observed)
+        self.assertEqual(len(self.case.model_calls), 1)
+
+    def test_pause_keeps_prepared_stage_but_refuses_launch(self):
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior)))
+        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
+        self.assignment.refused(self.case.launch(prepared), 'iteration_paused')
+        self.assertNotIn('runtime', self.assignment.ok(self.assignment.inspect(prepared)))
+        self.assertEqual(len(self.case.model_calls), 1)
+
+    def test_stop_during_simplification_checks_never_accepts_candidate(self):
+        import time
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior)))
+        self.case.mode('checks-hang')
+        process = self.case.started(prepared)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            observed = self.assignment.ok(self.assignment.inspect(prepared))
+            runtime = observed.get('runtime')
+            if runtime and (Path(runtime['artifacts']) / 'checks/container-inspection.json').exists():
+                break
+            self.assertIsNone(process.poll())
+            time.sleep(.02)
+        else:
+            self.fail('Simplification checks did not start')
+        self.assignment.ok(self.assignment.command('stop-assignment', assignment=prepared['assignment_id']))
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, error)
+        result = json.loads(output)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertNotIn('simplification_result', result)
+        self.assertNotIn('submitted_result', result)
+        self.assertFalse((self.case.bin / 'container.json').exists())
+        observed = self.assignment.ok(self.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], result['runtime'])
+        self.assertNotIn('simplification_result', observed)
 
     def test_generic_prepare_cannot_substitute_requirements_standards_or_diff(self):
         prior = self.implementation()

@@ -250,7 +250,7 @@ nor validates a real Hermes profile home or proves isolation.
 | --- | --- | --- | --- |
 | `implementation` | `implementation` | `implement` | None |
 | `corrections` | `implementation` | `implement` | `candidate`, `findings` |
-| `simplify` | `simplification` | `simplify-code` | `candidate`, `implementation-evidence` |
+| `simplify` | `simplification` | `simplify-code` | Controller-correlated `candidate`, `implementation-evidence`, `implementation-diff` (see #12 seam below) |
 | `review-standards` | `review` | `code-review` (Standards only) | `candidate`, `simplification-evidence` |
 | `review-spec` | `review` | `code-review` (Spec only) | `candidate`, `simplification-evidence` |
 | `diagnosis` | `debug` | `diagnosing-bugs` | `failure-evidence` |
@@ -520,8 +520,22 @@ candidate drift and cancellation cannot be promoted to verified work.
 
 Even verified isolated execution leaves `execution_allowed=false`,
 `advance_allowed=false` and `close_allowed=false`. It neither schedules a next
-stage nor authorizes publication/merges. Separate simplification, independent
-Standards/Spec review and controlled integration remain authoritative.
+stage nor authorizes publication/merges. The explicit simplification seam below,
+independent Standards/Spec review and controlled integration remain authoritative.
+
+### Fresh simplification of a tested implementation (#12)
+
+`prepare-simplification` requires a completed controller-checked implementation
+assignment, not arbitrary preceding evidence. It retains original requirements,
+standards, baseline/diff and checked source pins; launch copies that exact
+sanitized implementation tree and reruns the unchanged verification commands.
+The installed `simplify-code` runs in one fresh context across reuse, quality,
+efficiency and altitude. Structured outcomes admit tested scoped cleanup or a
+no-op; risky findings cannot silently apply changes or approve anything.
+Scope/pin/schema/check failures refuse admission. Worker-native execution remains
+unattested and all review/merge/close authority stays disabled. See
+[the production contract and smallest live harness](../docs/fresh-simplification.md)
+for request/result schemas, exact revision hashing and remaining proof limits.
 
 Default CI tests exercise the public lifecycle using **labeled deterministic
 Docker, model and tracker fixtures**, plus real local HTTP/UDS protocol seams.
