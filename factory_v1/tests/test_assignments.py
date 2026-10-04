@@ -265,6 +265,65 @@ class AssignmentTests(unittest.TestCase):
         self.refused(self.command(request=altered), 'profile_claim_conflict')
         self.assertEqual(self.ok(self.inspect(prepared))['claim_id'], 'fixture-claim-implementation')
 
+    def test_assignment_claim_refuses_different_reservation_without_effects(self):
+        prepared = self.ok(self.command())
+        before = self.tracker.inspect()
+        self.fixture.calls.clear()
+        self.refused(self.tracker.control('reserve-ticket', issue=12), 'claim_conflict')
+        self.assertEqual(self.tracker.inspect(), before)
+        self.assertEqual(self.ok(self.inspect(prepared))['ticket_scope']['issue_number'], 10)
+        self.assertEqual(self.tracker.members[12]['fields']['STATUS'], 'Ready')
+        self.assert_no_external_writes()
+
+    def test_assignment_claim_allows_same_ticket_reservation_and_replay(self):
+        prepared = self.ok(self.command())
+        reserved = self.ok(self.tracker.control('reserve-ticket', issue=10))
+        self.assertEqual(reserved['ticket_work']['frontier']['active'], [10])
+        self.assertEqual(self.ok(self.tracker.control('reserve-ticket', issue=10))['reservation'], reserved['reservation'])
+        self.assertEqual(self.ok(self.command())['assignment_id'], prepared['assignment_id'])
+        self.assertEqual(self.ok(self.inspect(prepared))['ticket_scope']['issue_number'], 10)
+
+    def test_ticket_reservation_refuses_different_assignment_without_effects(self):
+        reserved = self.ok(self.tracker.control('reserve-ticket', issue=12))
+        self.fixture.calls.clear()
+        self.refused(self.command(), 'claim_conflict')
+        self.assertEqual(self.tracker.inspect(), reserved)
+        self.refused(self.command('inspect-assignment', assignment='unknown'), 'not_found')
+        self.assert_no_external_writes()
+
+    def test_concurrent_prepare_and_reserve_admit_only_one_ticket(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            prepare = pool.submit(self.command)
+            reserve = pool.submit(self.tracker.control, 'reserve-ticket', issue=12)
+            prepared, reserved = prepare.result(), reserve.result()
+        self.assertEqual(sorted(r.returncode for r in (prepared, reserved)), [0, 2])
+        denied = prepared if prepared.returncode == 2 else reserved
+        self.refused(denied, 'claim_conflict')
+        observed = self.tracker.inspect()
+        if prepared.returncode == 0:
+            assignment = self.ok(prepared)
+            self.assertNotIn('reservation', observed)
+            self.assertEqual(observed['ticket_work']['frontier']['active'], [])
+            self.assertEqual(self.ok(self.inspect(assignment))['ticket_scope']['issue_number'], 10)
+            self.assert_no_external_writes()
+        else:
+            self.assertEqual(observed['reservation']['issue_number'], 12)
+            self.assertEqual(observed['ticket_work']['frontier']['active'], [12])
+            self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
+            self.refused(self.command(), 'claim_conflict')
+
+    def test_concurrent_prepare_and_reserve_share_same_ticket(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            prepare = pool.submit(self.command)
+            reserve = pool.submit(self.tracker.control, 'reserve-ticket', issue=10)
+            prepared, reserved = self.ok(prepare.result()), self.ok(reserve.result())
+        self.assertEqual(reserved['reservation']['issue_number'], 10)
+        observed = self.tracker.inspect()
+        self.assertEqual(observed['ticket_work']['frontier']['active'], [10])
+        self.assertEqual(observed['reservation'], reserved['reservation'])
+        self.assertEqual(self.ok(self.inspect(prepared))['ticket_scope']['issue_number'], 10)
+        self.assertEqual(self.ok(self.command())['assignment_id'], prepared['assignment_id'])
+
     def test_concurrent_claims_admit_exactly_one_ticket(self):
         other = self.configuration(number=12)
         with ThreadPoolExecutor(max_workers=2) as pool:

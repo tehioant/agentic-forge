@@ -318,7 +318,10 @@ policy observations remain subject to current grant expiry and external revision
 Non-dry preparation adds only local `role_assignments` storage, leaving concurrent
 attention, spending and ticket lifecycle payloads unchanged. The shared lock
 serializes claims: one ticket scope globally and one top-level assignment per
-profile name/home. Exact replay returns the original identity and retained result;
+profile name/home. Ticket reservation checks the same durable assignment ownership
+before frontier checkpoints, reservation persistence or tracker status mutations;
+compatible same-ticket reservations remain allowed in either admission order.
+Exact replay returns the original identity and retained result;
 changed claim scope, profile collision or changed handoff conflicts. Claims survive
 restart and are never silently stolen, released or replaced, including stale
 requirements. There is deliberately no release/reconciliation command here; a

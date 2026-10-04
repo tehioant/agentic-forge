@@ -458,6 +458,15 @@ def frontier(database, item, github):
 
 
 def reserve(database, item, github, number):
+    from .assignments import ticket_claims
+
+    row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
+                           (item['project_id'], item['iteration_id'])).fetchone()
+    item = json.loads(row[0])
+    scope = {'project': item['project_id'], 'iteration': item['iteration_id'],
+             'repository': item['repository'], 'issue_number': number,
+             'repository_id': item.get('repository_onboarding', {}).get('metadata', {}).get('id')}
+    ticket_claims(database, scope)
     item = frontier(database, item, github)
     active(item)
     work = item['ticket_work']

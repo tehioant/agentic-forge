@@ -129,9 +129,17 @@ def current(database, project, iteration, operator, require_active=True):
     return item
 
 
+def ticket_claims(database, scope):
+    """Check durable role ownership for every supplied ticket identity field."""
+    existing = rows(database)
+    for old in existing:
+        require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
+                'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
+    return existing
+
+
 def claims(database, request, scope, assignment_id):
-    for old in rows(database):
-        require(old['ticket_scope'] == scope, 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
+    for old in ticket_claims(database, scope):
         if old['assignment_id'] == assignment_id:
             continue
         require(old['claim_id'] != request['claim_id'], 'Claim identity already binds a different assignment.', 'claim_conflict')
