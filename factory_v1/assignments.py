@@ -25,6 +25,9 @@ PRECEDING = {
     'diagnosis': {'failure-evidence'}, 'repair': {'incident-evidence'},
 }
 CONTRACT = 'factory-bounded-result-v1'
+REQUEST_FIELDS = {'stage', 'profile', 'repository', 'repository_id', 'workspace', 'issue',
+                  'spec_commit', 'baseline', 'candidate', 'standards', 'preceding', 'skills',
+                  'capabilities', 'result_contract', 'claim_id'}
 
 
 def digest(value):
@@ -62,10 +65,7 @@ def artifacts(values, required, code='invalid_assignment'):
 
 
 def validate(request):
-    keys = {'stage', 'profile', 'repository', 'repository_id', 'workspace', 'issue',
-            'spec_commit', 'baseline', 'candidate', 'standards', 'preceding', 'skills',
-            'capabilities', 'result_contract', 'claim_id'}
-    require(isinstance(request, dict) and set(request) == keys, 'Provide only the bounded assignment fields.', 'invalid_assignment')
+    require(isinstance(request, dict) and set(request) == REQUEST_FIELDS, 'Provide only the bounded assignment fields.', 'invalid_assignment')
     stage = request['stage']
     role_skills.closure(stage)
     profile = request['profile']
@@ -278,8 +278,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     tests = request['tests']
     require(isinstance(tests, list) and tests and all(isinstance(t, dict) and set(t) == {'command', 'result'} and
             text(t['command']) and text(t['result']) for t in tests), 'Actual command/result evidence or explicit missing capability required.', 'invalid_result')
-    original = {key: handoff[key] for key in {'stage', 'profile', 'repository', 'repository_id', 'workspace', 'issue',
-                'spec_commit', 'baseline', 'candidate', 'standards', 'preceding', 'skills', 'capabilities', 'result_contract', 'claim_id'}}
+    original = {key: handoff[key] for key in REQUEST_FIELDS}
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
     old = assignment.get('submitted_result')
