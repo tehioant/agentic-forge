@@ -60,6 +60,21 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(set(request['payload']), {'input', 'reasoning'})
         self.assertEqual(request['payload']['reasoning'], {'effort': 'high'})
 
+    def test_native_hermes_cache_key_is_local_only_metadata(self):
+        status, content = self.post({'model': 'gpt-6.1-sol', 'stream': True, 'store': False,
+            'input': 'x', 'reasoning': {'effort': 'high', 'summary': 'auto'},
+            'include': ['reasoning.encrypted_content'], 'prompt_cache_key': 'pck_native_hermes'})
+        self.assertEqual(status, 200)
+        self.assertIn('response.completed', content)
+        self.assertEqual(self.calls[0]['payload'], {'input': 'x', 'reasoning': {'effort': 'high'}})
+
+    def test_invalid_cache_metadata_never_reaches_socket(self):
+        for key in (None, 123, {}, '', 'x' * 129):
+            status, _ = self.post({'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x',
+                                   'prompt_cache_key': key})
+            self.assertEqual(status, 400)
+        self.assertEqual(self.calls, [])
+
     def test_wrong_model_arbitrary_route_and_extra_provider_fields_never_reach_socket(self):
         for payload, path in [({'model': 'paid-model', 'stream': True, 'input': 'x'}, '/v1/responses'),
                               ({'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x'}, '/v1/chat/completions'),

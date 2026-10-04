@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -20,6 +21,9 @@ def main():
     os.chdir('/workspace')
     for path in ('/scratch/tmp', '/scratch/home/.hermes'):
         Path(path).mkdir(parents=True, exist_ok=True)
+    # Keep all six admitted file/terminal tools direct; discovery wrappers are not capabilities.
+    subprocess.run([sys.executable, '-m', 'hermes_cli.main', 'config', 'set',
+                    'tools.tool_search.enabled', 'off'], check=True, capture_output=True, timeout=30)
     from model_tools import handle_function_call
     from run_agent import AIAgent
 

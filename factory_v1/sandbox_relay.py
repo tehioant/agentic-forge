@@ -57,7 +57,10 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('invalid_route')
             request = json.loads(self.rfile.read(size))
             allowed = {'model', 'stream', 'store', 'input', 'instructions', 'tools', 'tool_choice',
-                       'parallel_tool_calls', 'reasoning', 'include', 'max_output_tokens', 'service_tier'}
+                       'parallel_tool_calls', 'reasoning', 'include', 'max_output_tokens', 'service_tier', 'prompt_cache_key'}
+            if 'prompt_cache_key' in request and (not isinstance(request['prompt_cache_key'], str) or
+                    not 0 < len(request['prompt_cache_key']) <= 128):
+                raise ValueError('invalid_request')
             if (not isinstance(request, dict) or set(request) - allowed or request.get('model') != MODEL or
                     request.get('stream') is not True or request.get('store', False) is not False or
                     request.get('service_tier', 'default') != 'default' or 'input' not in request):
