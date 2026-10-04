@@ -29,6 +29,9 @@ def main():
     docker = Docker()
     reason = 'controller_finished'
     while not (root / 'guard-finish').exists():
+        if (root / 'stop').exists():
+            reason = 'cancelled'
+            break
         if process_identity(record['controller_pid']) != record['controller_start']:
             reason = 'controller_lost'
             break

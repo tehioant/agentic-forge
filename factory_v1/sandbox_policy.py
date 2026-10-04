@@ -27,9 +27,14 @@ def load_config(path):
                 'Launcher config must be a private controller-owned file.', 'invalid_launcher')
         from .repositories import unambiguous_fields
         config = json.loads(path.read_text(), object_pairs_hook=unambiguous_fields)
-        require(isinstance(config, dict) and set(config) == {'image', 'uid', 'subscription_socket', 'artifacts_root', 'limits'} and
+        require(isinstance(config, dict) and {'image', 'uid', 'subscription_socket', 'artifacts_root', 'limits'} <= set(config) <=
+                {'image', 'uid', 'subscription_socket', 'artifacts_root', 'limits', 'verification_commands'} and
                 config['image'] == IMAGE and type(config['uid']) is int and 0 < config['uid'] < 2**31,
                 'Only the reviewed image, identity, resource limits, artifact root and subscription socket are configurable.', 'invalid_launcher')
+        checks = config.get('verification_commands', [])
+        require(isinstance(checks, list) and len(checks) <= 8 and
+                all(isinstance(value, str) and value.strip() and '\0' not in value and len(value) <= 1024
+                    for value in checks), 'Use bounded controller-admitted verification commands.', 'invalid_launcher')
         require(isinstance(config['limits'], dict) and set(config['limits']) == set(LIMITS),
                 'Supply explicit bounded launcher limits.', 'invalid_launcher')
         for key, (low, high) in LIMITS.items():

@@ -396,7 +396,7 @@ gates, not permissions granted by this interface.
 
 Only the trusted operator/controller supplies `--launcher-config`. It is a
 controller-owned mode-0600 regular JSON file outside the assignment workspace,
-with exactly these fields (the artifact root must already exist, be mode 0700,
+with these fields and optional `verification_commands` (the artifact root must already exist, be mode 0700,
 and belong to the controller):
 
 ```json
@@ -405,6 +405,7 @@ and belong to the controller):
   "uid": 10000,
   "subscription_socket": "/absolute/private/approved-subscription.sock",
   "artifacts_root": "/absolute/private/factory-artifacts",
+  "verification_commands": ["python -m unittest discover -v"],
   "limits": {
     "seconds": 1800,
     "max_calls": 100,
@@ -494,10 +495,22 @@ adaptation to the fresh conversation. It retains `events.jsonl`, `loads.json`,
 `probes.json`, the conversation, structured result and actual command outputs in
 scratch. Durable artifacts additionally include exact input/skill/dependency
 identities, initial and returned source manifests, model request/response evidence,
-Docker command/inspection and crash/container logs. Result verification correlates
-tool reads with exact pinned bytes and reported tests with retained actual
-terminal calls. Worker-created symlinks/devices and malformed/oversized evidence
-are recoverable refusals, never accepted work.
+Docker command/inspection and crash/container logs. Worker-written transcripts
+and results are untrusted reports: consistency checks do not attest that a claimed
+terminal call ran. They remain `trusted_execution=false`; containment is recorded
+separately as `isolated_execution=true`. Claimed tests are retained as
+`worker-reported-tests.json`, never mislabeled verified tests. Worker-created
+symlinks/devices and malformed/oversized evidence are recoverable refusals.
+
+Optional `verification_commands` are supplied only by the private controller
+configuration, never derived from worker claims. The controller reruns them in
+the same admitted Docker isolation with read-only candidate source, fresh scratch
+and no model socket, reusing the existing attempt/container/guard lifecycle and
+deadline. No candidate code executes on the host. Exact commands, bounded output,
+exit status, run ID and unchanged candidate manifest are retained outside worker
+mounts as `controller-checks.json`; only these independent checks can set
+`checks_verified=true`. Missing checks remain unverified. Failure, truncated output,
+candidate drift and cancellation cannot be promoted to verified work.
 
 Even verified isolated execution leaves `execution_allowed=false`,
 `advance_allowed=false` and `close_allowed=false`. It neither schedules a next

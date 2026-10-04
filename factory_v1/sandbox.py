@@ -19,6 +19,7 @@ from . import assignments, spending
 from .planning import require
 from .repositories import RepositoryError, state_lock
 from .sandbox_guard import process_identity
+from .sandbox_checks import verify_checks
 from .sandbox_policy import Docker, command, load_config, retain_logs, verify
 from .sandbox_source import manifest, physical, snapshot
 
@@ -82,7 +83,7 @@ def authorize(database, project, iteration, operator, assignment_id, run_id, req
 
 
 def check_worker_evidence(assignment, root, inputs):
-    """Check retained tool loads/commands against exact files, not names or success flags."""
+    """Validate worker report consistency without attesting its execution claims."""
     scratch = root / 'scratch'
     for name in ('result.json', 'loads.json', 'events.jsonl', 'conversation.json', 'probes.json'):
         path = physical(scratch / name)
@@ -125,7 +126,7 @@ def check_worker_evidence(assignment, root, inputs):
             'Reported tests must match retained actual terminal command/results.', 'invalid_result')
     require(any((root / 'model-evidence').glob('response-*.json')),
             'No admitted model response evidence.', 'invalid_result')
-    (root / 'verified-tests.json').write_text(json.dumps(executions))
+    (root / 'worker-reported-tests.json').write_text(json.dumps(executions))
     return result
 
 
@@ -278,17 +279,27 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             if not writable:
                 require(source == pins['workspace'], 'Read-only source changed.', 'invalid_result')
             require(not (root / 'workspace' / '.git').exists(), 'Worker Git metadata is not a source artifact.', 'invalid_result')
+            if (root / 'container.log').is_file():
+                shutil.copyfile(root / 'container.log', root / 'worker-container.log')
+            with closing(sqlite3.connect(state)) as database, state_lock(database):
+                assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
+                assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
+            checks_verified = verify_checks(root, config, runtime, deadline)
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 result = check_worker_evidence(assignment, root, selected_inputs)
                 assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github)
-                assignment['result_disposition'].update(trusted_execution=True, advance_allowed=False,
-                    close_allowed=False, reason='isolated_artifacts_require_separate_simplification_and_two_axis_review')
+                assert assignment is not None
+                assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
+                    checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
+                    reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
                 save(database, assignment)
             status = 'complete'
     except RepositoryError as error:
         error_code = error.code
-        if status != 'stopped':
+        if error.code == 'cancelled':
+            status = 'stopped'
+        elif status != 'stopped':
             status = 'failed'
     except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, subprocess.SubprocessError, sqlite3.Error):
         error_code = 'recoverable_run_error'
@@ -309,6 +320,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 error_code, status = 'stop_unconfirmed', 'unconfirmed'
         if broker:
             broker.join(timeout=1)
+            if broker.is_alive() or broker_errors:
+                error_code, status = 'stop_unconfirmed', 'unconfirmed'
         if capability and (not broker or not broker.is_alive()):
             shutil.rmtree(capability, ignore_errors=True)
         for signum, handler in signals.items():

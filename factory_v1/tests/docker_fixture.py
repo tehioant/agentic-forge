@@ -21,6 +21,16 @@ def option(name):
 
 def run_fixture(container):
     mounts = {m['Destination']: Path(m['Source']) for m in container['Mounts'] if m['Type'] == 'bind'}
+    check_path = mounts['/inputs'] / 'checks.json'
+    if check_path.exists():
+        check = json.loads(check_path.read_text())
+        mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+        exit_code = 1 if mode == 'checks-fail' else 0
+        container['State']['ExitCode'] = exit_code
+        container['check_report'] = {'run_id': check['run_id'], 'records': [
+            {'command': value, 'exit_code': exit_code, 'stdout': 'Labeled Docker CHECK fixture, not live execution',
+             'stderr': '', 'output_truncated': False} for value in check['commands']]}
+        return
     envelope = json.loads((mounts['/inputs'] / 'assignment.json').read_text())
     assignment = envelope['assignment']
     # Exercise the actual per-attempt host spending UDS; no fixture bypass of admission.
@@ -121,7 +131,9 @@ elif args[0] == 'inspect':
     container = json.loads(STATE.read_text())
     if removal.exists():
         container['State']['Status'] = 'removing'
-    if container['State']['Running'] and not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() in ('hang', 'stop-race')):
+    mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+    check_hang = mode == 'checks-hang' and 'check_report' in container
+    if container['State']['Running'] and mode not in ('hang', 'stop-race') and not check_hang:
         container['polls'] = container.get('polls', 0) + 1
         if container['polls'] >= 3:
             container['State']['Running'] = False
@@ -137,7 +149,9 @@ elif args[0] == 'start':
 elif args[0] == 'logs':
     if not STATE.exists():
         sys.exit(1)
-    print('Labeled deterministic Docker fixture log. NOT live Hermes execution.')
+    container = json.loads(STATE.read_text())
+    print(json.dumps(container['check_report']) if 'check_report' in container else
+          'Labeled deterministic Docker fixture log. NOT live Hermes execution.')
 elif args[0] == 'rm':
     removal = ROOT / 'removal-in-progress'
     if STATE.exists() and not removal.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
