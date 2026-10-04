@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -22,6 +23,7 @@ class BugTests(unittest.TestCase):
         self.patch_drop = False
         self.patch_omit = False
         self.patch_mismatch = False
+        self.patch_scope_mismatch = False
         parent = self.case.fixture.server.RequestHandlerClass
         case = self
 
@@ -34,6 +36,8 @@ class BugTests(unittest.TestCase):
                     case.case.issues[number].update(data)
                 if case.patch_mismatch:
                     case.case.issues[number]['body'] += '\nUnexpected edit.'
+                if case.patch_scope_mismatch:
+                    case.case.issues[number]['milestone']['id'] = 999
                 if case.patch_drop:
                     case.patch_drop = False
                     self.close_connection = True
@@ -107,6 +111,107 @@ class BugTests(unittest.TestCase):
         self.assertFalse(item['execution_allowed'])
         self.assertFalse(any(c[0] != 'GET' and '/issues/7' in c[1] for c in self.case.fixture.calls))
         self.assertEqual(self.native.milestones, [{'id': 501, 'number': 1, 'title': 'm1', 'state': 'open'}])
+
+    def assert_normalized_affected_publication(self, body, expected_body, dropped=None):
+        self.case.issues[10]['body'] = body
+        untouched = copy.deepcopy((self.case.issues[11], self.case.issues[12], self.case.planning.published))
+        request = self.completion(status='blocked')
+        if dropped == 'issue':
+            self.case.drop = 'issue'
+        if dropped == 'body':
+            self.patch_drop = True
+        item = self.complete(request)
+        if dropped:
+            self.assertEqual(self.work(item)['status'], 'blocked')
+            self.assertFalse(self.work(item).get('publication_complete', False))
+            self.assertEqual(self.case.deps, {11: [10]})
+            if dropped == 'issue':
+                self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [12])
+            item = self.retry(request['assignment_id'])
+        work = self.work(item)
+        self.assertEqual(work['status'], 'published')
+        self.assertTrue(work['publication_complete'])
+        self.assertEqual(work['identity'], {'number': 13, 'id': 1013, 'node_id': 'I13'})
+        self.assertEqual(self.case.issues[10]['body'], expected_body)
+        self.assertEqual(self.case.deps, {11: [10], 10: [13]})
+        self.assertEqual(self.case.issues[10]['milestone']['id'], 501)
+        self.assertEqual(self.case.issues[13]['milestone']['id'], 501)
+        self.assertEqual(untouched, (self.case.issues[11], self.case.issues[12], self.case.planning.published))
+        self.assertEqual(self.work(self.case.inspect()), work)
+        before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+        call_count = len(self.case.fixture.calls)
+        self.assertEqual(self.work(self.complete(request))['status'], 'published')
+        self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
+        self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+        self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and c[1] != '/graphql'
+                             for c in self.case.fixture.calls[call_count:]))
+        creates = [c for c in self.case.fixture.calls if c[0] == 'POST' and c[1] == '/repos/example/product/issues']
+        self.assertEqual(len(creates), 4)  # Three feature fixtures and exactly one bug.
+        self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [12])
+        for number in (10, 11, 13):
+            self.assertEqual(self.case.control('reserve-ticket', issue=number).returncode, 2)
+        self.assertEqual(self.case.ok(self.case.control('reserve-ticket', issue=12))['reservation']['status'], 'reserved')
+
+    def test_affected_heading_whitespace_completion_and_replay(self):
+        body = self.case.issues[10]['body'].replace('## Blocked by\n', '## Blocked by \t\n')
+        self.assert_normalized_affected_publication(body, body.replace('None (can start immediately).', '- #13'))
+
+    def test_affected_heading_leading_whitespace_completion_and_replay(self):
+        body = self.case.issues[10]['body'].replace('## Blocked by\n', '##  Blocked by\n')
+        self.assert_normalized_affected_publication(body, body.replace('None (can start immediately).', '- #13'))
+
+    def test_affected_content_whitespace_completion_and_replay(self):
+        content = '\n \t\n  None (can start immediately). \t\n\n'
+        body = self.case.issues[10]['body'].replace('\nNone (can start immediately).\n\n', content)
+        self.assert_normalized_affected_publication(body, body.replace(content, '\n- #13\n\n'))
+
+    def test_affected_section_crlf_lost_issue_response_replay(self):
+        section = '## Blocked by\n\nNone (can start immediately).\n\n'
+        body = self.case.issues[10]['body'].replace(section, section.replace('\n', '\r\n'))
+        self.assert_normalized_affected_publication(body, body.replace('None (can start immediately).', '- #13'), 'issue')
+
+    def test_affected_body_crlf_lost_patch_response_replay(self):
+        body = self.case.issues[10]['body'].replace('\n', '\r\n')
+        self.assert_normalized_affected_publication(body, body.replace('None (can start immediately).', '- #13'), 'body')
+
+    def test_stale_affected_text_intent_refuses_native_mutation_on_replay(self):
+        request = self.completion(status='blocked')
+        self.patch_omit = True
+        item = self.complete(request)
+        work = self.work(item)
+        self.assertEqual(work['status'], 'blocked')
+        self.assertFalse(work.get('publication_complete', False))
+        work['affected_intents']['10']['body'] = work['affected_intents']['10']['before']
+        with sqlite3.connect(self.case.fixture.state) as database:
+            database.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+        self.patch_omit = False
+        before = copy.deepcopy((self.case.issues, self.case.members, self.case.deps))
+        self.case.fixture.calls.clear()
+        work = self.work(self.retry(request['assignment_id']))
+        self.assertEqual(work['status'], 'blocked')
+        self.assertEqual(work['blocker']['code'], 'publication_mismatch')
+        self.assertFalse(work.get('publication_complete', False))
+        self.assertEqual((self.case.issues, self.case.members, self.case.deps), before)
+        self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and '/dependencies/' in c[1]
+                             for c in self.case.fixture.calls))
+        self.assertEqual(self.work(self.case.inspect()), work)
+        self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [12])
+        self.assertEqual(self.case.ok(self.case.control('reserve-ticket', issue=12))['reservation']['status'], 'reserved')
+
+    def test_affected_scope_checked_before_publication_complete_and_retry(self):
+        request = self.completion(status='blocked')
+        original_scope = copy.deepcopy(self.case.issues[10]['milestone'])
+        self.patch_scope_mismatch = True
+        work = self.work(self.complete(request))
+        self.assertEqual(work['status'], 'blocked')
+        self.assertEqual(work['blocker']['code'], 'projects_blocked')
+        self.assertFalse(work.get('publication_complete', False))
+        self.assertEqual(self.work(self.case.inspect()), work)
+        self.patch_scope_mismatch = False
+        self.case.issues[10]['milestone'] = original_scope
+        self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
+        self.assertEqual(self.case.deps, {11: [10], 10: [13]})
+        self.assertEqual(len(self.case.issues), 4)
 
     def test_ready_current_bug_is_required_and_completion_releases_affected_work(self):
         work = self.work(self.complete(self.completion()))

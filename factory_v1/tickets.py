@@ -119,7 +119,7 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
                 (story is None and requirement in milestone), 'Requirement reference is not defined in the pinned assigned scope.')
 
 
-def sections(body):
+def section_spans(body):
     headings = list(re.finditer(r'^## ([^\n]+)\n', body, re.MULTILINE))
     result = {}
     for index, heading in enumerate(headings):
@@ -127,8 +127,15 @@ def sections(body):
         if name in result:
             return None
         end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
-        result[name] = body[heading.end():end].strip()
+        result[name] = (heading.end(), end)
     return result
+
+
+def sections(body):
+    spans = section_spans(body)
+    if spans is None:
+        return None
+    return {name: body[start:end].strip() for name, (start, end) in spans.items()}
 
 
 def external_contract(issue, inputs, document_names=('milestone.md',)):

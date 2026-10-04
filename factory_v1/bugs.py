@@ -251,15 +251,23 @@ def affected_edges(database, item, work, github, issue):
                 'Affected issue identity replaced.', 'publication_mismatch')
         intents = work.setdefault('affected_intents', {})
         key = str(number)
+        expected_numbers = sorted({d['number'] for d in original['dependencies']} | {issue['number']})
         if key not in intents:
             require(dependent == original['issue'], 'Affected work changed before edge publication.', 'bug_conflict')
-            expected_numbers = sorted({d['number'] for d in original['dependencies']} | {issue['number']})
-            replacement = '## Blocked by\n\n' + '\n'.join('- #' + str(n) for n in expected_numbers) + '\n\n'
-            target = re.sub(r'^## Blocked by\n.*?(?=^## |\Z)', lambda m: replacement,
-                            dependent['body'], count=1, flags=re.MULTILINE | re.DOTALL)
+            spans = tickets.section_spans(dependent['body']) or {}
+            require('Blocked by' in spans,
+                    'Affected blocker section is missing or ambiguous.', 'publication_mismatch')
+            start, end = spans['Blocked by']
+            newline = '\r\n' if dependent['body'][start - 2:start] == '\r\n' else '\n'
+            replacement = newline + newline.join('- #' + str(n) for n in expected_numbers) + newline * 2
+            target = dependent['body'][:start] + replacement + dependent['body'][end:]
             intents[key] = {'before': dependent['body'], 'body': target}
             tickets.checkpoint(database, item)
         intent = intents[key]
+        require(tickets.external_contract({**dependent, 'body': intent['body']}, work['inputs']) and
+                set(re.findall(r'#([1-9][0-9]*)', sections(intent['body']).get('Blocked by', ''))) ==
+                {str(n) for n in expected_numbers},
+                'Affected text intent does not contain the exact desired blockers.', 'publication_mismatch')
         require(dependent['body'] in {intent['before'], intent['body']}, 'Affected body conflicts with scoped edge update.', 'publication_mismatch')
         if dependent['body'] != intent['body']:
             github.request('/repos/' + item['repository'] + '/issues/' + str(number), {'body': intent['body']}, method='PATCH')
@@ -403,6 +411,7 @@ def publish_locked(database, item, work, github):
         affected_edges(database, item, work, github, issue)
         observation = observe(item, github, board, gh.read_issue(github, item['repository'], issue['number']))
         verify_observation(item, work, observation)
+        verify_affected(item, work, github, issue)
         work.update(status='duplicate' if duplicate is not None else 'published', publication_complete=True, observation=observation)
         work.pop('blocker', None)
         transition(item, 'bug_tracked')
