@@ -179,8 +179,8 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
-    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment']:
-        control = commands.add_parser(name, help='Bounded role handoff; worker launch remains disabled.')
+    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment']:
+        control = commands.add_parser(name, help='Bounded role assignment and trusted full-process sandbox lifecycle.')
         control.add_argument('--project', required=True)
         control.add_argument('--iteration', required=True)
         if name in {'prepare-assignment', 'assignment-result'}:
@@ -210,16 +210,29 @@ def main():
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
-    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment'}:
+    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
         from . import assignments
         from .repositories import GitHub, RepositoryError
         import fcntl
         try:
             if args.command == 'launch-assignment':
-                if args.launcher_config:
-                    from .sandbox_policy import load_config
-                    load_config(args.launcher_config)
-                assignments.launch()
+                if not args.launcher_config:
+                    assignments.launch()
+                from .sandbox import launch
+                if not args.api_base:
+                    raise IntakeError('invalid_launcher', 'Launch requires the trusted read-only tracker route.')
+                result = launch(str(Path(args.state).resolve()), args.project, args.iteration, args.operator_id,
+                                args.assignment, args.launcher_config, GitHub(args.api_base, args.bearer, args.timeout))
+                print(json.dumps(result, sort_keys=True))
+                return
+            if args.command in {'stop-assignment', 'reconcile-assignment'}:
+                from .sandbox import stop_assignment, reconcile
+                uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+                with closing(sqlite3.connect(uri, uri=True)) as database:
+                    operation = stop_assignment if args.command == 'stop-assignment' else reconcile
+                    result = operation(database, args.project, args.iteration, args.operator_id, args.assignment)
+                print(json.dumps(result, sort_keys=True))
+                return
             request = None
             if hasattr(args, 'request'):
                 with open(args.request, encoding='utf-8') as source:

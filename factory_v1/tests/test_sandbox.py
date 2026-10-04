@@ -2,6 +2,12 @@
 import json
 import os
 import subprocess
+import shutil
+import socketserver
+import threading
+import time
+import sys
+from http.server import BaseHTTPRequestHandler
 import unittest
 from pathlib import Path
 
@@ -32,6 +38,59 @@ class SandboxTests(unittest.TestCase):
             'subscription_socket': str(self.root / 'subscription.sock'), 'artifacts_root': str(self.artifacts),
             'limits': {'seconds': 30, 'max_calls': 10, 'memory_mb': 512, 'cpus': 1, 'pids': 64, 'scratch_mb': 64}}))
         self.config.chmod(0o600)
+        self.bin = self.root / 'docker-fixture'
+        self.bin.mkdir()
+        shutil.copyfile(Path(__file__).parent / 'docker_fixture.py', self.bin / 'docker')
+        (self.bin / 'docker').chmod(0o755)
+        old_path = os.environ['PATH']
+        os.environ['PATH'] = str(self.bin) + os.pathsep + old_path
+        self.addCleanup(os.environ.__setitem__, 'PATH', old_path)
+        case = self
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_POST(self):
+                payload = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+                case.model_calls.append((self.path, payload))
+                response = {'id': 'resp_fixture', 'object': 'response', 'status': 'completed',
+                    'model': 'gpt-6.1-sol', 'output': [{'type': 'message', 'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': 'Labeled deterministic model fixture'}]}]}
+                data = ('data: ' + json.dumps({'type': 'response.completed', 'response': response}) + '\n\n').encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Content-Length', str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+        self.model_calls = []
+        self.upstream = socketserver.UnixStreamServer(str(self.root / 'subscription.sock'), Handler)
+        self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
+        self.upstream_thread.start()
+        self.addCleanup(self.stop_upstream)
+
+    def stop_upstream(self):
+        self.upstream.shutdown()
+        self.upstream.server_close()
+        self.upstream_thread.join()
+
+    def mode(self, mode):
+        (self.bin / 'mode').write_text(mode)
+
+    def started(self, prepared):
+        args = [sys.executable, '-m', 'factory_v1', '--state', str(self.assignment.fixture.state), '--operator-id', '42',
+            'launch-assignment', '--project', 'product', '--iteration', 'm1', '--assignment', prepared['assignment_id'],
+            '--launcher-config', str(self.config), '--api-base', self.assignment.fixture.base]
+        process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: process.kill() if process.poll() is None else None)
+        return process
+
+    def wait_running(self, prepared):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            assignment = self.assignment.ok(self.assignment.inspect(prepared))
+            if assignment.get('runtime', {}).get('status') == 'running':
+                return assignment
+            time.sleep(.05)
+        self.fail('Fixture attempt did not become running')
 
     def launch(self, prepared, **kwargs):
         return self.assignment.command('launch-assignment', assignment=prepared['assignment_id'],
@@ -46,6 +105,113 @@ class SandboxTests(unittest.TestCase):
         observed = self.assignment.ok(self.assignment.inspect(prepared))
         self.assertNotIn('runtime', observed)
         self.assertEqual(list(self.artifacts.iterdir()), [])
+
+
+    def test_launch_returns_verified_scoped_artifacts_without_modifying_original_source(self):
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'complete', launched)
+        self.assertTrue(launched['runtime']['container_removed'])
+        self.assertTrue(launched['result_disposition']['trusted_execution'])
+        self.assertFalse(launched['result_disposition']['advance_allowed'])
+        self.assertFalse(launched['result_disposition']['close_allowed'])
+        root = Path(launched['runtime']['artifacts'])
+        self.assertEqual((root / 'workspace/hello.py').read_text(), 'print("candidate fixture")\n')
+        self.assertEqual((self.source / 'hello.py').read_text(), 'print("baseline")\n')
+        self.assertFalse((root / 'workspace/.git').exists())
+        self.assertEqual(len(self.model_calls), 1)
+        self.assertEqual(self.model_calls[0][0], '/v1/responses')
+        self.assertEqual(self.model_calls[0][1]['model'], 'gpt-6.1-sol')
+        observed = self.assignment.ok(self.assignment.inspect(prepared))
+        self.assertEqual(observed['submitted_result'], launched['submitted_result'])
+        self.assignment.refused(self.launch(prepared), 'run_conflict')
+        self.assertFalse((self.bin / 'container.json').exists())
+        self.assignment.assert_no_external_writes()
+
+    def test_review_mount_is_read_only_and_returns_unchanged_candidate(self):
+        self.assignment.request = self.assignment.configuration(stage='review-standards')
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.source, text=True).strip()
+        self.assignment.request.update(baseline=head, candidate=head)
+        self.assignment.request['preceding'][0] = test_assignments.artifact('candidate', head)
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'complete', launched)
+        root = Path(launched['runtime']['artifacts'])
+        inspection = json.loads((root / 'container-inspection.json').read_text())
+        self.assertFalse(next(m for m in inspection['Mounts'] if m['Destination'] == '/workspace')['RW'])
+        self.assertEqual((root / 'workspace/hello.py').read_text(), 'print("baseline")\n')
+
+    def test_bad_physical_pin_is_recoverable_and_never_starts_worker(self):
+        self.assignment.request['baseline'] = 'a' * 40
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['status'], 'failed')
+        self.assertEqual(launched['runtime']['error'], 'source_blocked')
+        self.assertEqual(self.model_calls, [])
+        self.assertNotIn('submitted_result', launched)
+
+    def test_unexpected_anonymous_mount_refuses_before_model_or_start(self):
+        self.mode('extra-mount')
+        prepared = self.assignment.ok(self.assignment.command())
+        launched = self.assignment.ok(self.launch(prepared))
+        self.assertEqual(launched['runtime']['error'], 'isolation_unavailable')
+        self.assertEqual(self.model_calls, [])
+        self.assertFalse((self.bin / 'container.json').exists())
+
+    def test_malformed_result_and_forged_loads_retain_artifacts_but_never_advance(self):
+        for mode in ('malformed', 'bad-load', 'symlink'):
+            with self.subTest(mode=mode):
+                # Separate fresh role claims on the same ticket; no retry steals old ownership.
+                self.mode(mode)
+                self.assignment.request['profile']['name'] = 'factory-' + mode
+                self.assignment.request['profile']['home'] = str(self.root / ('profile-' + mode))
+                self.assignment.request['claim_id'] = 'claim-' + mode
+                prepared = self.assignment.ok(self.assignment.command())
+                launched = self.assignment.ok(self.launch(prepared))
+                self.assertEqual(launched['runtime']['status'], 'failed')
+                self.assertIn(launched['runtime']['error'], ('invalid_result', 'source_blocked', 'unsafe_path'))
+                self.assertNotIn('submitted_result', launched)
+                self.assertTrue(Path(launched['runtime']['artifacts']).is_dir())
+                self.assertFalse((self.bin / 'container.json').exists())
+
+    def test_pause_and_changed_ticket_refuse_before_any_attempt(self):
+        prepared = self.assignment.ok(self.assignment.command())
+        self.assignment.tracker.issues[10]['body'] += '\nMaterial scope change'
+        self.assignment.refused(self.launch(prepared), 'scope_mismatch')
+        self.assertNotIn('runtime', self.assignment.ok(self.assignment.inspect(prepared)))
+        self.assertEqual(self.model_calls, [])
+        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
+        self.assignment.refused(self.launch(prepared), 'iteration_paused')
+
+    def test_stop_and_controller_death_remove_real_fixture_process_target_and_retain_evidence(self):
+        self.mode('hang')
+        prepared = self.assignment.ok(self.assignment.command())
+        process = self.started(prepared)
+        running = self.wait_running(prepared)
+        response = self.assignment.command('stop-assignment', assignment=prepared['assignment_id'])
+        stopped = self.assignment.ok(response)
+        self.assertEqual(stopped['runtime']['status'], 'stopped')
+        process.communicate(timeout=10)
+        self.assertFalse((self.bin / 'container.json').exists())
+        self.assertTrue((Path(running['runtime']['artifacts']) / 'container.log').is_file())
+        # Fresh owned profile for the separate crash case.
+        self.assignment.request['profile']['name'] = 'factory-crash'
+        self.assignment.request['profile']['home'] = str(self.root / 'profile-crash')
+        self.assignment.request['claim_id'] = 'claim-crash'
+        prepared = self.assignment.ok(self.assignment.command())
+        process = self.started(prepared)
+        running = self.wait_running(prepared)
+        process.kill()
+        process.communicate(timeout=5)
+        root = Path(running['runtime']['artifacts'])
+        deadline = time.monotonic() + 10
+        while not (root / 'guard-result.json').exists() and time.monotonic() < deadline:
+            time.sleep(.05)
+        self.assertEqual(json.loads((root / 'guard-result.json').read_text())['reason'], 'controller_lost')
+        self.assertFalse((self.bin / 'container.json').exists())
+        reconciled = self.assignment.ok(self.assignment.command('reconcile-assignment', assignment=prepared['assignment_id']))
+        self.assertEqual(reconciled['runtime']['error'], 'controller_lost')
+        self.assertTrue(reconciled['runtime']['recoverable'])
 
 
 if __name__ == '__main__':
