@@ -207,7 +207,23 @@ def main():
         if name == 'deliver':
             attention_command.add_argument('--event', required=True)
             attention_command.add_argument('--transport-config')
+    publication = commands.add_parser('publish-candidate', help='Host-only exact candidate publication; never merge or close.')
+    for option in ('project', 'iteration', 'assignment', 'publication-config'):
+        publication.add_argument('--' + option, required=True)
+    publication.add_argument('--plan-only', action='store_true', help='Read-only deterministic candidate plan, not publication approval.')
     args = parser.parse_args()
+    if args.command == 'publish-candidate':
+        from .publication import publish
+        from .repositories import RepositoryError
+        try:
+            uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+            with closing(sqlite3.connect(uri, uri=True)) as database:
+                result = publish(database, args.project, args.iteration, args.operator_id, args.assignment,
+                                 args.publication_config, args.plan_only)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
     if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
