@@ -132,6 +132,30 @@ def _block(database, item, reason, scope):
     _save(database, item)
 
 
+def admission_preview(database, scope, reserve=1, now=None, allowance_only=True):
+    """Read-only policy check; actual operations must still reserve at call time."""
+    scope = _scope(*scope)
+    if type(reserve) is not int or not 0 < reserve <= MAX_UNITS:
+        raise SpendingError('invalid_reservation', 'Reservation must be a bounded positive integer.')
+    now = int(time.time()) if now is None else now
+    item = _iteration(database, scope[0], scope[1], require_active=True)
+    tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not {'model_operations', 'model_grants'} <= tables:
+        raise SpendingError('spending_blocked', 'No durable spending policy is available.')
+    pending = database.execute("SELECT 1 FROM model_operations WHERE project=? AND iteration=? AND status='pending' LIMIT 1", scope[:2]).fetchone()
+    if pending or item.get('model_access', {}).get('reason') == 'quota_exhausted':
+        reason = 'outcome_uncertain' if pending else 'quota_exhausted'
+        raise SpendingError(reason, 'Exact trusted reconciliation or quota-resume evidence is required.')
+    grant = database.execute('''SELECT grant_id, expires FROM model_grants
+      WHERE project=? AND iteration=? AND provider=? AND model=? AND operation=?
+      AND remaining>=? AND expires>? AND (?=0 OR kind='allowance') ORDER BY expires, grant_id LIMIT 1''',
+      (*scope, reserve, now, int(allowance_only))).fetchone()
+    if not grant:
+        raise SpendingError('spending_blocked', 'No unexpired exact-scope grant covers the controlled reservation.')
+    return {'grant_id': grant[0], 'expires': grant[1], 'scope': list(scope),
+            'reservation': reserve, 'reserved': False, 'recheck_at_call': True}
+
+
 def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowance_only=False, deadline=None):
     if not isinstance(operation_id, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', operation_id) is None:
         raise SpendingError('invalid_operation_id', 'A bounded stable idempotency key is required.')
@@ -157,22 +181,15 @@ def _prepare(database, scope, operation_id, request_bytes, reserve, now, allowan
         _decision(database, scope, operation_id, 'refused', 'outcome_uncertain', now)
         database.commit()
         raise SpendingError('outcome_uncertain', 'Reconcile the exact pending operation before any retry.', recorded=True)
-    pending = database.execute("SELECT 1 FROM model_operations WHERE project=? AND iteration=? AND status='pending' LIMIT 1", scope[:2]).fetchone()
-    if pending or item.get('model_access', {}).get('reason') == 'quota_exhausted':
-        reason = 'outcome_uncertain' if pending else 'quota_exhausted'
+    try:
+        policy = admission_preview(database, scope, reserve, now, allowance_only)
+    except SpendingError as error:
+        reason = 'authorization_unavailable_or_exhausted' if error.code == 'spending_blocked' else error.code
         _block(database, item, reason, scope)
         _decision(database, scope, operation_id, 'refused', reason, now)
         database.commit()
-        raise SpendingError(reason, 'Model access is blocked; exact trusted reconciliation or quota-resume evidence is required.', recorded=True)
-    grant = database.execute('''SELECT grant_id, expires FROM model_grants
-      WHERE project=? AND iteration=? AND provider=? AND model=? AND operation=?
-      AND remaining>=? AND expires>? AND (?=0 OR kind='allowance') ORDER BY expires, grant_id LIMIT 1''',
-      (*scope, reserve, now, int(allowance_only))).fetchone()
-    if not grant:
-        _decision(database, scope, operation_id, 'refused', 'authorization_unavailable_or_exhausted', now)
-        _block(database, item, 'authorization_unavailable_or_exhausted', scope)
-        database.commit()
-        raise SpendingError('spending_blocked', 'No unexpired exact-scope grant covers the controlled reservation.', recorded=True)
+        raise SpendingError(error.code, str(error), recorded=True) from error
+    grant = (policy['grant_id'], policy['expires'])
     database.execute('UPDATE model_grants SET remaining=remaining-? WHERE grant_id=?', (reserve, grant[0]))
     database.execute('INSERT INTO model_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
                      (operation_id, *scope, grant[0], reserve, 'pending', digest, None, now, None))

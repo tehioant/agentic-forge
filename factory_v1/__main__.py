@@ -178,6 +178,21 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
+    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment']:
+        control = commands.add_parser(name, help='Bounded role handoff; worker launch remains disabled.')
+        control.add_argument('--project', required=True)
+        control.add_argument('--iteration', required=True)
+        if name in {'prepare-assignment', 'assignment-result'}:
+            control.add_argument('--request', required=True)
+            control.add_argument('--api-base', required=True)
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
+        if name != 'prepare-assignment':
+            control.add_argument('--assignment', required=True)
+        if name == 'prepare-assignment':
+            control.add_argument('--dry-run', action='store_true')
+        if name == 'launch-assignment':
+            control.add_argument('--isolated', action='store_true', help='Untrusted assertion; never enables launch.')
     for name in ['attention', 'notifications', 'deliver', 'respond', 'attention-reconcile']:
         attention_command = commands.add_parser(name, help='Trusted exact-origin attention lifecycle.')
         attention_command.add_argument('--project', required=True)
@@ -190,6 +205,38 @@ def main():
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment'}:
+        from . import assignments
+        from .repositories import GitHub, RepositoryError
+        import fcntl
+        try:
+            if args.command == 'launch-assignment':
+                assignments.launch()
+            request = None
+            if hasattr(args, 'request'):
+                with open(args.request, encoding='utf-8') as source:
+                    try:
+                        request = json.load(source, object_pairs_hook=unique_fields)
+                    except (ValueError, RecursionError, IntakeError) as error:
+                        raise IntakeError('invalid_assignment', 'Provide unambiguous bounded assignment JSON.') from error
+            read_only = args.command == 'inspect-assignment' or getattr(args, 'dry_run', False)
+            uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if read_only else '?mode=rw')
+            with closing(sqlite3.connect(uri, uri=True)) as database:
+                # A dry-run must not create a lock, schema, claim, or lifecycle checkpoint.
+                with open(str(Path(args.state).resolve()) + '.onboarding.lock', 'r') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    if args.command == 'inspect-assignment':
+                        result = assignments.inspect(database, args.project, args.iteration, args.operator_id, args.assignment)
+                    else:
+                        github = GitHub(args.api_base, args.bearer, args.timeout)
+                        if args.command == 'prepare-assignment':
+                            result = assignments.prepare(database, args.project, args.iteration, args.operator_id, request, github, args.dry_run)
+                        else:
+                            result = assignments.store_result(database, args.project, args.iteration, args.operator_id, args.assignment, request, github)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command in {'attention', 'notifications', 'deliver', 'respond', 'attention-reconcile'}:
         from .attention import lifecycle, records, load_iteration
         request = None
