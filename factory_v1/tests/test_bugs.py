@@ -291,6 +291,102 @@ class BugTests(unittest.TestCase):
         self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
         self.assertEqual(len(self.case.issues), 4)
 
+    def test_uncertain_creation_blocks_reworded_new_discovery(self):
+        first = self.completion()
+        self.case.drop, self.case.omit_effect = 'issue', True
+        self.complete(first)
+        self.case.omit_effect = False
+        reworded = self.completion(self.discovery(discovery_id='new-observer', symptoms='Accents disappear while reading notes'))
+        work = self.work(self.complete(reworded), reworded['assignment_id'])
+        self.assertEqual(work['blocker']['code'], 'publication_uncertain')
+        self.assertNotIn('issue_intent', work)
+        self.assertEqual(len(self.case.issues), 3)
+
+    def test_explicit_bug_blockers_and_affected_edges_are_both_native(self):
+        request = self.completion()
+        request['bug']['blockers'] = [12]
+        item = self.complete(self.signed(request))
+        self.assertEqual(self.work(item)['status'], 'published')
+        self.assertEqual(self.case.deps, {11: [10], 13: [12], 10: [13]})
+        self.assertIn('- #12', self.case.issues[13]['body'])
+        self.assertEqual(item['ticket_work']['frontier']['eligible'], [12])
+        self.case.issues[12].update(state='closed', state_reason='completed')
+        self.case.members[12]['fields']['STATUS'] = 'Done'
+        self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [13])
+
+    def test_published_readbacks_refuse_drift_and_recover_without_writes(self):
+        request = self.completion()
+        self.complete(request)
+        original = copy.deepcopy(self.case.issues[13])
+        member = copy.deepcopy(self.case.members[13])
+        for defect in ('refs', 'symptoms', 'triage', 'scope', 'progress', 'membership', 'affected-edge'):
+            with self.subTest(defect=defect):
+                if defect == 'refs': self.case.issues[13]['body'] = original['body'].replace('US-1', 'US-999')
+                if defect == 'symptoms': self.case.issues[13]['body'] = original['body'].replace('Reopened notes lose accents', 'Other symptoms')
+                if defect == 'triage': self.case.issues[13]['labels'] = []
+                if defect == 'scope': self.case.issues[13]['milestone'] = None
+                if defect == 'progress': self.case.members[13]['fields']['STATUS'] = 'Unknown'
+                if defect == 'membership': self.case.members.pop(13)
+                if defect == 'affected-edge': self.case.deps[10] = []
+                self.case.fixture.calls.clear()
+                work = self.work(self.retry(request['assignment_id']))
+                self.assertEqual(work['status'], 'blocked')
+                self.assertEqual(work['blocker']['code'], 'publication_mismatch')
+                self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and c[1] != '/graphql' for c in self.case.fixture.calls))
+                self.assertFalse(any(c[0] == 'POST' and c[1] == '/graphql' and 'mutation' in c[2]['query'] for c in self.case.fixture.calls))
+                self.case.issues[13] = copy.deepcopy(original)
+                self.case.members[13] = copy.deepcopy(member)
+                self.case.deps[10] = [13]
+                self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
+
+    def test_evidence_only_unknown_environment_and_future_vision_reference(self):
+        discovery = self.discovery(scope='deferred')
+        discovery['discovery'].update(reproduction=[], environment=None)
+        request = self.completion(discovery)
+        work = self.work(self.case.inspect())
+        request['bug']['references'] = [{'spec': work['inputs']['documents']['vision.md']['url'], 'requirement': 'team sharing'}]
+        result = self.work(self.complete(self.signed(request)))
+        self.assertEqual(result['status'], 'published')
+        self.assertIn('## Environment\n\nUnavailable.', self.case.issues[13]['body'])
+        self.assertIn('team sharing', self.case.issues[13]['body'])
+        self.assertEqual(self.case.control('reserve-ticket', issue=13).returncode, 2)
+
+    def test_synthesis_pins_empty_dependencies_and_actual_adaptation_load(self):
+        request = self.completion()
+        work = self.work(self.case.inspect())
+        self.assertEqual(work['skill']['dependencies'], [])
+        self.assertIn('no-new-milestone', work['adaptation'])
+        request['execution']['loads'] = [load for load in request['execution']['loads'] if not load['source'].startswith('bug-adaptation:')]
+        before = self.case.inspect()
+        result = self.case.control('complete-bug', request)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)['error'], 'execution_evidence_required')
+        self.assertEqual(self.case.inspect(), before)
+        self.assertEqual(len(self.case.issues), 3)
+
+    def test_additional_affected_scope_is_not_silently_discarded(self):
+        self.case.ok(self.case.control('synthesize-bug', self.discovery()))
+        before = self.case.inspect()
+        additional = self.discovery(discovery_id='another-affected-ticket')
+        additional['discovery']['affected'] = [10, 12]
+        result = self.case.control('synthesize-bug', additional)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stderr)['error'], 'bug_conflict')
+        self.assertEqual(self.case.inspect(), before)
+
+    def test_missing_projects_keeps_synthesis_and_refuses_writes(self):
+        request = self.completion()
+        self.case.boards = []
+        item = self.complete(request)
+        work = self.work(item)
+        self.assertEqual(work['blocker']['code'], 'projects_blocked')
+        self.assertEqual(work['status'], 'blocked')
+        self.assertEqual(work['execution'], request['execution'])
+        self.assertEqual(work['bug'], request['bug'])
+        self.assertEqual(len(self.case.issues), 3)
+        self.case.boards = [{'id': 'P1', 'title': 'Approved linked board', 'closed': False}]
+        self.assertEqual(self.work(self.retry(request['assignment_id']))['status'], 'published')
+
     def test_concurrent_publish_retries_serialize(self):
         request = self.completion()
         self.case.drop = 'issue'

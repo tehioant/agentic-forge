@@ -116,6 +116,8 @@ def synthesize(database, item, request, github):
     work = item.setdefault('bug_work', {}).get(key)
     if work:
         require(work['inputs'] == inputs and work['board'] == board, 'Bug assignment scope changed.', 'bug_conflict')
+        require(set(request['discovery']['affected']) <= set(work['discovery']['affected']),
+                'Additional affected edges require explicit controller investigation; never silently drop them.', 'bug_conflict')
         tickets.checkpoint(database, item)
         return item
     candidates = observations(item, github, board)
@@ -129,7 +131,8 @@ def synthesize(database, item, request, github):
                 'Affected work must be an open contracted current-milestone issue.', 'invalid_bug')
     assignment = str(uuid.uuid4())
     sources = {f'bug-discovery:{assignment}': tickets.digest(request['discovery']),
-               f'bug-comparisons:{assignment}': tickets.digest(candidates)}
+               f'bug-comparisons:{assignment}': tickets.digest(candidates),
+               f'bug-adaptation:{assignment}': tickets.digest({'adaptation': ADAPTATION, 'instructions': INSTRUCTIONS})}
     item['bug_work'][key] = {'assignment_id': assignment, 'stage': 'to-tickets', 'status': 'synthesis_pending',
                              'skill': selected, 'request': request, 'adaptation': ADAPTATION, 'inputs': inputs,
                              'board': board, 'discovery': request['discovery'], 'candidates': candidates,
@@ -193,10 +196,12 @@ def complete(database, item, request, github):
     require(isinstance(request, dict) and set(request) == {'assignment_id', 'input_digest', 'adaptation', 'execution', 'bug'},
             'Provide correlated bug synthesis and execution evidence.', 'invalid_bug')
     work = assigned(item, request['assignment_id'])
-    inputs, board = context(database, item, github)
+    tickets.active(item)
     tickets.skill(work['request']['skill'])
+    inputs = tickets.pinned_inputs(database, item, github)
     require(request['input_digest'] == work['input_digest'] and request['adaptation'] == ADAPTATION and
-            inputs == work['inputs'] and board == work['board'], 'Bug synthesis is stale or uncorrelated.', 'bug_conflict')
+            inputs == work['inputs'] and item.get('ticket_work', {}).get('inputs') == inputs,
+            'Bug synthesis is stale or uncorrelated.', 'bug_conflict')
     evidence = tickets.validate_execution(work, request['execution'], request['bug'])
     duplicate = validate_result(work, request['bug'], item)
     completion_digest = tickets.digest(request)
@@ -317,9 +322,10 @@ def verify_observation(item, work, observation):
 def publish_locked(database, item, work, github):
     require(work.get('bug') and work.get('execution'), 'Actual bug synthesis must complete first.', 'synthesis_required')
     tickets.skill(work['request']['skill'])
-    inputs, board = context(database, item, github)
-    require(inputs == work['inputs'] and board == work['board'], 'Pinned bug scope changed.', 'bug_conflict')
+    tickets.active(item)
     try:
+        inputs, board = context(database, item, github)
+        require(inputs == work['inputs'] and board == work['board'], 'Pinned bug scope changed.', 'bug_conflict')
         if work.get('publication_complete'):
             issue = gh.read_issue(github, item['repository'], work['identity']['number'])
             require(all(issue[k] == work['identity'][k] for k in ('number', 'id', 'node_id')),
