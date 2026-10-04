@@ -122,13 +122,17 @@ elif args[0] == 'inspect':
     removal = ROOT / 'removal-in-progress'
     if removal.exists() and STATE.exists():
         if removal.read_text() == 'observed':
-            STATE.unlink()
+            STATE.unlink(missing_ok=True)
         else:
             removal.write_text('observed')
     if not STATE.exists():
         print('Error: No such object: fixture-container', file=sys.stderr)
         sys.exit(1)
-    container = json.loads(STATE.read_text())
+    try:
+        container = json.loads(STATE.read_text())
+    except FileNotFoundError:
+        print('Error: No such object: fixture-container', file=sys.stderr)
+        sys.exit(1)
     if removal.exists():
         container['State']['Status'] = 'removing'
     mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
@@ -154,8 +158,9 @@ elif args[0] == 'logs':
           'Labeled deterministic Docker fixture log. NOT live Hermes execution.')
 elif args[0] == 'rm':
     removal = ROOT / 'removal-in-progress'
-    if STATE.exists() and not removal.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
-        removal.write_text('pending')
+    if STATE.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
+        if not removal.exists():
+            removal.write_text('pending')
         print('Error: removal of container fixture-container is already in progress', file=sys.stderr)
         sys.exit(1)
     STATE.unlink(missing_ok=True)

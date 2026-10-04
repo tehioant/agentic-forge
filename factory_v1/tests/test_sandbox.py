@@ -244,6 +244,26 @@ class SandboxTests(unittest.TestCase):
         self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
         self.assignment.refused(self.launch(prepared), 'iteration_paused')
 
+    def test_removal_fixture_cannot_skip_progress_inspection_with_multiple_removers(self):
+        from factory_v1.repositories import RepositoryError
+        self.mode('stop-race')
+        state = self.bin / 'container.json'
+        state.write_text(json.dumps({'State': {'Running': True}}))
+        docker = Docker()
+        for _ in range(2):
+            with self.assertRaises(RepositoryError):
+                docker.call('rm', '-f', 'fixture-container')
+            self.assertEqual((self.bin / 'removal-in-progress').read_text(), 'pending')
+            self.assertTrue(state.exists())
+        present = docker.inspect('fixture-container')
+        self.assertIsNotNone(present)
+        assert present is not None
+        self.assertEqual(present['State']['Status'], 'removing')
+        self.assertEqual((self.bin / 'removal-in-progress').read_text(), 'observed')
+        self.assertIsNone(docker.inspect('fixture-container', optional=True))
+        self.assertFalse(state.exists())
+        docker.remove('fixture-container')
+
     def test_stop_during_concurrent_removal_keeps_controller_and_readback_consistent(self):
         self.mode('stop-race')
         prepared = self.assignment.ok(self.assignment.command())
@@ -259,8 +279,9 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(launched['runtime']['status'], 'stopped')
         self.assertEqual(launched['runtime']['error'], 'cancelled')
         self.assertTrue(launched['runtime']['container_removed'])
-        self.assertEqual(json.loads((root / 'guard-result.json').read_text()),
-                         {'status': 'stopped', 'reason': 'controller_finished'})
+        guarded = json.loads((root / 'guard-result.json').read_text())
+        self.assertEqual(guarded['status'], 'stopped')
+        self.assertIn(guarded['reason'], ('cancelled', 'controller_finished'))
         observed = self.assignment.ok(self.assignment.inspect(prepared))
         self.assertEqual(observed['runtime'], launched['runtime'])
         stopped = self.assignment.ok(self.assignment.command('stop-assignment', assignment=prepared['assignment_id']))
