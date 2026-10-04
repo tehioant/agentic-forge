@@ -52,7 +52,8 @@ def verify_checks(root, config, runtime, deadline):
             require(not (root / 'stop').exists(), 'Attempt cancelled during checks.', 'cancelled')
             require(time.monotonic() < deadline, 'Independent checks reached attempt deadline.', 'time_limit')
             observed = docker.inspect(name)
-            assert observed is not None
+            if observed is None:
+                raise RepositoryError('verification_failed', 'Independent check container disappeared.')
             if not observed['State']['Running']:
                 require(observed['State']['ExitCode'] == 0 and not observed['State'].get('OOMKilled'),
                         'Independent checks failed; retained worker claims are not verification.', 'verification_failed')
@@ -73,6 +74,7 @@ def verify_checks(root, config, runtime, deadline):
                 for expected, record in zip(commands, records)),
                 'Independent check record does not match controller-admitted commands.', 'verification_failed')
         require(manifest(workspace) == candidate, 'Candidate changed during independent checks.', 'invalid_result')
+        require(not (root / 'stop').exists(), 'Attempt cancelled before accepting checks.', 'cancelled')
         (root / 'controller-checks.json').write_text(json.dumps(
             {'run_id': runtime['run_id'], 'candidate': candidate, 'records': records,
              'provenance': 'controller_admitted_read_only_sandbox_checks'}))

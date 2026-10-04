@@ -115,6 +115,112 @@ class ProvenanceTests(unittest.TestCase):
         self.assertFalse((roots[0] / 'controller-checks.json').exists())
         self.assertFalse((self.case.bin / 'container.json').exists())
 
+    def signal_during_checks(self, signum):
+        import time
+        self.set_checks(['python -m unittest discover -v'])
+        self.case.mode('checks-hang')
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        process = self.case.started(prepared)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            roots = list(self.case.artifacts.iterdir())
+            if roots and (roots[0] / 'checks/container-inspection.json').exists():
+                break
+            self.assertIsNone(process.poll())
+            time.sleep(.02)
+        else:
+            self.fail('Controller verifier did not begin')
+        process.send_signal(signum)
+        output, errors = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, errors)
+        observed = json.loads(output)
+        self.assertEqual(observed['runtime']['status'], 'stopped', observed)
+        self.assertEqual(observed['runtime']['error'], 'cancelled')
+        self.assertTrue(observed['runtime']['container_removed'])
+        self.assertTrue((roots[0] / 'stop').exists())
+        self.assertNotIn('submitted_result', observed)
+        self.assertFalse((roots[0] / 'controller-checks.json').exists())
+        self.assertFalse((self.case.bin / 'container.json').exists())
+
+    def test_sigterm_during_controller_checks_cancels_public_launch(self):
+        import signal
+        self.signal_during_checks(signal.SIGTERM)
+
+    def test_sigint_during_controller_checks_cancels_public_launch(self):
+        import signal
+        self.signal_during_checks(signal.SIGINT)
+
+    def test_check_container_disappearing_after_cancellation_is_structured(self):
+        self.set_checks(['python -m unittest discover -v'])
+        self.case.mode('checks-hang')
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = Docker.inspect
+        injected = []
+
+        def cancelled_inspection(docker, name, *args, **kwargs):
+            observed = original(docker, name, *args, **kwargs)
+            roots = list(self.case.artifacts.iterdir())
+            if roots and (roots[0] / 'checks').exists() and observed and observed['State']['Running']:
+                (roots[0] / 'stop').touch()
+                injected.append(True)
+                return None
+            return observed
+
+        with patch.object(Docker, 'inspect', cancelled_inspection):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertTrue(injected)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertTrue(result['runtime']['container_removed'])
+        self.assertNotIn('submitted_result', result)
+        self.assertFalse((self.case.bin / 'container.json').exists())
+
+    def test_cancellation_at_check_output_cannot_accept_verification(self):
+        self.set_checks(['python -m unittest discover -v'])
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = Docker.call
+        injected = []
+
+        def cancelled_output(docker, *args, **kwargs):
+            response = original(docker, *args, **kwargs)
+            roots = list(self.case.artifacts.iterdir())
+            if args[0] == 'logs' and roots and (roots[0] / 'checks/container-inspection.json').exists():
+                (roots[0] / 'stop').touch()
+                injected.append(True)
+            return response
+
+        with patch.object(Docker, 'call', cancelled_output):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertTrue(injected)
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertNotIn('submitted_result', result)
+        self.assertFalse((Path(result['runtime']['artifacts']) / 'controller-checks.json').exists())
+        self.assertFalse((self.case.bin / 'container.json').exists())
+
+    def test_cancellation_after_worker_evidence_cannot_submit_result(self):
+        self.set_checks(['python -m unittest discover -v'])
+        prepared = self.case.assignment.ok(self.case.assignment.command())
+        original = sandbox.check_worker_evidence
+
+        def cancelled_evidence(assignment, root, inputs):
+            result = original(assignment, root, inputs)
+            (root / 'stop').touch()
+            return result
+
+        with patch.object(sandbox, 'check_worker_evidence', cancelled_evidence):
+            result = sandbox.launch(str(self.case.assignment.fixture.state), 'product', 'm1', '42',
+                                    prepared['assignment_id'], str(self.case.config),
+                                    GitHub(self.case.assignment.fixture.base, 'fixture', 10))
+        self.assertEqual(result['runtime']['status'], 'stopped', result)
+        self.assertEqual(result['runtime']['error'], 'cancelled')
+        self.assertNotIn('submitted_result', result)
+        self.assertFalse((self.case.bin / 'container.json').exists())
+
     def test_controller_checks_share_original_attempt_deadline(self):
         self.set_checks(['python -m unittest discover -v'])
         config = json.loads(self.case.config.read_text())

@@ -172,6 +172,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     capability = None
     def cancel(signum, frame):
         stop.set()
+        (root / 'stop').touch()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signals[signum] = signal.signal(signum, cancel)
     try:
@@ -288,6 +289,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 result = check_worker_evidence(assignment, root, selected_inputs)
+                require(not (root / 'stop').exists(), 'Attempt cancelled before result admission.', 'cancelled')
                 assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github)
                 assert assignment is not None
                 assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
