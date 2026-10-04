@@ -109,11 +109,19 @@ elif args[0] == 'create':
     STATE.write_text(json.dumps(container))
     print('fixture-container')
 elif args[0] == 'inspect':
+    removal = ROOT / 'removal-in-progress'
+    if removal.exists() and STATE.exists():
+        if removal.read_text() == 'observed':
+            STATE.unlink()
+        else:
+            removal.write_text('observed')
     if not STATE.exists():
         print('Error: No such object: fixture-container', file=sys.stderr)
         sys.exit(1)
     container = json.loads(STATE.read_text())
-    if container['State']['Running'] and not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'hang'):
+    if removal.exists():
+        container['State']['Status'] = 'removing'
+    if container['State']['Running'] and not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() in ('hang', 'stop-race')):
         container['polls'] = container.get('polls', 0) + 1
         if container['polls'] >= 3:
             container['State']['Running'] = False
@@ -121,7 +129,8 @@ elif args[0] == 'inspect':
     print(json.dumps([container]))
 elif args[0] == 'start':
     container = json.loads(STATE.read_text())
-    run_fixture(container)
+    if not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race'):
+        run_fixture(container)
     container['State']['Running'] = True
     STATE.write_text(json.dumps(container))
     print('fixture-container')
@@ -130,6 +139,11 @@ elif args[0] == 'logs':
         sys.exit(1)
     print('Labeled deterministic Docker fixture log. NOT live Hermes execution.')
 elif args[0] == 'rm':
+    removal = ROOT / 'removal-in-progress'
+    if STATE.exists() and not removal.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
+        removal.write_text('pending')
+        print('Error: removal of container fixture-container is already in progress', file=sys.stderr)
+        sys.exit(1)
     STATE.unlink(missing_ok=True)
 else:
     sys.exit(1)

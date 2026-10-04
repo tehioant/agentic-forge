@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 from pathlib import Path
 
 from .planning import require
@@ -94,8 +95,11 @@ class Docker:
 
     def remove(self, name):
         self.call('rm', '-f', name, optional=True)
-        require(self.inspect(name, optional=True) is None,
-                'Container removal was not verified; ownership remains held.', 'stop_unconfirmed')
+        deadline = time.monotonic() + 30
+        while self.inspect(name, optional=True) is not None:
+            require(time.monotonic() < deadline,
+                    'Container removal was not verified; ownership remains held.', 'stop_unconfirmed')
+            time.sleep(.1)
 
 
 def mount_args(mounts):

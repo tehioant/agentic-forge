@@ -1,6 +1,7 @@
 """Public launcher tests; Docker/model fixtures are NOT live isolation evidence."""
 import json
 import os
+import signal
 import subprocess
 import shutil
 import socketserver
@@ -10,7 +11,10 @@ import sys
 from http.server import BaseHTTPRequestHandler
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from factory_v1.repositories import RepositoryError
+from factory_v1.sandbox_policy import Docker
 from factory_v1.tests import test_assignments
 
 IMAGE = 'nousresearch/hermes-agent@sha256:d4da4a40cd7a28aba983775d9fd31d94cbf153eeb0cb9e844d6d0f612b7c24db'
@@ -238,6 +242,30 @@ class SandboxTests(unittest.TestCase):
         self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
         self.assignment.refused(self.launch(prepared), 'iteration_paused')
 
+    def test_stop_during_concurrent_removal_keeps_controller_and_readback_consistent(self):
+        self.mode('stop-race')
+        prepared = self.assignment.ok(self.assignment.command())
+        process = self.started(prepared)
+        running = self.wait_running(prepared)
+        process.send_signal(signal.SIGTERM)
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, error)
+        launched = json.loads(output)
+        root = Path(running['runtime']['artifacts'])
+        self.assertEqual((self.bin / 'removal-in-progress').read_text(), 'observed')
+        self.assertFalse((self.bin / 'container.json').exists())
+        self.assertEqual(launched['runtime']['status'], 'stopped')
+        self.assertEqual(launched['runtime']['error'], 'cancelled')
+        self.assertTrue(launched['runtime']['container_removed'])
+        self.assertEqual(json.loads((root / 'guard-result.json').read_text()),
+                         {'status': 'stopped', 'reason': 'controller_finished'})
+        observed = self.assignment.ok(self.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], launched['runtime'])
+        stopped = self.assignment.ok(self.assignment.command('stop-assignment', assignment=prepared['assignment_id']))
+        self.assertEqual(stopped['runtime'], launched['runtime'])
+        self.assertEqual(self.model_calls, [])
+        self.assignment.assert_no_external_writes()
+
     def test_stop_and_controller_death_remove_real_fixture_process_target_and_retain_evidence(self):
         self.mode('hang')
         prepared = self.assignment.ok(self.assignment.command())
@@ -267,6 +295,69 @@ class SandboxTests(unittest.TestCase):
         reconciled = self.assignment.ok(self.assignment.command('reconcile-assignment', assignment=prepared['assignment_id']))
         self.assertEqual(reconciled['runtime']['error'], 'controller_lost')
         self.assertTrue(reconciled['runtime']['recoverable'])
+
+
+class DockerRemovalTests(unittest.TestCase):
+    def setUp(self):
+        with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
+            self.docker = Docker()
+        self.name = 'factory-run-removal-fixture'
+
+    def response(self, args, code=0, stdout=b'', stderr=b''):
+        return subprocess.CompletedProcess(['/fixture/docker', *args], code, stdout, stderr)
+
+    def test_conflicting_remove_waits_for_verified_absence(self):
+        responses = [
+            self.response(['rm', '-f', self.name], 1, stderr=b'removal is already in progress'),
+            self.response(['inspect', self.name], stdout=b'[{"State": {"Status": "removing"}}]'),
+            self.response(['inspect', self.name], 1, stderr=b'Error: No such object'),
+        ]
+        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run, \
+                patch('time.sleep'):
+            self.docker.remove(self.name)
+        self.assertEqual([call.args[0][1:] for call in run.call_args_list],
+                         [['rm', '-f', self.name], ['inspect', self.name], ['inspect', self.name]])
+
+    def test_already_removed_is_idempotent_but_still_inspected(self):
+        responses = [self.response(['rm', '-f', self.name], 1, stderr=b'No such container'),
+                     self.response(['inspect', self.name], 1, stderr=b'Error: No such container')]
+        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run:
+            self.docker.remove(self.name)
+        self.assertEqual(run.call_count, 2)
+
+    def test_remaining_container_never_counts_as_removed(self):
+        for state in ('running', 'removing'):
+            with self.subTest(state=state):
+                responses = [self.response(['rm', '-f', self.name], 1),
+                             self.response(['inspect', self.name], stdout=json.dumps([{'State': {'Status': state}}]).encode()),
+                             self.response(['inspect', self.name], stdout=json.dumps([{'State': {'Status': state}}]).encode())]
+                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses), \
+                        patch('time.monotonic', side_effect=[0, 0, 30]), \
+                        patch('time.sleep') as sleep, \
+                        self.assertRaises(RepositoryError) as caught:
+                    self.docker.remove(self.name)
+                self.assertEqual(caught.exception.code, 'stop_unconfirmed')
+                sleep.assert_called_once_with(.1)
+
+    def test_removal_timeout_is_not_hidden_by_optional_command(self):
+        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=
+                   subprocess.TimeoutExpired('docker rm', 30)) as run, \
+                self.assertRaises(RepositoryError) as caught:
+            self.docker.remove(self.name)
+        self.assertEqual(caught.exception.code, 'container_unavailable')
+        self.assertEqual(run.call_count, 1)
+
+    def test_inspection_failures_never_count_as_absence(self):
+        failures = [self.response(['inspect', self.name], 1, stderr=b'Cannot connect to Docker daemon'),
+                    self.response(['inspect', self.name], stdout=b'not JSON'),
+                    subprocess.TimeoutExpired('docker inspect', 30)]
+        for failure in failures:
+            with self.subTest(failure=failure):
+                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=[
+                        self.response(['rm', '-f', self.name]), failure]), \
+                        self.assertRaises(RepositoryError) as caught:
+                    self.docker.remove(self.name)
+                self.assertEqual(caught.exception.code, 'container_unavailable')
 
 
 if __name__ == '__main__':
