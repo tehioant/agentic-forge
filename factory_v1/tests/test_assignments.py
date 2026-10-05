@@ -368,7 +368,7 @@ class AssignmentTests(unittest.TestCase):
                     'diagnosis': ['diagnosing-bugs'], 'repair': ['diagnosing-bugs', 'implement']}
         for stage, entry in expected.items():
             request = self.configuration(stage=stage)
-            if stage == 'simplify':
+            if stage in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
                 request['preceding'].append(artifact('implementation-diff', 'Labeled unverified diff'))
                 self.refused(self.command(request=request, dry_run=True), 'implementation_unverified')
                 continue
@@ -480,16 +480,9 @@ class AssignmentTests(unittest.TestCase):
                 self.assertIn('error', json.loads(response.stderr))
         self.assertEqual(self.fixture.calls, [])
 
-    def test_assigned_review_axes_cannot_share_a_top_level_profile(self):
-        standards = self.configuration(stage='review-standards')
-        assignment = self.ok(self.command(request=standards))
-        spec = self.configuration(stage='review-spec')
-        spec['profile']['home'] = standards['profile']['home']
-        self.refused(self.command(request=spec), 'profile_claim_conflict')
-        spec = self.configuration(stage='review-spec')
-        other = self.ok(self.command(request=spec))
-        self.assertNotEqual(assignment['assignment_id'], other['assignment_id'])
-        self.assertNotIn('write_workspace', other['handoff']['capabilities'])
+    def test_review_axis_placeholder_artifacts_are_not_a_candidate(self):
+        for stage in ('review-standards', 'review-spec'):
+            self.refused(self.command(request=self.configuration(stage=stage)), 'implementation_unverified')
         self.assert_no_external_writes()
 
     def test_public_controls_refuse_wrong_operator_and_unknown_assignment(self):

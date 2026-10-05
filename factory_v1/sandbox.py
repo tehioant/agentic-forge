@@ -135,9 +135,9 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
-        if prepared['handoff']['stage'] == 'simplify':
+        if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec'}:
             assignments.prepare(database, project, iteration, operator, original(prepared), github, dry_run=True)
-            require(config.get('verification_commands', []) == prepared['handoff']['simplification']['verification_commands'],
+            require(config.get('verification_commands', []) == (prepared['handoff'].get('review') or prepared['handoff']['simplification'])['verification_commands'],
                     'Simplification must rerun the exact implementation checks; no weakened or absent commands.', 'verification_required')
     docker = Docker()
     image_id = docker.image()
@@ -190,6 +190,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                                    'workspace': assignment['handoff']['candidate'] or assignment['handoff']['baseline']}, root)
         if assignment['handoff']['stage'] == 'simplify':
             from .simplification import copy_candidate
+            with closing(sqlite3.connect(state)) as database, state_lock(database):
+                copy_candidate(database, project, iteration, operator, assignment, root, pins)
+        if assignment['handoff']['stage'] in {'review-standards', 'review-spec', 'corrections'}:
+            from .review import copy_candidate
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 copy_candidate(database, project, iteration, operator, assignment, root, pins)
         shutil.move(root / 'baseline', inputs / 'baseline')
