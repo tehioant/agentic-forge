@@ -238,6 +238,12 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(before, self.writes())
         payload = next(c[2] for c in before if c[1].endswith('/git/trees'))
         self.assertEqual([c['path'] for c in payload['tree']], ['factory_v1/behavior.py'])
+        identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com',
+                    'date': '2026-01-01T00:00:00Z'}
+        commit = next(c[2] for c in before if c[1].endswith('/git/commits'))
+        self.assertEqual(commit, {'message': 'Factory candidate: Refs #10\n', 'tree': self.plan['tree'],
+                                  'parents': ['a' * 40], 'author': identity, 'committer': identity})
+        self.assertEqual(result['candidate'], self.plan['candidate'])
 
     def test_lost_ref_response_reconciles_same_target_after_restart(self):
         self.drop = '/git/refs'

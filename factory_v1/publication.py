@@ -95,6 +95,12 @@ def load_config(path, operator):
         raise RepositoryError('invalid_publication', 'Invalid private publication configuration.') from error
 
 
+def commit_payload(plan, config):
+    identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com', 'date': config['commit_date']}
+    return {'message': plan['message'] + '\n', 'tree': plan['tree'],
+            'parents': [config['expected_head']], 'author': identity, 'committer': identity}
+
+
 class PublicationGitHub:
     """No arbitrary URLs or operations; every write payload is preapproved verbatim."""
     def __init__(self, github, config):
@@ -106,12 +112,10 @@ class PublicationGitHub:
 
     def approve(self, plan, content, pr_payload):
         config = self.config
-        identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com', 'date': config['commit_date']}
         self.allowed = {
             ('POST', '/git/blobs'): [{'content': base64.b64encode(data).decode(), 'encoding': 'base64'} for data in content.values()],
             ('POST', '/git/trees'): [{'base_tree': plan['base_tree'], 'tree': plan['changes']}],
-            ('POST', '/git/commits'): [{'message': plan['message'] + '\n', 'tree': plan['tree'],
-                                       'parents': [config['expected_head']], 'author': identity, 'committer': identity}],
+            ('POST', '/git/commits'): [commit_payload(plan, config)],
             ('POST', '/git/refs'): [{'ref': 'refs/heads/' + config['branch'], 'sha': plan['candidate']}],
             ('PATCH', '/git/refs/heads/' + config['branch']): [{'sha': plan['candidate'], 'force': False}],
             ('POST', '/pulls'): [pr_payload],
@@ -341,9 +345,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
                 require(isinstance(result, dict) and result.get('sha') == expected, 'Blob mismatch.', 'github_mismatch')
             result = api.write('/git/trees', {'base_tree': plan['base_tree'], 'tree': plan['changes']})
             require(isinstance(result, dict) and result.get('sha') == plan['tree'], 'Tree mismatch.', 'github_mismatch')
-            identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com', 'date': config['commit_date']}
-            result = api.write('/git/commits', {'message': plan['message'] + '\n', 'tree': plan['tree'],
-                                              'parents': [config['expected_head']], 'author': identity, 'committer': identity})
+            result = api.write('/git/commits', commit_payload(plan, config))
             require(isinstance(result, dict) and result.get('sha') == plan['candidate'], 'Commit mismatch.', 'github_mismatch')
             verify_commit(api, plan, config)
             current = api.read(ref_path)
