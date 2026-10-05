@@ -268,8 +268,9 @@ def require_result_active(assignment):
             'Attempt cancelled before result admission.', 'cancelled')
 
 
-def store_result(database, project, iteration, operator, assignment_id, request, github):
+def store_result(database, project, iteration, operator, assignment_id, request, github, *, sandbox_run_id=None):
     assignment = inspect(database, project, iteration, operator, assignment_id)
+    assert assignment is not None
     keys = {'assignment_id', 'handoff_digest', 'claim_id', 'run_id', 'status', 'loads', 'work', 'artifacts', 'tests'}
     require(isinstance(request, dict) and set(request) == keys and request['assignment_id'] == assignment_id and
             request['handoff_digest'] == assignment['handoff_digest'] and request['claim_id'] == assignment['claim_id'] and
@@ -295,6 +296,13 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     prepare(database, project, iteration, operator, original, github, dry_run=True)
     simplification_result = None
     if handoff['stage'] == 'simplify':
+        runtime = assignment.get('runtime') or {}
+        launcher_submission = (runtime.get('status') == 'running' and
+                               sandbox_run_id == request['run_id'] == runtime.get('run_id'))
+        completed_replay = (runtime.get('status') == 'complete' and runtime.get('container_removed') is True and
+                            assignment.get('submitted_result') == request)
+        require(launcher_submission or completed_replay,
+                'Simplification accepts only launcher-validated output or exact completed replay.', 'invalid_result')
         from .simplification import validate_result
         simplification_result = validate_result(assignment, request)
     old = assignment.get('submitted_result')

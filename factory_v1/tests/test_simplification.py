@@ -1,9 +1,11 @@
 """Public stage/launcher regressions; Docker/model doubles are NOT live skill evidence."""
 import copy
 import json
+import sqlite3
 import unittest
 from pathlib import Path
 
+from factory_v1 import assignments
 from factory_v1.tests import test_assignments, test_sandbox
 
 
@@ -213,6 +215,66 @@ class SimplificationTests(unittest.TestCase):
         self.assertNotIn('submitted_result', observed)
         self.assertNotIn('simplification_result', observed)
         self.assertEqual(len(self.case.model_calls), 1)
+
+    def test_failed_malformed_attempt_cannot_accept_caller_replacement(self):
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior, 'failed-replacement')))
+        self.case.mode('malformed-stage')
+        failed = self.assignment.ok(self.case.launch(prepared))
+        self.assertEqual(failed['runtime']['status'], 'failed')
+        root = Path(failed['runtime']['artifacts'])
+        original = (root / 'scratch/result.json').read_bytes()
+        replacement = json.loads(original)
+        contract = prepared['handoff']['simplification']
+        checks = json.loads((root / 'controller-checks.json').read_text())
+        report = {'contract': contract['contract'], 'adaptation': prepared['handoff']['adaptation'],
+                  'input_candidate_sha256': contract['input_candidate_sha256'],
+                  'candidate_sha256': assignments.digest(checks['candidate']), 'outcome': 'no-op',
+                  'behavior_preservation': 'preserved',
+                  'angles': {angle: 'Caller replacement, not executed work' for angle in contract['angles']},
+                  'findings': []}
+        replacement['artifacts'] = [test_assignments.artifact('simplification-result', json.dumps(report))
+                                    if artifact['name'] == 'simplification-result' else artifact
+                                    for artifact in replacement['artifacts']]
+        before = self.assignment.fixture.state.read_bytes()
+        self.assignment.refused(self.assignment.command('assignment-result', replacement, prepared['assignment_id']), 'invalid_result')
+        self.assertEqual(self.assignment.fixture.state.read_bytes(), before)
+        observed = self.assignment.ok(self.assignment.inspect(prepared))
+        self.assertEqual(observed['runtime'], failed['runtime'])
+        self.assertNotIn('submitted_result', observed)
+        self.assertNotIn('simplification_result', observed)
+        self.assertEqual((root / 'scratch/result.json').read_bytes(), original)
+
+    def test_only_exact_completed_launcher_result_can_replay(self):
+        prior = self.implementation()
+        prepared = self.assignment.ok(self.prepare(self.request(prior, 'completed-replay')))
+        completed = self.assignment.ok(self.case.launch(prepared))
+        accepted = completed['submitted_result']
+        replay = self.assignment.ok(self.assignment.command('assignment-result', accepted, prepared['assignment_id']))
+        self.assertEqual(replay['simplification_result'], completed['simplification_result'])
+        for change in ('work', 'sandbox_run_id'):
+            altered = copy.deepcopy(accepted)
+            altered[change] = ['Caller replacement'] if change == 'work' else accepted['run_id']
+            before = self.assignment.fixture.state.read_bytes()
+            self.assignment.refused(self.assignment.command('assignment-result', altered, prepared['assignment_id']), 'invalid_result')
+            self.assertEqual(self.assignment.fixture.state.read_bytes(), before)
+        for status in ('running', 'failed', 'unconfirmed', 'stopped'):
+            with self.subTest(injected_runtime_status=status):
+                injected = copy.deepcopy(completed)
+                injected['runtime'].update(status=status, container_removed=status != 'unconfirmed')
+                database = sqlite3.connect(self.assignment.fixture.state)
+                try:
+                    with database:
+                        database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
+                                         (json.dumps(injected), prepared['assignment_id']))
+                finally:
+                    database.close()
+                before = self.assignment.fixture.state.read_bytes()
+                self.assignment.refused(self.assignment.command('assignment-result', accepted, prepared['assignment_id']), 'invalid_result')
+                self.assertEqual(self.assignment.fixture.state.read_bytes(), before)
+                observed = self.assignment.ok(self.assignment.inspect(prepared))
+                self.assertEqual(observed['runtime'], injected['runtime'])
+                self.assertEqual(observed['submitted_result'], accepted)
 
     def test_pause_keeps_prepared_stage_but_refuses_launch(self):
         prior = self.implementation()

@@ -302,7 +302,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 result = check_worker_evidence(assignment, root, selected_inputs)
                 assignments.require_result_active(assignment)
-                assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github)
+                assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github,
+                                                    sandbox_run_id=run_id)
                 assert assignment is not None
                 assignments.require_result_active(assignment)
                 assignment['runtime']['candidate_sha256'] = assignments.digest(source)

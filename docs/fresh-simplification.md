@@ -119,6 +119,15 @@ labels or a catalog entry. Native `tests.command` must match the complete
 terminal invocation verbatim; `tests.result` is a nonempty actual-output/status
 string. Preserve malformed/rejected raw output rather than normalizing it.
 
+Only the trusted launcher may make the initial simplification submission, after
+validating the native output and candidate checks for its correlated running
+attempt. Public `assignment-result` permits only an exact replay of the already
+admitted result after confirmed successful completion/removal. Failed, running,
+stopped or unconfirmed attempts cannot accept caller-authored replacement
+reports, even when private candidate checks passed. The internal launcher run
+correlation is not a public request field or a general execution-attestation
+capability; worker reports remain untrusted and delivery gates remain disabled.
+
 The resulting revision is **not an invented Git commit**. It is SHA-256 over the
 canonical source manifest, including file bytes and executable status:
 
