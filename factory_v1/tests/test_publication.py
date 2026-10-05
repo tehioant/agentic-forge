@@ -316,6 +316,34 @@ class PublicationTests(unittest.TestCase):
                     self.assertEqual(self.calls, [])
                     self.assertEqual(self.fixture.state.read_bytes(), before)
 
+    def test_authorization_hardlinks_in_each_excluded_scope_refused_before_http_or_state(self):
+        scopes = (self.artifacts, self.artifacts / 'scratch',
+                  Path(self.assignment['handoff']['workspace']),
+                  Path(self.assignment['handoff']['profile']['home']))
+        for scope in scopes:
+            scope.mkdir(exist_ok=True)
+            alias = scope / 'authorization-hardlink.json'
+            os.link(self.config_path, alias)
+            try:
+                self.assertTrue(alias.samefile(self.config_path))
+                self.assertEqual(self.config_path.stat().st_nlink, 2)
+                for extra in (('--plan-only',), ()):
+                    with self.subTest(scope=str(scope), extra=extra):
+                        self.calls.clear()
+                        before = self.fixture.state.read_bytes()
+                        result = self.cli(*extra)
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertEqual(json.loads(result.stderr)['error'], 'approval_required')
+                        self.assertEqual(result.stdout, '')
+                        self.assertNotIn(self.config['bearer'], result.stdout + result.stderr)
+                        self.assertEqual(self.calls, [])
+                        self.assertEqual(self.fixture.state.read_bytes(), before)
+            finally:
+                alias.unlink()
+        self.assertEqual(self.config_path.stat().st_nlink, 1)
+        self.assertEqual(self.ok(self.cli('--plan-only'))['status'], 'plan_only')
+        self.assertEqual(self.ok(self.cli())['status'], 'published')
+
     def test_protected_scope_aliases_refused_before_http_or_state(self):
         outside = self.root / 'outside'
         outside.mkdir()

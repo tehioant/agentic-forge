@@ -55,7 +55,8 @@ def load_config(path, operator):
     try:
         path = physical(path)
         info = path.stat()
-        require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 8 * 1024 * 1024,
+        require(info.st_nlink == 1 and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 8 * 1024 * 1024,
                 'Use a private controller-owned publication authorization.', 'approval_required')
         config = read_json(path)
         fields = {'operator_id', 'reference', 'execution_reference', 'binding', 'manifest', 'paths',
