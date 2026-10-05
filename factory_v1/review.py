@@ -176,7 +176,9 @@ def execution_binding(axis):
     root = physical(axis['runtime']['artifacts'], directory=True)
     evidence = {}
     for group, names in (('scratch', ['result.json', 'loads.json', 'events.jsonl', 'conversation.json', 'probes.json']),
-                         ('', ['container-inspection.json', 'launch-command.json', 'controller-checks.json'])):
+                         ('inputs', ['worker.py', 'sandbox_relay.py', 'assignment.json', 'handoff.json']),
+                         ('', ['container-inspection.json', 'launch-command.json', 'controller-checks.json',
+                               'initial-source.json', 'source-artifacts.json'])):
         for name in names:
             path = physical(root / group / name)
             require(path.stat().st_size <= 16_000_000, 'Execution evidence exceeds bound.', 'execution_required')

@@ -265,7 +265,7 @@ class ReviewTests(unittest.TestCase):
         self.assertFalse(feedback['advance_allowed'])
         self.assignment.refused(self.command('prepare-corrections', request), 'corrections_held')
 
-    def test_public_malformed_scope_and_wrong_operator_refuse_without_new_assignments(self):
+    def test_public_malformed_scope_refuses_without_new_assignments(self):
         request = self.request('review-spec')
         before = self.assignment.fixture.state.read_bytes()
         for altered in (None, [], {}, {**request, 'axis': ['review-spec']}, {**request, 'candidate_assignment': 'BAD'},

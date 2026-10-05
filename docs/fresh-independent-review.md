@@ -165,7 +165,8 @@ approval. Its fields: `assignment_id`, `run_id`, `handoff_digest`, `pins`, `axis
 `report_sha256`, `skills` (name/source/hash/dependencies), `adaptation_sha256`,
 `loads_sha256`, `work_sha256`, `evidence`, `model_evidence`. `evidence` hashes
 scratch result/loads/events/conversation/probes and private host
-container-inspection/launch-command/controller-checks files. `model_evidence`
+container-inspection/launch-command/controller-checks/source-manifest files plus
+immutable staged worker/relay/assignment/handoff inputs. `model_evidence`
 hashes all private admitted request/response records and requires a response.
 
 **Only compute/sign off this config after independently verifying the execution.**
