@@ -259,9 +259,12 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
                 'Private trusted artifact envelope required.', 'execution_required')
         assignments.require_result_active(assignment)
-        config_location = Path(config_path)
-        require(not any(config_location.is_relative_to(Path(p)) for p in
-                        (handoff['workspace'], handoff['profile']['home'], str(root))),
+        config_location = physical(config_path)
+        scopes = (handoff['workspace'], handoff['profile']['home'], str(root))
+        require(all(assignments.absolute(p) and
+                    not any(parent.is_symlink() for parent in (Path(p), *Path(p).parents)) for p in scopes),
+                'Worker-mounted scopes must be physical absolute paths, not aliases.', 'unsafe_path')
+        require(not any(config_location.is_relative_to(Path(p)) for p in scopes),
                 'Controller authorization must never be in a worker-mounted scope.', 'approval_required')
         require(config['api_base'] == item['repository_onboarding']['api_base'] == handoff['tracker']['api_base'],
                 'Capability endpoint cannot be replaced.', 'capability_conflict')

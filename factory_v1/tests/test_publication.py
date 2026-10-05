@@ -284,6 +284,90 @@ class PublicationTests(unittest.TestCase):
         self.write_config()
         self.deny('approval_required')
 
+    def test_artifact_authorization_dotdot_alias_refused_before_http_or_state(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        self.config_path = self.artifacts / 'publication.json'
+        self.write_config()
+        before = self.fixture.state.read_bytes()
+        self.deny('approval_required')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.fixture.state.read_bytes(), before)
+        self.config_path = outside / '..' / self.artifacts.name / 'publication.json'
+        self.deny('unsafe_path')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_authorization_in_each_excluded_scope_refused_before_http_or_state(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        scopes = (Path(self.assignment['handoff']['workspace']),
+                  Path(self.assignment['handoff']['profile']['home']), self.artifacts)
+        for scope in scopes:
+            scope.mkdir(exist_ok=True)
+            self.config_path = scope / 'publication.json'
+            self.write_config()
+            for path, code in ((self.config_path, 'approval_required'),
+                               (outside / '..' / scope.name / 'publication.json', 'unsafe_path')):
+                with self.subTest(scope=scope.name, path=str(path)):
+                    self.config_path = path
+                    before = self.fixture.state.read_bytes()
+                    self.deny(code)
+                    self.assertEqual(self.calls, [])
+                    self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_protected_scope_aliases_refused_before_http_or_state(self):
+        outside = self.root / 'outside'
+        outside.mkdir()
+        original = copy.deepcopy(self.assignment)
+        for name in ('workspace', 'profile', 'artifacts'):
+            scope = Path(original['handoff']['workspace'] if name == 'workspace' else
+                         original['handoff']['profile']['home'] if name == 'profile' else
+                         original['runtime']['artifacts'])
+            scope.mkdir(exist_ok=True)
+            link = self.root / (name + '-alias')
+            link.symlink_to(scope, target_is_directory=True)
+            for alias in (outside / '..' / scope.name, link):
+                with self.subTest(scope=name, alias=str(alias)):
+                    self.assignment = copy.deepcopy(original)
+                    if name == 'workspace':
+                        self.assignment['handoff']['workspace'] = str(alias)
+                    elif name == 'profile':
+                        self.assignment['handoff']['profile']['home'] = str(alias)
+                    else:
+                        self.assignment['runtime']['artifacts'] = str(alias)
+                    self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
+                    self.config['binding'] = publication.binding(self.assignment)
+                    self.persist_assignment()
+                    self.config_path = scope / 'publication.json'
+                    self.write_config()
+                    before = self.fixture.state.read_bytes()
+                    self.deny('unsafe_path')
+                    self.assertEqual(self.calls, [])
+                    self.assertEqual(self.fixture.state.read_bytes(), before)
+
+    def test_private_outside_authorization_valid_but_aliases_refused(self):
+        outside = self.root / 'assigned-workspace-outside'
+        outside.mkdir()
+        self.config_path = outside / 'publication.json'
+        self.write_config()
+        canonical = self.config_path
+        file_link = self.root / 'authorization-alias.json'
+        file_link.symlink_to(canonical)
+        directory_link = self.root / 'outside-alias'
+        directory_link.symlink_to(outside, target_is_directory=True)
+        for alias in (file_link, directory_link / canonical.name,
+                      outside / '..' / outside.name / canonical.name):
+            with self.subTest(alias=str(alias)):
+                self.config_path = alias
+                before = self.fixture.state.read_bytes()
+                self.deny('unsafe_path')
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.fixture.state.read_bytes(), before)
+        self.config_path = canonical
+        self.assertEqual(self.ok(self.cli())['status'], 'published')
+        self.assertEqual(self.stored()['publication']['status'], 'published')
+
     def test_scope_role_repository_branch_issue_pin_denials_before_writes(self):
         original = copy.deepcopy(self.config)
         for field, value in [('repository', 'other/product'), ('repository_id', 999), ('branch', 'main'),

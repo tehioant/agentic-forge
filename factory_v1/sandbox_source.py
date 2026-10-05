@@ -17,8 +17,9 @@ MAX_FILES = 20000
 
 def physical(path, directory=False):
     path = Path(path)
-    require(path.is_absolute() and not any(p.is_symlink() for p in (path, *path.parents)),
-            'Sandbox paths must be physical absolute paths, not symlink aliases.', 'unsafe_path')
+    require(path.anchor == '/' and '..' not in path.parts and
+            not any(p.is_symlink() for p in (path, *path.parents)),
+            'Sandbox paths must be physical absolute paths, not dotdot or symlink aliases.', 'unsafe_path')
     info = path.lstat()
     require(stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode),
             'Expected a physical directory or regular file.', 'unsafe_path')

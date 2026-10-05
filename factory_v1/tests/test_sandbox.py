@@ -111,6 +111,59 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual(list(self.artifacts.iterdir()), [])
 
 
+    def test_launcher_path_aliases_refused_before_attempt_or_external_operations(self):
+        prepared = self.assignment.ok(self.assignment.command())
+        outside = self.root / 'outside'
+        outside.mkdir()
+        canonical = self.config
+        original = json.loads(canonical.read_text())
+        before = self.assignment.fixture.state.read_bytes()
+        self.config = outside / '..' / canonical.name
+        self.assignment.refused(self.launch(prepared), 'unsafe_path')
+        self.config = canonical
+        changed = dict(original, artifacts_root=str(outside / '..' / self.artifacts.name))
+        canonical.write_text(json.dumps(changed))
+        self.assignment.refused(self.launch(prepared), 'unsafe_path')
+        canonical.write_text(json.dumps(original))
+        self.assertEqual(self.assignment.fixture.state.read_bytes(), before)
+        self.assertEqual(list(self.artifacts.iterdir()), [])
+        self.assertEqual(self.model_calls, [])
+        self.assignment.assert_no_external_writes()
+
+    def test_disjoint_controller_scopes_refused_before_runtime_mutation(self):
+        from factory_v1 import sandbox
+        from factory_v1.repositories import GitHub
+
+        prepared = self.assignment.ok(self.assignment.command())
+        outside = self.root / 'outside'
+        outside.mkdir()
+        state = self.assignment.fixture.state
+        original = json.loads(self.config.read_text())
+        mounted_config = self.source / 'launcher.json'
+        mounted_config.write_text(json.dumps(original))
+        mounted_config.chmod(0o600)
+        nested_artifacts = self.source / 'artifacts'
+        nested_artifacts.mkdir(mode=0o700)
+        before = state.read_bytes()
+        # Only prerequisite Docker/provider discovery is simulated; no fake binary
+        # execution or sandbox receipt is needed to test refusal before launch.
+        with patch.object(Docker, 'image', return_value=IMAGE), patch('factory_v1.model_access.transport'):
+            for state_path, config_path, artifacts in (
+                    (outside / '..' / state.name, self.config, self.artifacts),
+                    (state, mounted_config, self.artifacts),
+                    (state, self.config, nested_artifacts)):
+                with self.subTest(state=str(state_path), config=str(config_path), artifacts=str(artifacts)):
+                    self.config.write_text(json.dumps(dict(original, artifacts_root=str(artifacts))))
+                    with self.assertRaises(RepositoryError) as refusal:
+                        sandbox.launch(str(state_path), 'product', 'm1', '42', prepared['assignment_id'],
+                                       str(config_path), GitHub(self.assignment.fixture.base, 'fixture', 10))
+                    self.assertEqual(refusal.exception.code, 'unsafe_path')
+                    self.assertEqual(state.read_bytes(), before)
+                    self.assertEqual(list(self.artifacts.iterdir()), [])
+                    self.assertEqual(list(nested_artifacts.iterdir()), [])
+        self.assertEqual(self.model_calls, [])
+        self.assignment.assert_no_external_writes()
+
     def test_launch_returns_verified_scoped_artifacts_without_modifying_original_source(self):
         prepared = self.assignment.ok(self.assignment.command())
         launched = self.assignment.ok(self.launch(prepared))
