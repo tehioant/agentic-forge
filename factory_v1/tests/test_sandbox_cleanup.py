@@ -76,7 +76,7 @@ class CleanupErrorTests(unittest.TestCase):
         artifacts = self.root / 'artifacts'
         artifacts.mkdir()
         assignment = {'assignment_id': 'a', 'ticket_scope': {'project': 'p', 'iteration': 'i'},
-                      'handoff': {'profile': {'home': str(self.root / 'absent-home')},
+                      'handoff': {'stage': 'implementation', 'profile': {'home': str(self.root / 'absent-home')},
                                   'workspace': str(self.root / 'source'), 'baseline': 'b' * 40,
                                   'candidate': None}}
         config = {'subscription_socket': str(self.root / 'unused-socket'),

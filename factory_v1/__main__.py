@@ -179,18 +179,18 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
-    for name in ['prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment']:
+    for name in ['prepare-assignment', 'prepare-simplification', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment']:
         control = commands.add_parser(name, help='Bounded role assignment and trusted full-process sandbox lifecycle.')
         control.add_argument('--project', required=True)
         control.add_argument('--iteration', required=True)
-        if name in {'prepare-assignment', 'assignment-result'}:
+        if name in {'prepare-assignment', 'prepare-simplification', 'assignment-result'}:
             control.add_argument('--request', required=True)
             control.add_argument('--api-base', required=True)
             control.add_argument('--bearer', default='credential-blind-controller')
             control.add_argument('--timeout', type=float, default=10)
-        if name != 'prepare-assignment':
+        if name not in {'prepare-assignment', 'prepare-simplification'}:
             control.add_argument('--assignment', required=True)
-        if name == 'prepare-assignment':
+        if name in {'prepare-assignment', 'prepare-simplification'}:
             control.add_argument('--dry-run', action='store_true')
         if name == 'launch-assignment':
             control.add_argument('--isolated', action='store_true', help='Untrusted assertion; never enables launch.')
@@ -228,7 +228,7 @@ def main():
             raise IntakeError('invalid_publication', 'Malformed publication inputs or persistent state; reconcile with the operator.') from error
         print(json.dumps(result, sort_keys=True))
         return
-    if args.command in {'prepare-assignment', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
+    if args.command in {'prepare-assignment', 'prepare-simplification', 'inspect-assignment', 'assignment-result', 'launch-assignment', 'stop-assignment', 'reconcile-assignment'}:
         from . import assignments
         from .repositories import GitHub, RepositoryError
         import fcntl
@@ -268,8 +268,10 @@ def main():
                         result = assignments.inspect(database, args.project, args.iteration, args.operator_id, args.assignment)
                     else:
                         github = GitHub(args.api_base, args.bearer, args.timeout)
-                        if args.command == 'prepare-assignment':
-                            result = assignments.prepare(database, args.project, args.iteration, args.operator_id, request, github, args.dry_run)
+                        if args.command in {'prepare-assignment', 'prepare-simplification'}:
+                            from . import simplification
+                            prepare = simplification.prepare if args.command == 'prepare-simplification' else assignments.prepare
+                            result = prepare(database, args.project, args.iteration, args.operator_id, request, github, args.dry_run)
                         else:
                             result = assignments.store_result(database, args.project, args.iteration, args.operator_id, args.assignment, request, github)
         except RepositoryError as error:

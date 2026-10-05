@@ -81,11 +81,55 @@ def run_fixture(container):
         loads[0]['tool_reference'] = 'invented'
         result['loads'] = loads
         (scratch / 'loads.json').write_text(json.dumps(loads))
-    (scratch / 'result.json').write_text(json.dumps(result))
-    if mounts['/workspace'] and container['Mounts'][0]['RW']:
+    if mounts['/workspace'] and container['Mounts'][0]['RW'] and assignment['handoff']['stage'] != 'simplify' and mode != 'implementation-no-op':
         (mounts['/workspace'] / 'hello.py').write_text('print("candidate fixture")\n')
     if mode == 'symlink':
         (mounts['/workspace'] / 'escape').symlink_to('/home/ops/.hermes/auth.json')
+    if assignment['handoff']['stage'] == 'simplify' and mode != 'malformed':
+        contract = assignment['handoff']['simplification']
+        if mode in ('cleanup', 'false-no-op', 'applied-finding'):
+            (mounts['/workspace'] / 'hello.py').write_text('print("candidate fixture")  \n')
+        if mode == 'scope-violation':
+            (mounts['/workspace'] / 'unrelated.py').write_text('unapproved = True\n')
+        tree = {}
+        for path in mounts['/workspace'].rglob('*'):
+            if path.is_file():
+                raw = path.read_bytes()
+                tree[str(path.relative_to(mounts['/workspace']))] = {
+                    'sha256': hashlib.sha256(raw).hexdigest(), 'bytes': len(raw),
+                    'executable': bool(path.stat().st_mode & 0o111)}
+        revision = hashlib.sha256(json.dumps(tree, sort_keys=True, ensure_ascii=False,
+            separators=(',', ':')).encode()).hexdigest()
+        findings = [{'kind': 'behavior', 'path': 'hello.py:1', 'evidence': 'Labeled risky proposal fixture',
+                     'proposal': 'Do not apply: change output.'}] if mode in ('findings', 'applied-finding', 'false-approval') else []
+        report = {'contract': contract['contract'], 'adaptation': assignment['handoff']['adaptation'],
+            'input_candidate_sha256': contract['input_candidate_sha256'], 'candidate_sha256': revision,
+            'outcome': 'cleanup' if mode == 'cleanup' else ('findings' if findings else 'no-op'),
+            'behavior_preservation': 'not-established' if findings else 'preserved',
+            'angles': {angle: 'Labeled ' + angle + ' search/work fixture' for angle in contract['angles']},
+            'findings': findings}
+        if mode == 'wrong-revision':
+            report['candidate_sha256'] = '0' * 64
+        if mode == 'wrong-input':
+            report['input_candidate_sha256'] = '0' * 64
+        if mode == 'wrong-adaptation':
+            report['adaptation'] = 'unreviewed'
+        if mode == 'missing-angle':
+            del report['angles']['altitude']
+        if mode == 'behavior-not-preserved':
+            report['behavior_preservation'] = 'not-established'
+        if mode == 'false-approval':
+            report.update(outcome='no-op', behavior_preservation='preserved')
+        content = json.dumps(report, sort_keys=True)
+        if mode == 'malformed-stage':
+            content = '{not JSON'
+        if mode == 'nested-stage':
+            content = '{"nested":' + '[' * 2000 + '0' + ']' * 2000 + '}'
+        if mode == 'duplicate-stage':
+            content = content[:-1] + ', "outcome": "no-op"}'
+        result['artifacts'].append({'name': 'simplification-result', 'content': content,
+                                    'sha256': hashlib.sha256(content.encode()).hexdigest()})
+    (scratch / 'result.json').write_text(json.dumps(result))
 
 
 if args[:2] == ['image', 'inspect']:
