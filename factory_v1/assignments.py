@@ -314,7 +314,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
         completed_replay = (runtime.get('status') == 'complete' and runtime.get('container_removed') is True and
                             assignment.get('submitted_result') == request)
         require(launcher_submission or completed_replay,
-                'Simplification accepts only launcher-validated output or exact completed replay.', 'invalid_result')
+                'Stage accepts only launcher-validated output or exact completed replay.', 'invalid_result')
         if handoff['stage'] == 'simplify':
             from .simplification import validate_result
         else:

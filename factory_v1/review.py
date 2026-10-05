@@ -6,7 +6,7 @@ import shutil
 import stat
 from pathlib import Path
 
-from . import assignments, role_skills, simplification
+from . import assignments, simplification
 from .planning import require, text
 from .publication import policy_path
 from .repositories import RepositoryError
@@ -23,14 +23,14 @@ def candidate(database, project, iteration, operator, assignment_id):
     assert prior is not None
     for child in assignments.rows(database):
         if (child['handoff'].get('corrections', {}).get('pins', {}).get('candidate_assignment') == assignment_id and
-                child.get('runtime', {}).get('status') == 'complete'):
+                child.get('runtime', {}).get('status') == 'complete' and child.get('submitted_result', {}).get('status') == 'done'):
             require(False, 'Corrective work superseded this candidate; both axes and checks must rerun.', 'stale_review')
     runtime = prior.get('runtime', {})
     stage = prior.get('simplification_result', {})
     require(prior['handoff']['stage'] == 'simplify' and runtime.get('status') == 'complete' and
             runtime.get('container_removed') is True and prior.get('submitted_result', {}).get('status') == 'done' and
             stage.get('outcome') in {'cleanup', 'no-op'} and stage.get('checks_verified') is True and
-            not stage.get('findings') and not prior.get('review_successor'),
+            not stage.get('findings'),
             'An unchanged completed simplified candidate without unresolved findings is required.', 'candidate_unverified')
     try:
         root = physical(runtime['artifacts'], directory=True)
@@ -78,7 +78,8 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
 
 def handoff(database, project, iteration, operator, request):
     evidence = simplification.handoff_evidence(next(a['content'] for a in request['preceding'] if a['name'] == 'simplification-evidence'))
-    identity = evidence.get('pins', {}).get('candidate_assignment')
+    require(isinstance(evidence.get('pins'), dict), 'Exact candidate pins required.', 'candidate_unverified')
+    identity = evidence['pins'].get('candidate_assignment')
     require(assignments.sha(identity), 'Exact simplified candidate identity required.', 'candidate_unverified')
     prior, root, source, baseline, checks = candidate(database, project, iteration, operator, identity)
     require(all(request[key] == prior['handoff'][key] for key in
@@ -110,7 +111,15 @@ def validate_result(assignment, result):
     contract = assignment['handoff']['review']
     runtime = assignment.get('runtime', {})
     root = physical(runtime['artifacts'], directory=True)
-    source, _, checks = simplification.check_receipt(root, runtime)
+    source, raw_checks, checks = simplification.check_receipt(root, runtime)
+    baseline = manifest(root / 'inputs' / 'baseline')
+    require(assignments.digest(baseline) == contract['pins']['baseline_sha256'],
+            'Review baseline changed.', 'invalid_result')
+    if runtime.get('status') == 'complete':
+        require(runtime.get('candidate_sha256') == assignments.digest(source) and
+                runtime.get('baseline_sha256') == assignments.digest(baseline) and
+                runtime.get('checks_sha256') == hashlib.sha256(raw_checks.encode()).hexdigest(),
+                'Completed review source/check receipt pins changed.', 'invalid_result')
     require(assignments.digest(source) == contract['pins']['tree_sha256'] and
             [r['command'] for r in checks['records']] == contract['verification_commands'],
             'Review source/checks must remain unchanged.', 'invalid_result')
@@ -228,10 +237,16 @@ def evaluate(database, project, iteration, operator, request, github, config_pat
         config = saved
     decision = config['policy_decision'] if config else None
     policy_held = bool(sensitive or weakening) and not (decision and decision['paths'] == sensitive and decision['findings'] == weakening)
-    status = ('operator-decision' if policy_held else 'diagnosis' if any(r['verdict'] == 'stuck' for r in reports.values())
+    stuck_corrections = [child for child in assignments.rows(database)
+                         if child['handoff'].get('corrections', {}).get('pins') == axes[0]['handoff']['review']['pins'] and
+                         child.get('runtime', {}).get('status') == 'complete' and
+                         child.get('submitted_result', {}).get('status') == 'stuck']
+    status = ('operator-decision' if policy_held else 'diagnosis' if stuck_corrections or any(r['verdict'] == 'stuck' for r in reports.values())
               else 'corrections' if findings else 'accepted' if config else 'execution-unverified')
     result = {'contract': CONTRACT, 'pins': axes[0]['handoff']['review']['pins'], 'axes': reports,
               'status': status, 'findings': findings, 'policy_paths': sensitive, 'policy_findings': weakening,
+              'debug_evidence': [{'assignment_id': c['assignment_id'], 'runtime': c['runtime'],
+                                  'result': c['submitted_result']} for c in stuck_corrections],
               'execution_verified': config is not None, 'advance_allowed': status == 'accepted',
               'merge_allowed': False, 'close_allowed': False,
               'execution_reference': config['execution_reference'] if config else None}
@@ -271,5 +286,6 @@ def corrections_handoff(database, project, iteration, operator, request, github)
                 ('repository', 'repository_id', 'workspace', 'issue', 'spec_commit', 'baseline', 'candidate', 'standards')),
             'Corrections must retain exact rejected scope and requirements.', 'scope_mismatch')
     return {'pins': feedback['pins'], 'reviews': evidence['reviews'], 'findings': feedback['findings'],
+            'verification_commands': axes[0]['handoff']['review']['verification_commands'],
             'rerun_required': ['implementation-checks', 'simplify', 'Standards', 'Spec'],
             'advance_allowed': False}

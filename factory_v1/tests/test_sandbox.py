@@ -242,11 +242,11 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o002, 0o002)
         self.assertEqual(root.stat().st_mode & 0o077, 0)
 
-    def test_review_mount_is_read_only_and_returns_unchanged_candidate(self):
-        self.assignment.request = self.assignment.configuration(stage='review-standards')
+    def test_diagnostic_mount_is_read_only_and_returns_unchanged_candidate(self):
+        # Review-specific mounts now use real controller-derived precursors in test_review.
+        self.assignment.request = self.assignment.configuration(stage='diagnosis')
         head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.source, text=True).strip()
-        self.assignment.request.update(baseline=head, candidate=head)
-        self.assignment.request['preceding'][0] = test_assignments.artifact('candidate', head)
+        self.assignment.request.update(baseline=head)
         prepared = self.assignment.ok(self.assignment.command())
         launched = self.assignment.ok(self.launch(prepared))
         self.assertEqual(launched['runtime']['status'], 'complete', launched)

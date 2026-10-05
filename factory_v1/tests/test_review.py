@@ -1,6 +1,7 @@
 """Public fresh-process review lifecycle. All Docker/model/tracker evidence is labeled simulation."""
 import copy
 import json
+import time
 import unittest
 from pathlib import Path
 
@@ -17,7 +18,7 @@ class ReviewTests(unittest.TestCase):
         self.assignment = self.case.assignment
         grant = self.assignment.fixture.cli('spend-grant', '--project', 'product', '--iteration', 'm1',
             '--provider', 'openai-codex', '--model', 'gpt-6.1-sol', '--operation', 'responses',
-            '--kind', 'allowance', '--ceiling', '100', '--expires', str(__import__('time').time_ns() // 1_000_000_000 + 600),
+            '--kind', 'allowance', '--ceiling', '100', '--expires', str(int(time.time()) + 600),
             '--reference', 'Labeled bounded review-test fixture allowance, not new live spending')
         self.assignment.ok(grant)
         self.implemented = self.seam.implementation()
@@ -201,6 +202,108 @@ class ReviewTests(unittest.TestCase):
         skill.write_text(skill.read_text() + '\nUnreviewed change')
         self.assignment.refused(self.case.launch(prepared), 'skill_blocked')
         self.assertNotIn('runtime', self.assignment.ok(self.assignment.inspect(prepared)))
+
+    def candidate_with_mode(self, mode):
+        config = copy.deepcopy(self.assignment.request)
+        config['profile'].update(name='builder-' + mode, home=str(self.case.root / ('builder-home-' + mode)))
+        config['claim_id'] = 'builder-' + mode
+        self.case.mode(mode)
+        prepared = self.assignment.ok(self.assignment.command(request=config))
+        implemented = self.assignment.ok(self.case.launch(prepared))
+        self.assertEqual(implemented['runtime']['status'], 'complete', implemented)
+        self.case.mode('')
+        prepared = self.assignment.ok(self.seam.prepare(self.seam.request(implemented, mode)))
+        return self.assignment.ok(self.case.launch(prepared))
+
+    def test_policy_paths_hold_claimed_passes_but_legitimate_test_changes_are_requirement_reviewed(self):
+        for mode in ('implementation-policy', 'implementation-test'):
+            candidate = self.candidate_with_mode(mode)
+            axes = self.pair(suffix='-' + mode, candidate=candidate)
+            request = self.pair_request(axes)
+            result = self.assignment.ok(self.command('review-candidate', request, self.authorization(axes)))
+            if mode == 'implementation-policy':
+                self.assertEqual(result['status'], 'operator-decision')
+                self.assertFalse(result['advance_allowed'])
+                path = '.github/workflows/checks.yml'
+                bad = {'reference': 'Fixture wrong operator scope', 'paths': [], 'findings': []}
+                self.assertEqual(self.assignment.ok(self.command('review-candidate', request, self.authorization(axes, bad)))['status'], 'operator-decision')
+                exact = {'reference': 'Fixture explicit exact policy decision', 'paths': [path], 'findings': []}
+                self.assertEqual(self.assignment.ok(self.command('review-candidate', request, self.authorization(axes, exact)))['status'], 'accepted')
+            else:
+                self.assertEqual(result['status'], 'accepted')
+                self.assertEqual(axes[1]['handoff']['review']['test_changes'], ['test_hello.py'])
+                self.assertTrue(result['axes']['Spec']['test_assessment'])
+
+    def test_axes_from_distinct_candidates_never_mix_and_private_receipt_tree_baseline_drift_refuses(self):
+        first_axes = self.pair()
+        second = self.candidate_with_mode('implementation-test')
+        second_spec = self.axis('review-spec', suffix='-different', candidate=second)
+        self.assignment.refused(self.command('review-candidate', self.pair_request((first_axes[0], second_spec))), 'stale_review')
+        root = Path(self.candidate['runtime']['artifacts'])
+        receipt = root / 'controller-checks.json'
+        raw = receipt.read_bytes()
+        receipt.write_bytes(raw + b'\n')
+        self.assignment.refused(self.command('review-candidate', self.pair_request(first_axes)), 'candidate_unverified')
+        receipt.write_bytes(raw)
+        (root / 'inputs/baseline/hello.py').write_text('baseline drift')
+        self.assignment.refused(self.command('review-candidate', self.pair_request(first_axes)), 'candidate_unverified')
+
+    def test_stuck_corrective_attempt_keeps_agent_evidence_for_debug_and_never_satisfies_review(self):
+        axes = self.pair('review-reject')
+        config = self.assignment.configuration(stage='corrections')
+        request = {**self.pair_request(axes), 'profile': config['profile'], 'skills': config['skills'], 'claim_id': 'stuck-fix'}
+        prepared = self.assignment.ok(self.command('prepare-corrections', request))
+        self.seam.set_checks(['true'])
+        self.assignment.refused(self.case.launch(prepared), 'verification_required')
+        self.seam.set_checks(['python -m unittest discover -v'])
+        self.case.mode('correction-stuck')
+        stuck = self.assignment.ok(self.case.launch(prepared))
+        self.assertEqual(stuck['runtime']['status'], 'complete', stuck)
+        feedback = self.assignment.ok(self.command('review-candidate', self.pair_request(axes)))
+        self.assertEqual(feedback['status'], 'diagnosis')
+        self.assertEqual(feedback['debug_evidence'][0]['result'], stuck['submitted_result'])
+        self.assertFalse(feedback['advance_allowed'])
+        self.assignment.refused(self.command('prepare-corrections', request), 'corrections_held')
+
+    def test_public_malformed_scope_and_wrong_operator_refuse_without_new_assignments(self):
+        request = self.request('review-spec')
+        before = self.assignment.fixture.state.read_bytes()
+        for altered in (None, [], {}, {**request, 'axis': ['review-spec']}, {**request, 'candidate_assignment': 'BAD'},
+                        {**request, 'extra': True}):
+            self.assignment.refused(self.command('prepare-review', altered), 'invalid_review')
+            self.assertEqual(before, self.assignment.fixture.state.read_bytes())
+        prepared = self.assignment.ok(self.command('prepare-review', request))
+        generic = {key: prepared['handoff'][key] for key in self.assignment.request}
+        generic['skills'] = [{k: v for k, v in s.items() if k != 'instructions'} for s in generic['skills']]
+        for key in ('candidate', 'baseline', 'spec_commit'):
+            wrong = copy.deepcopy(generic)
+            wrong[key] = 'f' * 40
+            self.assignment.refused(self.assignment.command(request=wrong), 'scope_mismatch')
+
+    def test_pause_and_stop_during_review_checks_preserve_raw_attempt_without_acceptance(self):
+        prepared = self.assignment.ok(self.command('prepare-review', self.request('review-spec')))
+        self.case.mode('checks-hang')
+        process = self.case.started(prepared)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            observed = self.assignment.ok(self.assignment.inspect(prepared))
+            runtime = observed.get('runtime')
+            if runtime and (Path(runtime['artifacts']) / 'checks/container-inspection.json').exists():
+                break
+            self.assertIsNone(process.poll())
+            time.sleep(.02)
+        else:
+            self.fail('Review checks did not start')
+        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
+        self.assignment.ok(self.assignment.command('stop-assignment', assignment=prepared['assignment_id']))
+        output, error = process.communicate(timeout=10)
+        self.assertEqual(process.returncode, 0, error)
+        stopped = json.loads(output)
+        self.assertEqual(stopped['runtime']['status'], 'stopped')
+        self.assertNotIn('submitted_result', stopped)
+        self.assertNotIn('review_result', stopped)
+        self.assertFalse((self.case.bin / 'container.json').exists())
+        self.assertEqual(self.assignment.ok(self.assignment.inspect(prepared))['runtime'], stopped['runtime'])
 
     def test_generic_review_and_corrections_cannot_inject_prose_or_substitute_original_scope(self):
         arbitrary = self.assignment.configuration(stage='review-spec')

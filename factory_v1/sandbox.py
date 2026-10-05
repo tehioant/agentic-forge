@@ -135,10 +135,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
-        if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec'}:
+        if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
             assignments.prepare(database, project, iteration, operator, original(prepared), github, dry_run=True)
-            require(config.get('verification_commands', []) == (prepared['handoff'].get('review') or prepared['handoff']['simplification'])['verification_commands'],
-                    'Simplification must rerun the exact implementation checks; no weakened or absent commands.', 'verification_required')
+            require(config.get('verification_commands', []) == (prepared['handoff'].get('review') or prepared['handoff'].get('corrections') or prepared['handoff']['simplification'])['verification_commands'],
+                    'Dependent stages must rerun the exact original checks; no weakened or absent commands.', 'verification_required')
     docker = Docker()
     image_id = docker.image()
     # Validate fixed host route before claiming any runtime; never mount this upstream socket.

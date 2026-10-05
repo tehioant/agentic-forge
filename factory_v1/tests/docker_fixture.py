@@ -75,6 +75,9 @@ def run_fixture(container):
         'tests': [{'command': command, 'result': 'Labeled fixture pass'}],
         'artifacts': [{'name': 'stage-evidence', 'content': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}]}
     mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+    if mode == 'correction-stuck':
+        result['status'] = 'stuck'
+        result['work'].append('Labeled agent-declared engineering stuckness; actual attempts retained for debug.')
     if mode == 'malformed':
         result = {'status': 'done'}
     if mode == 'bad-load':
@@ -83,6 +86,12 @@ def run_fixture(container):
         (scratch / 'loads.json').write_text(json.dumps(loads))
     if mounts['/workspace'] and container['Mounts'][0]['RW'] and assignment['handoff']['stage'] != 'simplify' and mode != 'implementation-no-op':
         (mounts['/workspace'] / 'hello.py').write_text('print("candidate fixture")\n')
+    if assignment['handoff']['stage'] == 'implementation' and mode == 'implementation-policy':
+        policy = mounts['/workspace'] / '.github/workflows/checks.yml'
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text('# Labeled policy-path change fixture, not executed CI\n')
+    if assignment['handoff']['stage'] == 'implementation' and mode == 'implementation-test':
+        (mounts['/workspace'] / 'test_hello.py').write_text('# Labeled legitimate requirement-based test addition fixture\n')
     if mode == 'symlink':
         (mounts['/workspace'] / 'escape').symlink_to('/home/ops/.hermes/auth.json')
     if assignment['handoff']['stage'] == 'simplify' and mode != 'malformed':
