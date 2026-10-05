@@ -10,6 +10,10 @@ Keep SQLite state, journals/backups, request files, receipts and output in a pri
 
 The configured GitHub endpoint must be an approved narrow controller capability. Use a credential-blind broker, not a worker's personal token. HTTPS and loopback HTTP endpoints are supported. URL credentials, query/fragment, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Endpoint and immutable repository identity are pinned by onboarding. The adapter does not itself prove OS isolation or broker authorization. Ticket publication requires a separately authorized Issues/dependencies/Projects capability at that same endpoint; metadata-only bootstrap access does not grant mutation authority. No credential bridge, paid fallback, protection bypass or gate weakening is introduced here. Independent review, required security/CI checks, controlled integration and integrated-main verification remain mandatory.
 
+## Candidate publication (#14)
+
+`publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes only a fixed candidate branch and draft PR; it never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
+
 ## Intake and repository onboarding
 
 Example placeholders are not evidence:

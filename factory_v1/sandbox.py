@@ -148,10 +148,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             require('runtime' not in assignment, 'Attempt already owns this assignment; inspect/stop/reconcile, never duplicate launch.', 'run_conflict')
             home = Path(assignment['handoff']['profile']['home'])
             require(not home.exists() and not home.is_symlink(), 'Role home must be fresh; no ambient profile is mounted or copied.', 'profile_blocked')
-            artifact_root = Path(config['artifacts_root'])
-            workspace = Path(assignment['handoff']['workspace'])
+            artifact_root = physical(config['artifacts_root'], directory=True)
+            workspace = physical(assignment['handoff']['workspace'], directory=True)
             require(not artifact_root.is_relative_to(workspace) and not workspace.is_relative_to(artifact_root) and
-                    not Path(config_path).is_relative_to(workspace) and not Path(state).is_relative_to(workspace),
+                    not physical(config_path).is_relative_to(workspace) and not physical(state).is_relative_to(workspace),
                     'Controller state/config, artifacts and source scopes must be disjoint.', 'unsafe_path')
             run_id = 'run-' + uuid.uuid4().hex
             root = artifact_root / run_id

@@ -81,6 +81,8 @@ class CleanupErrorTests(unittest.TestCase):
                                   'candidate': None}}
         config = {'subscription_socket': str(self.root / 'unused-socket'),
                   'artifacts_root': str(artifacts), 'image': 'fixture', 'limits': {'seconds': 1}}
+        (self.root / 'source').mkdir()
+        (self.root / 'config.json').write_text(json.dumps(config))
         docker = Mock()
         docker.image.return_value = 'fixture'
         docker.remove.side_effect = FileNotFoundError('injected Docker disappearance during cleanup')
