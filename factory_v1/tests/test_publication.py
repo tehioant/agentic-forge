@@ -48,6 +48,7 @@ class PublicationTests(unittest.TestCase):
         # Fixture-only trusted-host injection. This is not a worker isolation receipt.
         self.calls = []
         self.commits = {}
+        self.commit_readback_overrides = {}
         self.refs = {'main': 'a' * 40}
         self.prs = []
         self.drop = None
@@ -78,7 +79,9 @@ class PublicationTests(unittest.TestCase):
                 elif path == '/issues/10':
                     value = case.issue
                 elif path.startswith('/git/commits/'):
-                    value = case.commits.get(path.split('/')[-1])
+                    value = copy.deepcopy(case.commits.get(path.split('/')[-1]))
+                    if isinstance(value, dict) and 'message' in value:
+                        value.update(case.commit_readback_overrides)
                 elif path == '/git/trees/' + case.tree + '?recursive=1':
                     value = {'sha': case.tree, 'tree': case.entries, 'truncated': False}
                 elif path.startswith('/git/ref/heads/'):
@@ -117,7 +120,8 @@ class PublicationTests(unittest.TestCase):
                 elif path == '/git/commits':
                     raw = f"tree {body['tree']}\nparent {body['parents'][0]}\nauthor Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\ncommitter Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n\n{body['message']}".encode()
                     actual = subprocess.run(['/usr/bin/git', 'hash-object', '--stdin', '-t', 'commit'], input=raw, capture_output=True, check=True).stdout.decode().strip()
-                    value = {'sha': actual, 'tree': {'sha': body['tree']}, 'parents': [{'sha': body['parents'][0]}], 'message': body['message']}
+                    assert body['message'].endswith('\n')
+                    value = {'sha': actual, 'tree': {'sha': body['tree']}, 'parents': [{'sha': body['parents'][0]}], 'message': body['message'][:-1]}
                     case.commits[actual] = value
                 elif path == '/git/refs':
                     case.refs[body['ref'].removeprefix('refs/heads/')] = body['sha']
@@ -244,6 +248,52 @@ class PublicationTests(unittest.TestCase):
         self.assertEqual(commit, {'message': 'Factory candidate: Refs #10\n', 'tree': self.plan['tree'],
                                   'parents': ['a' * 40], 'author': identity, 'committer': identity})
         self.assertEqual(result['candidate'], self.plan['candidate'])
+
+    def test_exact_commit_message_readback_with_and_without_terminal_lf(self):
+        result = self.ok(self.cli())
+        self.assertEqual(result['status'], 'published')
+        self.assertEqual(result['candidate'], self.plan['candidate'])
+        commit = self.commits[result['candidate']]
+        self.assertEqual(commit['message'], self.plan['message'])
+        payload = next(c[2] for c in self.writes() if c[1].endswith('/git/commits'))
+        self.assertEqual(payload['message'], self.plan['message'] + '\n')
+        before = self.writes()
+        self.assertEqual(self.ok(self.cli()), result)
+        commit['message'] = self.plan['message'] + '\n'
+        self.assertEqual(self.ok(self.cli()), result)
+        self.assertEqual(self.writes(), before)
+
+    def test_commit_readback_mismatch_keeps_pending_intent_before_ref_or_pr(self):
+        message = self.plan['message']
+        cases = [('message', value) for value in (
+            'drift', ' ' + message, message + ' ', message + '\t', message + '\r\n',
+            message + '\n\n', message + '\n ', message + '\n\t', '\n' + message,
+            None, [], {}, 123, True)]
+        cases.extend([('sha', 'c' * 40), ('tree', {'sha': 'c' * 40}),
+                      ('parents', []), ('parents', [{'sha': 'c' * 40}]),
+                      ('parents', [{'sha': self.config['expected_head']}] * 2)])
+        saved = None
+        for field, value in cases:
+            with self.subTest(field=field, value=value):
+                self.calls.clear()
+                self.commit_readback_overrides = {field: value}
+                result = self.cli()
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                self.assertEqual(result.stdout, '')
+                self.assertEqual(json.loads(result.stderr), {
+                    'error': 'github_mismatch', 'message': 'Exact commit readback failed.'})
+                self.assertNotIn(self.config['bearer'], result.stdout + result.stderr)
+                self.assertNotIn(self.config['branch'], self.refs)
+                self.assertEqual(self.prs, [])
+                self.assertEqual(self.refs['main'], self.config['expected_head'])
+                self.assertEqual(self.issue['state'], 'open')
+                self.assertEqual(self.stored()['publication']['status'], 'pending')
+                if saved is None:
+                    saved = self.stored()['publication']
+                self.assertEqual(self.stored()['publication'], saved)
+                self.assertEqual([c[1] for c in self.writes()], [
+                    '/repos/example/product/git/blobs', '/repos/example/product/git/trees',
+                    '/repos/example/product/git/commits'])
 
     def test_lost_ref_response_reconciles_same_target_after_restart(self):
         self.drop = '/git/refs'

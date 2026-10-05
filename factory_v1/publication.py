@@ -414,7 +414,7 @@ def verify_commit(api, plan, config):
     require(isinstance(value, dict) and value.get('sha') == plan['candidate'] and
             value.get('tree', {}).get('sha') == plan['tree'] and
             [p.get('sha') for p in value.get('parents', [])] == [config['expected_head']] and
-            value.get('message') == plan['message'] + '\n', 'Exact commit readback failed.', 'github_mismatch')
+            value.get('message') in (plan['message'], plan['message'] + '\n'), 'Exact commit readback failed.', 'github_mismatch')
 
 
 def verify_pr(value, config, plan, title, body):
