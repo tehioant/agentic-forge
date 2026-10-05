@@ -81,6 +81,31 @@ def implementation(database, project, iteration, operator, assignment_id):
     return prior, root, source, baseline, receipt
 
 
+def handoff_json(value):
+    """Keep native input lines bounded, with lossless JSON transport for long strings."""
+    content = json.dumps(value, sort_keys=True, indent=2)
+    if any(len(line) > 2000 for line in content.splitlines()):
+        # JSON cannot split a string token across physical lines. Chunk the serialized
+        # JSON instead; escaping each 256-character chunk stays below the tool bound.
+        content = json.dumps({'format': 'factory-json-chunks-v1',
+                              'decode': "json.loads(''.join(chunks))",
+                              'chunks': [content[start:start + 256] for start in range(0, len(content), 256)]},
+                             sort_keys=True, indent=2)
+    return content
+
+
+def handoff_evidence(content):
+    evidence = object_json(content, 'implementation_unverified')
+    if evidence.get('format') == 'factory-json-chunks-v1':
+        require(set(evidence) == {'format', 'decode', 'chunks'} and
+                evidence['decode'] == "json.loads(''.join(chunks))" and
+                isinstance(evidence['chunks'], list) and
+                all(isinstance(chunk, str) for chunk in evidence['chunks']),
+                'Malformed handoff JSON chunks.', 'implementation_unverified')
+        evidence = object_json(''.join(evidence['chunks']), 'implementation_unverified')
+    return evidence
+
+
 def diff_artifact(root, before, after):
     entries = []
     for path in changed_paths(before, after):
@@ -92,7 +117,7 @@ def diff_artifact(root, before, after):
         except UnicodeError:
             diff = 'Binary change: inspect the pinned baseline and implementation bytes.'
         entries.append({'path': path, 'before': before.get(path), 'after': after.get(path), 'diff': diff})
-    return artifact('implementation-diff', json.dumps(entries, sort_keys=True))
+    return artifact('implementation-diff', handoff_json(entries))
 
 
 def preceding(prior, root, source, baseline, receipt):
@@ -102,7 +127,7 @@ def preceding(prior, root, source, baseline, receipt):
                 'checks': receipt, 'implementation_result': prior['submitted_result'],
                 'native_execution_trusted': False}
     return [artifact('candidate', prior['handoff']['candidate'] or prior['handoff']['baseline']),
-            artifact('implementation-evidence', json.dumps(evidence, sort_keys=True)),
+            artifact('implementation-evidence', handoff_json(evidence)),
             diff_artifact(root, baseline, source)]
 
 
@@ -122,7 +147,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
 def handoff(database, project, iteration, operator, request):
     """Also guard generic prepare-assignment; arbitrary preceding prose cannot bypass the seam."""
     supplied = next(a for a in request['preceding'] if a['name'] == 'implementation-evidence')
-    evidence = object_json(supplied['content'], 'implementation_unverified')
+    evidence = handoff_evidence(supplied['content'])
     require(assignments.sha(evidence.get('assignment_id')), 'Exact previous implementation assignment required.', 'implementation_unverified')
     prior, root, source, baseline, receipt = implementation(database, project, iteration, operator, evidence['assignment_id'])
     assert prior is not None

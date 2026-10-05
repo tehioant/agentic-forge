@@ -61,7 +61,16 @@ old attempt.
 The controller builds the handoff from the original issue/spec/standards, exact
 Git baseline, sanitized tested implementation tree, path/content/mode diff,
 preceding structured result and actual controller check outputs. It does not
-inherit the implementation conversation. `--dry-run` writes no claim or state;
+inherit the implementation conversation. Generated evidence/diff JSON is formatted
+across lines for the pinned native file tool. A long JSON string cannot itself be
+split across physical lines, so inputs exceeding its 2,000-column limit use the
+lossless `factory-json-chunks-v1` envelope: decode with
+`json.loads(''.join(chunks))`. These are transport bytes, pinned before staging;
+only precursor evidence uses the decoder, not worker result contracts. Startup
+refuses `truncated_lines` as well as page truncation before inference. Exact
+native-read consistency verification is unchanged.
+
+`--dry-run` writes no claim or state;
 exact replay preserves the original assignment. The generic
 `prepare-assignment` path enforces the same precursor contract, not a bypass.
 

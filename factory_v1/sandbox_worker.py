@@ -86,7 +86,7 @@ def main():
         if hashlib.sha256(raw).hexdigest() != item['sha256']:
             raise RuntimeError('immutable_input_changed')
         parsed = json.loads(value)
-        if parsed.get('error') or parsed.get('truncated') or parsed.get('not_found'):
+        if parsed.get('error') or parsed.get('truncated') or parsed.get('truncated_lines') or parsed.get('not_found'):
             raise RuntimeError('instruction_load_incomplete')
         loads.append({'source': item['source'], 'sha256': item['sha256'], 'tool_reference': reference})
         instructions.append({'source': item['source'], 'path': item['path'], 'tool_result': parsed})
