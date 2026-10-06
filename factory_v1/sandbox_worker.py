@@ -129,6 +129,22 @@ def main():
                    'on the final candidate. No-op must include four-angle work and actual tests. '
                    'Native execution claims remain untrusted; do not assert approval.\n' +
                    json.dumps({'adaptation': handoff['adaptation'], **handoff['simplification']}))
+    if 'review' in handoff:
+        prompt += ('\nINDEPENDENT REVIEW RESULT: Load and follow code-review for ONLY the assigned axis. '
+                   'Do not spawn the other axis; it has its own fresh read-only assignment. '
+                   'Compare /inputs/baseline and /workspace using the pinned diff; Git metadata is intentionally absent. '
+                   'Retain stage-evidence AND review-result artifacts. review-result content is JSON with exactly '
+                   'result_fields below: contract, axis, adaptation and pins must match exactly. verdict is pass, '
+                   'reject or stuck. findings have exactly finding_fields and an admitted kind. Every finding '
+                   'needs an original requirement/standard citation, actual source evidence and a correction. '
+                   'A pass has no findings and stuckness=null; reject has findings and stuckness=null. '
+                   'Stuck has status=stuck and stuckness with nonempty attempts/evidence/uncertainty/recommendation strings. '
+                   'test_assessment must evaluate test additions/removals against actual original requirements, '
+                   'not only green tests. Reject omitted/partial behavior, scope creep, harmful simplification and '
+                   'unjustified test weakening. Gate/security weakening requires an operator decision, never a green shortcut. '
+                   'Run the unchanged verification_commands in scratch if needed; never change submitted source. '
+                   'Worker execution claims are untrusted; do not assert delivery or authority.\n' +
+                   json.dumps({'adaptation': handoff['adaptation'], **handoff['review']}))
     result = agent.run_conversation(prompt, conversation_history=[], task_id=run_id)
     Path('/scratch/conversation.json').write_text(json.dumps(result, default=str))
     final = json.loads(result['final_response'])

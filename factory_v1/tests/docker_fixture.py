@@ -75,6 +75,9 @@ def run_fixture(container):
         'tests': [{'command': command, 'result': 'Labeled fixture pass'}],
         'artifacts': [{'name': 'stage-evidence', 'content': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}]}
     mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+    if mode == 'correction-stuck':
+        result['status'] = 'stuck'
+        result['work'].append('Labeled agent-declared engineering stuckness; actual attempts retained for debug.')
     if mode == 'malformed':
         result = {'status': 'done'}
     if mode == 'bad-load':
@@ -83,6 +86,12 @@ def run_fixture(container):
         (scratch / 'loads.json').write_text(json.dumps(loads))
     if mounts['/workspace'] and container['Mounts'][0]['RW'] and assignment['handoff']['stage'] != 'simplify' and mode != 'implementation-no-op':
         (mounts['/workspace'] / 'hello.py').write_text('print("candidate fixture")\n')
+    if assignment['handoff']['stage'] == 'implementation' and mode == 'implementation-policy':
+        policy = mounts['/workspace'] / '.github/workflows/checks.yml'
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text('# Labeled policy-path change fixture, not executed CI\n')
+    if assignment['handoff']['stage'] == 'implementation' and mode == 'implementation-test':
+        (mounts['/workspace'] / 'test_hello.py').write_text('# Labeled legitimate requirement-based test addition fixture\n')
     if mode == 'symlink':
         (mounts['/workspace'] / 'escape').symlink_to('/home/ops/.hermes/auth.json')
     if assignment['handoff']['stage'] == 'simplify' and mode != 'malformed':
@@ -128,6 +137,45 @@ def run_fixture(container):
         if mode == 'duplicate-stage':
             content = content[:-1] + ', "outcome": "no-op"}'
         result['artifacts'].append({'name': 'simplification-result', 'content': content,
+                                    'sha256': hashlib.sha256(content.encode()).hexdigest()})
+    if 'review' in assignment['handoff'] and mode != 'malformed':
+        contract = assignment['handoff']['review']
+        findings = []
+        if mode in ('review-reject', 'review-gate', 'review-security', 'review-test', 'review-false-pass'):
+            kind = {'review-gate': 'gate-weakening', 'review-security': 'security-weakening', 'review-test': 'test-weakening'}.get(mode, 'missing')
+            findings = [{'id': 'R1', 'kind': kind, 'path': 'hello.py:1',
+                         'requirement': 'Fixture requirement: print required greeting.',
+                         'evidence': 'Labeled omitted behavior despite passing check fixture.',
+                         'correction': 'Implement required greeting and meaningful regression.'}]
+        report = {'contract': contract['contract'], 'axis': contract['axis'],
+                  'adaptation': assignment['handoff']['adaptation'], 'pins': contract['pins'],
+                  'verdict': 'reject' if findings else 'pass', 'findings': findings,
+                  'test_assessment': 'Labeled requirement-based legitimate test-change assessment; not live review.',
+                  'stuckness': None}
+        if mode == 'review-stuck':
+            result['status'] = 'stuck'
+            report.update(verdict='stuck', stuckness={k: 'Labeled actual diagnostic uncertainty fixture' for k in
+                          ('attempts', 'evidence', 'uncertainty', 'recommendation')})
+        if mode == 'review-wrong-axis':
+            report['axis'] = 'combined'
+        if mode == 'review-wrong-tree':
+            report['pins'] = {**contract['pins'], 'tree_sha256': '0' * 64}
+        if mode == 'review-wrong-adaptation':
+            report['adaptation'] = 'unreviewed'
+        if mode == 'review-false-pass':
+            report['verdict'] = 'pass'
+        if mode == 'review-duplicate-finding':
+            finding = {'id': 'same', 'kind': 'missing', 'path': 'hello.py', 'requirement': 'required',
+                       'evidence': 'fixture', 'correction': 'fix'}
+            report.update(verdict='reject', findings=[finding, finding])
+        if mode == 'review-write':
+            (mounts['/workspace'] / 'hello.py').write_text('forged read-only mutation')
+        content = json.dumps(report, sort_keys=True)
+        if mode == 'review-malformed':
+            content = '{not JSON'
+        if mode == 'review-duplicate':
+            content = content[:-1] + ', "verdict":"pass"}'
+        result['artifacts'].append({'name': 'review-result', 'content': content,
                                     'sha256': hashlib.sha256(content.encode()).hexdigest()})
     (scratch / 'result.json').write_text(json.dumps(result))
 

@@ -165,6 +165,14 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     selected = validate(request)
     item = current(database, project, iteration, operator)
     simplification = None
+    review_contract = None
+    corrections_contract = None
+    if request['stage'] in {'review-standards', 'review-spec'}:
+        from .review import handoff as review_handoff
+        review_contract = review_handoff(database, project, iteration, operator, request)
+    if request['stage'] == 'corrections':
+        from .review import corrections_handoff
+        corrections_contract = corrections_handoff(database, project, iteration, operator, request, github)
     if request['stage'] == 'simplify':
         from .simplification import handoff as simplify_handoff
         simplification = simplify_handoff(database, project, iteration, operator, request)
@@ -227,6 +235,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                    'advancement': 'disabled-without-trusted-whole-process-evidence'}}
     if simplification is not None:
         handoff['simplification'] = simplification
+    if review_contract is not None:
+        handoff['review'] = review_contract
+    if corrections_contract is not None:
+        handoff['corrections'] = corrections_contract
     result = {'assignment_id': assignment_id, 'claim_id': request['claim_id'], 'ticket_scope': scope,
               'handoff': handoff, 'handoff_digest': digest(handoff), 'assignment_ready': True,
               'launchable': False, 'execution_allowed': False, 'status': 'prepared',
@@ -295,15 +307,18 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
     simplification_result = None
-    if handoff['stage'] == 'simplify':
+    if handoff['stage'] in {'simplify', 'review-standards', 'review-spec'}:
         runtime = assignment.get('runtime') or {}
         launcher_submission = (runtime.get('status') == 'running' and
                                sandbox_run_id == request['run_id'] == runtime.get('run_id'))
         completed_replay = (runtime.get('status') == 'complete' and runtime.get('container_removed') is True and
                             assignment.get('submitted_result') == request)
         require(launcher_submission or completed_replay,
-                'Simplification accepts only launcher-validated output or exact completed replay.', 'invalid_result')
-        from .simplification import validate_result
+                'Stage accepts only launcher-validated output or exact completed replay.', 'invalid_result')
+        if handoff['stage'] == 'simplify':
+            from .simplification import validate_result
+        else:
+            from .review import validate_result
         simplification_result = validate_result(assignment, request)
     old = assignment.get('submitted_result')
     require(old is None or old == request, 'Result replay cannot replace previously stored evidence.', 'result_conflict')
@@ -313,7 +328,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
     if simplification_result is not None:
         assert assignment is not None
-        assignment['simplification_result'] = simplification_result
+        assignment['review_result' if 'review' in handoff else 'simplification_result'] = simplification_result
     with database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
