@@ -67,7 +67,8 @@ class SandboxTests(unittest.TestCase):
                 self.wfile.write(data)
         self.model_calls = []
         self.upstream = socketserver.UnixStreamServer(str(self.root / 'subscription.sock'), Handler)
-        self.upstream_thread = threading.Thread(target=self.upstream.serve_forever, daemon=True)
+        self.upstream_thread = threading.Thread(target=self.upstream.serve_forever,
+                                                kwargs={'poll_interval': 0.01}, daemon=True)
         self.upstream_thread.start()
         self.addCleanup(self.stop_upstream)
 
