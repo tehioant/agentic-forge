@@ -423,6 +423,39 @@ class MergeTests(unittest.TestCase):
         self.refused('skill_blocked')
         self.assertEqual(self.writes(), [])
 
+    def test_shared_fingerprints_keep_stage_bindings_private_envelopes_and_evidence_bounds(self):
+        axis = self.axes[0]
+        review_binding = test_review.review.execution_binding(axis)
+        merge_binding = merge.execution_binding(axis)
+        self.assertEqual(review_binding['evidence'], merge_binding['evidence'])
+        self.assertEqual(review_binding['model_evidence'], merge_binding['model_evidence'])
+        self.assertEqual(review_binding['axis'], 'Standards')
+        self.assertEqual(merge_binding['binding'], publication.binding(axis))
+        root = Path(axis['runtime']['artifacts'])
+        root.chmod(0o755)
+        self.refused('execution_required')
+        root.chmod(0o700)
+        response = next((root / 'model-evidence').glob('response-*.json'))
+        hidden = response.with_suffix('.retained')
+        response.rename(hidden)
+        self.refused('execution_required')
+        hidden.rename(response)
+        transcript = root / 'scratch/conversation.json'
+        raw = transcript.read_bytes()
+        with transcript.open('wb') as stream:
+            stream.truncate(16_000_001)
+        self.refused('execution_required')
+        transcript.write_bytes(raw)
+        raw = response.read_bytes()
+        with response.open('wb') as stream:
+            stream.truncate(16_000_001)
+        self.refused('execution_required')
+        response.write_bytes(raw)
+        transcript.rename(transcript.with_suffix('.retained'))
+        transcript.symlink_to(transcript.with_suffix('.retained'))
+        self.refused('unsafe_path')
+        self.assertEqual(self.writes(), [])
+
     def test_pause_and_requirement_revisions_survive_restart_and_reopen_obsolete_closure(self):
         self.assignment.mutate_iteration(lambda i: i.update(status='paused'))
         self.refused('iteration_paused')

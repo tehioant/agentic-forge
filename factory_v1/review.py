@@ -171,9 +171,7 @@ def pair(database, project, iteration, operator, request, github):
     return axes
 
 
-def execution_binding(axis):
-    handoff = axis['handoff']
-    root = physical(axis['runtime']['artifacts'], directory=True)
+def evidence_fingerprints(root):
     evidence = {}
     for group, names in (('scratch', ['result.json', 'loads.json', 'events.jsonl', 'conversation.json', 'probes.json']),
                          ('inputs', ['worker.py', 'sandbox_relay.py', 'assignment.json', 'handoff.json']),
@@ -189,6 +187,13 @@ def execution_binding(axis):
         require(path.stat().st_size <= 16_000_000, 'Model evidence exceeds bound.', 'execution_required')
         model[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
     require(any(name.startswith('response-') for name in model), 'Admitted model responses required.', 'execution_required')
+    return evidence, model
+
+
+def execution_binding(axis):
+    handoff = axis['handoff']
+    root = physical(axis['runtime']['artifacts'], directory=True)
+    evidence, model = evidence_fingerprints(root)
     return {'assignment_id': axis['assignment_id'], 'run_id': axis['runtime']['run_id'],
             'handoff_digest': axis['handoff_digest'], 'pins': handoff['review']['pins'],
             'axis': handoff['review']['axis'], 'report_sha256': axis['review_result']['report_sha256'],
