@@ -82,6 +82,32 @@ def authorize(database, project, iteration, operator, assignment_id, run_id, req
         raise spending.SpendingError('invalid_request', 'Server-side tools and reasoning/model changes are not admitted.')
 
 
+def check_terminal_results(root, tests, *, verbatim=False):
+    """Match reported commands to retained tool output; this is not native provenance."""
+    conversation_path = physical(root / 'scratch/conversation.json')
+    require(conversation_path.stat().st_size <= spending.SANDBOX_MAX_REQUEST * 10,
+            'Worker evidence exceeds its bound.', 'invalid_result')
+    conversation = json.loads(conversation_path.read_text())
+    require(isinstance(conversation, dict) and isinstance(conversation.get('messages'), list),
+            'Actual conversation/tool results are required.', 'invalid_result')
+    calls, executions = {}, []
+    for message in conversation['messages']:
+        if message.get('role') == 'assistant':
+            for call in message.get('tool_calls', []):
+                function = call.get('function', {})
+                if function.get('name') == 'terminal':
+                    args = json.loads(function['arguments'])
+                    calls[call['id']] = args.get('command')
+        if message.get('role') == 'tool' and message.get('tool_call_id') in calls:
+            executions.append({'command': calls[message['tool_call_id']], 'output': message.get('content')})
+    require(executions and isinstance(tests, list) and tests and all(isinstance(test, dict) and
+            any(test.get('command') == execution['command'] and execution['output'] and
+                (not verbatim or isinstance(execution['output'], str) and test.get('result') == execution['output'])
+                for execution in executions) for test in tests),
+            'Reported tests must match retained actual terminal command/results.', 'invalid_result')
+    return executions
+
+
 def check_worker_evidence(assignment, root, inputs):
     """Validate worker report consistency without attesting its execution claims."""
     scratch = root / 'scratch'
@@ -107,23 +133,8 @@ def check_worker_evidence(assignment, root, inputs):
         actual = '\n'.join(line.split('|', 1)[1] for line in content['content'].splitlines())
         raw = (root / 'inputs' / Path(expected['path']).name).read_text()
         require(actual.rstrip('\n') == raw.rstrip('\n'), 'Tool read differs from pinned instruction bytes.', 'invalid_result')
-    conversation = json.loads((scratch / 'conversation.json').read_text())
-    require(isinstance(conversation, dict) and isinstance(conversation.get('messages'), list),
-            'Actual conversation/tool results are required.', 'invalid_result')
-    calls, executions = {}, []
-    for message in conversation['messages']:
-        if message.get('role') == 'assistant':
-            for call in message.get('tool_calls', []):
-                function = call.get('function', {})
-                if function.get('name') == 'terminal':
-                    args = json.loads(function['arguments'])
-                    calls[call['id']] = args.get('command')
-        if message.get('role') == 'tool' and message.get('tool_call_id') in calls:
-            executions.append({'command': calls[message['tool_call_id']], 'output': message.get('content')})
-    tests = result.get('tests')
-    require(executions and isinstance(tests, list) and tests and all(isinstance(test, dict) and
-            any(test.get('command') == execution['command'] and execution['output'] for execution in executions) for test in tests),
-            'Reported tests must match retained actual terminal command/results.', 'invalid_result')
+    executions = check_terminal_results(root, result.get('tests'),
+                                        verbatim=assignment.get('handoff', {}).get('stage') == 'diagnosis')
     require(any((root / 'model-evidence').glob('response-*.json')),
             'No admitted model response evidence.', 'invalid_result')
     (root / 'worker-reported-tests.json').write_text(json.dumps(executions))

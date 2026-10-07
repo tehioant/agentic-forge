@@ -166,7 +166,7 @@ def claims(database, request, scope, assignment_id):
                     'Existing ticket reservation conflicts or was invalidated.', 'claim_conflict')
 
 
-def prepare(database, project, iteration, operator, request, github, dry_run=False):
+def prepare(database, project, iteration, operator, request, github, dry_run=False, *, diagnosis_revalidation=None):
     """Validate startup before read-only frontier queries, and persist only local assignments."""
     selected = validate(request)
     item = current(database, project, iteration, operator)
@@ -203,6 +203,23 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     if diagnosis_contract is not None:
         from .diagnosis import debug_claim
         debug_claim(database, item['stuck_work'][diagnosis_contract['pins']['stuck_assignment']], assignment_id)
+    diagnosis_statuses = {'blocked'}
+    if diagnosis_revalidation is not None:
+        require(dry_run and diagnosis_contract is not None and diagnosis_revalidation == assignment_id,
+                'Release reconciliation cannot admit new assignments.', 'diagnosis_held')
+        from .diagnosis import execution_binding
+        assert diagnosis_contract is not None
+        record = item['stuck_work'][diagnosis_contract['pins']['stuck_assignment']]
+        axis = inspect(database, project, iteration, operator, assignment_id)
+        assert axis is not None
+        require(record['status'] == 'release-pending' and record['diagnosis_assignment'] == assignment_id and
+                record['applied_response'] is not None and record['direction']['action'] == 'retry' and
+                axis.get('runtime', {}).get('status') == 'complete' and axis['runtime'].get('container_removed') is True and
+                axis.get('result_disposition', {}).get('isolated_execution') is True and
+                record.get('authorization', {}).get('diagnosis') == execution_binding(axis),
+                'Only exact completed host-authorized diagnosis can reconcile release.', 'execution_required')
+        previous_status = record['previous_statuses'][str(request['issue']['number'])]
+        diagnosis_statuses.add('ready' if previous_status == 'active' else previous_status)
     claims(database, request, scope, assignment_id)
     # Frontier currently checkpoints. Copy state so query validation never writes lifecycle state.
     with closing(sqlite3.connect(':memory:')) as observation:
@@ -215,7 +232,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
             (request['stage'] == 'diagnosis' or set(frontier['active']) <= {number}), 'Conflicting or incomplete authoritative work frontier.', 'ticket_ineligible')
     row = next((row for row in frontier['items'] if row['number'] == number), None)
     require(row is not None and (row['admissible'] if request['stage'] != 'diagnosis' else
-            row['issue_state'] == 'open' and row['status'] == 'blocked' and row['held']) and
+            row['issue_state'] == 'open' and row['held'] and row['status'] in diagnosis_statuses) and
             all(row[key] == request['issue'][key] for key in ('id', 'node_id')),
             'Issue is blocked, wrong identity or outside the current eligible frontier.', 'ticket_ineligible')
     issue = tickets.gh.read_issue(ReadOnlyGitHub(github), item['repository'], number)
@@ -226,7 +243,8 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         if candidate_artifact:
             require(candidate_artifact['content'] == request['candidate'], 'Candidate artifact differs from pinned head.', 'scope_mismatch')
     directions = [record for record in item.get('stuck_work', {}).values() if record['status'] == 'released' and
-                  number in record['affected'] and record['pins']['issue_sha256'] == request['issue']['body_sha256']]
+                  number in record['affected'] and all(record['issues'][str(number)][key] == request['issue'][key]
+                                                       for key in ('id', 'node_id', 'body_sha256'))]
     operator_direction = (max(directions, key=lambda record: record['sequence'])['applied_response']
                           if directions and request['stage'] == 'implementation' else None)
     input_loads = {issue['html_url']: request['issue']['body_sha256']}

@@ -128,6 +128,34 @@ class ReportPolicyTests(unittest.TestCase):
             with self.assertRaises(RepositoryError):
                 diagnosis.debug_claim(database, {**record, 'status': 'awaiting-direction'}, 'new')
 
+    def test_retained_json_terminal_response_is_matched_verbatim_not_reformatted(self):
+        from factory_v1.sandbox import check_terminal_results
+
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
+            root = Path(directory)
+            (root / 'scratch').mkdir()
+            output = '{"output": "LABELED AssertionError\\n", "exit_code": 1}'
+            command = 'python symptom.py && python other.py'
+            conversation = {'messages': [
+                {'role': 'assistant', 'tool_calls': [{'id': 'repro', 'function': {
+                    'name': 'terminal', 'arguments': json.dumps({'command': command})}}]},
+                {'role': 'tool', 'tool_call_id': 'repro', 'content': output}]}
+            path = root / 'scratch/conversation.json'
+            path.write_text(json.dumps(conversation))
+            check_terminal_results(root, [{'command': command, 'result': output}], verbatim=True)
+            for changed in ('ALL PASSED; exit_code=0', 'LABELED AssertionError; exit_code=1',
+                            json.dumps(json.loads(output), separators=(',', ':')), output + '\n'):
+                with self.subTest(result=changed), self.assertRaises(RepositoryError) as refusal:
+                    check_terminal_results(root, [{'command': command, 'result': changed}], verbatim=True)
+                self.assertEqual(refusal.exception.code, 'invalid_result')
+            with self.assertRaises(RepositoryError):
+                check_terminal_results(root, [{'command': 'python symptom.py', 'result': output}], verbatim=True)
+            # The retained response must be correlated to a terminal call, not arbitrary prose.
+            conversation['messages'][1]['tool_call_id'] = 'unrelated'
+            path.write_text(json.dumps(conversation))
+            with self.assertRaises(RepositoryError):
+                check_terminal_results(root, [{'command': command, 'result': output}], verbatim=True)
+
     def test_readonly_report_validation_retains_red_evidence_and_refuses_source_or_baseline_drift(self):
         with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
             root = Path(directory)
@@ -143,7 +171,22 @@ class ReportPolicyTests(unittest.TestCase):
                           'handoff': {'adaptation': 'read-only-adaptation', 'diagnosis': {'pins': pins}}}
             result = {'artifacts': [diagnosis.simplification.artifact('diagnosis-report', json.dumps(report))],
                       'status': 'done', 'tests': [self.command]}
+            scratch = root / 'scratch'
+            scratch.mkdir()
+            conversation = {'messages': [
+                {'role': 'assistant', 'tool_calls': [{'id': 'repro', 'function': {
+                    'name': 'terminal', 'arguments': json.dumps({'command': self.command['command']})}}]},
+                {'role': 'tool', 'tool_call_id': 'repro', 'content': self.command['result']}]}
+            (scratch / 'conversation.json').write_text(json.dumps(conversation))
             validated = diagnosis.validate_result(assignment, result)
+            forged_command = {**self.command, 'result': 'ALL PASSED\nexit_code=0'}
+            forged_report = {**report, 'commands': [forged_command],
+                             'feedback_loop': {**report['feedback_loop'], 'result': forged_command['result']}}
+            forged = {**result, 'tests': [forged_command],
+                      'artifacts': [diagnosis.simplification.artifact('diagnosis-report', json.dumps(forged_report))]}
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.validate_result(assignment, forged)
+            self.assertEqual(refusal.exception.code, 'invalid_result')
             self.assertFalse(validated['native_execution_trusted'])
             self.assertFalse(validated['advance_allowed'])
             self.assertFalse(validated['close_allowed'])
@@ -309,6 +352,33 @@ class DiagnosisLifecycleTests(unittest.TestCase):
         self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
         self.assertEqual(self.tracker.members[12]['fields']['STATUS'], 'Active')
         self.tracker.issues[11]['body'] = dependent_body
+        # Lose the response after restoring the root; the dependent remains held.
+        self.tracker.drop = 'field'
+        interrupted = self.command('apply-direction', apply)
+        self.assertEqual(interrupted.returncode, 2, interrupted.stdout)
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
+        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
+        pending = self.tracker.inspect()['stuck_work'][stuck['assignment_id']]
+        self.assertEqual(pending['status'], 'release-pending')
+        self.assertIsNotNone(pending['applied_response'])
+        frontier = self.assignment.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
+        self.assertNotIn(10, frontier['eligible'])
+        self.assertNotIn(11, frontier['eligible'])
+        self.assertEqual(self.assignment.ok(self.assignment.inspect(stuck))['stuck_disposition'], 'held')
+        self.assertNotIn('stuck_disposition', self.assignment.ok(self.assignment.inspect(axis)))
+        self.assignment.refused(self.case.launch(debug), 'ticket_ineligible')
+        self.assignment.refused(self.command('prepare-diagnosis', self.debug_request()), 'diagnosis_held')
+        replacement = copy.deepcopy(axis['handoff'])
+        replacement = {k: replacement[k] for k in diagnosis.assignments.REQUEST_FIELDS}
+        replacement['skills'] = self.assignment.configuration(stage='diagnosis')['skills']
+        replacement['profile'].update(name='replacement-debug', home=str(self.root / 'replacement-debug'))
+        replacement['claim_id'] = 'replacement-debug'
+        self.assignment.refused(self.assignment.command(request=replacement), 'claim_conflict')
+        transcript.write_bytes(actual + b'\n')
+        refused = self.command('apply-direction', apply)
+        self.assertEqual(refused.returncode, 2, refused.stdout)
+        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
+        transcript.write_bytes(actual)
         released = self.assignment.ok(self.command('apply-direction', apply))
         self.assertEqual(released['status'], 'released')
         self.assertEqual(self.assignment.ok(self.command('apply-direction', apply)), released)
@@ -322,6 +392,36 @@ class DiagnosisLifecycleTests(unittest.TestCase):
         retry['profile'].update(name='retry-builder', home=str(self.root / 'retry-home'))
         retry['claim_id'] = 'retry-claim'
         self.assignment.refused(self.assignment.command(request=retry), 'claim_conflict')
+
+    def test_public_diagnosis_rejects_green_claim_contradicting_retained_red_output(self):
+        from factory_v1 import sandbox
+
+        self.stuck()
+        self.assignment.ok(self.command('declare-stuck', self.identity))
+        debug = self.assignment.ok(self.command('prepare-diagnosis', self.debug_request()))
+        self.case.mode('diagnosis-false-green')
+        axis = self.assignment.ok(self.case.launch(debug))
+        self.assertEqual(axis['runtime']['status'], 'failed', axis.get('runtime'))
+        self.assertEqual(axis['runtime']['error'], 'invalid_result')
+        self.assertTrue(axis['runtime']['container_removed'])
+        self.assertNotIn('submitted_result', axis)
+        self.assertNotIn('diagnosis_result', axis)
+        root = Path(axis['runtime']['artifacts'])
+        conversation = (root / 'scratch/conversation.json').read_bytes()
+        self.assertIn(b'AssertionError', conversation)
+        self.assertIn(b'exit_code=1', conversation)
+        result = json.loads((root / 'scratch/result.json').read_text())
+        self.assertEqual(result['tests'][0]['result'], 'ALL PASSED\nexit_code=0')
+        envelope = json.loads((root / 'inputs/assignment.json').read_text())
+        for validate in (lambda: sandbox.check_worker_evidence(axis, root, envelope['inputs']),
+                         lambda: diagnosis.validate_result(axis, result)):
+            with self.assertRaises(RepositoryError) as refusal:
+                validate()
+            self.assertEqual(refusal.exception.code, 'invalid_result')
+        self.assertEqual((root / 'scratch/conversation.json').read_bytes(), conversation)
+        self.assignment.refused(self.command('request-direction', self.identity), 'diagnosis_incomplete')
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
+        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
 
     def test_missing_capability_material_direction_and_pause_stale_replay_fail_closed(self):
         prepared = self.assignment.ok(self.assignment.command())

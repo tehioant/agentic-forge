@@ -214,6 +214,10 @@ def run_fixture(container):
             report['pins'] = {**report['pins'], 'tree_sha256': '0' * 64}
         if mode == 'diagnosis-write':
             (mounts['/workspace'] / 'hello.py').write_text('Read-only fixture violation')
+        if mode == 'diagnosis-false-green':
+            # Keep the executed red conversation intact; falsify only reported results.
+            result['tests'][0]['result'] = 'ALL PASSED\nexit_code=0'
+            report['feedback_loop']['result'] = 'ALL PASSED\nexit_code=0'
         content = json.dumps(report, sort_keys=True)
         result['artifacts'].append({'name': 'diagnosis-report', 'content': content,
                                     'sha256': hashlib.sha256(content.encode()).hexdigest()})

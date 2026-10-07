@@ -144,12 +144,18 @@ def declare(database, project, iteration, operator, request, github):
         related = [a for a in assignments.rows(database) if a['ticket_scope'] == prior['ticket_scope']]
         require(all(not a.get('runtime') or a['runtime']['status'] in TERMINAL for a in related),
                 'Stop/reconcile other live roles before releasing ticket ownership.', 'run_conflict')
+        previous_statuses = {str(r['number']): r['status'] for r in rows if r['number'] in affected}
+        for number in affected:
+            holds = [r for r in observed.get('stuck_work', {}).values()
+                     if r['status'] != 'released' and number in r['affected']]
+            if holds:
+                previous_statuses[str(number)] = min(holds, key=lambda r: r['sequence'])['previous_statuses'][str(number)]
         record = {'status': 'blocking', 'sequence': 1 + len(observed.get('stuck_work', {})),
                   'pins': pins, 'declaration': declaration, 'affected': sorted(affected),
                   'issues': {str(r['number']): {**{k: r[k] for k in ('id', 'node_id')},
                       'body_sha256': hashlib.sha256(tickets.gh.read_issue(github, item['repository'], r['number'])['body'].encode()).hexdigest()}
                       for r in rows if r['number'] in affected},
-                  'previous_statuses': {str(r['number']): r['status'] for r in rows if r['number'] in affected},
+                  'previous_statuses': previous_statuses,
                   'retired_assignments': [a['assignment_id'] for a in related], 'blocks_verified': False,
                   'diagnosis_assignment': None, 'event_id': None, 'applied_response': None}
         observed.setdefault('stuck_work', {})[identity] = record
@@ -269,6 +275,8 @@ def validate_result(assignment, result):
     require(artifact is not None, 'Separate structured diagnosis report required.', 'invalid_result')
     assert artifact is not None
     report = simplification.object_json(artifact['content'], 'invalid_result')
+    from .sandbox import check_terminal_results
+    check_terminal_results(root, result['tests'], verbatim=True)
     validate_report(report, contract, assignment['handoff']['adaptation'], result['tests'])
     require(result['status'] == ('blocked' if report['feedback_loop'] is None else 'done'),
             'Missing capability is a blocker, not a successful diagnosis or repair.', 'invalid_result')
@@ -305,7 +313,8 @@ def completed(database, project, iteration, operator, record, github):
     axis = assignments.inspect(database, project, iteration, operator, identity)
     assert axis is not None
     from .sandbox import original
-    assignments.prepare(database, project, iteration, operator, original(axis), github, dry_run=True)
+    assignments.prepare(database, project, iteration, operator, original(axis), github, dry_run=True,
+                        diagnosis_revalidation=identity if record['status'] == 'release-pending' else None)
     require(axis.get('runtime', {}).get('status') == 'complete' and axis['runtime'].get('container_removed') is True and
             axis.get('result_disposition', {}).get('isolated_execution') is True and 'diagnosis_result' in axis,
             'Only a completed isolated diagnosis report can request direction.', 'diagnosis_incomplete')
