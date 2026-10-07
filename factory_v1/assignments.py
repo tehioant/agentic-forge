@@ -163,6 +163,9 @@ def claims(database, request, scope, assignment_id):
 def prepare(database, project, iteration, operator, request, github, dry_run=False):
     """Validate startup before read-only frontier queries, and persist only local assignments."""
     selected = validate(request)
+    # Pin the same canonical closure used in handoff/replay, including repair's
+    # two entry points; caller descriptor order cannot change a claim identity.
+    request = {**request, 'skills': [{k: v for k, v in s.items() if k != 'instructions'} for s in selected]}
     item = current(database, project, iteration, operator)
     simplification = None
     review_contract = None
