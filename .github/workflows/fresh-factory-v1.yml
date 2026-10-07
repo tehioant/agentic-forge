@@ -28,6 +28,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Public lifecycle tests
-        run: python -m unittest discover -s factory_v1/tests -v
+        run: python scripts/run_factory_tests.py
       - name: Compile fresh controller
         run: python -m compileall -q factory_v1
