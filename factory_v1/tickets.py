@@ -470,8 +470,11 @@ def frontier(database, item, github):
     def completed(number):
         row = rows.get(number)
         # Unknown/out-of-scope blockers cannot be asserted delivered.
-        return row is not None and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
+        return row is not None and number not in holds and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
+    from .diagnosis import held_numbers
+    holds = held_numbers(item)
     for row in rows.values():
+        row['held'] = row['held'] or row['number'] in holds
         row['admissible'] = bool(row['contract_valid'] and not row['held'] and row['issue_state'] == 'open' and
                                  row['status'] in {'ready', 'active'} and all(completed(b) for b in row['blockers']))
     eligible = [n for n, r in rows.items() if r['admissible'] and r['status'] == 'ready']

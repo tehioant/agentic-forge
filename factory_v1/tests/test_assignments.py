@@ -368,7 +368,7 @@ class AssignmentTests(unittest.TestCase):
                     'diagnosis': ['diagnosing-bugs'], 'repair': ['diagnosing-bugs', 'implement']}
         for stage, entry in expected.items():
             request = self.configuration(stage=stage)
-            if stage in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
+            if stage in {'simplify', 'review-standards', 'review-spec', 'corrections', 'diagnosis'}:
                 request['preceding'].append(artifact('implementation-diff', 'Labeled unverified diff'))
                 self.refused(self.command(request=request, dry_run=True), 'implementation_unverified')
                 continue

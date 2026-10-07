@@ -256,6 +256,16 @@ def respond(database, item, response, operator_id):
         raise IntakeError('invalid_decision', 'Authenticated input must bind the exact pending decision and origin.')
     record = get_record(database, item, response['event_id'])
     validate_response(response, record, operator_id)
+    stuck_records = item.get('stuck_work', {})
+    if not isinstance(stuck_records, dict) or any(not isinstance(stuck, dict) for stuck in stuck_records.values()):
+        raise IntakeError('state_error', 'Recorded stuck-decision context is malformed; no response was accepted.')
+    if any(stuck.get('event_id') == response['event_id'] for stuck in stuck_records.values()):
+        from .diagnosis import operator_direction
+        from .repositories import RepositoryError
+        try:
+            operator_direction(response['response'])
+        except RepositoryError as error:
+            raise IntakeError('invalid_decision', 'Stuck work needs an explicit structured retry/revise direction.') from error
     if record['decision_response'] is not None:
         if record['decision_response'] != response:
             raise IntakeError('decision_conflict', 'This decision already has a different response.')

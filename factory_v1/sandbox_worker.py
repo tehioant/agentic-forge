@@ -145,6 +145,28 @@ def main():
                    'Run the unchanged verification_commands in scratch if needed; never change submitted source. '
                    'Worker execution claims are untrusted; do not assert delivery or authority.\n' +
                    json.dumps({'adaptation': handoff['adaptation'], **handoff['review']}))
+    if 'operator_direction' in handoff:
+        prompt += '\nExplicit Antoine direction for fresh scoped retry (not acceptance or relaxed gates):\n' + json.dumps(handoff['operator_direction'])
+    if handoff['stage'] != 'diagnosis':
+        prompt += ('\nIf genuinely stuck after attempted fixes, return status=stuck and a stuck-declaration artifact. '
+                   'Its content is JSON with exactly reason (string), attempted_fixes (nonempty array of objects '
+                   'change/command/result strings), findings (nonempty string array). Retain actual attempted repairs '
+                   'and exact artifacts/results, not a configured crash/run-limit claim. Controller arranges separate debug.')
+    if 'diagnosis' in handoff:
+        prompt += ('\nREAD-ONLY DEBUG REPORT: Independently run diagnosing-bugs on original requirements and failed source. '
+                   'Stop before any modifying phases (including instrumentation of submitted source). Never choose product direction, '
+                   'apply a fix, or claim acceptance. Retain stage-evidence AND diagnosis-report artifacts. '
+                   'The report content must have exactly result_fields below. feedback_loop is command/symptom/result '
+                   'from a command already run. commands are command/result pairs exactly matching tests. hypotheses is an '
+                   'ordered ranked array of hypothesis/prediction/evidence strings. attempted_repairs retains responsible fixes '
+                   'and any investigation attempts without implying edits. findings is a nonempty string array. '
+                   'cause_or_uncertainty is honest. directions is a nonempty array id/direction/tradeoff; recommendation '
+                   'names one direction id. blockers is an array of missing capabilities. If no loop is available, '
+                   'feedback_loop=null, hypotheses=[], blockers nonempty, status=blocked; do not theorize without a loop. '
+                   'Otherwise status=done describes the investigation, NEVER a verified repair. Actual commands may fail '
+                   'and must retain output/exit status. Genuine missing input goes through controller exact-origin attention; '
+                   'routine hypothesis progress remains in evidence. Pins and adaptation must match exactly.\n' +
+                   json.dumps({'adaptation': handoff['adaptation'], **handoff['diagnosis']}))
     result = agent.run_conversation(prompt, conversation_history=[], task_id=run_id)
     Path('/scratch/conversation.json').write_text(json.dumps(result, default=str))
     final = json.loads(result['final_response'])

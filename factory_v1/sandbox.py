@@ -151,6 +151,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     with closing(sqlite3.connect(state)) as database:
         with state_lock(database):
             assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
+            assignments.require_result_active(assignment)
             assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
             require('runtime' not in assignment, 'Attempt already owns this assignment; inspect/stop/reconcile, never duplicate launch.', 'run_conflict')
             home = Path(assignment['handoff']['profile']['home'])
@@ -194,6 +195,10 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 copy_candidate(database, project, iteration, operator, assignment, root, pins)
         if assignment['handoff']['stage'] in {'review-standards', 'review-spec', 'corrections'}:
             from .review import copy_candidate
+            with closing(sqlite3.connect(state)) as database, state_lock(database):
+                copy_candidate(database, project, iteration, operator, assignment, root, pins)
+        if assignment['handoff']['stage'] == 'diagnosis':
+            from .diagnosis import copy_candidate
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 copy_candidate(database, project, iteration, operator, assignment, root, pins)
         shutil.move(root / 'baseline', inputs / 'baseline')
@@ -301,7 +306,12 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
-            checks_verified = verify_checks(root, config, runtime, deadline)
+            # Stuckness and diagnosis retain a red loop; neither claims a verified fix.
+            assert assignment is not None
+            result = check_worker_evidence(assignment, root, selected_inputs)
+            checks_verified = (False if (result.get('status') == 'stuck' and assignment['handoff']['stage'] in
+                                         {'implementation', 'corrections', 'repair'}) or assignment['handoff']['stage'] == 'diagnosis'
+                               else verify_checks(root, config, runtime, deadline))
             with closing(sqlite3.connect(state)) as database, state_lock(database):
                 assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
                 result = check_worker_evidence(assignment, root, selected_inputs)

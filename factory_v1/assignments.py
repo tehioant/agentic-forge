@@ -132,7 +132,8 @@ def current(database, project, iteration, operator, require_active=True):
 
 def ticket_claims(database, scope):
     """Check durable role ownership for every supplied ticket identity field."""
-    existing = rows(database)
+    from .diagnosis import released_claim
+    existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and not released_claim(database, old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
                 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
@@ -140,7 +141,10 @@ def ticket_claims(database, scope):
 
 
 def claims(database, request, scope, assignment_id):
-    for old in ticket_claims(database, scope):
+    existing = rows(database)
+    if request['stage'] != 'diagnosis':
+        ticket_claims(database, scope)
+    for old in existing:
         if old['assignment_id'] == assignment_id:
             continue
         require(old['claim_id'] != request['claim_id'], 'Claim identity already binds a different assignment.', 'claim_conflict')
@@ -148,6 +152,8 @@ def claims(database, request, scope, assignment_id):
         profile = request['profile']
         require(old_profile['name'] != profile['name'] and old_profile['home'] != profile['home'],
                 'One top-level worker assignment per dedicated profile.', 'profile_claim_conflict')
+    if request['stage'] == 'diagnosis':
+        return
     for row in database.execute('SELECT payload FROM iterations'):
         item = json.loads(row[0])
         reservation = item.get('reservation')
@@ -167,6 +173,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     simplification = None
     review_contract = None
     corrections_contract = None
+    diagnosis_contract = None
+    if request['stage'] == 'diagnosis':
+        from .diagnosis import handoff as diagnosis_handoff
+        diagnosis_contract = diagnosis_handoff(database, project, iteration, operator, request)
     if request['stage'] in {'review-standards', 'review-spec'}:
         from .review import handoff as review_handoff
         review_contract = review_handoff(database, project, iteration, operator, request)
@@ -190,6 +200,9 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
              'repository_id': request['repository_id'], 'issue_number': request['issue']['number'],
              'issue_id': request['issue']['id'], 'workspace': request['workspace']}
     assignment_id = digest({'request': request, 'scope': scope})
+    if diagnosis_contract is not None:
+        from .diagnosis import debug_claim
+        debug_claim(database, item['stuck_work'][diagnosis_contract['pins']['stuck_assignment']], assignment_id)
     claims(database, request, scope, assignment_id)
     # Frontier currently checkpoints. Copy state so query validation never writes lifecycle state.
     with closing(sqlite3.connect(':memory:')) as observation:
@@ -199,9 +212,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     frontier = work['frontier']
     number = request['issue']['number']
     require(work.get('publication_complete') and not frontier['foreign_active'] and
-            set(frontier['active']) <= {number}, 'Conflicting or incomplete authoritative work frontier.', 'ticket_ineligible')
+            (request['stage'] == 'diagnosis' or set(frontier['active']) <= {number}), 'Conflicting or incomplete authoritative work frontier.', 'ticket_ineligible')
     row = next((row for row in frontier['items'] if row['number'] == number), None)
-    require(row is not None and row['admissible'] and
+    require(row is not None and (row['admissible'] if request['stage'] != 'diagnosis' else
+            row['issue_state'] == 'open' and row['status'] == 'blocked' and row['held']) and
             all(row[key] == request['issue'][key] for key in ('id', 'node_id')),
             'Issue is blocked, wrong identity or outside the current eligible frontier.', 'ticket_ineligible')
     issue = tickets.gh.read_issue(ReadOnlyGitHub(github), item['repository'], number)
@@ -211,6 +225,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         candidate_artifact = next((a for a in request['preceding'] if a['name'] == 'candidate'), None)
         if candidate_artifact:
             require(candidate_artifact['content'] == request['candidate'], 'Candidate artifact differs from pinned head.', 'scope_mismatch')
+    directions = [record for record in item.get('stuck_work', {}).values() if record['status'] == 'released' and
+                  number in record['affected'] and record['pins']['issue_sha256'] == request['issue']['body_sha256']]
+    operator_direction = (max(directions, key=lambda record: record['sequence'])['applied_response']
+                          if directions and request['stage'] == 'implementation' else None)
     input_loads = {issue['html_url']: request['issue']['body_sha256']}
     input_loads.update({document['url']: document['sha256'] for document in work['inputs']['documents'].values()})
     for group in ('standards', 'preceding'):
@@ -233,6 +251,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                    'required_evidence': ['actual-selected-instruction-loads', 'observable-skill-guided-work',
                                          'artifacts', 'tests', 'trusted-whole-process-execution'],
                    'advancement': 'disabled-without-trusted-whole-process-evidence'}}
+    if operator_direction is not None:
+        handoff['operator_direction'] = operator_direction
+    if diagnosis_contract is not None:
+        handoff['diagnosis'] = diagnosis_contract
     if simplification is not None:
         handoff['simplification'] = simplification
     if review_contract is not None:
@@ -275,6 +297,7 @@ def inspect(database, project, iteration, operator, assignment_id):
 
 
 def require_result_active(assignment):
+    require(not assignment.get('stuck_disposition'), 'Held or superseded work requires fresh scoped implementation.', 'stuck_held')
     runtime = assignment.get('runtime')
     require(not runtime or not (Path(runtime['artifacts']) / 'stop').exists(),
             'Attempt cancelled before result admission.', 'cancelled')
@@ -307,7 +330,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
     simplification_result = None
-    if handoff['stage'] in {'simplify', 'review-standards', 'review-spec'}:
+    if handoff['stage'] in {'simplify', 'review-standards', 'review-spec', 'diagnosis'}:
         runtime = assignment.get('runtime') or {}
         launcher_submission = (runtime.get('status') == 'running' and
                                sandbox_run_id == request['run_id'] == runtime.get('run_id'))
@@ -315,7 +338,9 @@ def store_result(database, project, iteration, operator, assignment_id, request,
                             assignment.get('submitted_result') == request)
         require(launcher_submission or completed_replay,
                 'Stage accepts only launcher-validated output or exact completed replay.', 'invalid_result')
-        if handoff['stage'] == 'simplify':
+        if handoff['stage'] == 'diagnosis':
+            from .diagnosis import validate_result
+        elif handoff['stage'] == 'simplify':
             from .simplification import validate_result
         else:
             from .review import validate_result
@@ -328,7 +353,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
     if simplification_result is not None:
         assert assignment is not None
-        assignment['review_result' if 'review' in handoff else 'simplification_result'] = simplification_result
+        assignment['diagnosis_result' if 'diagnosis' in handoff else 'review_result' if 'review' in handoff else 'simplification_result'] = simplification_result
     with database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)

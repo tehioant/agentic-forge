@@ -242,18 +242,15 @@ class SandboxTests(unittest.TestCase):
         self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o002, 0o002)
         self.assertEqual(root.stat().st_mode & 0o077, 0)
 
-    def test_diagnostic_mount_is_read_only_and_returns_unchanged_candidate(self):
-        # Review-specific mounts now use real controller-derived precursors in test_review.
-        self.assignment.request = self.assignment.configuration(stage='diagnosis')
-        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.source, text=True).strip()
-        self.assignment.request.update(baseline=head)
-        prepared = self.assignment.ok(self.assignment.command())
-        launched = self.assignment.ok(self.launch(prepared))
-        self.assertEqual(launched['runtime']['status'], 'complete', launched)
-        root = Path(launched['runtime']['artifacts'])
-        inspection = json.loads((root / 'container-inspection.json').read_text())
-        self.assertFalse(next(m for m in inspection['Mounts'] if m['Destination'] == '/workspace')['RW'])
-        self.assertEqual((root / 'workspace/hello.py').read_text(), 'print("baseline")\n')
+    def test_unlinked_diagnostic_assignment_cannot_inject_failure_prose(self):
+        # Actual read-only diagnosis now needs the declared stuck precursor in test_diagnosis.
+        request = self.assignment.configuration(stage='diagnosis')
+        request['baseline'] = self.assignment.request['baseline']
+        before = self.assignment.fixture.state.read_bytes()
+        self.assignment.refused(self.assignment.command(request=request), 'implementation_unverified')
+        self.assertEqual(self.assignment.fixture.state.read_bytes(), before)
+        self.assertEqual(self.model_calls, [])
+        self.assertEqual(list(self.artifacts.iterdir()), [])
 
     def test_bad_physical_pin_is_recoverable_and_never_starts_worker(self):
         self.assignment.request['baseline'] = 'a' * 40

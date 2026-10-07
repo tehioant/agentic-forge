@@ -24,6 +24,20 @@ boundary](../docs/fresh-independent-review.md).
 
 `publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes only a fixed candidate branch and draft PR; it never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
 
+## Stuck-work diagnosis and operator direction (#16)
+
+`declare-stuck` retains the responsible worker's attempted fixes and exact failure
+evidence, blocks the open issue and transitive dependents with GitHub read-back,
+and releases only the verified held ticket's implementation ownership so eligible
+independent work can continue. `prepare-diagnosis` binds a fresh isolated read-only
+`diagnosing-bugs` assignment to that source and the original requirements.
+`request-direction` persists an exact-origin decision only after separate host
+execution verification; `apply-direction` admits only Antoine's correlated explicit
+retry/revise response. Retry requires fresh ordinary engineering gates; material
+revision stays held for versioned resynthesis. Run limits, green assertions,
+message delivery and silence are never stuckness, fixes or direction grants.
+See [contracts, commands, replay boundaries and remaining live acceptance](../docs/fresh-stuck-diagnosis.md).
+
 ## Intake and repository onboarding
 
 Example placeholders are not evidence:
