@@ -31,21 +31,7 @@ def execution_binding(assignment):
     root = physical(assignment['runtime']['artifacts'], directory=True)
     require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
             'Private host evidence envelope required.', 'execution_required')
-    files = {}
-    for group, names in (('scratch', ['result.json', 'loads.json', 'events.jsonl', 'conversation.json', 'probes.json']),
-                         ('inputs', ['worker.py', 'sandbox_relay.py', 'assignment.json', 'handoff.json']),
-                         ('', ['container-inspection.json', 'launch-command.json', 'controller-checks.json',
-                               'initial-source.json', 'source-artifacts.json'])):
-        for name in names:
-            path = physical(root / group / name)
-            require(path.stat().st_size <= 16_000_000, 'Execution evidence exceeds bound.', 'execution_required')
-            files[(group + '/' if group else '') + name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    model = {}
-    for path in sorted((root / 'model-evidence').glob('*.json')):
-        path = physical(path)
-        require(path.stat().st_size <= 16_000_000, 'Model evidence exceeds bound.', 'execution_required')
-        model[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    require(any(name.startswith('response-') for name in model), 'Admitted model responses required.', 'execution_required')
+    files, model = review.evidence_fingerprints(root)
     return {'binding': publication.binding(assignment), 'result_sha256': assignments.digest(assignment['submitted_result']),
             'skills': [{k: s[k] for k in ('name', 'source', 'sha256', 'dependencies')} for s in assignment['handoff']['skills']],
             'adaptation_sha256': hashlib.sha256(assignment['handoff']['adaptation'].encode()).hexdigest(),
