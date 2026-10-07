@@ -139,6 +139,16 @@ class AssignmentTests(unittest.TestCase):
                      not (c[1] == '/graphql' and c[2]['query'].lstrip().startswith('query '))]
         self.assertEqual(mutations, [])
 
+    def test_repair_selected_closure_order_keeps_one_claim_on_exact_replay(self):
+        request = self.configuration(stage='repair')
+        prepared = self.ok(self.command(request=request))
+        request['skills'].reverse()
+        replay = self.ok(self.command(request=request))
+        self.assertEqual(replay['assignment_id'], prepared['assignment_id'])
+        self.assertEqual(replay['handoff_digest'], prepared['handoff_digest'])
+        self.assertEqual([s['name'] for s in replay['handoff']['skills']], ['diagnosing-bugs', 'implement'])
+        self.assert_no_external_writes()
+
     def test_released_direction_matches_each_affected_issue_identity_and_own_body(self):
         from factory_v1 import assignments
         from factory_v1.repositories import GitHub
