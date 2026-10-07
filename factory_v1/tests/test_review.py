@@ -126,11 +126,17 @@ class ReviewTests(unittest.TestCase):
         self.assignment.refused(self.command('review-candidate', request, mounted), 'approval_required')
 
     def test_rejection_routes_exact_findings_to_fresh_implement_then_invalidates_both_axes(self):
+        approved = self.pair(suffix='-original')
+        self.assertEqual(self.assignment.ok(self.command('review-candidate', self.pair_request(approved),
+                                                       self.authorization(approved)))['status'], 'accepted')
         axes = self.pair('review-reject')
         feedback = self.assignment.ok(self.command('review-candidate', self.pair_request(axes)))
         self.assertEqual(feedback['status'], 'corrections')
         self.assertEqual(feedback['axes']['Standards']['verdict'], 'pass')
         self.assertEqual(feedback['axes']['Spec']['verdict'], 'reject')
+        stale = self.assignment.ok(self.command('review-candidate', self.pair_request(approved)))
+        self.assertEqual(stale['status'], 'corrections')
+        self.assertFalse(stale['advance_allowed'])
         config = self.assignment.configuration(stage='corrections')
         request = {**self.pair_request(axes), 'profile': config['profile'], 'skills': config['skills'], 'claim_id': 'fix-1'}
         before = self.assignment.fixture.state.read_bytes()
@@ -153,7 +159,8 @@ class ReviewTests(unittest.TestCase):
 
     def test_gate_security_and_test_weakening_are_not_green_shortcuts(self):
         for mode in ('review-gate', 'review-security', 'review-test'):
-            axes = self.pair(mode, '-' + mode)
+            candidate = self.candidate_with_mode('builder-' + mode)
+            axes = self.pair(mode, '-' + mode, candidate=candidate)
             request = self.pair_request(axes)
             config = self.authorization(axes)
             feedback = self.assignment.ok(self.command('review-candidate', request, config))
@@ -171,6 +178,41 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(result['status'], 'diagnosis')
         self.assertEqual(set(result['axes']['Spec']['stuckness']), {'attempts', 'evidence', 'uncertainty', 'recommendation'})
         self.assertFalse(result['advance_allowed'])
+
+    def test_lone_rejection_persists_candidate_hold_and_later_passes_cannot_reset_it(self):
+        approved = self.pair()
+        self.assignment.ok(self.command('review-candidate', self.pair_request(approved), self.authorization(approved)))
+        rejected = self.axis('review-spec', 'review-reject', '-lone')
+        held = self.assignment.ok(self.assignment.inspect(self.candidate))
+        self.assertEqual(held['review_holds'][rejected['assignment_id']]['verdict'], 'reject')
+        for _ in range(2):
+            result = self.assignment.ok(self.command('review-candidate', self.pair_request(approved)))
+            self.assertEqual(result['status'], 'corrections')
+            self.assertEqual(result['adverse_reviews'][0]['assignment_id'], rejected['assignment_id'])
+            self.assertFalse(result['advance_allowed'])
+        later_passes = self.pair(suffix='-retry')
+        result = self.assignment.ok(self.command('review-candidate', self.pair_request(later_passes),
+                                                self.authorization(later_passes)))
+        self.assertEqual(result['status'], 'corrections')
+        self.assertEqual(self.assignment.ok(self.assignment.inspect(self.candidate))['review_holds'], held['review_holds'])
+
+    def test_all_completed_adverse_axes_remain_correlated_in_current_feedback(self):
+        approved = self.pair()
+        self.assignment.ok(self.command('review-candidate', self.pair_request(approved), self.authorization(approved)))
+        rejected = self.axis('review-spec', 'review-reject', '-reject')
+        stuck = self.axis('review-standards', 'review-stuck', '-stuck')
+        result = self.assignment.ok(self.command('review-candidate', self.pair_request(approved)))
+        self.assertEqual(result['status'], 'diagnosis')
+        self.assertEqual({a['assignment_id'] for a in result['adverse_reviews']},
+                         {rejected['assignment_id'], stuck['assignment_id']})
+        self.assertEqual(result['findings'][0]['kind'], 'missing')
+        self.assertFalse(result['advance_allowed'])
+        policy = self.axis('review-spec', 'review-gate', '-policy')
+        result = self.assignment.ok(self.command('review-candidate', self.pair_request(approved)))
+        self.assertEqual(result['status'], 'operator-decision')
+        self.assertEqual(result['policy_findings'], ['Spec:R1'])
+        self.assertEqual(len(result['adverse_reviews']), 3)
+        self.assertIn(policy['assignment_id'], self.assignment.ok(self.assignment.inspect(self.candidate))['review_holds'])
 
     def test_malformed_wrong_axis_scope_pins_and_false_pass_never_admit(self):
         for mode in ('review-wrong-axis', 'review-wrong-tree', 'review-wrong-adaptation', 'review-false-pass',

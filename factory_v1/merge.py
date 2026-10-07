@@ -239,6 +239,8 @@ def chain(database, project, iteration, operator, config, config_path):
             prior['handoff']['preceding'] == simplification.preceding(builder, physical(builder['runtime']['artifacts'], directory=True),
                 *simplification.implementation(database, project, iteration, operator, builder['assignment_id'])[2:]),
             'Implementation-to-simplification chain changed.', 'stale_review')
+    require(not review.adverse_reviews(database, review.pins(prior, source, baseline)),
+            'Candidate has unresolved independent rejection or stuckness; corrective work and both axes must rerun.', 'stale_review')
     for axis in axes:
         require(axis['handoff']['review']['pins'] == review.pins(prior, source, baseline) and
                 axis['review_result'] == review.validate_result(axis, axis['submitted_result']) and
@@ -264,6 +266,17 @@ def issue(api, assignment, config):
             'pull_request' not in value and isinstance(value.get('body'), str) and value.get('state') in {'open', 'closed'},
             'Exact assigned issue identity required.', 'scope_mismatch')
     return value
+
+
+def reopen(api, assignment, config, observed):
+    if observed['state'] != 'closed':
+        return
+    try:
+        api.issue_state('open', observed)
+    except RepositoryError:
+        after = issue(api, assignment, config)
+        require(after['state'] == 'open' and after['body'] == observed['body'],
+                'Reopening outcome must reconcile before retry.', 'delivery_uncertain')
 
 
 def target(api, config):
@@ -416,6 +429,7 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                     'Incident or requirements changed at admission.', 'stale_admission')
             if incident is None:
                 checks(api, config, config['baseline'])
+            require_publication(database, latest, api)
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}
@@ -433,8 +447,11 @@ def lifecycle(database, project, iteration, operator, config_path, action):
         evidence = merged_evidence(api, config, pr, plan)
         require(journal.get('integrated_evidence') is None or
                 journal['integrated_evidence']['integrated'] == evidence['integrated'], 'Merged commit changed.', 'integration_mismatch')
-        journal.update(status='merged', integrated_evidence=evidence, close_allowed=False, failure=None)
+        journal.update(status='merged', integrated_evidence=evidence, delivery_checks=[], close_allowed=False, failure=None)
         save(database, prior, journal)
+        observed_issue = issue(api, prior, config)
+        require(hashlib.sha256(observed_issue['body'].encode()).hexdigest() == prior['handoff']['issue']['body_sha256'],
+                'Requirements changed during integration.', 'stale_requirements')
         if action == 'verify-delivery':
             protection(api, config)
             integrated_checks = checks(api, config, evidence['integrated'])
@@ -463,8 +480,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                             'Closure outcome must reconcile before retry.', 'delivery_uncertain')
             journal.update(status='delivered', failure=None)
             save(database, prior, journal)
-        elif observed_issue['state'] == 'closed' and journal['status'] != 'delivered':
-            api.issue_state('open', observed_issue)
+        else:
+            reopen(api, prior, config, observed_issue)
         return {**journal, 'merge_allowed': False}
     except (RepositoryError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
         if not isinstance(error, RepositoryError):
@@ -480,6 +497,5 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             assignment['merge_refusal'] = {'candidate': config['head'], 'revision': assignment['revision'], **failure}
             publication.save(database, assignment)
         current_issue = issue(api, assignment, config)
-        if current_issue['state'] == 'closed':
-            api.issue_state('open', current_issue)
+        reopen(api, assignment, config, current_issue)
         raise error
