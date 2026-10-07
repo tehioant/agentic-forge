@@ -48,6 +48,9 @@ class MergeTests(unittest.TestCase):
         self.drop_merge = False
         self.omit_merge = False
         self.drop_close = False
+        self.auto_close = False
+        self.after_merge = None
+        self.boundary_change = None
         self.membership = 'identical'
         self.merge_sha = 'c' * 40
         parent = self.fixture.server.RequestHandlerClass
@@ -79,6 +82,10 @@ class MergeTests(unittest.TestCase):
                              'repository_url': 'https://api.github.com/repos/example/product'}
                 elif suffix in {'/rules/branches/main', '/branches/main/protection'}:
                     case.calls.append(('GET', self.path, None))
+                    if suffix == '/branches/main/protection' and case.boundary_change:
+                        reads = sum(c[:2] == ('GET', self.path) for c in case.calls)
+                        if reads == 2:
+                            case.boundary_change()
                     if case.protection_http != 200:
                         self.reply(case.protection_http, {'message': 'Upgrade to GitHub Pro or make this repository public to enable this feature.'})
                     else:
@@ -136,6 +143,10 @@ class MergeTests(unittest.TestCase):
                     case.commits[case.merge_sha] = {'sha': case.merge_sha, 'tree': {'sha': case.plan['tree']},
                                                   'parents': [{'sha': case.base_sha}, {'sha': case.config['head']}]}
                     case.refs['main'] = case.merge_sha
+                    if case.auto_close:
+                        case.assignment.tracker.issues[10]['state'] = 'closed'
+                    if case.after_merge:
+                        case.after_merge()
                 if case.drop_merge:
                     self.close_connection = True
                     return
@@ -149,6 +160,10 @@ class MergeTests(unittest.TestCase):
                     stored = case.stored()['merge']
                     assert stored['integrated_evidence']['integrated'] == case.merge_sha
                     assert stored['delivery_checks'] and stored['close_allowed'] is True
+                elif case.auto_close:
+                    stored = case.stored()['merge']
+                    assert stored['close_allowed'] is False
+                    assert stored['failure'] or not stored['delivery_checks']
                 case.assignment.tracker.issues[10].update(body)
                 if case.drop_close:
                     self.close_connection = True
@@ -253,6 +268,74 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(self.writes(), writes)
         inspected = self.assignment.ok(self.assignment.inspect(self.candidate))
         self.assertEqual(inspected['merge'], self.stored()['merge'])
+
+    def test_pinned_spec_issue_changed_at_final_protection_read_never_merges(self):
+        spec = self.review.seam.case.assignment.tracker.planning
+        def change():
+            spec.published[spec.issue_path]['body'] += '\nBoundary requirement change'
+        self.boundary_change = change
+        self.refused('publication_mismatch')
+        self.assertEqual(self.writes('PUT'), [])
+        self.assertNotIn('merge', self.stored())
+        self.refused('publication_mismatch')
+
+    def test_old_approved_pair_cannot_override_later_completed_rejection(self):
+        later = self.review.pair('review-reject', '-later')
+        feedback = self.assignment.ok(self.review.command('review-candidate', self.review.pair_request(later)))
+        self.assertEqual(feedback['status'], 'corrections')
+        for _ in range(2):
+            self.refused('stale_review')
+        self.assertEqual(self.writes('PUT'), [])
+        self.assertFalse(self.stored()['merge_refusal'].get('close_allowed', False))
+
+    def test_pinned_document_changed_at_final_protection_read_never_merges(self):
+        spec = self.assignment.tracker.planning
+        def change():
+            path = next(p for p in spec.published if '/contents/' in p)
+            spec.published[path]['content'] = base64.b64encode(b'Changed pinned bytes').decode()
+        self.boundary_change = change
+        self.refused('publication_mismatch')
+        self.assertEqual(self.writes('PUT'), [])
+
+    def test_lone_completed_rejecting_axis_blocks_old_approved_merge_without_aggregation(self):
+        self.review.axis('review-spec', 'review-reject', '-lone')
+        self.refused('stale_review')
+        self.assertEqual(self.writes('PUT'), [])
+
+    def test_merge_autoclosure_reopens_immediately_including_lost_responses(self):
+        self.auto_close = True
+        self.drop_merge = True
+        self.drop_close = True
+        result = self.ok(self.cli())
+        self.assertEqual(result['status'], 'merged')
+        self.assertFalse(result['close_allowed'])
+        self.assertEqual(result['delivery_checks'], [])
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
+        self.assertEqual(len(self.writes('PUT')), 1)
+        self.assertEqual(len(self.writes('PATCH')), 1)
+        self.ok(self.cli())
+        self.assertEqual(len(self.writes('PUT')), 1)
+        self.assertEqual(len(self.writes('PATCH')), 1)
+
+    def test_requirements_changed_during_merge_autoclosure_are_reopened_not_delivered(self):
+        self.auto_close = True
+        def change():
+            self.assignment.tracker.issues[10]['body'] += '\nChanged during integration'
+        self.after_merge = change
+        self.refused('stale_requirements')
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
+        self.assertFalse(self.stored()['merge']['close_allowed'])
+        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
+
+    def test_issue_identity_changed_during_merge_refuses_without_unsafe_state_write(self):
+        self.auto_close = True
+        def change():
+            self.assignment.tracker.issues[10]['node_id'] = 'REPLACED'
+        self.after_merge = change
+        self.refused('scope_mismatch')
+        self.assertEqual(self.writes('PATCH'), [])
+        self.assertFalse(self.stored()['merge']['close_allowed'])
+        self.assertEqual(self.stored()['merge']['failure']['code'], 'scope_mismatch')
 
     def test_branch_only_and_premature_manual_closure_are_reopened_not_delivered(self):
         self.assignment.tracker.issues[10]['state'] = 'closed'

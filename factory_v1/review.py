@@ -198,6 +198,49 @@ def execution_binding(axis):
             'work_sha256': assignments.digest(axis['submitted_result']['work']), 'evidence': evidence, 'model_evidence': model}
 
 
+def record_hold(database, axis):
+    report = axis.get('review_result')
+    if (axis['handoff']['stage'] not in AXES or axis.get('runtime', {}).get('status') != 'complete' or
+            not report or report['verdict'] == 'pass'):
+        return
+    identity = axis['handoff']['review']['pins']['candidate_assignment']
+    prior = next(a for a in assignments.rows(database) if a['assignment_id'] == identity)
+    holds = prior.setdefault('review_holds', {})
+    holds[axis['assignment_id']] = {'run_id': axis['runtime']['run_id'], 'report_sha256': report['report_sha256'],
+                                    'verdict': report['verdict']}
+    database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
+                     (json.dumps(prior, sort_keys=True), identity))
+
+
+def adverse_reviews(database, candidate_pins):
+    rows = assignments.rows(database)
+    prior = next(a for a in rows if a['assignment_id'] == candidate_pins['candidate_assignment'])
+    adverse = []
+    holds = {}
+    for axis in sorted(rows, key=lambda a: a['assignment_id']):
+        contract = axis['handoff'].get('review', {})
+        if (contract.get('pins', {}).get('candidate_assignment') != prior['assignment_id'] or
+                axis.get('runtime', {}).get('status') != 'complete'):
+            continue
+        require(contract['pins'] == candidate_pins and axis['ticket_scope'] == prior['ticket_scope'] and
+                axis['revision'] == prior['revision'] and axis['runtime'].get('container_removed') is True and
+                axis.get('result_disposition', {}).get('checks_verified') is True,
+                'Completed candidate review evidence changed.', 'stale_review')
+        assignments.require_result_active(axis)
+        result = axis['submitted_result']
+        require(result['assignment_id'] == axis['assignment_id'] and result['handoff_digest'] == axis['handoff_digest'] and
+                result['run_id'] == axis['runtime']['run_id'] and result['claim_id'] == axis['claim_id'] and
+                axis['review_result'] == validate_result(axis, result), 'Correlated completed review required.', 'stale_review')
+        report = axis['review_result']
+        if report['verdict'] != 'pass':
+            adverse.append(axis)
+            holds[axis['assignment_id']] = {'run_id': axis['runtime']['run_id'], 'report_sha256': report['report_sha256'],
+                                            'verdict': report['verdict']}
+    require(all(holds.get(identity) == hold for identity, hold in prior.get('review_holds', {}).items()),
+            'Unresolved candidate rejection or stuckness cannot be reset.', 'stale_review')
+    return adverse
+
+
 def authorization(path, operator, axes):
     path = physical(path)
     info = path.stat()
@@ -227,9 +270,12 @@ def evaluate(database, project, iteration, operator, request, github, config_pat
     assignments.current(database, project, iteration, operator)
     axes = pair(database, project, iteration, operator, request, github)
     reports = {a['handoff']['review']['axis']: a['review_result'] for a in axes}
-    findings = [{'axis': axis, **finding} for axis, report in reports.items() for finding in report['findings']]
-    sensitive = sorted({p for a in axes for p in a['handoff']['review']['policy_paths']})
-    weakening = sorted(f['axis'] + ':' + f['id'] for f in findings if f['kind'] in {'gate-weakening', 'security-weakening'})
+    adverse = adverse_reviews(database, axes[0]['handoff']['review']['pins'])
+    evidence = {a['assignment_id']: a for a in [*axes, *adverse]}
+    findings = [{'axis': a['handoff']['review']['axis'], **finding}
+                for a in evidence.values() for finding in a['review_result']['findings']]
+    sensitive = sorted({p for a in evidence.values() for p in a['handoff']['review']['policy_paths']})
+    weakening = sorted({f['axis'] + ':' + f['id'] for f in findings if f['kind'] in {'gate-weakening', 'security-weakening'}})
     config = authorization(config_path, operator, axes) if config_path else None
     if config is None and axes[0].get('review_authorization') is not None:
         saved = axes[0]['review_authorization']
@@ -243,10 +289,11 @@ def evaluate(database, project, iteration, operator, request, github, config_pat
                          if child['handoff'].get('corrections', {}).get('pins') == axes[0]['handoff']['review']['pins'] and
                          child.get('runtime', {}).get('status') == 'complete' and
                          child.get('submitted_result', {}).get('status') == 'stuck']
-    status = ('operator-decision' if policy_held else 'diagnosis' if stuck_corrections or any(r['verdict'] == 'stuck' for r in reports.values())
+    status = ('operator-decision' if policy_held else 'diagnosis' if stuck_corrections or any(a['review_result']['verdict'] == 'stuck' for a in evidence.values())
               else 'corrections' if findings else 'accepted' if config else 'execution-unverified')
     result = {'contract': CONTRACT, 'pins': axes[0]['handoff']['review']['pins'], 'axes': reports,
               'status': status, 'findings': findings, 'policy_paths': sensitive, 'policy_findings': weakening,
+              'adverse_reviews': [{'assignment_id': a['assignment_id'], 'report': a['review_result']} for a in adverse],
               'debug_evidence': [{'assignment_id': c['assignment_id'], 'runtime': c['runtime'],
                                   'result': c['submitted_result']} for c in stuck_corrections],
               'execution_verified': config is not None, 'advance_allowed': status == 'accepted',
