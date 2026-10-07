@@ -347,7 +347,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     original = {key: handoff[key] for key in REQUEST_FIELDS}
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
-    simplification_result = None
+    stage_result = None
     if handoff['stage'] in {'simplify', 'review-standards', 'review-spec', 'diagnosis'}:
         runtime = assignment.get('runtime') or {}
         launcher_submission = (runtime.get('status') == 'running' and
@@ -362,16 +362,22 @@ def store_result(database, project, iteration, operator, assignment_id, request,
             from .simplification import validate_result
         else:
             from .review import validate_result
-        simplification_result = validate_result(assignment, request)
+        stage_result = validate_result(assignment, request)
     old = assignment.get('submitted_result')
     require(old is None or old == request, 'Result replay cannot replace previously stored evidence.', 'result_conflict')
     assignment['submitted_result'] = request
     assignment['result_disposition'] = {'structurally_valid': True, 'trusted_execution': False,
                                        'advance_allowed': False, 'close_allowed': False,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
-    if simplification_result is not None:
+    if stage_result is not None:
         assert assignment is not None
-        assignment['diagnosis_result' if 'diagnosis' in handoff else 'review_result' if 'review' in handoff else 'simplification_result'] = simplification_result
+        if 'diagnosis' in handoff:
+            result_key = 'diagnosis_result'
+        elif 'review' in handoff:
+            result_key = 'review_result'
+        else:
+            result_key = 'simplification_result'
+        assignment[result_key] = stage_result
     with database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)

@@ -47,6 +47,8 @@ iteration limit or deadline does **not** declare engineering work stuck.
    - `contract`, `adaptation`, exact `pins`;
    - `feedback_loop`: executed `command`, exact `symptom`, actual `result`;
    - `commands`: actual `command`/`result` pairs matching retained tests;
+     each result copies the complete retained terminal tool response string verbatim,
+     including JSON formatting and exit status. Contradictory summaries are rejected.
    - `hypotheses`: ranked `hypothesis`/falsifiable `prediction`/`evidence` objects;
    - `attempted_repairs`, `findings` and `cause_or_uncertainty`;
    - `directions`: unique `id`/`direction`/`tradeoff` objects, with

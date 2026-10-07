@@ -190,7 +190,6 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     bounded.update(stage='diagnosis', profile=request['profile'], skills=request['skills'], claim_id=request['claim_id'],
                    capabilities=['read_workspace', 'scratch', 'model'], preceding=preceding(record, declaration, prior))
     result = assignments.prepare(database, project, iteration, operator, bounded, github, dry_run=True)
-    debug_claim(database, record, result['assignment_id'])
     if not dry_run:
         result = assignments.prepare(database, project, iteration, operator, bounded, github)
         item = assignments.current(database, project, iteration, operator)
