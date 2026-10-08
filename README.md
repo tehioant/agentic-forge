@@ -38,5 +38,13 @@ To run the staged checks manually:
 mise exec -- lefthook run pre-commit
 ```
 
+CI runs the complete discovered factory suite in two isolated subprocess shards
+through `python scripts/run_factory_tests.py`. Discovery refuses errors or duplicate
+IDs; every discovered test is assigned exactly once, and either shard's failure
+fails the existing check. The Python matrix, check names, assertions, permissions
+and 15-minute job limit are unchanged. Antoine explicitly approved sharding after
+the sequential suite exceeded that limit. `mise run test` still runs sequentially;
+use `mise exec -- python scripts/run_factory_tests.py` for the CI execution layout.
+
 See [`factory_v1/README.md`](factory_v1/README.md) for the controller CLI and its
 trust boundaries.

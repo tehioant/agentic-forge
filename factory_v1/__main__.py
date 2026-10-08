@@ -221,9 +221,35 @@ def main():
     for option in ('project', 'iteration', 'assignment', 'publication-config'):
         publication.add_argument('--' + option, required=True)
     publication.add_argument('--plan-only', action='store_true', help='Read-only deterministic candidate plan, not publication approval.')
+    inspection = commands.add_parser('inspect-merge', help='Inspect exact durable merge/refusal evidence, including obsolete revisions.')
+    for option in ('project', 'iteration', 'assignment'):
+        inspection.add_argument('--' + option, required=True)
+    for name in ('merge-preflight', 'merge-candidate', 'verify-delivery'):
+        control = commands.add_parser(name, help='Host-only gated merge and exact integrated delivery verification.')
+        for option in ('project', 'iteration', 'merge-config'):
+            control.add_argument('--' + option, required=True)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'merge-preflight', 'merge-candidate', 'verify-delivery', 'inspect-merge'}:
+        from .merge import lifecycle, inspect_merge
+        from .repositories import RepositoryError
+        import fcntl
+        try:
+            uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command in {'merge-preflight', 'inspect-merge'} else '?mode=rw')
+            with closing(sqlite3.connect(uri, uri=True)) as database:
+                with open(str(Path(args.state).resolve()) + '.onboarding.lock', 'r') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    if args.command == 'inspect-merge':
+                        result = inspect_merge(database, args.project, args.iteration, args.operator_id, args.assignment)
+                    else:
+                        result = lifecycle(database, args.project, args.iteration, args.operator_id, args.merge_config, args.command)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_merge', 'Malformed merge state or evidence; no admission permitted.') from error
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command in {'prepare-review', 'prepare-corrections', 'review-candidate'}:
         from . import review
         from .repositories import GitHub, RepositoryError, state_lock
