@@ -1,6 +1,6 @@
 # Fresh factory v1 — intake, onboarding, planning, tickets, assignments and attention
 
-Standard-library Python 3.11+ controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, controls ticket publication/frontier/reservation, and prepares bounded role handoffs. It never dispatches implementation workers.
+Standard-library Python 3.14 controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, controls ticket publication/frontier/reservation, and prepares bounded role handoffs. It never dispatches implementation workers.
 
 ## Trust and safety boundary
 
