@@ -177,6 +177,50 @@ def run_fixture(container):
             content = content[:-1] + ', "verdict":"pass"}'
         result['artifacts'].append({'name': 'review-result', 'content': content,
                                     'sha256': hashlib.sha256(content.encode()).hexdigest()})
+    if result.get('status') == 'stuck' or mode == 'implementation-stuck':
+        result['status'] = 'stuck'
+        declaration = {'reason': 'LABELED fixture worker stuck after attempted repair, not a limit.',
+                       'attempted_fixes': [{'change': 'LABELED fixture attempted greeting correction',
+                                            'command': command, 'result': 'LABELED fixture still wrong greeting'}],
+                       'findings': ['LABELED fixture failed greeting remains in exact source.']}
+        content = json.dumps(declaration, sort_keys=True)
+        result['artifacts'].append({'name': 'stuck-declaration', 'content': content,
+                                    'sha256': hashlib.sha256(content.encode()).hexdigest()})
+    if 'diagnosis' in assignment['handoff'] and mode != 'malformed':
+        import subprocess
+        command = f"{sys.executable} -c \"import subprocess; out=subprocess.check_output(['{sys.executable}', '{mounts['/workspace'] / 'hello.py'}'], text=True); assert out.strip() == 'required greeting', out\""
+        reproduction = subprocess.run(command, shell=True, capture_output=True, text=True)
+        output = reproduction.stdout + reproduction.stderr + f'\nexit_code={reproduction.returncode}'
+        conversation = {'messages': [
+            {'role': 'assistant', 'tool_calls': [{'id': 'fixture-repro', 'function': {'name': 'terminal', 'arguments': json.dumps({'command': command})}}]},
+            {'role': 'tool', 'tool_call_id': 'fixture-repro', 'content': output}]}
+        (scratch / 'conversation.json').write_text(json.dumps(conversation))
+        result['tests'] = [{'command': command, 'result': output}]
+        report = {'contract': assignment['handoff']['diagnosis']['contract'],
+                  'adaptation': assignment['handoff']['adaptation'], 'pins': assignment['handoff']['diagnosis']['pins'],
+                  'feedback_loop': {'command': command, 'symptom': 'LABELED fixture greeting mismatch', 'result': output},
+                  'commands': result['tests'], 'hypotheses': [
+                      {'hypothesis': 'LABELED greeting literal differs', 'prediction': 'Exact greeting check remains red', 'evidence': output}],
+                  'attempted_repairs': ['LABELED responsible greeting attempt retained; debug did not modify source'],
+                  'findings': ['LABELED test fixture reproduction is red; NOT native Hermes execution'],
+                  'cause_or_uncertainty': 'LABELED fixture literal differs; real product diagnosis unverified.',
+                  'directions': [{'id': 'retry-greeting', 'direction': 'Retry within original greeting requirement',
+                                  'tradeoff': 'LABELED fixture direction, not product approval'}],
+                  'recommendation': 'retry-greeting', 'blockers': []}
+        if mode == 'diagnosis-blocker':
+            report.update(feedback_loop=None, hypotheses=[], blockers=['LABELED missing product environment; HITL template unavailable'])
+            result['status'] = 'blocked'
+        if mode == 'diagnosis-wrong-pins':
+            report['pins'] = {**report['pins'], 'tree_sha256': '0' * 64}
+        if mode == 'diagnosis-write':
+            (mounts['/workspace'] / 'hello.py').write_text('Read-only fixture violation')
+        if mode == 'diagnosis-false-green':
+            # Keep the executed red conversation intact; falsify only reported results.
+            result['tests'][0]['result'] = 'ALL PASSED\nexit_code=0'
+            report['feedback_loop']['result'] = 'ALL PASSED\nexit_code=0'
+        content = json.dumps(report, sort_keys=True)
+        result['artifacts'].append({'name': 'diagnosis-report', 'content': content,
+                                    'sha256': hashlib.sha256(content.encode()).hexdigest()})
     (scratch / 'result.json').write_text(json.dumps(result))
 
 

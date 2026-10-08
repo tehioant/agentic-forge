@@ -139,6 +139,35 @@ class AssignmentTests(unittest.TestCase):
                      not (c[1] == '/graphql' and c[2]['query'].lstrip().startswith('query '))]
         self.assertEqual(mutations, [])
 
+    def test_released_direction_matches_each_affected_issue_identity_and_own_body(self):
+        from factory_v1 import assignments
+        from factory_v1.repositories import GitHub
+
+        issues = {str(n): self.configuration(n)['issue'] for n in (10, 11)}
+        response = {'response': json.dumps({'action': 'retry', 'direction': 'LABELED original-scope retry'})}
+        record = {'status': 'released', 'sequence': 1, 'affected': [10, 11], 'issues': issues,
+                  'pins': {'issue_sha256': issues['10']['body_sha256']}, 'applied_response': response}
+        for number in (10, 11):
+            with self.subTest(number=number):
+                self.tracker.members[10]['fields']['STATUS'] = 'Done' if number == 11 else 'Ready'
+                self.tracker.issues[10]['state'] = 'closed' if number == 11 else 'open'
+                self.tracker.issues[10]['state_reason'] = 'completed' if number == 11 else None
+                for change in ({}, {'id': 99999}, {'node_id': 'wrong'}, {'body_sha256': '0' * 64}):
+                    with self.subTest(change=change):
+                        retained = copy.deepcopy(record)
+                        retained['issues'][str(number)].update(change)
+                        self.mutate_iteration(lambda item: item.update(stuck_work={'released-fixture': retained}))
+                        before = self.fixture.state.read_bytes()
+                        with closing(sqlite3.connect(self.fixture.state)) as database:
+                            prepared = assignments.prepare(database, 'product', 'm1', '42', self.configuration(number),
+                                GitHub(self.fixture.base, 'fixture', 10), dry_run=True)
+                        self.assertEqual(self.fixture.state.read_bytes(), before)
+                        if change:
+                            self.assertIsNone(prepared['handoff'].get('operator_direction'))
+                        else:
+                            self.assertEqual(prepared['handoff'].get('operator_direction'), response)
+        self.assert_no_external_writes()
+
     def test_prepare_inspect_restart_and_exact_replay_preserve_actual_bytes(self):
         prepared = self.ok(self.command())
         self.assertTrue(prepared['assignment_ready'])
@@ -368,7 +397,7 @@ class AssignmentTests(unittest.TestCase):
                     'diagnosis': ['diagnosing-bugs'], 'repair': ['diagnosing-bugs', 'implement']}
         for stage, entry in expected.items():
             request = self.configuration(stage=stage)
-            if stage in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
+            if stage in {'simplify', 'review-standards', 'review-spec', 'corrections', 'diagnosis'}:
                 request['preceding'].append(artifact('implementation-diff', 'Labeled unverified diff'))
                 self.refused(self.command(request=request, dry_run=True), 'implementation_unverified')
                 continue

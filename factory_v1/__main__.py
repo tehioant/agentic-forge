@@ -179,6 +179,16 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
+    for name in ('declare-stuck', 'prepare-diagnosis', 'request-direction', 'apply-direction'):
+        control = commands.add_parser(name, help='Explicit stuckness, read-only debug and exact operator direction.')
+        for option in ('project', 'iteration', 'request', 'api-base'):
+            control.add_argument('--' + option, required=True)
+        control.add_argument('--bearer', default='credential-blind-controller')
+        control.add_argument('--timeout', type=float, default=10)
+        if name == 'prepare-diagnosis':
+            control.add_argument('--dry-run', action='store_true')
+        if name == 'request-direction':
+            control.add_argument('--diagnosis-config', help='Private host-only independent debug execution authorization.')
     for name in ('prepare-review', 'prepare-corrections', 'review-candidate'):
         control = commands.add_parser(name, help='Exact two-axis review/corrections; no merge or closure.')
         for option in ('project', 'iteration', 'request', 'api-base'):
@@ -224,6 +234,28 @@ def main():
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'declare-stuck', 'prepare-diagnosis', 'request-direction', 'apply-direction'}:
+        from . import diagnosis
+        from .repositories import GitHub, RepositoryError, state_lock
+        try:
+            with open(args.request, encoding='utf-8') as source:
+                request = json.load(source, object_pairs_hook=unique_fields)
+            read_only = getattr(args, 'dry_run', False)
+            uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if read_only else '?mode=rw')
+            with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database):
+                github = GitHub(args.api_base, args.bearer, args.timeout)
+                operation = {'declare-stuck': diagnosis.declare, 'prepare-diagnosis': diagnosis.prepare,
+                             'request-direction': diagnosis.request_direction, 'apply-direction': diagnosis.apply_direction}[args.command]
+                extra = {'dry_run': args.dry_run} if args.command == 'prepare-diagnosis' else (
+                    {'config_path': args.diagnosis_config} if args.command == 'request-direction' else {})
+                result = operation(database, args.project, args.iteration, args.operator_id, request, github, **extra)
+                database.commit()
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_diagnosis', 'Malformed or unavailable debug input/state; no direction granted.') from error
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command in {'prepare-review', 'prepare-corrections', 'review-candidate'}:
         from . import review
         from .repositories import GitHub, RepositoryError, state_lock
