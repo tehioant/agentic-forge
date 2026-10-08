@@ -205,7 +205,7 @@ def execution_binding(axis):
 
 def record_hold(database, axis):
     report = axis.get('review_result')
-    if (axis['handoff']['stage'] not in AXES or axis.get('runtime', {}).get('status') != 'complete' or
+    if (axis.get('runtime', {}).get('status') != 'complete' or axis['handoff']['stage'] not in AXES or
             not report or report['verdict'] == 'pass'):
         return
     identity = axis['handoff']['review']['pins']['candidate_assignment']
