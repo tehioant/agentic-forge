@@ -461,7 +461,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require_publication(database, item, api)
             if fresh_issue['state'] != 'closed':
                 assignments.current(database, project, iteration, operator)
-            journal.update(status='merged', integrated_evidence=evidence, delivery_checks=integrated_checks,
+            journal.update(status=previous_delivery['status'] if previous_delivery else 'merged',
+                           integrated_evidence=evidence, delivery_checks=integrated_checks,
                            close_allowed=True, failure=None)
             if previous_delivery is None or fresh_issue['state'] != 'closed':
                 save(database, prior, journal)  # Verified integration/checks precede any closure.

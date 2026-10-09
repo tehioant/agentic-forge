@@ -56,6 +56,7 @@ class MergeTests(unittest.TestCase):
         self.after_merge = None
         self.boundary_change = None
         self.before_main_commit = None
+        self.before_close_readback = None
         self.membership = 'identical'
         self.merge_sha = 'c' * 40
         parent = self.fixture.server.RequestHandlerClass
@@ -174,6 +175,9 @@ class MergeTests(unittest.TestCase):
                     assert stored['close_allowed'] is False
                     assert stored['failure'] or not stored['delivery_checks']
                 case.assignment.tracker.issues[10].update(body)
+                if body['state'] == 'closed' and case.before_close_readback and case.before_close_readback():
+                    self.close_connection = True
+                    return
                 if case.drop_close:
                     self.close_connection = True
                     return
@@ -521,24 +525,26 @@ class MergeTests(unittest.TestCase):
         self.refs['main'] = later
         self.membership = 'ahead'
         self.commits[later] = {'sha': later, 'tree': {'sha': 'e' * 40}}
-        reached = threading.Event()
-        released = threading.Event()
-        def crash_boundary():
-            reached.set()
-            released.wait(10)
-            return True
-        self.before_main_commit = crash_boundary
-        process = subprocess.Popen([sys.executable, '-m', 'factory_v1', '--state', str(self.fixture.state),
-            '--operator-id', '42', 'verify-delivery', '--project', 'product', '--iteration', 'm1',
-            '--merge-config', str(self.config_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-        try:
-            self.assertTrue(reached.wait(10), 'Revalidation did not reach the current-main read')
-        finally:
-            process.kill()
-            process.communicate(timeout=10)
-            self.before_main_commit = None
-            released.set()
+        def kill_at_boundary(boundary):
+            reached = threading.Event()
+            released = threading.Event()
+            def crash_boundary():
+                reached.set()
+                released.wait(10)
+                return True
+            setattr(self, boundary, crash_boundary)
+            process = subprocess.Popen([sys.executable, '-m', 'factory_v1', '--state', str(self.fixture.state),
+                '--operator-id', '42', 'verify-delivery', '--project', 'product', '--iteration', 'm1',
+                '--merge-config', str(self.config_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+            try:
+                self.assertTrue(reached.wait(10), 'Revalidation did not reach ' + boundary)
+            finally:
+                process.kill()
+                process.communicate(timeout=10)
+                setattr(self, boundary, None)
+                released.set()
+        kill_at_boundary('before_main_commit')
         self.assertEqual(self.stored()['merge'],
                          {key: value for key, value in delivered.items() if key != 'merge_allowed'})
         self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
@@ -555,11 +561,24 @@ class MergeTests(unittest.TestCase):
         self.commits[later]['tree']['sha'] = self.plan['tree']
         self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
         self.assertEqual(self.writes(), writes)
+        self.assignment.tracker.issues[10]['state'] = 'open'
+        kill_at_boundary('before_close_readback')
+        retained = self.stored()['merge']
+        self.assertEqual(retained['status'], 'delivered')
+        self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
+        writes = self.writes()
+        self.commits[later]['tree']['sha'] = 'e' * 40
+        self.refused('delivery_stale', 'verify-delivery')
+        self.assertEqual(self.stored()['merge']['status'], 'revalidation-required')
+        self.assertEqual(self.stored()['merge']['delivery_checks'], retained['delivery_checks'])
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
+        self.assertEqual(self.writes(), writes)
         self.commits[later]['tree']['sha'] = self.baseline_tree
         self.refused('delivery_removed', 'verify-delivery')
         self.assertEqual(self.stored()['merge']['status'], 'incomplete')
         self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(len(self.writes('PATCH')), 2)
+        self.assertEqual(len(self.writes('PATCH')), 3)
 
     def test_integrated_tree_membership_and_failed_checks_hold_delivery(self):
         self.ok(self.cli())
