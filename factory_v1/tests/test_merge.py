@@ -2,7 +2,11 @@
 import base64
 import copy
 import json
+import os
 import sqlite3
+import subprocess
+import sys
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -51,6 +55,7 @@ class MergeTests(unittest.TestCase):
         self.auto_close = False
         self.after_merge = None
         self.boundary_change = None
+        self.before_main_commit = None
         self.membership = 'identical'
         self.merge_sha = 'c' * 40
         parent = self.fixture.server.RequestHandlerClass
@@ -63,6 +68,10 @@ class MergeTests(unittest.TestCase):
                 if suffix == '':
                     value = case.repo
                 elif suffix.startswith('/git/commits/'):
+                    if (case.before_main_commit and suffix == '/git/commits/' + case.refs['main'] and
+                            case.before_main_commit()):
+                        self.close_connection = True
+                        return
                     value = case.commits.get(suffix.split('/')[-1])
                     if value is None:
                         super().do_GET()
@@ -512,6 +521,28 @@ class MergeTests(unittest.TestCase):
         self.refs['main'] = later
         self.membership = 'ahead'
         self.commits[later] = {'sha': later, 'tree': {'sha': 'e' * 40}}
+        reached = threading.Event()
+        released = threading.Event()
+        def crash_boundary():
+            reached.set()
+            released.wait(10)
+            return True
+        self.before_main_commit = crash_boundary
+        process = subprocess.Popen([sys.executable, '-m', 'factory_v1', '--state', str(self.fixture.state),
+            '--operator-id', '42', 'verify-delivery', '--project', 'product', '--iteration', 'm1',
+            '--merge-config', str(self.config_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+        try:
+            self.assertTrue(reached.wait(10), 'Revalidation did not reach the current-main read')
+        finally:
+            process.kill()
+            process.communicate(timeout=10)
+            self.before_main_commit = None
+            released.set()
+        self.assertEqual(self.stored()['merge'],
+                         {key: value for key, value in delivered.items() if key != 'merge_allowed'})
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
+        self.assertEqual(self.writes(), writes)
         for _ in range(2):
             self.refused('delivery_stale', 'verify-delivery')
             retained = self.stored()['merge']

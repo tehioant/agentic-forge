@@ -435,8 +435,9 @@ def lifecycle(database, project, iteration, operator, config_path, action):
         evidence = merged_evidence(api, config, pr, plan)
         require(journal.get('integrated_evidence') is None or
                 journal['integrated_evidence']['integrated'] == evidence['integrated'], 'Merged commit changed.', 'integration_mismatch')
-        journal.update(status='merged', integrated_evidence=evidence, delivery_checks=[], close_allowed=False, failure=None)
-        save(database, prior, journal)
+        if previous_delivery is None:
+            journal.update(status='merged', integrated_evidence=evidence, delivery_checks=[], close_allowed=False, failure=None)
+            save(database, prior, journal)
         observed_issue = issue(api, prior, config)
         require(hashlib.sha256(observed_issue['body'].encode()).hexdigest() == prior['handoff']['issue']['body_sha256'],
                 'Requirements changed during integration.', 'stale_requirements')
@@ -460,8 +461,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require_publication(database, item, api)
             if fresh_issue['state'] != 'closed':
                 assignments.current(database, project, iteration, operator)
-            journal.update(delivery_checks=integrated_checks, close_allowed=True)
-            save(database, prior, journal)  # Verified integration/checks precede any closure.
+            journal.update(status='merged', integrated_evidence=evidence, delivery_checks=integrated_checks,
+                           close_allowed=True, failure=None)
+            if previous_delivery is None or fresh_issue['state'] != 'closed':
+                save(database, prior, journal)  # Verified integration/checks precede any closure.
             if fresh_issue['state'] != 'closed':
                 try:
                     api.issue_state('closed', fresh_issue)
