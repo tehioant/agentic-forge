@@ -1,6 +1,6 @@
 # Gated autonomous merge and integrated delivery (#17)
 
-Standard-library Python 3.11+, in the existing `factory_v1` controller. This extends
+Standard-library Python 3.14, in the existing `factory_v1` controller. This extends
 [#13 independent review](../docs/fresh-independent-review.md) and
 [#14 publication](PUBLICATION.md), not a second worker/scheduler framework. Scope:
 fresh specification and interview pinned at
@@ -190,27 +190,29 @@ pause/revision, wrong scope/stale head/baseline, inaccessible protection, failed
 branch-only checks, exact integration and premature closure. **Docker/model/GitHub
 responses and host authority are labeled simulations; none prove live acceptance.**
 
-Parent's actual read-only preflight on 2026-10-07 found the authorized private repository
-`tehioant/agentic-forge-fresh-v1-validation`, default/base `fresh-spec-validation`, but
-**both** effective-rules and classic-protection endpoints returned HTTP 403:
-“Upgrade to GitHub Pro or make this repository public to enable this feature.”
-Actual retained evidence is
-`/home/ops/.hermes/fresh-forge-evidence/issue17/live-prerequisites.json` (outside worker mounts).
-PR #3 remains an open draft on `factory/issue14-publication-acceptance`, head
-`f378806276f3687cf092a38337ae9c9aa6a062db`: publication, **not delivery**.
+The initial private-repository preflight returned HTTP 403 for protection endpoints.
+That historical refusal remains retained in
+`/home/ops/.hermes/fresh-forge-evidence/issue17/live-prerequisites.json`.
+After explicit operator authorization and a privacy/secrets audit, only the disposable
+`tehioant/agentic-forge-fresh-v1-validation` repository was made public. Quality/security
+workflows were installed at baseline `66833cf33988b26ebff31b99ba48e738b7635835`.
 
-Runnable read-only prerequisite checks, with already approved host authentication:
+Fresh read-only verification confirms repository ID `1402450718`, default/base
+`fresh-spec-validation`, effective rules `[]`, and strict classic protection requiring
+`validation-tests` and `validation-secrets`, each bound to GitHub Actions app `15368`.
+Administrator enforcement is enabled; force pushes and deletion are disabled.
+The initial 403 blocker is resolved without spending or protection weakening.
 
 ```sh
 mise exec -- gh api repos/tehioant/agentic-forge-fresh-v1-validation/rules/branches/fresh-spec-validation
 mise exec -- gh api repos/tehioant/agentic-forge-fresh-v1-validation/branches/fresh-spec-validation/protection
 ```
 
-No upgrade/spending, visibility change, policy weakening, live merge or live issue
-closure is authorized. Live gated merge and integrated-check readback therefore remain
-**blocked**, not accepted through fixture evidence. After the prerequisite is resolved
-through an explicit authorized decision, the parent must exercise the complete real
-skill-guided chain, actual protections/quality/security gates, fixed candidate mapping,
-live merge/membership and integrated checks in the disposable repository, retaining exact
-readbacks and genuine refusal cases. Deployment observations are still needed for
-iteration acceptance. This implementation worker performed no live mutations.
+Existing draft PR #3 at head `f378806276f3687cf092a38337ae9c9aa6a062db` predates the
+protected baseline; it proves publication, **not current merge admission or delivery**.
+Live acceptance still requires a genuine `implement` → `simplify-code` → independent
+Standards/Spec execution chain bound to the current baseline, independently verified
+host bindings, fixed candidate publication, live gated merge/main membership and
+integrated-SHA checks. Deterministic fixture results and green baseline CI cannot
+replace those records. No source PR merge, protection bypass or live closure is
+claimed. Deployment observations remain separate requirements for iteration acceptance.
