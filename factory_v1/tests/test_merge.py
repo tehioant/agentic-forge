@@ -503,6 +503,33 @@ class MergeTests(unittest.TestCase):
             self.assertEqual(self.ok(result)['status'], 'merged')
         self.assertEqual(len(self.writes('PUT')), 1)
 
+    def test_later_main_drift_preserves_prior_delivery_until_removed_or_revalidated(self):
+        self.ok(self.cli())
+        self.pass_checks(self.merge_sha)
+        delivered = self.ok(self.cli('verify-delivery'))
+        writes = self.writes()
+        later = 'd' * 40
+        self.refs['main'] = later
+        self.membership = 'ahead'
+        self.commits[later] = {'sha': later, 'tree': {'sha': 'e' * 40}}
+        for _ in range(2):
+            self.refused('delivery_stale', 'verify-delivery')
+            retained = self.stored()['merge']
+            self.assertEqual(retained['status'], 'revalidation-required')
+            self.assertFalse(retained['close_allowed'])
+            self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
+            self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
+            self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
+            self.assertEqual(self.writes(), writes)
+        self.commits[later]['tree']['sha'] = self.plan['tree']
+        self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
+        self.assertEqual(self.writes(), writes)
+        self.commits[later]['tree']['sha'] = self.baseline_tree
+        self.refused('delivery_removed', 'verify-delivery')
+        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
+        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
+        self.assertEqual(len(self.writes('PATCH')), 2)
+
     def test_integrated_tree_membership_and_failed_checks_hold_delivery(self):
         self.ok(self.cli())
         self.pass_checks(self.merge_sha)

@@ -163,9 +163,14 @@ already completed merge while paused, but cannot admit a new merge or silently r
 
 Delivery requires required checks on the **actual integrated SHA**, unchanged current
 requirements/review/execution pins, and verified main membership. Current main must
-still have that exact reviewed tree; later changed code or a revert conservatively
-requires delivery revalidation rather than relying on ancestry. Branch-only green
-checks cannot close work. Verified integration/check receipts commit before closure;
+still have that exact reviewed tree to grant fresh delivery approval; later changed code
+requires revalidation rather than relying on ancestry. For previously delivered work,
+unknown tree drift persists `revalidation-required`, retains the prior integrated/check
+receipts and refuses further closure without reopening the issue merely because main
+changed. Restoring the exact reviewed tree permits fresh verification; restoring the
+pre-candidate tree proves removal and reopens work. Other stale requirements, missing
+integration or failed integrated checks retain the incomplete/reopening behavior.
+Branch-only green checks cannot close work. Verified integration/check receipts commit before closure;
 lost closure responses read back the same issue before retry. Failure/refusal is durable
 before corrective reopening IO. Changed requirements or failing integrated checks
 reopen previously closed incomplete work rather than accepting GitHub closure as proof.

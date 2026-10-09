@@ -363,10 +363,12 @@ def lifecycle(database, project, iteration, operator, config_path, action):
     authority = {k: v for k, v in config.items() if k != 'bearer'}
     journal = assignment.get('merge')
     if journal:
-        require(journal.get('authority') == authority and journal.get('status') in {'pending', 'merged', 'incomplete', 'delivered'},
+        require(journal.get('authority') == authority and journal.get('status') in {'pending', 'merged', 'incomplete', 'delivered', 'revalidation-required'},
                 'Fixed merge intent cannot be replaced.', 'merge_conflict')
-        if journal['status'] == 'delivered':
+        if journal['status'] in {'delivered', 'revalidation-required'}:
             action = 'verify-delivery'
+    previous_delivery = (json.loads(json.dumps(journal)) if journal and
+                         journal['status'] in {'delivered', 'revalidation-required'} else None)
     try:
         prior, builder, root = chain(database, project, iteration, operator, config, config_path)
         require_publication(database, item, api)
@@ -444,7 +446,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             # Current main must still be exactly this reviewed tree. Later main changes
             # require their own requirement/delivery verifier; ancestry alone is insufficient.
             main_commit = api.read('/git/commits/' + evidence['main'])
-            require(main_commit.get('tree', {}).get('sha') == plan['tree'],
+            current_tree = main_commit.get('tree', {}).get('sha')
+            require(current_tree != plan['base_tree'] or plan['tree'] == plan['base_tree'],
+                    'Main restored the pre-candidate tree; delivered changes were removed.', 'delivery_removed')
+            require(current_tree == plan['tree'],
                     'Main changed after integration; delivered requirements need revalidation.', 'delivery_stale')
             require(merged_evidence(api, config, target(api, config), plan) == evidence,
                     'Main changed during delivery checks.', 'delivery_stale')
@@ -475,6 +480,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
         # Persist failure before corrective network IO; neither pause nor obsolete
         # requirements can turn a partial operation into delivered work on restart.
         failure = {'code': error.code, 'message': str(error)}
+        if error.code == 'delivery_stale' and previous_delivery is not None:
+            previous_delivery.update(status='revalidation-required', close_allowed=False, failure=failure)
+            save(database, assignment, previous_delivery)
+            raise error
         if journal:
             journal.update(status='incomplete' if journal.get('integrated_evidence') else 'pending',
                            close_allowed=False, failure=failure)
