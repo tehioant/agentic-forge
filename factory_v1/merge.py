@@ -442,6 +442,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             # Delivery reads can change admission too. Revalidate AFTER sampling,
             # with requirement publication the last remote guard before intent/PUT.
             latest = revalidate_admission(boundary_incident)
+            require(review.evaluate(database, project, iteration, operator, pair, assignments.ReadOnlyGitHub(api.github))['status'] == 'accepted',
+                    'Final authoritative frontier and independent review admission required.', 'stale_review')
             require_publication(database, latest, api, config['issue'])
             require(issue(api, prior, config) == observed_issue,
                     'Exact work issue changed at final requirement boundary.', 'stale_requirements')

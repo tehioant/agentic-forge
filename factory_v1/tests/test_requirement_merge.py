@@ -79,6 +79,36 @@ class RequirementMergeTests(unittest.TestCase):
             '--request', str(file), '--api-base', self.case.fixture.base), 'stale_assignment')
         self.assertNotIn('clarification', self.case.assignment.tracker.inspect().get('requirement_changes', {}))
 
+    def assert_final_frontier_drift_refused(self, fault):
+        self.case.boundary_change = fault
+        result = self.case.cli()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('error', json.loads(result.stderr))
+        self.assertEqual(self.case.writes('PUT'), [])
+        self.assertNotIn('merge', self.case.stored())
+        self.assertIn('merge_refusal', self.case.stored())
+
+    def test_native_blocker_drift_at_protection_read_refuses_merge(self):
+        self.assert_final_frontier_drift_refused(lambda: self.case.assignment.tracker.deps.update({10: [12]}))
+
+    def test_board_scope_drift_at_protection_read_refuses_merge(self):
+        self.assert_final_frontier_drift_refused(lambda: self.case.assignment.tracker.members[10]['fields'].update(SCOPE='M2'))
+
+    def test_board_progress_drift_at_last_protection_read_refuses_merge(self):
+        parent = self.case.fixture.server.RequestHandlerClass
+        case = self.case
+        fired = []
+        class Handler(parent):
+            def do_GET(inner):
+                if inner.path.endswith('/branches/main/protection') and sum(
+                        c[:2] == ('GET', inner.path) for c in case.calls) == 2:
+                    fired.append(True)
+                    case.assignment.tracker.members[10]['fields']['STATUS'] = 'Blocked'
+                super().do_GET()
+        self.case.fixture.server.RequestHandlerClass = Handler
+        self.assert_final_frontier_drift_refused(None)
+        self.assertTrue(fired)
+
     def test_exact_ticket_revision_at_last_protection_read_refuses_approved_candidate(self):
         self.case.calls.clear()
         self.case.boundary_change = lambda: self.case.assignment.tracker.issues[10].update(
