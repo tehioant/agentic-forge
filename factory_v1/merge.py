@@ -321,18 +321,21 @@ def inspect_merge(database, project, iteration, operator, assignment_id):
     assignment = next((a for a in assignments.rows(database) if a['assignment_id'] == assignment_id), None)
     require(assignment is not None and assignment['ticket_scope']['project'] == project and
             assignment['ticket_scope']['iteration'] == iteration, 'Exact assignment not found.', 'not_found')
-    return {'assignment_id': assignment_id, 'revision': assignment['revision'], 'current_spec': item.get('handoff'),
+    from .requirements import authority
+    current_revision = authority(item, assignment['ticket_scope']['issue_number'])
+    return {'assignment_id': assignment_id, 'revision': assignment['revision'], 'current_spec': current_revision['spec'],
+            'current_revision': current_revision, 'requirement_disposition': assignment.get('requirement_disposition'),
             'merge': assignment.get('merge'), 'refusal': assignment.get('merge_refusal'),
             'iteration_complete': False, 'deployment_verified': False}
 
 
-def require_publication(database, item, api):
+def require_publication(database, item, api, number):
     # pinned_inputs reconciles onboarding; isolate its checkpoints from the trusted
     # merge transaction (and never backup a connection with an uncommitted write).
     with closing(sqlite3.connect(':memory:')) as observation:
         database.backup(observation)
-        inputs = tickets.pinned_inputs(observation, json.loads(json.dumps(item)), assignments.ReadOnlyGitHub(api.github))
-    require(inputs == item['ticket_work']['inputs'], 'Pinned requirement publication changed.', 'stale_requirements')
+        from .requirements import revalidate_inputs
+        revalidate_inputs(observation, json.loads(json.dumps(item)), assignments.ReadOnlyGitHub(api.github), number)
 
 
 def lifecycle(database, project, iteration, operator, config_path, action):
@@ -371,7 +374,7 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                          journal['status'] in {'delivered', 'revalidation-required'} else None)
     try:
         prior, builder, root = chain(database, project, iteration, operator, config, config_path)
-        require_publication(database, item, api)
+        require_publication(database, item, api, config['issue'])
         require(hashlib.sha256(observed_issue['body'].encode()).hexdigest() == prior['handoff']['issue']['body_sha256'],
                 'Current requirements changed; old candidate obsolete.', 'stale_requirements')
         plan = mapped_candidate(api, config, prior, root)
@@ -445,7 +448,9 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             # Delivery reads can change admission too. Revalidate AFTER sampling,
             # with requirement publication the last remote guard before intent/PUT.
             latest = revalidate_admission(boundary_incident)
-            require_publication(database, latest, api)
+            require_publication(database, latest, api, config['issue'])
+            require(issue(api, prior, config) == observed_issue,
+                    'Exact work issue changed at final requirement boundary.', 'stale_requirements')
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}
@@ -486,7 +491,7 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             fresh_issue = issue(api, prior, config)
             require(hashlib.sha256(fresh_issue['body'].encode()).hexdigest() == prior['handoff']['issue']['body_sha256'],
                     'Requirements changed before closure.', 'stale_requirements')
-            require_publication(database, item, api)
+            require_publication(database, item, api, config['issue'])
             if fresh_issue['state'] != 'closed':
                 assignments.current(database, project, iteration, operator)
             journal.update(status=previous_delivery['status'] if previous_delivery else 'merged',

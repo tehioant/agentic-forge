@@ -254,7 +254,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
                 'write_workspace' in handoff['capabilities'] and
                 handoff['repository'] == item['repository'] == config['repository'] and
                 handoff['repository_id'] == config['repository_id'] == item['repository_onboarding']['metadata']['id'] and
-                handoff['issue']['number'] == config['issue'] and handoff['spec_commit'] == item['handoff']['commit'],
+                handoff['issue']['number'] == config['issue'] and handoff['spec_commit'] == assignment['revision']['spec']['commit'],
                 'Wrong caller, role, assignment or pinned publication scope.', 'scope_mismatch')
         runtime = assignment.get('runtime', {})
         require(runtime.get('status') == 'complete' and runtime.get('container_removed') is True and

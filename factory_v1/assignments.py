@@ -133,7 +133,9 @@ def current(database, project, iteration, operator, require_active=True):
 def ticket_claims(database, scope):
     """Check durable role ownership for every supplied ticket identity field."""
     from .diagnosis import released_claim
-    existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and not released_claim(database, old)]
+    from .requirements import released_claim as revised_claim
+    existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
+                not released_claim(database, old) and not revised_claim(database, old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
                 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
@@ -144,7 +146,10 @@ def claims(database, request, scope, assignment_id):
     existing = rows(database)
     if request['stage'] != 'diagnosis':
         ticket_claims(database, scope)
+    from .requirements import released_claim as revised_claim
     for old in existing:
+        if revised_claim(database, old):
+            continue
         if old['assignment_id'] == assignment_id:
             continue
         require(old['claim_id'] != request['claim_id'], 'Claim identity already binds a different assignment.', 'claim_conflict')
@@ -189,7 +194,12 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     if request['stage'] == 'simplify':
         from .simplification import handoff as simplify_handoff
         simplification = simplify_handoff(database, project, iteration, operator, request)
-    require(request['repository'] == item['repository'] and request['spec_commit'] == item.get('handoff', {}).get('commit'),
+    from .requirements import authority, inputs, held_numbers
+    number = request['issue']['number']
+    require(number not in held_numbers(item), 'Affected requirements await explicit revision resumption.', 'requirements_held')
+    revision = authority(item, number)
+    scoped_inputs = inputs(item, number)
+    require(request['repository'] == item['repository'] and request['spec_commit'] == revision['spec']['commit'],
             'Wrong repository or stale specification pin.', 'scope_mismatch')
     require(item.get('repository_onboarding', {}).get('status') == 'verified' and
             request['repository_id'] == item['repository_onboarding']['metadata']['id'],
@@ -251,7 +261,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     operator_direction = (max(directions, key=lambda record: record['sequence'])['applied_response']
                           if directions and request['stage'] == 'implementation' else None)
     input_loads = {issue['html_url']: request['issue']['body_sha256']}
-    input_loads.update({document['url']: document['sha256'] for document in work['inputs']['documents'].values()})
+    input_loads.update({document['url']: document['sha256'] for document in scoped_inputs['documents'].values()})
     for group in ('standards', 'preceding'):
         input_loads.update({'handoff:' + group + ':' + a['name']: a['sha256'] for a in request[group]})
     support_keys = {'required', 'repository-inputs'}
@@ -260,7 +270,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         if key in role_skills.SUPPORT_POLICY:
             support_keys.add(key)
     handoff = {**request, 'skills': selected, 'issue_body': issue['body'],
-               'specification': work['inputs'], 'adaptation': role_skills.ADAPTATIONS[request['stage']],
+               'specification': scoped_inputs, 'adaptation': role_skills.ADAPTATIONS[request['stage']],
                'stage_rules': role_skills.STAGE_RULES[request['stage']],
                'support_policy': {key: role_skills.SUPPORT_POLICY[key] for key in sorted(support_keys)},
                'input_loads': input_loads,
@@ -274,6 +284,11 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                    'advancement': 'disabled-without-trusted-whole-process-evidence'}}
     if operator_direction is not None:
         handoff['operator_direction'] = operator_direction
+    if revision['spec'] != item['handoff']:
+        change = item['requirement_changes'][revision['ticket_assignment']]
+        handoff['requirement_change'] = {k: change[k] for k in
+            ('requirements', 'old_revision', 'new_revision', 'resolution', 'resume_direction')}
+        input_loads['handoff:requirement-change'] = digest(handoff['requirement_change'])
     if diagnosis_contract is not None:
         handoff['diagnosis'] = diagnosis_contract
     if simplification is not None:
@@ -286,7 +301,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
               'handoff': handoff, 'handoff_digest': digest(handoff), 'assignment_ready': True,
               'launchable': False, 'execution_allowed': False, 'status': 'prepared',
               'refusal': 'whole_process_isolation_unavailable',
-              'revision': {'spec': item['handoff'], 'ticket_assignment': work['assignment_id'], 'ticket_inputs': work['input_digest']}}
+              'revision': revision}
     previous = next((old for old in rows(database) if old['assignment_id'] == assignment_id), None)
     if previous:
         require(previous['handoff_digest'] == result['handoff_digest'] and previous['revision'] == result['revision'],
@@ -305,10 +320,12 @@ def inspect(database, project, iteration, operator, assignment_id):
     assignment = next((r for r in rows(database) if r['assignment_id'] == assignment_id), None)
     require(assignment is not None and assignment['ticket_scope']['project'] == project and
             assignment['ticket_scope']['iteration'] == iteration, 'Exact assignment identity not found.', 'not_found')
-    revision = assignment['revision']
-    require(revision['spec'] == item.get('handoff') and
-            revision['ticket_assignment'] == item.get('ticket_work', {}).get('assignment_id') and
-            revision['ticket_inputs'] == item.get('ticket_work', {}).get('input_digest'),
+    assert assignment is not None
+    from .requirements import authority, held_numbers
+    number = assignment['ticket_scope']['issue_number']
+    require(not assignment.get('requirement_disposition') and number not in held_numbers(item),
+            'Obsolete or held requirements cannot reuse evidence.', 'requirements_held')
+    require(assignment['revision'] == authority(item, number),
             'Requirements or ticket synthesis changed; old claim cannot be reused.', 'stale_assignment')
     require(digest(assignment['handoff']) == assignment['handoff_digest'], 'Stored handoff changed.', 'stale_assignment')
     for skill in assignment['handoff']['skills']:
@@ -318,6 +335,7 @@ def inspect(database, project, iteration, operator, assignment_id):
 
 
 def require_result_active(assignment):
+    require(not assignment.get('requirement_disposition'), 'Obsolete work cannot admit results or merge.', 'requirements_held')
     require(not assignment.get('stuck_disposition'), 'Held or superseded work requires fresh scoped implementation.', 'stuck_held')
     runtime = assignment.get('runtime')
     require(not runtime or not (Path(runtime['artifacts']) / 'stop').exists(),

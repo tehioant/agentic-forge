@@ -101,6 +101,9 @@ def synthesize(database, item, request, github):
             isinstance(request['discovery_id'], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', request['discovery_id']),
             'Provide stable discovery identity, selected skill and defect.', 'invalid_bug')
     validate_discovery(request['discovery'])
+    from .requirements import held_numbers
+    require(not set(request['discovery']['affected']).intersection(held_numbers(item)),
+            'Affected revision scope cannot admit stale bug synthesis.', 'requirements_held')
     selected = tickets.skill(request['skill'])
     inputs, board = context(database, item, github)
     require(request['skill'] == item['ticket_work']['request']['skill'], 'Use the current selected to-tickets source.', 'skill_blocked')
@@ -143,6 +146,9 @@ def synthesize(database, item, request, github):
 def assigned(item, assignment):
     matches = [w for w in item.get('bug_work', {}).values() if w['assignment_id'] == assignment]
     require(len(matches) == 1, 'Use a current correlated bug assignment.', 'synthesis_required')
+    from .requirements import held_numbers
+    require(not set(matches[0]['discovery']['affected']).intersection(held_numbers(item)),
+            'Affected revision invalidated bug synthesis/publication.', 'requirements_held')
     return matches[0]
 
 

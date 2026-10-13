@@ -238,7 +238,7 @@ def validate_execution(work, evidence, result):
             isinstance(evidence['run_id'], str) and evidence['run_id'].strip() and
             isinstance(evidence['decomposition'], str) and evidence['decomposition'].strip() and
             evidence['result_digest'] == digest(result), 'Actual correlated synthesis execution evidence required.', 'execution_evidence_required')
-    expected = {work['skill']['path']: PIN, **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()},
+    expected = {work['skill']['path']: work['skill']['sha256'], **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()},
                 **work.get('load_sources', {})}
     loads = evidence['loads']
     require(isinstance(loads, list) and len(loads) == len(expected) and
@@ -389,6 +389,7 @@ def frontier(database, item, github):
     require(work is not None and work.get('board'), 'Verified linked board required.', 'projects_blocked')
     skill(work['request']['skill'])
     require(pinned_inputs(database, item, github) == work['inputs'], 'Pinned requirements changed.', 'ticket_conflict')
+    checkpoint(database, item)  # Repository reconciliation writes must finish before scoped read-only copies.
     board = verified_board(work, github, item['repository'], item['iteration_id'])
     status_options = {board['status']['options'][name]: role for role, name in work['request']['tracker']['statuses'].items()}
     rows = {}
@@ -420,7 +421,11 @@ def frontier(database, item, github):
         require(issue['number'] not in rows, 'Duplicate project issue membership.', 'github_mismatch')
         state = status_options.get(fields.get(board['status']['id']))
         require(state is not None, 'Unknown authoritative progress option.', 'projects_blocked')
-        contract = external_contract(issue, work['inputs'])
+        from .requirements import inputs as requirement_inputs, revalidate_inputs
+        scoped_inputs = requirement_inputs(item, issue['number'])
+        if scoped_inputs != work['inputs']:
+            revalidate_inputs(database, item, github, issue['number'])
+        contract = external_contract(issue, scoped_inputs)
         parts = sections(issue['body']) or {}
         triaged = any(isinstance(l, dict) and l.get('name') == work['request']['tracker']['triage_label'] for l in issue['labels'])
         deps = gh.dependencies(github, item['repository'], issue['number'])
@@ -472,7 +477,8 @@ def frontier(database, item, github):
         # Unknown/out-of-scope blockers cannot be asserted delivered.
         return row is not None and number not in holds and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
     from .diagnosis import held_numbers
-    holds = held_numbers(item)
+    from .requirements import held_numbers as requirement_holds
+    holds = held_numbers(item) | requirement_holds(item)
     for row in rows.values():
         row['held'] = row['held'] or row['number'] in holds
         row['admissible'] = bool(row['contract_valid'] and not row['held'] and row['issue_state'] == 'open' and
