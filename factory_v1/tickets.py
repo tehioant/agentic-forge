@@ -443,7 +443,8 @@ def frontier(database, item, github):
                                 'contract_valid': bool(contract and triaged),
                                 'held': contract in {'blocked', 'deferred'} or
                                     parts.get('Bug scope') not in {None, 'current'} or any(
-                                    bug['discovery']['scope'] == 'current' and bug['status'] not in {'published', 'duplicate'} and
+                                    not bug.get('requirement_disposition') and bug['discovery']['scope'] == 'current' and
+                                    bug['status'] not in {'published', 'duplicate'} and
                                     (issue['number'] in bug['discovery']['affected'] or
                                      bug.get('identity', {}).get('number') == issue['number'])
                                     for bug in item.get('bug_work', {}).values())}

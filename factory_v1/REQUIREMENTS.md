@@ -160,6 +160,15 @@ after protection/check/health reads and before durable intent/merge. A scheduled
 approved candidate cannot cross a material hold or use old revisions after resumption.
 Global planning reassignment cannot bypass these scoped holds.
 
+Material revisions also retire affected discovered-bug synthesis. Discovery/diagnosis,
+old synthesis evidence and uncertain publication intents remain inspectable; a replay
+creates a fresh selected-skill assignment rather than accepting obsolete completion.
+Each affected issue contributes its current scoped inputs and revision pins to the load
+contract. The bug's own references/authority use the first affected issue's specification;
+downstream body updates preserve each affected issue's own references. Independent bugs
+keep their authority. Retired uncertain creation still denies blind duplicate writes and
+requires investigation; retirement is not reconciliation of an unknown external effect.
+
 ## Verification and remaining acceptance
 
 `factory_v1.tests.test_requirements` and `test_requirement_merge` use real public CLI

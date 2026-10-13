@@ -255,6 +255,11 @@ def record_change(database, project, iteration, operator, request, github):
                     close_allowed=False, failure={'code': 'stale_requirements', 'message': 'Material revision invalidated delivery evidence.'})
             database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
                              (json.dumps(assignment, sort_keys=True), assignment['assignment_id']))
+        for work in item.get('bug_work', {}).values():
+            if affected.intersection(work['discovery']['affected'] + [work.get('identity', {}).get('number')]):
+                work['requirement_disposition'] = {'change_id': request['change_id'], 'status': 'obsolete',
+                    'prior_status': work['status'], 'invalidated': ['skill-execution', 'completion']}
+                work['status'] = 'obsolete'
         if item.get('reservation', {}).get('issue_number') in affected:
             item.setdefault('reservation_history', []).append(item.pop('reservation'))
     else:
