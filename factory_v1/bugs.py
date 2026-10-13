@@ -88,7 +88,7 @@ def validate_discovery(value):
 
 
 def context(database, item, github, affected=(), check_board=True):
-    tickets.active(item)
+    tickets.active(item, database)
     work = item.get('ticket_work')
     require(work is not None and work.get('publication_complete'), 'Publish current-milestone tickets first.', 'tickets_required')
     tickets.skill(work['request']['skill'])
@@ -259,7 +259,7 @@ def complete(database, item, request, github):
     require(isinstance(request, dict) and set(request) == {'assignment_id', 'input_digest', 'adaptation', 'execution', 'bug'},
             'Provide correlated bug synthesis and execution evidence.', 'invalid_bug')
     work = assigned(item, request['assignment_id'])
-    tickets.active(item)
+    tickets.active(item, database)
     tickets.skill(work['request']['skill'])
     inputs, _ = work_context(database, item, work, github, check_board=False)
     require(request['input_digest'] == work['input_digest'] and request['adaptation'] == ADAPTATION and
@@ -393,7 +393,7 @@ def verify_observation(item, work, observation):
 def publish_locked(database, item, work, github):
     require(work.get('bug') and work.get('execution'), 'Actual bug synthesis must complete first.', 'synthesis_required')
     tickets.skill(work['request']['skill'])
-    tickets.active(item)
+    tickets.active(item, database)
     try:
         inputs, board = work_context(database, item, work, github)
         require(inputs == work['inputs'] and board == work['board'], 'Pinned bug scope changed.', 'bug_conflict')

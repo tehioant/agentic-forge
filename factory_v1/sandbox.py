@@ -183,7 +183,9 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                                      'artifacts': str(root), 'image': config['image'], 'limits': config['limits'],
                                      'controller_pid': os.getpid(), 'controller_start': process_identity(os.getpid()),
                                      'advance_allowed': False, 'close_allowed': False}
-            save(database, assignment)
+            from .controls import admission
+            with admission(database, project, iteration):
+                save(database, assignment)
     runtime = assignment['runtime']
     stop = threading.Event()
     broker = None
@@ -274,6 +276,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         guard = subprocess.Popen([sys.executable, '-m', 'factory_v1.sandbox_guard', str(root / 'guard.json')],
                                  cwd=Path(__file__).parent.parent, stdout=guard_log, stderr=guard_log, start_new_session=True)
         guard_log.close()
+        (root / 'guard-process.json').write_text(json.dumps({'pid': guard.pid, 'start': process_identity(guard.pid)}))
+        require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before container creation.', 'cancelled')
         docker.call(*command(config, runtime['container'], mounts))
         observed = docker.inspect(runtime['container'])
         verify(observed, config, runtime['container'], image_id, mounts)
@@ -283,7 +287,9 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
             require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt was cancelled before start.', 'cancelled')
             assignment['runtime']['status'] = 'running'
-            save(database, assignment)
+            with admission(database, project, iteration):
+                save(database, assignment)
+        require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before worker start.', 'cancelled')
         docker.call('start', runtime['container'])
         deadline = time.monotonic() + config['limits']['seconds']
         while True:
@@ -347,6 +353,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     except RepositoryError as error:
         error_code = error.code
         if error.code == 'cancelled':
+            status = 'stopped'
+        elif error.code == 'iteration_paused':
             status = 'stopped'
         elif status != 'stopped':
             status = 'failed'

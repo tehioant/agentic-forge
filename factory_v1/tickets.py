@@ -75,13 +75,15 @@ def pinned_inputs(database, item, github):
     return {'handoff': handoff, 'documents': docs}
 
 
-def active(item):
+def active(item, database):
     require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
+    from .controls import require_active
+    require_active(database, item['project_id'], item['iteration_id'])
 
 
 def synthesize(database, item, request, github):
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     require(isinstance(request, dict) and set(request) == {'skill', 'tracker'}, 'Provide only selected skill and tracker configuration.')
     require(isinstance(request['tracker'], dict) and isinstance(request['tracker'].get('triage_label'), str) and
             request['tracker']['triage_label'].strip(), 'Configured tracker and triage label required.')
@@ -212,7 +214,7 @@ def validate_batch(batch, inputs, iteration, label):
 
 def complete_synthesis(database, item, request, github):
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     work = item.get('ticket_work')
     require(work is not None, 'Start the correlated to-tickets stage first.', 'synthesis_required')
     require(isinstance(request, dict) and set(request) == {'assignment_id', 'input_digest', 'adaptation', 'execution', 'tickets'} and
@@ -281,7 +283,7 @@ def verified_board(work, github, repository, iteration):
 def publish(database, item, github):
     # Caller holds repository/state lock across every durable network intent.
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     work = item.get('ticket_work')
     require(work is not None and work.get('tickets') and work.get('execution'), 'Actual ticket synthesis must complete first.', 'synthesis_required')
     skill(work['request']['skill'])
@@ -499,7 +501,7 @@ def reserve(database, item, github, number):
              'repository_id': item.get('repository_onboarding', {}).get('metadata', {}).get('id')}
     ticket_claims(database, scope)
     item = frontier(database, item, github)
-    active(item)
+    active(item, database)
     work = item['ticket_work']
     require(work.get('publication_complete'), 'Partial/unverified publication cannot admit work.', 'publication_pending')
     require(not work['frontier']['foreign_active'], 'Out-of-iteration work is already active on GitHub.', 'reservation_conflict')
@@ -517,11 +519,14 @@ def reserve(database, item, github, number):
         require(not any(i.get('reservation') for i in all_items), 'One implementation reservation across the factory.', 'reservation_conflict')
         item['reservation'] = {'issue_number': number, 'run_id': str(uuid.uuid4()), 'status': 'pending',
                                'assignment_id': work['assignment_id'], 'input_digest': work['input_digest']}
-        checkpoint(database, item)
+        from .controls import admission
+        with admission(database, item['project_id'], item['iteration_id']):
+            checkpoint(database, item)
     row = next(r for r in work['frontier']['items'] if r['number'] == number)
     require(row['admissible'], 'Reserved ticket has unresolved authoritative blockers or invalid contract.', 'ticket_ineligible')
     require(set(work['frontier']['active']) <= {number}, 'Conflicting authoritative active work.', 'reservation_conflict')
     if row['status'] != 'active':
+        active(item, database)
         gh.set_field(github, work['board']['project_id'], row['membership_id'], work['board']['status']['id'],
                      work['board']['status']['options'][work['request']['tracker']['statuses']['active']])
     item = frontier(database, item, github)

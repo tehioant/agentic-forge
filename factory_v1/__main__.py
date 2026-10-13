@@ -112,6 +112,12 @@ def main():
     inspect = commands.add_parser('inspect')
     inspect.add_argument('--project', required=True)
     inspect.add_argument('--iteration', required=True)
+    for name in ('pause', 'emergency-stop', 'resume', 'inspect-control'):
+        control = commands.add_parser(name, help='Durable operator interruption; no rollback or automatic restart.')
+        control.add_argument('--project', required=True)
+        control.add_argument('--iteration', required=True)
+        if name != 'inspect-control':
+            control.add_argument('--reference', required=True)
     onboarding = commands.add_parser('onboard')
     onboarding.add_argument('--project', required=True)
     onboarding.add_argument('--iteration', required=True)
@@ -287,6 +293,24 @@ def main():
             raise IntakeError(error.code, str(error)) from error
         except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
             raise IntakeError('invalid_delivery', 'Malformed delivery state/configuration; no health claim permitted.') from error
+        return
+    if args.command in {'pause', 'emergency-stop', 'resume', 'inspect-control'}:
+        from . import controls
+        from .repositories import RepositoryError
+        try:
+            uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+            with closing(sqlite3.connect(uri, uri=True)) as database:
+                if args.command == 'inspect-control':
+                    result = controls.inspect(database, args.project, args.iteration, args.operator_id)
+                elif args.command == 'resume':
+                    result = controls.resume(database, args.project, args.iteration, args.operator_id, args.reference)
+                else:
+                    result = controls.request(database, args.project, args.iteration, args.operator_id, args.command, args.reference)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_control', 'Malformed control state; no execution authorized.') from error
+        print(json.dumps(result, sort_keys=True))
         return
     if args.command in {'merge-preflight', 'merge-candidate', 'verify-delivery', 'inspect-merge'}:
         from .merge import lifecycle, inspect_merge
@@ -505,6 +529,13 @@ def main():
             result = read_iteration(database, args.project, args.iteration)
             if result is None:
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
+            if args.command == 'inspect':
+                from .controls import read
+                control = read(database, args.project, args.iteration)
+                if control is not None:
+                    result['operator_control'] = {k: control[k] for k in ('request_id', 'action', 'state', 'reference')}
+                    if control['action'] != 'resume':
+                        result['status'] = 'paused'
             if args.command not in {'inspect', 'spend-grant', 'spend-reconcile', 'spend-resume'}:
                 if result.get('approval', {}).get('operator_id') != args.operator_id or not text(result.get('approval', {}).get('reference')):
                     raise IntakeError('approval_required', 'Recorded approval from the configured operator is required for this lifecycle operation.')

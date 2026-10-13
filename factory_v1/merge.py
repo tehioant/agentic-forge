@@ -447,15 +447,21 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require_publication(database, latest, api, config['issue'])
             require(issue(api, prior, config) == observed_issue,
                     'Exact work issue changed at final requirement boundary.', 'stale_requirements')
+            from .controls import admission, require_active
+            require_active(database, project, iteration)
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}
-            save(database, prior, journal)
+            with admission(database, project, iteration):
+                save(database, prior, journal)
             # Any outcome, including an HTTP failure, is reconciled by reading this exact PR.
             try:
+                require_active(database, project, iteration)
                 api.request(api.prefix + '/pulls/' + str(config['pr_number']) + '/merge',
                             {'sha': config['head'], 'merge_method': 'merge'}, 'PUT')
-            except RepositoryError:
+            except RepositoryError as error:
+                if error.code == 'iteration_paused':
+                    raise
                 pass
             pr = target(api, config)
         if not journal:
