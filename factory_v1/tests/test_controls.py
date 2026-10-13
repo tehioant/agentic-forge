@@ -88,6 +88,12 @@ class ControlTests(unittest.TestCase):
         for content in ('{malformed', '{}'):
             record.write_text(content)
             self.assignment.refused(cli(self.state, 'resume'), 'invalid_control')
+            self.assignment.refused(self.assignment.fixture.cli('inspect', '--project', 'product', '--iteration', 'm1'), 'invalid_control')
+            self.assignment.refused(self.assignment.command(), 'invalid_control')
+            self.assignment.refused(self.assignment.fixture.cli('model-broker', '--project', 'product', '--iteration', 'm1',
+                '--provider', 'openai-codex', '--model', 'gpt-6.1-sol', '--operation', 'responses',
+                '--socket', str(self.assignment.root / 'blocked.sock'), '--subscription-socket', str(self.assignment.root / 'absent.sock')),
+                'invalid_control')
         for changed in (dict(paused, operator_id='99'), dict(paused, action='resume', state='requested'),
                         dict(paused, checkpoint={})):
             record.write_text(json.dumps(changed))

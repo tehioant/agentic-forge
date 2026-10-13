@@ -531,7 +531,11 @@ def main():
                 raise IntakeError('not_found', 'No iteration exists with these exact identities.')
             if args.command == 'inspect':
                 from .controls import read
-                control = read(database, args.project, args.iteration)
+                from .repositories import RepositoryError
+                try:
+                    control = read(database, args.project, args.iteration)
+                except RepositoryError as error:
+                    raise IntakeError(error.code, str(error)) from error
                 if control is not None:
                     result['operator_control'] = {k: control[k] for k in ('request_id', 'action', 'state', 'reference')}
                     if control['action'] != 'resume':

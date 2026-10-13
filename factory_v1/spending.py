@@ -77,8 +77,13 @@ def _iteration(database, project, iteration, operator_id=None, require_active=Fa
     if operator_id is not None and (item.get('approval', {}).get('operator_id') != operator_id or not item.get('approval', {}).get('reference')):
         raise SpendingError('approval_required', 'Broker requires the configured operator and registered approval.')
     from .controls import blocked
-    if require_active and (item.get('status') != 'active' or blocked(database, project, iteration)):
-        raise SpendingError('iteration_paused', 'Paused iterations cannot admit model operations.')
+    if require_active:
+        try:
+            interrupted = item.get('status') != 'active' or blocked(database, project, iteration)
+        except RepositoryError as error:
+            raise SpendingError(error.code, str(error)) from error
+        if interrupted:
+            raise SpendingError('iteration_paused', 'Paused iterations cannot admit model operations.')
     return item
 
 
