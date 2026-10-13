@@ -134,6 +134,13 @@ def successful(record):
             'Required main CI/CD failed, pending or unknown.', 'delivery_failed')
 
 
+def _expected_health(config, sha, deployment_id):
+    contract = config['contract']
+    return {'repository': config['repository'], 'sha': sha, 'deployment_id': deployment_id,
+            'environment': config['environment'], 'contract_sha256': assignments.digest(contract),
+            'acceptance': contract['acceptance']}
+
+
 def observe(config, api=None):
     """A coherent exact-main snapshot; partial evidence survives failure, never healthy."""
     api = api or DeliveryGitHub(config)
@@ -189,10 +196,10 @@ def observe(config, api=None):
         require(status.get('state') == 'success', 'Deployment failed, pending or unknown.', 'delivery_failed')
         contract = config['contract']
         health = http_json(contract['health_url'], config['timeout'])
-        expected_health = {'repository': config['repository'], 'sha': sha, 'deployment_id': deployed['id'],
-                           'environment': config['environment'], 'contract_sha256': assignments.digest(contract), 'acceptance': contract['acceptance']}
-        evidence['health'] = {'response_sha256': assignments.digest(health), 'expected': expected_health,
-                              'matched': isinstance(health, dict) and assignments.digest(health) == assignments.digest(expected_health)}
+        expected_health = _expected_health(config, sha, deployed['id'])
+        response_sha256 = assignments.digest(health)
+        evidence['health'] = {'response_sha256': response_sha256, 'expected': expected_health,
+                              'matched': isinstance(health, dict) and response_sha256 == assignments.digest(expected_health)}
         require(evidence['health']['matched'],
                 'Exact deployment health/acceptance contract not satisfied.', 'delivery_unhealthy')
         require(all(api.read(suffix) == value for suffix, value in reads.items()) and
@@ -268,12 +275,11 @@ def persisted_evidence(database, project, iteration, evidence_id, config):
                     record['head_branch'] == 'main' and record['event'] == expected['event'],
                     'Healthy persisted main workflow binding inconsistent.', 'invalid_delivery')
             successful(record)
-        expected_health = {'repository': config['repository'], 'sha': sha, 'deployment_id': deployed['id'],
-                           'environment': config['environment'], 'contract_sha256': assignments.digest(config['contract']),
-                           'acceptance': config['contract']['acceptance']}
+        expected_health = _expected_health(config, sha, deployed['id'])
+        expected_sha256 = assignments.digest(expected_health)
         require(set(health) == {'response_sha256', 'expected', 'matched'} and
-                assignments.digest(health['expected']) == assignments.digest(expected_health) and
-                health['response_sha256'] == assignments.digest(expected_health),
+                assignments.digest(health['expected']) == expected_sha256 and
+                health['response_sha256'] == expected_sha256,
                 'Healthy persisted deployment health contract inconsistent.', 'invalid_delivery')
     return evidence
 
