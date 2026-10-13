@@ -379,6 +379,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
         if action == 'merge-candidate' and not journal:
             assignments.current(database, project, iteration, operator)
             assignments.ticket_claims(database, prior['ticket_scope'])
+            from . import delivery
+            item = delivery.mutation_boundary(database, project, iteration, operator)
             incident = item.get('main_incident')
             if incident is not None:
                 recovery = config['recovery']
@@ -418,6 +420,17 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             if incident is None:
                 checks(api, config, config['baseline'])
             require_publication(database, latest, api)
+            latest = delivery.mutation_boundary(database, project, iteration, operator)
+            boundary_incident = latest.get('main_incident')
+            if boundary_incident is not None:
+                recovery = config['recovery']
+                require(isinstance(boundary_incident, dict) and boundary_incident.get('status') == 'active' and
+                        recovery is not None and boundary_incident.get('incident_id') == recovery['incident_id'] and
+                        boundary_incident.get('recovery_assignment') == recovery['implementation_assignment'] == builder['assignment_id'] and
+                        boundary_incident.get('recovery_issue') == config['issue'] and builder['handoff']['stage'] == 'repair',
+                        'Delivery changed at mutation boundary; ordinary merges frozen.', 'main_frozen')
+            else:
+                require(config['recovery'] is None, 'Recovery scope no longer has an active incident.', 'scope_mismatch')
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}

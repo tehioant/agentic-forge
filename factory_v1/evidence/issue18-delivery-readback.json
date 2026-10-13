@@ -1,0 +1,869 @@
+{
+  "observed_at": "2026-10-13T11:06:45.371199+00:00",
+  "source_base": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+  "github_live_read_only": {
+    "first_observation": {
+      "command": "observe-delivery",
+      "exit": 0,
+      "result": {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 15368,
+              "conclusion": "success",
+              "head_sha": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+              "id": 115230157012,
+              "name": "factory-v1-tests (Python 3.14)",
+              "status": "completed"
+            }
+          ],
+          "deployment": null,
+          "failure": "delivery_unknown",
+          "health": null,
+          "main": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+          "repository": "tehioant/agentic-forge",
+          "repository_id": 1401835832,
+          "status": "unknown",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+              "id": 38377711264,
+              "status": "completed",
+              "workflow_id": 373467855
+            }
+          ]
+        },
+        "incident": {
+          "first_evidence": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+          "incident_id": "main-a6ef71dd874dd8b2ac2b82399e86599caf0842fa923ad250e34d07f674deca1c",
+          "latest_evidence": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+          "monitor_sha256": "2be2e46eec2a0832b50c48996b70bf39d326707f81b374f6009ae69e7b02eefb",
+          "recovery_assignment": null,
+          "recovery_issue": null,
+          "status": "active"
+        },
+        "monitor": {
+          "config": {
+            "api_base": "https://api.github.com",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Test-only loopback probe, NOT a product-approved production health contract",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "issue18-read-only-test-not-production",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "tehioant/agentic-forge",
+            "repository_id": 1401835832,
+            "required_checks": [
+              {
+                "app_id": 15368,
+                "context": "factory-v1-tests (Python 3.14)"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 373467855
+              }
+            ],
+            "timeout": 10
+          },
+          "config_sha256": "2be2e46eec2a0832b50c48996b70bf39d326707f81b374f6009ae69e7b02eefb",
+          "latest": {
+            "evidence_id": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+            "main": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+            "status": "unknown"
+          },
+          "sequence": 1
+        }
+      }
+    },
+    "repeated_observation": {
+      "command": "observe-delivery",
+      "exit": 0,
+      "result": {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 15368,
+              "conclusion": "success",
+              "head_sha": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+              "id": 115230157012,
+              "name": "factory-v1-tests (Python 3.14)",
+              "status": "completed"
+            }
+          ],
+          "deployment": null,
+          "failure": "delivery_unknown",
+          "health": null,
+          "main": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+          "repository": "tehioant/agentic-forge",
+          "repository_id": 1401835832,
+          "status": "unknown",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+              "id": 38377711264,
+              "status": "completed",
+              "workflow_id": 373467855
+            }
+          ]
+        },
+        "incident": {
+          "first_evidence": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+          "incident_id": "main-a6ef71dd874dd8b2ac2b82399e86599caf0842fa923ad250e34d07f674deca1c",
+          "latest_evidence": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+          "monitor_sha256": "2be2e46eec2a0832b50c48996b70bf39d326707f81b374f6009ae69e7b02eefb",
+          "recovery_assignment": null,
+          "recovery_issue": null,
+          "status": "active"
+        },
+        "monitor": {
+          "config": {
+            "api_base": "https://api.github.com",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Test-only loopback probe, NOT a product-approved production health contract",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "issue18-read-only-test-not-production",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "tehioant/agentic-forge",
+            "repository_id": 1401835832,
+            "required_checks": [
+              {
+                "app_id": 15368,
+                "context": "factory-v1-tests (Python 3.14)"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 373467855
+              }
+            ],
+            "timeout": 10
+          },
+          "config_sha256": "2be2e46eec2a0832b50c48996b70bf39d326707f81b374f6009ae69e7b02eefb",
+          "latest": {
+            "evidence_id": "886d0ae3c5e4b8c486d62121d1c8d1f52bb99b17d4354cfbc5f864bd95cfebbe",
+            "main": "0026bc459aafc50c2c477e818405e52d8e4680bd",
+            "status": "unknown"
+          },
+          "sequence": 1
+        }
+      }
+    },
+    "outbox_count": 1,
+    "limitation": "Live main CI/checks observed. No GitHub deployment exists for the test environment. No production health contract was configured or invented; no live CD recovery proven."
+  },
+  "loopback_live_http_test_only": {
+    "observations": [
+      {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 99,
+              "conclusion": "success",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 31,
+              "name": "quality",
+              "status": "completed"
+            }
+          ],
+          "deployment": {
+            "environment": "test",
+            "id": 21,
+            "ref": "main",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": {
+              "id": 51,
+              "state": "success"
+            }
+          },
+          "failure": null,
+          "health": {
+            "expected": {
+              "acceptance": {
+                "journey": true
+              },
+              "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+              "deployment_id": 21,
+              "environment": "test",
+              "repository": "example/product",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "matched": true,
+            "response_sha256": "bda4b64466f47e587dfb09d991d2f6b4fed2adb1cc24e068b642573ef84c2099"
+          },
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "example/product",
+          "repository_id": 7,
+          "status": "healthy",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 41,
+              "status": "completed",
+              "workflow_id": 11
+            }
+          ]
+        },
+        "incident": null,
+        "monitor": {
+          "config": {
+            "api_base": "http://127.0.0.1:44083",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Explicit test-only acceptance agreement; NOT production approval",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "test",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "example/product",
+            "repository_id": 7,
+            "required_checks": [
+              {
+                "app_id": 99,
+                "context": "quality"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 11
+              }
+            ],
+            "timeout": 2
+          },
+          "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "latest": {
+            "evidence_id": "9f2202ce569e21821aa15b89286cdd4c0ab75df110dc6d98f2332f8f861dfd93",
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "healthy"
+          },
+          "sequence": 0
+        }
+      },
+      {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 99,
+              "conclusion": "success",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 31,
+              "name": "quality",
+              "status": "completed"
+            }
+          ],
+          "deployment": {
+            "environment": "test",
+            "id": 21,
+            "ref": "main",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": {
+              "id": 51,
+              "state": "success"
+            }
+          },
+          "failure": "delivery_unhealthy",
+          "health": {
+            "expected": {
+              "acceptance": {
+                "journey": true
+              },
+              "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+              "deployment_id": 21,
+              "environment": "test",
+              "repository": "example/product",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "matched": false,
+            "response_sha256": "c4329d2df19fd44fdb8b2ec0be0eb67552b56fb090c62f13ac030f8f2696d995"
+          },
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "example/product",
+          "repository_id": 7,
+          "status": "failed",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 41,
+              "status": "completed",
+              "workflow_id": 11
+            }
+          ]
+        },
+        "incident": {
+          "first_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "incident_id": "main-66d8cb759a3ba57542c34098331de92030079d6486c16d07e26f3e9dc3eaad07",
+          "latest_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "monitor_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "recovery_assignment": null,
+          "recovery_issue": null,
+          "status": "active"
+        },
+        "monitor": {
+          "config": {
+            "api_base": "http://127.0.0.1:44083",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Explicit test-only acceptance agreement; NOT production approval",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "test",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "example/product",
+            "repository_id": 7,
+            "required_checks": [
+              {
+                "app_id": 99,
+                "context": "quality"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 11
+              }
+            ],
+            "timeout": 2
+          },
+          "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "latest": {
+            "evidence_id": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "failed"
+          },
+          "sequence": 1
+        }
+      },
+      {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 99,
+              "conclusion": "success",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 31,
+              "name": "quality",
+              "status": "completed"
+            }
+          ],
+          "deployment": {
+            "environment": "test",
+            "id": 21,
+            "ref": "main",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": {
+              "id": 51,
+              "state": "success"
+            }
+          },
+          "failure": "delivery_unhealthy",
+          "health": {
+            "expected": {
+              "acceptance": {
+                "journey": true
+              },
+              "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+              "deployment_id": 21,
+              "environment": "test",
+              "repository": "example/product",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "matched": false,
+            "response_sha256": "c4329d2df19fd44fdb8b2ec0be0eb67552b56fb090c62f13ac030f8f2696d995"
+          },
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "example/product",
+          "repository_id": 7,
+          "status": "failed",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 41,
+              "status": "completed",
+              "workflow_id": 11
+            }
+          ]
+        },
+        "incident": {
+          "first_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "incident_id": "main-66d8cb759a3ba57542c34098331de92030079d6486c16d07e26f3e9dc3eaad07",
+          "latest_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "monitor_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "recovery_assignment": null,
+          "recovery_issue": null,
+          "status": "active"
+        },
+        "monitor": {
+          "config": {
+            "api_base": "http://127.0.0.1:44083",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Explicit test-only acceptance agreement; NOT production approval",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "test",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "example/product",
+            "repository_id": 7,
+            "required_checks": [
+              {
+                "app_id": 99,
+                "context": "quality"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 11
+              }
+            ],
+            "timeout": 2
+          },
+          "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "latest": {
+            "evidence_id": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "failed"
+          },
+          "sequence": 1
+        }
+      },
+      {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 99,
+              "conclusion": "success",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 31,
+              "name": "quality",
+              "status": "completed"
+            }
+          ],
+          "deployment": {
+            "environment": "test",
+            "id": 21,
+            "ref": "main",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": {
+              "id": 51,
+              "state": "success"
+            }
+          },
+          "failure": "delivery_unavailable",
+          "health": null,
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "example/product",
+          "repository_id": 7,
+          "status": "unknown",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 41,
+              "status": "completed",
+              "workflow_id": 11
+            }
+          ]
+        },
+        "incident": {
+          "first_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "incident_id": "main-66d8cb759a3ba57542c34098331de92030079d6486c16d07e26f3e9dc3eaad07",
+          "latest_evidence": "fbd51dadfb2a51eb0e549f8fead48f23d50b69f26c410b6abb9ca7f158e65a17",
+          "monitor_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "recovery_assignment": null,
+          "recovery_issue": null,
+          "status": "active"
+        },
+        "monitor": {
+          "config": {
+            "api_base": "http://127.0.0.1:44083",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Explicit test-only acceptance agreement; NOT production approval",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "test",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "example/product",
+            "repository_id": 7,
+            "required_checks": [
+              {
+                "app_id": 99,
+                "context": "quality"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 11
+              }
+            ],
+            "timeout": 2
+          },
+          "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "latest": {
+            "evidence_id": "fbd51dadfb2a51eb0e549f8fead48f23d50b69f26c410b6abb9ca7f158e65a17",
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "unknown"
+          },
+          "sequence": 1
+        }
+      },
+      {
+        "evidence": {
+          "checks": [
+            {
+              "app_id": 99,
+              "conclusion": "success",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 31,
+              "name": "quality",
+              "status": "completed"
+            }
+          ],
+          "deployment": {
+            "environment": "test",
+            "id": 21,
+            "ref": "main",
+            "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": {
+              "id": 51,
+              "state": "success"
+            }
+          },
+          "failure": null,
+          "health": {
+            "expected": {
+              "acceptance": {
+                "journey": true
+              },
+              "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+              "deployment_id": 21,
+              "environment": "test",
+              "repository": "example/product",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "matched": true,
+            "response_sha256": "bda4b64466f47e587dfb09d991d2f6b4fed2adb1cc24e068b642573ef84c2099"
+          },
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "repository": "example/product",
+          "repository_id": 7,
+          "status": "healthy",
+          "workflows": [
+            {
+              "conclusion": "success",
+              "event": "push",
+              "head_branch": "main",
+              "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "id": 41,
+              "status": "completed",
+              "workflow_id": 11
+            }
+          ]
+        },
+        "incident": null,
+        "monitor": {
+          "config": {
+            "api_base": "http://127.0.0.1:44083",
+            "contract": {
+              "acceptance": {
+                "journey": true
+              },
+              "health_url": "http://127.0.0.1:44083/health",
+              "reference": "Explicit test-only acceptance agreement; NOT production approval",
+              "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            },
+            "environment": "test",
+            "issue": 18,
+            "operator_id": "42",
+            "repository": "example/product",
+            "repository_id": 7,
+            "required_checks": [
+              {
+                "app_id": 99,
+                "context": "quality"
+              }
+            ],
+            "required_workflows": [
+              {
+                "event": "push",
+                "id": 11
+              }
+            ],
+            "timeout": 2
+          },
+          "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+          "latest": {
+            "evidence_id": "9f2202ce569e21821aa15b89286cdd4c0ab75df110dc6d98f2332f8f861dfd93",
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "healthy"
+          },
+          "sequence": 1
+        }
+      }
+    ],
+    "history": {
+      "incident": null,
+      "incidents": [
+        {
+          "id": "main-66d8cb759a3ba57542c34098331de92030079d6486c16d07e26f3e9dc3eaad07",
+          "record": {
+            "clearance_evidence": "9f2202ce569e21821aa15b89286cdd4c0ab75df110dc6d98f2332f8f861dfd93",
+            "first_evidence": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+            "incident_id": "main-66d8cb759a3ba57542c34098331de92030079d6486c16d07e26f3e9dc3eaad07",
+            "latest_evidence": "fbd51dadfb2a51eb0e549f8fead48f23d50b69f26c410b6abb9ca7f158e65a17",
+            "monitor_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+            "recovery_assignment": null,
+            "recovery_issue": null,
+            "status": "cleared"
+          }
+        }
+      ],
+      "monitor": {
+        "config": {
+          "api_base": "http://127.0.0.1:44083",
+          "contract": {
+            "acceptance": {
+              "journey": true
+            },
+            "health_url": "http://127.0.0.1:44083/health",
+            "reference": "Explicit test-only acceptance agreement; NOT production approval",
+            "revision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          },
+          "environment": "test",
+          "issue": 18,
+          "operator_id": "42",
+          "repository": "example/product",
+          "repository_id": 7,
+          "required_checks": [
+            {
+              "app_id": 99,
+              "context": "quality"
+            }
+          ],
+          "required_workflows": [
+            {
+              "event": "push",
+              "id": 11
+            }
+          ],
+          "timeout": 2
+        },
+        "config_sha256": "8a4d6230fdc02d62874022e8520604ea401c350c47e95cb7f91981b672456e93",
+        "latest": {
+          "evidence_id": "9f2202ce569e21821aa15b89286cdd4c0ab75df110dc6d98f2332f8f861dfd93",
+          "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "healthy"
+        },
+        "sequence": 1
+      },
+      "observations": [
+        {
+          "id": "9f2202ce569e21821aa15b89286cdd4c0ab75df110dc6d98f2332f8f861dfd93",
+          "record": {
+            "checks": [
+              {
+                "app_id": 99,
+                "conclusion": "success",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 31,
+                "name": "quality",
+                "status": "completed"
+              }
+            ],
+            "deployment": {
+              "environment": "test",
+              "id": 21,
+              "ref": "main",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "status": {
+                "id": 51,
+                "state": "success"
+              }
+            },
+            "failure": null,
+            "health": {
+              "expected": {
+                "acceptance": {
+                  "journey": true
+                },
+                "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+                "deployment_id": 21,
+                "environment": "test",
+                "repository": "example/product",
+                "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "matched": true,
+              "response_sha256": "bda4b64466f47e587dfb09d991d2f6b4fed2adb1cc24e068b642573ef84c2099"
+            },
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repository": "example/product",
+            "repository_id": 7,
+            "status": "healthy",
+            "workflows": [
+              {
+                "conclusion": "success",
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 41,
+                "status": "completed",
+                "workflow_id": 11
+              }
+            ]
+          }
+        },
+        {
+          "id": "8794e4a8d14a4505df2da24547037a6c0dacfed1bc659d19a9384fb0be03f1a8",
+          "record": {
+            "checks": [
+              {
+                "app_id": 99,
+                "conclusion": "success",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 31,
+                "name": "quality",
+                "status": "completed"
+              }
+            ],
+            "deployment": {
+              "environment": "test",
+              "id": 21,
+              "ref": "main",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "status": {
+                "id": 51,
+                "state": "success"
+              }
+            },
+            "failure": "delivery_unhealthy",
+            "health": {
+              "expected": {
+                "acceptance": {
+                  "journey": true
+                },
+                "contract_sha256": "b3ee4bb913f15038626ef4b8f58208fa31498addea975ce673990ee63ca390ec",
+                "deployment_id": 21,
+                "environment": "test",
+                "repository": "example/product",
+                "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              },
+              "matched": false,
+              "response_sha256": "c4329d2df19fd44fdb8b2ec0be0eb67552b56fb090c62f13ac030f8f2696d995"
+            },
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repository": "example/product",
+            "repository_id": 7,
+            "status": "failed",
+            "workflows": [
+              {
+                "conclusion": "success",
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 41,
+                "status": "completed",
+                "workflow_id": 11
+              }
+            ]
+          }
+        },
+        {
+          "id": "fbd51dadfb2a51eb0e549f8fead48f23d50b69f26c410b6abb9ca7f158e65a17",
+          "record": {
+            "checks": [
+              {
+                "app_id": 99,
+                "conclusion": "success",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 31,
+                "name": "quality",
+                "status": "completed"
+              }
+            ],
+            "deployment": {
+              "environment": "test",
+              "id": 21,
+              "ref": "main",
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "status": {
+                "id": 51,
+                "state": "success"
+              }
+            },
+            "failure": "delivery_unavailable",
+            "health": null,
+            "main": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "repository": "example/product",
+            "repository_id": 7,
+            "status": "unknown",
+            "workflows": [
+              {
+                "conclusion": "success",
+                "event": "push",
+                "head_branch": "main",
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "id": 41,
+                "status": "completed",
+                "workflow_id": 11
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "outbox_count": 1,
+    "github_metadata": "SIMULATED fixture, not real GitHub deployment or CI/CD",
+    "health": "Actual loopback HTTP GETs against test-only target, including injected failure and outage; no public service"
+  },
+  "external_mutations": [],
+  "notification_delivery": "Durable local outbox only; no live Discord send. #15 mock-only acceptance preserved."
+}

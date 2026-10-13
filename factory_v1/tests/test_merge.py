@@ -263,6 +263,50 @@ class MergeTests(unittest.TestCase):
     def writes(self, method=None):
         return [c for c in self.calls if c[0] == method] if method else [c for c in self.calls if c[0] != 'GET']
 
+    def install_delivery_observer(self):
+        from factory_v1.tests.test_delivery import DeliveryTarget, configuration
+        config = configuration(self.fixture.base, repository_id=123, issue=10)
+        config['required_checks'] = copy.deepcopy(self.config['required_checks'])
+        target = DeliveryTarget(config, self.base_sha)
+        target.attach(self.fixture.server, extra_only=True)
+        path = self.root / 'private-delivery.json'
+        path.write_text(json.dumps(config))
+        path.chmod(0o600)
+        result = self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path))
+        observed = self.ok(result)
+        self.assertEqual(observed['evidence']['status'], 'healthy')
+        return target, path
+
+    def test_delivery_health_race_at_mutation_boundary_freezes_before_put(self):
+        target, path = self.install_delivery_observer()
+        target.after_health = lambda: setattr(target, 'healthy', target.health_reads < 3)
+        self.refused('main_frozen')
+        self.assertEqual(target.health_reads, 3)  # Installed healthy, admission healthy, boundary unhealthy.
+        self.assertEqual(self.writes('PUT'), [])
+        self.assertNotIn('merge', self.stored())
+        result = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
+        self.assertEqual(result['incident']['status'], 'active')
+        self.assertEqual(result['observations'][-1]['record']['failure'], 'delivery_unhealthy')
+        notifications = self.ok(self.fixture.cli('notifications', '--project', 'product', '--iteration', 'm1'))
+        self.assertEqual(len(notifications), 1)
+        self.refused('main_frozen')  # Fresh process refuses despite still-green branch/main checks.
+        self.assertEqual(len(self.writes('PUT')), 0)
+        target.after_health = None
+        target.healthy = True
+        cleared = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
+        self.assertIsNone(cleared['incident'])
+        self.assertEqual(self.ok(self.cli())['status'], 'merged')
+        self.assertEqual(len(self.writes('PUT')), 1)
+
+    def test_delivery_outage_at_mutation_boundary_freezes_before_put(self):
+        target, _ = self.install_delivery_observer()
+        self.boundary_change = lambda: setattr(target, 'health_outage', True)
+        self.refused('main_frozen')
+        self.assertEqual(self.writes('PUT'), [])
+        result = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
+        self.assertEqual(result['monitor']['latest']['status'], 'unknown')
+        self.assertIsNotNone(result['incident'])
+
     def test_merge_then_integrated_checks_close_and_restart_inspects_exact_evidence(self):
         merged = self.ok(self.cli())
         self.assertEqual(merged['status'], 'merged')
@@ -619,6 +663,25 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(self.writes(), [])
 
     def test_exact_incident_repair_uses_same_checks_and_independent_reviews(self):
+        self.assert_incident_repair_uses_same_checks_and_independent_reviews()
+
+    def test_observed_incident_admits_gated_repair_and_only_exact_deployment_clears(self):
+        target, path = self.install_delivery_observer()
+        target.healthy = False
+        failed = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
+        incident_id = failed['incident']['incident_id']
+        self.assert_incident_repair_uses_same_checks_and_independent_reviews()
+        target.sha = target.check_sha = target.workflow_sha = self.merge_sha
+        target.healthy = True
+        # CI is green, but deployment still points at the pre-repair main.
+        still_frozen = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
+        self.assertEqual(still_frozen['incident']['incident_id'], incident_id)
+        target.deploy_sha = self.merge_sha
+        cleared = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
+        self.assertIsNone(cleared['incident'])
+        self.assertEqual(cleared['evidence']['main'], self.merge_sha)
+
+    def assert_incident_repair_uses_same_checks_and_independent_reviews(self):
         request = self.assignment.configuration(stage='repair')
         request.update(baseline=self.base_sha, claim_id='incident-repair')
         request['profile'].update(name='incident-repair', home=str(self.root / 'incident-repair-profile'))
@@ -642,9 +705,16 @@ class MergeTests(unittest.TestCase):
         self.assignment.ok(self.publish())
         self.pr['draft'] = False
         self.candidate = self.assignment.ok(self.assignment.inspect(candidate))
-        recovery = {'incident_id': 'main-failure-1', 'implementation_assignment': builder['assignment_id'], 'issue': 10}
-        self.assignment.mutate_iteration(lambda i: i.update(main_incident={'status': 'active', 'incident_id': recovery['incident_id'],
-            'recovery_assignment': builder['assignment_id'], 'recovery_issue': 10}))
+        with closing(sqlite3.connect(self.fixture.state)) as db, db:
+            item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+            incident = item.get('main_incident') or {'status': 'active', 'incident_id': 'main-failure-1'}
+            incident.update(recovery_assignment=builder['assignment_id'], recovery_issue=10)
+            recovery = {'incident_id': incident['incident_id'], 'implementation_assignment': builder['assignment_id'], 'issue': 10}
+            item['main_incident'] = incident
+            db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+            if 'delivery_monitor' in item:
+                # SIMULATED future repair-controller authorization; both pointers update atomically.
+                db.execute('UPDATE delivery_incidents SET payload=? WHERE id=?', (json.dumps(incident), incident['incident_id']))
         self.config.update(candidate_assignment=self.candidate['assignment_id'], **self.review.pair_request(axes),
             executions=[merge.execution_binding(a) for a in [builder, self.candidate, *axes]],
             branch='factory/repair-10', head=self.plan['candidate'], recovery=recovery)
