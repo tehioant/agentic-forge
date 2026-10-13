@@ -121,3 +121,16 @@ class RequirementBugTests(unittest.TestCase):
         self.assertEqual(item['bug_work'][key]['blocker']['code'], 'publication_uncertain')
         self.assertTrue(item['bug_work_history'][0]['issue_intent'])
         self.assertFalse(any(c[:2] == ('POST', '/repos/example/product/issues') for c in self.tracker.fixture.calls))
+
+    def test_retired_discovery_cannot_silently_drop_an_affected_issue_on_refresh(self):
+        _, old = self.synthesize(self.discovery(affected=[10, 12]))
+        self.case.ok(self.case.resume(self.case.publish()))
+        before = self.tracker.inspect()
+        result = self.tracker.control('synthesize-bug', self.discovery('narrowed-observer', [10]))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(json.loads(result.stderr)['error'], 'bug_conflict')
+        self.assertEqual(self.tracker.inspect(), before)
+        item, fresh = self.synthesize(self.discovery(affected=[10, 12]))
+        self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
+        self.assertEqual(fresh['discovery']['affected'], [10, 12])
+        self.assertEqual(fresh['scoped_inputs']['12'], requirements.inputs(item, 12))

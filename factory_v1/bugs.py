@@ -143,6 +143,9 @@ def synthesize(database, item, request, github):
                 'Additional affected edges require explicit controller investigation; never silently drop them.', 'bug_conflict')
         tickets.checkpoint(database, item)
         return item
+    if work:
+        require(request['discovery']['affected'] == work['discovery']['affected'],
+                'Refreshing retired synthesis must preserve every affected issue; scope changes require investigation.', 'bug_conflict')
     candidates = observations(item, github, board)
     affected = request['discovery']['affected']
     current_option = board['milestone']['id'] if 'milestone' in board else board['scope']['options'][item['iteration_id']]
