@@ -18,10 +18,24 @@ CONFIG_FIELDS = {'operator_id', 'repository', 'repository_id', 'api_base', 'issu
 
 
 def decode(raw):
-    require(len(raw) <= LIMIT, 'Delivery JSON exceeds supported bounds.', 'delivery_unknown')
     try:
-        return json.loads(raw, object_pairs_hook=unambiguous_fields,
-                          parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        require(len(raw.encode() if isinstance(raw, str) else raw) <= LIMIT,
+                'Delivery JSON exceeds supported bounds.', 'delivery_unknown')
+        value = json.loads(raw, object_pairs_hook=unambiguous_fields,
+                           parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        pending = [value]
+        while pending:
+            entry = pending.pop()
+            if isinstance(entry, str):
+                entry.encode('utf-8', errors='strict')
+            elif isinstance(entry, float) and not math.isfinite(entry):
+                raise ValueError('nonfinite number')
+            elif isinstance(entry, dict):
+                pending.extend(entry.keys())
+                pending.extend(entry.values())
+            elif isinstance(entry, list):
+                pending.extend(entry)
+        return value
     except (ValueError, TypeError, UnicodeError, RecursionError) as error:
         raise RepositoryError('delivery_unknown', 'Delivery JSON is malformed or ambiguous.') from error
 
@@ -134,6 +148,15 @@ def successful(record):
             'Required main CI/CD failed, pending or unknown.', 'delivery_failed')
 
 
+def retained_record(record, fields):
+    values = {k: record.get(k) for k in fields}
+    require(all(positive(value) if key in {'id', 'workflow_id'} else
+                value is None or (isinstance(value, str) and 0 < len(value) <= 100)
+                for key, value in values.items()),
+            'Delivery evidence fields must be bounded typed identities/states.', 'delivery_unknown')
+    return values
+
+
 def _expected_health(config, sha, deployment_id):
     contract = config['contract']
     return {'repository': config['repository'], 'sha': sha, 'deployment_id': deployment_id,
@@ -168,7 +191,7 @@ def observe(config, api=None):
                        type(r['app'].get('id')) is int and r['app']['id'] == expected['app_id']]
             require(len(matches) == 1 and matches[0].get('head_sha') == sha, 'Exact required main check unknown.', 'delivery_unknown')
             r = matches[0]
-            evidence['checks'].append({k: r.get(k) for k in ('id', 'name', 'head_sha', 'status', 'conclusion')} | {'app_id': expected['app_id']})
+            evidence['checks'].append(retained_record(r, ('id', 'name', 'head_sha', 'status', 'conclusion')) | {'app_id': expected['app_id']})
             successful(r)
         for expected in config['required_workflows']:
             query = urllib.parse.urlencode({'branch': 'main', 'head_sha': sha, 'event': expected['event'], 'per_page': 100})
@@ -179,20 +202,20 @@ def observe(config, api=None):
                     r['repository']['id'] == config['repository_id'] and r['repository'].get('full_name') == config['repository'] for r in runs) and
                     len({r['id'] for r in runs}) == len(runs), 'Exact main workflow identity unknown.', 'delivery_unknown')
             r = max(runs, key=lambda r: r['id'])
-            evidence['workflows'].append({k: r.get(k) for k in ('id', 'workflow_id', 'head_sha', 'head_branch', 'event', 'status', 'conclusion')})
+            evidence['workflows'].append(retained_record(r, ('id', 'workflow_id', 'head_sha', 'head_branch', 'event', 'status', 'conclusion')))
             successful(r)
         query = urllib.parse.urlencode({'environment': config['environment'], 'per_page': 100})
         deployments = bounded_list(read('/deployments?' + query))
         require(deployments and all(positive(d.get('id')) and d.get('environment') == config['environment'] for d in deployments) and
                 len({d['id'] for d in deployments}) == len(deployments), 'Deployment identity unknown.', 'delivery_unknown')
         deployed = max(deployments, key=lambda d: d['id'])
-        evidence['deployment'] = {k: deployed.get(k) for k in ('id', 'sha', 'ref', 'environment')}
+        evidence['deployment'] = retained_record(deployed, ('id', 'sha', 'ref', 'environment'))
         require(deployed.get('sha') == sha and deployed.get('ref') in {'main', sha}, 'Latest deployment is not exact current main.', 'delivery_unknown')
         statuses = bounded_list(read('/deployments/' + str(deployed['id']) + '/statuses?per_page=100'))
         require(statuses and all(positive(s.get('id')) for s in statuses) and len({s['id'] for s in statuses}) == len(statuses),
                 'Latest deployment status unknown.', 'delivery_unknown')
         status = max(statuses, key=lambda s: s['id'])
-        evidence['deployment']['status'] = {'id': status['id'], 'state': status.get('state')}
+        evidence['deployment']['status'] = retained_record(status, ('id', 'state'))
         require(status.get('state') == 'success', 'Deployment failed, pending or unknown.', 'delivery_failed')
         contract = config['contract']
         health = http_json(contract['health_url'], config['timeout'])
@@ -246,7 +269,11 @@ def persisted_evidence(database, project, iteration, evidence_id, config):
     row = database.execute('SELECT payload FROM delivery_observations WHERE project=? AND iteration=? AND id=?',
                            (project, iteration, evidence_id)).fetchone()
     require(row is not None, 'Persisted delivery evidence missing.', 'invalid_delivery')
-    evidence = decode(row[0])
+    return validate_evidence(row[0], evidence_id, config)
+
+
+def validate_evidence(payload, evidence_id, config):
+    evidence = decode(payload)
     require(isinstance(evidence, dict) and set(evidence) == {'repository', 'repository_id', 'main', 'checks', 'workflows',
             'deployment', 'health', 'status', 'failure'} and assignments.digest(evidence) == evidence_id and
             evidence['repository'] == config['repository'] and type(evidence['repository_id']) is int and
@@ -337,13 +364,17 @@ def sample(database, project, iteration, operator, config=None):
                 'Active incident attention intent missing or inconsistent.', 'invalid_delivery')
     evidence = observe(config)
     evidence_id = assignments.digest(evidence)
+    evidence_payload = json.dumps(evidence)
+    validate_evidence(evidence_payload, evidence_id, config)
     sequence = saved['sequence'] if saved else 0
     with database:
         database.execute('BEGIN IMMEDIATE')
         database.execute('CREATE TABLE IF NOT EXISTS delivery_observations (project TEXT, iteration TEXT, id TEXT, payload TEXT, PRIMARY KEY(project, iteration, id))')
         database.execute('CREATE TABLE IF NOT EXISTS delivery_incidents (project TEXT, iteration TEXT, id TEXT, payload TEXT, PRIMARY KEY(project, iteration, id))')
         database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
-        database.execute('INSERT OR IGNORE INTO delivery_observations VALUES (?, ?, ?, ?)', (project, iteration, evidence_id, json.dumps(evidence)))
+        database.execute('INSERT OR IGNORE INTO delivery_observations VALUES (?, ?, ?, ?)', (project, iteration, evidence_id, evidence_payload))
+        require(persisted_evidence(database, project, iteration, evidence_id, config) == evidence,
+                'Existing durable evidence differs; no pointer promotion permitted.', 'invalid_delivery')
         if evidence['status'] != 'healthy':
             if incident is None:
                 sequence += 1
@@ -360,9 +391,13 @@ def sample(database, project, iteration, operator, config=None):
             incident.update(status='cleared', clearance_evidence=evidence_id)
             item.pop('main_incident')
         if incident is not None:
-            database.execute('INSERT OR REPLACE INTO delivery_incidents VALUES (?, ?, ?, ?)', (project, iteration, incident['incident_id'], json.dumps(incident)))
+            incident_payload = json.dumps(incident)
+            validate_incident(decode(incident_payload), config)
+            database.execute('INSERT OR REPLACE INTO delivery_incidents VALUES (?, ?, ?, ?)', (project, iteration, incident['incident_id'], incident_payload))
         item['delivery_monitor'] = {'config': config, 'config_sha256': assignments.digest(config), 'sequence': sequence,
                                     'latest': {'evidence_id': evidence_id, 'status': evidence['status'], 'main': evidence['main']}}
+        durable_item = decode(json.dumps(item))
+        validate_persisted(database, durable_item, monitor_state(durable_item, operator))
         save_iteration(database, item)
     return {'monitor': item['delivery_monitor'], 'incident': item.get('main_incident'), 'evidence': evidence}
 

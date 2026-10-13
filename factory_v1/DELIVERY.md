@@ -51,8 +51,9 @@ approved auth. Use a suitably read-scoped host identity, not worker credentials.
 The only alternative API base is explicit loopback HTTP for labeled test metadata.
 The health URL supports HTTPS or loopback HTTP, no URL credentials/query/fragment,
 redirects or ambient HTTP proxies. Health GETs send no authorization header.
-Timeouts are finite `(0, 30]`; JSON is bounded to 2 MiB and rejects duplicate keys,
-non-finite numbers and parser-limit failures. No external diagnostic body or
+Timeouts are finite `(0, 30]`; JSON is bounded to 2 MiB of UTF-8 and rejects duplicate
+keys, non-finite numbers (including numeric overflow), invalid Unicode strings/keys
+at any nesting depth and parser-limit failures. No external diagnostic body or
 credential is included in retained errors.
 
 The health endpoint must execute the agreed acceptance checks against the deployed
@@ -131,6 +132,14 @@ failure evidence updates the same active incident; a new episode after verified
 clearance gets a new deterministic iteration-scoped sequence/identity. The first
 attention intent remains immutable with the original evidence pointer.
 
+Retained remote identity/state fields are typed and bounded to 100 characters;
+oversized or malformed fields produce bounded `unknown` evidence, not retained
+raw remote strings. New serialized observations, incidents and monitor context
+must satisfy the same size/semantic contract as their restart readers before
+commit. Reusing a content-addressed observation validates the exact existing row
+before pointer promotion or clearance; corruption refuses atomically and is never
+silently repaired, even when a new remote sample is healthy.
+
 `inspect-delivery` exposes the current monitor/freeze and durable incident and
 observation records. Successful clearance archives the exact healthy evidence ID;
 it removes only the active freeze pointer, not failure history or pending attention.
@@ -145,8 +154,12 @@ driver must deliver the outbox using the approved transport; uncertain delivery 
 reconciled there, never resent blindly. #15's accepted **mock-only notification
 limitation is unchanged**; this issue does not claim a live Discord delivery.
 
-Once configured, `merge-candidate` observes delivery at admission and again as its
-last remote readback before the exact-SHA merge PUT. Ordinary work is refused if
+Once configured, `merge-candidate` observes delivery at admission and again before
+the exact-SHA merge PUT. It then revalidates the reviewed main baseline (including
+the sampled main), host config, exact target, protection, candidate checks, branch,
+issue and local admission. Pinned requirement publication is the **last remote
+guard**, after delivery observation and all other admission reads, before durable
+merge intent and PUT. Ordinary work is refused if
 an incident is active or the boundary observation becomes unhealthy/unknown.
 The lock excludes concurrent local watcher/control writes through intent and PUT.
 Existing candidate, review, requirements, protection and quality/security gates
@@ -188,6 +201,16 @@ readbacks, observation races, transaction rollback on notification persistence f
 and failure/outage immediately before merge mutation. The gated recovery fixture
 uses the real public stages with **simulated** GitHub/native-worker metadata, then
 proves CI-green alone cannot clear a stale deployment.
+
+The #18 review corrections add public-CLI/parser and controller matrices for
+numeric overflow/lone surrogates in all response families, UTF-8 responses whose
+escaped persistence would exceed the limit, corrupt archived clearance evidence,
+new-record/restart contract symmetry, requirement issue/document drift during the
+final health read, and coherent healthy main/config/admission drift after the prior
+guard. Each matrix reuses its fixture rather than launching another worker chain
+per input. All six new regression methods failed against immutable production
+bytes at `32b157ec75d899424f3541c933f1afc19bd1d7b6`; the passing correction evidence
+is local/advisory, not real CD or native isolated execution qualification.
 
 [Retained readback](evidence/issue18-delivery-readback.json) distinguishes:
 

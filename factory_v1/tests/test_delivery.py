@@ -266,6 +266,144 @@ class DeliveryTests(unittest.TestCase):
         self.target.responses[path] = json.dumps(value).encode()
         self.assertEqual(self.sample()['evidence']['failure'], 'delivery_unknown')
 
+    def test_nonfinite_and_invalid_unicode_readbacks_freeze_and_recover(self):
+        self.assertEqual(self.sample()['evidence']['status'], 'healthy')
+        check_path = '/repos/example/product/commits/' + self.target.sha + '/check-runs?per_page=100&filter=latest'
+        workflow_path = '/repos/example/product/actions/workflows/11/runs?branch=main&head_sha=' + self.target.sha + '&event=push&per_page=100'
+        paths = ['/repos/example/product', '/repos/example/product/git/ref/heads/main', check_path,
+                 workflow_path, '/repos/example/product/deployments?environment=test&per_page=100',
+                 '/repos/example/product/deployments/21/statuses?per_page=100', '/health']
+        for path in paths:
+            for token in [b'1e309', b'"\\ud800"']:
+                with self.subTest(path=path, token=token):
+                    value = self.target.value(path)
+                    # Unused nested fields are still part of the untrusted read boundary.
+                    record = value[0] if isinstance(value, list) else value
+                    record['untrusted'] = {'nested': ['TOKEN']}
+                    raw = json.dumps(value).encode().replace(b'"TOKEN"', token)
+                    self.target.responses[path] = raw
+                    observed = self.sample()
+                    self.assertEqual(observed['evidence']['status'], 'unknown')
+                    self.assertEqual(observed['evidence']['failure'], 'delivery_unknown')
+                    self.assertIsNotNone(observed['incident'])
+                    self.assertEqual(self.inspect()['monitor'], observed['monitor'])
+                    self.target.responses.clear()
+                    self.assertIsNone(self.sample()['incident'])
+        for token in [b'1e309', b'"\\ud800"']:
+            with self.subTest(conclusion=token):
+                self.target.responses[check_path] = json.dumps(self.target.value(check_path)).encode().replace(b'"success"', token)
+                self.assertEqual(self.sample()['evidence']['status'], 'unknown')
+                self.target.responses.clear()
+                self.assertIsNone(self.sample()['incident'])
+        self.assertTrue(self.notifications())
+
+    def test_large_external_evidence_fields_remain_bounded_and_restart_clearable(self):
+        self.sample()
+        snapshot = sqlite3.connect(':memory:')
+        self.addCleanup(snapshot.close)
+        with closing(sqlite3.connect(self.state)) as db:
+            db.backup(snapshot)
+        cases = [('check_conclusion', '/commits/' + self.target.sha + '/check-runs?per_page=100&filter=latest'),
+                 ('workflow_conclusion', '/actions/workflows/11/runs?branch=main&head_sha=' + self.target.sha + '&event=push&per_page=100'),
+                 ('deploy_sha', '/deployments?environment=test&per_page=100'),
+                 ('deployment_state', '/deployments/21/statuses?per_page=100')]
+        value = '😀' * 200_000
+        for field, suffix in cases:
+            with self.subTest(field=field):
+                with closing(sqlite3.connect(self.state)) as db:
+                    snapshot.backup(db)
+                self.target.responses.clear()
+                self.target.check_conclusion = self.target.workflow_conclusion = self.target.deployment_state = 'success'
+                self.target.deploy_sha = self.target.sha
+                original = getattr(self.target, field)
+                setattr(self.target, field, value)
+                # Real UTF-8 fits the external limit but escaped persistence would not.
+                path = '/repos/example/product' + suffix
+                raw = json.dumps(self.target.value(path), ensure_ascii=False).encode()
+                self.assertLess(len(raw), delivery.LIMIT)
+                self.target.responses[path] = raw
+                unknown = self.sample()
+                self.assertEqual(unknown['evidence']['status'], 'unknown')
+                self.assertIsNotNone(unknown['incident'])
+                self.assertNotIn(value, json.dumps(unknown, ensure_ascii=False))
+                self.assertEqual(self.inspect()['monitor'], unknown['monitor'])
+                with closing(sqlite3.connect(self.state)) as db:
+                    for (payload,) in db.execute('SELECT payload FROM delivery_observations'):
+                        self.assertLessEqual(len(payload.encode()), delivery.LIMIT)
+                self.target.responses.clear()
+                setattr(self.target, field, original)
+                self.assertIsNone(self.sample()['incident'])
+                self.assertEqual(self.inspect()['monitor']['latest']['status'], 'healthy')
+
+    def test_corrupt_archived_evidence_cannot_be_promoted_or_clear_an_incident(self):
+        healthy = self.sample()
+        self.target.healthy = False
+        self.sample()
+        before = self.stored()
+        evidence_id = healthy['monitor']['latest']['evidence_id']
+        snapshot = sqlite3.connect(':memory:')
+        self.addCleanup(snapshot.close)
+        with closing(sqlite3.connect(self.state)) as db:
+            db.backup(snapshot)
+            original = db.execute('SELECT payload FROM delivery_observations WHERE id=?', (evidence_id,)).fetchone()[0]
+        self.target.healthy = True
+        for raw in ['[]', '{"status":"healthy"}', json.dumps(dict(healthy['evidence'], main='b' * 40)),
+                    ' ' * delivery.LIMIT + original]:
+            with self.subTest(raw=raw[:80]):
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    snapshot.backup(db)
+                    db.execute('UPDATE delivery_observations SET payload=? WHERE id=?', (raw, evidence_id))
+                    journals = db.execute('SELECT * FROM delivery_incidents').fetchall()
+                    notifications = db.execute('SELECT * FROM notifications').fetchall()
+                refused = self.invoke('observe-delivery', '--delivery-config', str(self.config_path))
+                self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+                self.assertEqual(refused.stdout, '')
+                self.assertEqual(self.stored(), before)
+                with closing(sqlite3.connect(self.state)) as db:
+                    self.assertEqual(db.execute('SELECT payload FROM delivery_observations WHERE id=?', (evidence_id,)).fetchone()[0], raw)
+                    self.assertEqual(db.execute('SELECT * FROM delivery_incidents').fetchall(), journals)
+                    self.assertEqual(db.execute('SELECT * FROM notifications').fetchall(), notifications)
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE delivery_observations SET payload=? WHERE id=?', (original, evidence_id))
+        self.assertIsNone(self.sample()['incident'])
+        self.assertEqual(self.inspect()['monitor']['latest']['status'], 'healthy')
+
+    def test_new_durable_records_must_satisfy_reader_before_atomic_save(self):
+        from unittest.mock import patch
+        from factory_v1.repositories import state_lock
+        healthy = self.sample()['evidence']
+        before = self.stored()
+        snapshot = sqlite3.connect(':memory:')
+        self.addCleanup(snapshot.close)
+        with closing(sqlite3.connect(self.state)) as db:
+            db.backup(snapshot)
+        cases = {'incomplete-healthy': dict(healthy, checks=[]),
+                 'oversized-evidence': dict(healthy, status='unknown', failure='delivery_unknown',
+                                           health=None, checks=['😀' * 200_000]),
+                 'oversized-iteration': dict(healthy, status='unknown', failure='delivery_unknown', health=None)}
+        for mode, evidence in cases.items():
+            with self.subTest(mode=mode):
+                item = copy.deepcopy(before)
+                if mode == 'oversized-iteration':
+                    item['padding'] = ''
+                    item['padding'] = 'x' * (delivery.LIMIT - len(json.dumps(item).encode()) - 1)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    snapshot.backup(db)
+                    db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+                    observations = db.execute('SELECT * FROM delivery_observations').fetchall()
+                    incidents = db.execute('SELECT * FROM delivery_incidents').fetchall()
+                    notifications = db.execute('SELECT * FROM notifications').fetchall()
+                with closing(sqlite3.connect(self.state)) as db, state_lock(db), patch.object(delivery, 'observe', return_value=evidence):
+                    with self.assertRaises(delivery.RepositoryError):
+                        delivery.sample(db, 'product', 'm1', '42')
+                self.assertEqual(self.stored(), item)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    self.assertEqual(db.execute('SELECT * FROM delivery_observations').fetchall(), observations)
+                    self.assertEqual(db.execute('SELECT * FROM delivery_incidents').fetchall(), incidents)
+                    self.assertEqual(db.execute('SELECT * FROM notifications').fetchall(), notifications)
+                    db.execute('UPDATE iterations SET payload=?', (json.dumps(before),))
+        self.assertEqual(self.inspect()['monitor']['latest']['status'], 'healthy')
+
     def test_health_redirects_http_errors_and_wrong_contract_refused(self):
         for status in [302, 401, 500]:
             self.target.http_status = status

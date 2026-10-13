@@ -298,6 +298,128 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(self.ok(self.cli())['status'], 'merged')
         self.assertEqual(len(self.writes('PUT')), 1)
 
+    def test_requirements_changed_during_final_delivery_sample_never_merge(self):
+        target, _ = self.install_delivery_observer()
+        spec = self.assignment.tracker.planning
+        original_publication = copy.deepcopy(spec.published)
+        original_assignment = self.stored()
+        original_pr = copy.deepcopy(self.pr)
+        for source in ['issue', 'document']:
+            with self.subTest(source=source):
+                final_health_read = target.health_reads + 2
+                def change():
+                    if target.health_reads == final_health_read:
+                        if source == 'issue':
+                            spec.published[spec.issue_path]['body'] += '\nChanged during final delivery sample'
+                        else:
+                            path = next(p for p in spec.published if '/contents/' in p)
+                            spec.published[path]['content'] = base64.b64encode(b'Changed pinned bytes').decode()
+                target.after_health = change
+                try:
+                    self.refused('publication_mismatch')
+                    self.assertEqual(target.health_reads, final_health_read)
+                    self.assertEqual(self.writes('PUT'), [])
+                    self.assertNotIn('merge', self.stored())
+                    observed = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
+                    self.assertEqual(observed['monitor']['latest']['status'], 'healthy')
+                finally:
+                    target.after_health = None
+                    spec.published = copy.deepcopy(original_publication)
+                    self.write_assignment(original_assignment)
+                    self.pr = copy.deepcopy(original_pr)
+                    self.refs['main'] = self.base_sha
+                    self.calls.clear()
+
+    def test_coherent_healthy_main_move_during_final_delivery_sample_never_merges(self):
+        from unittest.mock import patch
+        from factory_v1 import delivery
+        from factory_v1.repositories import state_lock
+        target, _ = self.install_delivery_observer()
+        original_read = delivery.DeliveryGitHub.read
+        original_boundary = delivery.mutation_boundary
+        original_merge_read = merge.MergeGitHub.read
+        original_config = copy.deepcopy(self.config)
+        original_protection = copy.deepcopy(self.protection)
+        original_issue = copy.deepcopy(self.assignment.tracker.issues[10])
+        original_refs = dict(self.refs)
+        original_checks = copy.deepcopy(self.check_runs)
+        moved = 'd' * 40
+        cases = {'main': 'stale_baseline', 'post-admission-main': 'stale_baseline',
+                 'config': 'stale_admission', 'protection': 'stale_protection',
+                 'branch': 'stale_head', 'candidate-check': 'checks_failed', 'issue': 'stale_admission',
+                 'pause': 'iteration_paused'}
+        # Reuse the single qualified fixture; no additional stage/worker chains per case.
+        with closing(sqlite3.connect(':memory:')) as snapshot:
+            with closing(sqlite3.connect(self.fixture.state)) as db:
+                db.backup(snapshot)
+            for mode, code in cases.items():
+                with self.subTest(mode=mode):
+                    with closing(sqlite3.connect(self.fixture.state)) as db:
+                        snapshot.backup(db)
+                    self.config = copy.deepcopy(original_config)
+                    self.write_config()
+                    self.protection = copy.deepcopy(original_protection)
+                    self.assignment.tracker.issues[10] = copy.deepcopy(original_issue)
+                    self.refs = dict(original_refs)
+                    self.check_runs = copy.deepcopy(original_checks)
+                    target.sha = target.check_sha = target.deploy_sha = target.workflow_sha = self.base_sha
+                    target.health_reads = 1
+                    self.calls.clear()
+                    starts = 0
+                    boundaries = 0
+                    protection_reads = 0
+                    def merge_read(api, suffix):
+                        nonlocal protection_reads
+                        value = original_merge_read(api, suffix)
+                        if suffix == '/branches/main/protection':
+                            protection_reads += 1
+                            if mode == 'post-admission-main' and protection_reads == 3:
+                                self.refs['main'] = moved
+                                self.pass_checks(moved)
+                        return value
+
+                    def boundary(*args):
+                        nonlocal boundaries
+                        result = original_boundary(*args)
+                        boundaries += 1
+                        if mode == 'pause' and boundaries == 2:
+                            self.assignment.mutate_iteration(lambda i: i.update(status='paused'))
+                        return result
+
+                    def read(api, suffix):
+                        nonlocal starts
+                        if suffix == '':
+                            starts += 1
+                            if starts == 3:  # Final observer initial read, AFTER prior admission.
+                                if mode == 'main':
+                                    self.refs['main'] = moved
+                                    self.pass_checks(moved)
+                                    target.sha = target.check_sha = target.deploy_sha = target.workflow_sha = moved
+                                elif mode == 'config':
+                                    self.config['baseline'] = moved
+                                    self.write_config()
+                                elif mode == 'protection':
+                                    self.protection['required_status_checks']['strict'] = False
+                                elif mode == 'branch':
+                                    self.refs[self.config['branch']] = moved
+                                elif mode == 'candidate-check':
+                                    self.check_runs[self.config['head']][0]['conclusion'] = 'failure'
+                                elif mode == 'issue':
+                                    self.assignment.tracker.issues[10]['body'] += '\nChanged during final sample'
+                        return original_read(api, suffix)
+                    with (closing(sqlite3.connect(self.fixture.state)) as db, state_lock(db),
+                          patch.object(delivery.DeliveryGitHub, 'read', read), patch.object(delivery, 'mutation_boundary', boundary),
+                          patch.object(merge.MergeGitHub, 'read', merge_read)):
+                        with self.assertRaises(merge.RepositoryError) as refused:
+                            merge.lifecycle(db, 'product', 'm1', '42', str(self.config_path), 'merge-candidate')
+                        self.assertEqual(refused.exception.code, code)
+                    self.assertEqual(self.writes('PUT'), [])
+                    self.assertNotIn('merge', self.stored())
+                    observed = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
+                    self.assertEqual(observed['monitor']['latest']['status'], 'healthy')
+                    self.assertEqual(observed['monitor']['latest']['main'], moved if mode == 'main' else self.base_sha)
+                    self.assertIsNone(observed['incident'])
+
     def test_delivery_outage_at_mutation_boundary_freezes_before_put(self):
         target, _ = self.install_delivery_observer()
         self.boundary_change = lambda: setattr(target, 'health_outage', True)

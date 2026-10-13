@@ -407,19 +407,30 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require(pr.get('state') == 'open' and pr.get('merged') is False and pr.get('draft') is False and
                     pr.get('mergeable') is True and pr.get('mergeable_state') == 'clean',
                     'PR must be ready and all authoritative merge gates clean.', 'merge_not_ready')
-            # Repeat all local pins and exact target immediately at the mutation boundary.
-            chain(database, project, iteration, operator, config, config_path)
-            require(target(api, config) == pr and protection(api, config) == gate and
-                    checks(api, config, config['head']) == branch_checks and
-                    publication.ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == config['baseline'] and
-                    issue(api, prior, config) == observed_issue, 'Admission changed before merge.', 'stale_admission')
-            latest = assignments.current(database, project, iteration, operator)
-            require(latest.get('main_incident') == incident and latest['handoff'] == item['handoff'] and
-                    latest['ticket_work']['input_digest'] == item['ticket_work']['input_digest'],
-                    'Incident or requirements changed at admission.', 'stale_admission')
-            if incident is None:
-                checks(api, config, config['baseline'])
-            require_publication(database, latest, api)
+            def revalidate_admission(expected_incident):
+                require(load_config(config_path, operator) == config, 'Merge authority changed.', 'stale_admission')
+                chain(database, project, iteration, operator, config, config_path)
+                require(publication.ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == config['baseline'],
+                        'Main baseline moved; refresh reviews.', 'stale_baseline')
+                require(target(api, config) == pr and protection(api, config) == gate and
+                        checks(api, config, config['head']) == branch_checks and
+                        publication.ref_sha(api.read('/git/ref/heads/' + config['branch']), config['branch']) == config['head'] and
+                        issue(api, prior, config) == observed_issue, 'Admission changed before merge.', 'stale_admission')
+                require(publication.ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == config['baseline'],
+                        'Main baseline moved during admission reads; refresh reviews.', 'stale_baseline')
+                latest = assignments.current(database, project, iteration, operator)
+                if 'delivery_monitor' in latest:
+                    require(latest['delivery_monitor']['latest']['main'] in {None, config['baseline']},
+                            'Observed delivery main differs from reviewed baseline.', 'stale_baseline')
+                require(latest.get('main_incident') == expected_incident and latest['handoff'] == item['handoff'] and
+                        latest['ticket_work']['input_digest'] == item['ticket_work']['input_digest'],
+                        'Incident or requirements changed at admission.', 'stale_admission')
+                assignments.ticket_claims(database, prior['ticket_scope'])
+                if expected_incident is None:
+                    checks(api, config, config['baseline'])
+                return latest
+
+            revalidate_admission(incident)
             latest = delivery.mutation_boundary(database, project, iteration, operator)
             boundary_incident = latest.get('main_incident')
             if boundary_incident is not None:
@@ -431,6 +442,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                         'Delivery changed at mutation boundary; ordinary merges frozen.', 'main_frozen')
             else:
                 require(config['recovery'] is None, 'Recovery scope no longer has an active incident.', 'scope_mismatch')
+            # Delivery reads can change admission too. Revalidate AFTER sampling,
+            # with requirement publication the last remote guard before intent/PUT.
+            latest = revalidate_admission(boundary_incident)
+            require_publication(database, latest, api)
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}
