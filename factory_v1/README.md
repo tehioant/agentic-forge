@@ -1,6 +1,6 @@
-# Fresh factory v1 — intake, onboarding, planning, tickets, assignments and attention
+# Fresh factory v1 — intake, execution, review, merge and delivery
 
-Standard-library Python 3.14 controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, assigns selected `to-tickets` synthesis, controls ticket publication/frontier/reservation, and prepares bounded role handoffs. It never dispatches implementation workers.
+Standard-library Python 3.14 controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, controls ticket publication/frontier/reservation, and exposes bounded role launch, simplification, independent review, candidate publication, gated merge and integrated delivery verification. Automatic scheduling remains separate from these explicit trusted-host operations.
 
 ## Trust and safety boundary
 
@@ -23,6 +23,21 @@ boundary](../docs/fresh-independent-review.md).
 ## Candidate publication (#14)
 
 `publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes only a fixed candidate branch and draft PR; it never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
+
+## Gated merge and integrated delivery (#17)
+
+`merge-preflight`, `merge-candidate`, `verify-delivery` and `inspect-merge` reuse the
+existing assignments, two-axis review, publication mapping and state lock. Admission
+revalidates exact skill/native execution bindings, candidate bytes/modes, current
+requirements/review/baseline, authoritative protection and app-bound checks. Intent
+precedes merge IO; exact merged commit/main membership and **integrated-SHA checks**
+precede ticket closure. Incomplete premature closures are reopened; deployment and
+iteration completion are never inferred. Host execution binding is deployment authority,
+not a blanket per-merge human approval. See [the contracts, conservative capability
+limits and live acceptance status](MERGE.md). The disposable validation
+repository now has strict app-bound quality/security checks installed. A fresh native
+stage chain on that baseline, live gated merge and integrated delivery remain unverified;
+fixtures and baseline CI do not satisfy them.
 
 ## Stuck-work diagnosis and operator direction (#16)
 

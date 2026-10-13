@@ -15,7 +15,7 @@ import uuid
 from contextlib import closing
 from pathlib import Path
 
-from . import assignments, spending
+from . import assignments, review, spending
 from .planning import require
 from .repositories import RepositoryError, state_lock
 from .sandbox_guard import process_identity
@@ -30,6 +30,7 @@ def save(database, assignment):
     database.execute('BEGIN IMMEDIATE')
     database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
                      (json.dumps(assignment, sort_keys=True), assignment['assignment_id']))
+    review.record_hold(database, assignment)
     database.commit()
 
 
