@@ -208,6 +208,86 @@ class ActiveControlTests(unittest.TestCase):
         self.assignment = self.sandbox.assignment
         self.state = self.assignment.fixture.state
 
+    def test_emergency_stop_retains_logs_before_removal_with_guard_suspended(self):
+        import signal
+        self.sandbox.mode('process-tree')
+        prepared = self.assignment.ok(self.assignment.command())
+        controller = self.sandbox.started(prepared)
+        self.addCleanup(controller.communicate, timeout=10)
+        runtime = self.sandbox.wait_running(prepared)['runtime']
+        root = Path(runtime['artifacts'])
+        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
+        tree = json.loads((root / 'scratch/process-tree.json').read_text())
+        identities = {pid: process_identity(pid) for pid in tree.values()}
+        guard = json.loads((root / 'guard-process.json').read_text())
+        os.kill(guard['pid'], signal.SIGSTOP)
+        def release_guard():
+            if process_identity(guard['pid']) == guard['start']:
+                os.kill(guard['pid'], signal.SIGCONT)
+        self.addCleanup(release_guard)
+        try:
+            with closing(sqlite3.connect(self.state)) as db, state_lock(db):
+                available = subprocess.run([str(self.sandbox.bin / 'docker'), 'logs', runtime['container']],
+                                           capture_output=True, timeout=3)
+                self.assertEqual(available.returncode, 0, available.stderr)
+                stopped = value(self, cli(self.state, 'emergency-stop'))
+                self.assertTrue(stopped['cleanup'][prepared['assignment_id']]['container_removed'])
+                wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()),
+                     'Worker survived stop')
+                self.assertTrue((root / 'container.log').exists(), 'Available diagnostics lost before capture')
+                self.assertEqual((root / 'container.log').read_bytes(), available.stdout)
+                calls = [json.loads(line) for line in (self.sandbox.bin / 'docker-calls.jsonl').read_text().splitlines()]
+                kill = next(i for i, call in enumerate(calls) if call[0] == 'kill')
+                log = next(i for i, call in enumerate(calls) if i > kill and call[0] == 'logs')
+                removal = next(i for i, call in enumerate(calls) if call[0] == 'rm')
+                self.assertLess(kill, log)
+                self.assertLess(log, removal)
+                release_guard()
+            output, error = controller.communicate(timeout=10)
+            self.assertEqual(controller.returncode, 0, error)
+            self.assertEqual(json.loads(output)['runtime']['status'], 'stopped')
+            self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
+        finally:
+            release_guard()
+
+    def test_log_timeout_cannot_delay_execution_halt_or_skip_removal(self):
+        from factory_v1.sandbox_policy import Docker
+        self.sandbox.mode('process-tree')
+        prepared = self.assignment.ok(self.assignment.command())
+        controller = self.sandbox.started(prepared)
+        self.addCleanup(controller.communicate, timeout=10)
+        runtime = self.sandbox.wait_running(prepared)['runtime']
+        root = Path(runtime['artifacts'])
+        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
+        tree = json.loads((root / 'scratch/process-tree.json').read_text())
+        identities = {pid: process_identity(pid) for pid in tree.values()}
+        original = Docker.call
+        captured = []
+        import signal
+        guard = json.loads((root / 'guard-process.json').read_text())
+        os.kill(guard['pid'], signal.SIGSTOP)
+        def release_guard():
+            if process_identity(guard['pid']) == guard['start']:
+                os.kill(guard['pid'], signal.SIGCONT)
+        self.addCleanup(release_guard)
+        def fail_logs(docker, *args, **kwargs):
+            if args[0] == 'logs':
+                captured.append(True)
+                wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()),
+                     'Optional logs ran before execution halt')
+                self.assertTrue((self.sandbox.bin / 'container.json').exists())
+                raise RepositoryError('container_unavailable', 'LABELED log timeout')
+            return original(docker, *args, **kwargs)
+        with closing(sqlite3.connect(self.state)) as db, state_lock(db), patch.object(Docker, 'call', fail_logs):
+            stopped = controls.request(db, 'product', 'm1', '42', 'emergency-stop', 'LABELED log timeout')
+        self.assertEqual(captured, [True])
+        self.assertTrue(stopped['cleanup'][prepared['assignment_id']]['container_removed'])
+        self.assertFalse((self.sandbox.bin / 'container.json').exists())
+        self.assertEqual(json.loads((root / 'container-log-error.json').read_text())['error'], 'log_unavailable')
+        release_guard()
+        controller.communicate(timeout=10)
+        self.assertEqual(controller.returncode, 0)
+
     def test_signal_failure_does_not_skip_actual_worker_removal(self):
         self.sandbox.mode('process-tree')
         prepared = self.assignment.ok(self.assignment.command())

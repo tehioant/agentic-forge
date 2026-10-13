@@ -21,6 +21,17 @@ def option(name):
     return args[args.index(name) + 1]
 
 
+def halt_fixture_worker(container):
+    worker = container.get('fixture_worker')
+    if worker:
+        try:
+            identity = Path(f"/proc/{worker['pid']}/stat").read_text().rsplit(')', 1)[1].split()[19]
+            if identity == worker['start']:
+                os.killpg(worker['pid'], signal.SIGKILL)
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+
+
 def run_fixture(container):
     mounts = {m['Destination']: Path(m['Source']) for m in container['Mounts'] if m['Type'] == 'bind'}
     check_path = mounts['/inputs'] / 'checks.json'
@@ -312,18 +323,25 @@ elif args[0] == 'logs':
     container = json.loads(STATE.read_text())
     print(json.dumps(container['check_report']) if 'check_report' in container else
           'Labeled deterministic Docker fixture log. NOT live Hermes execution.')
+elif args[0] == 'kill':
+    # Halt the real fixture process group but retain metadata/logs until rm.
+    try:
+        with STATE.open('r+') as stream:
+            container = json.load(stream)
+            halt_fixture_worker(container)
+            container['State']['Running'] = False
+            container['State']['ExitCode'] = 137
+            stream.seek(0)
+            json.dump(container, stream)
+            stream.truncate()
+    except FileNotFoundError:
+        print('Error: No such container: fixture-container', file=sys.stderr)
+        sys.exit(1)
 elif args[0] == 'rm':
     removal = ROOT / 'removal-in-progress'
     if STATE.exists():
         container = json.loads(STATE.read_text())
-        worker = container.get('fixture_worker')
-        if worker:
-            try:
-                identity = Path(f"/proc/{worker['pid']}/stat").read_text().rsplit(')', 1)[1].split()[19]
-                if identity == worker['start']:
-                    os.killpg(worker['pid'], signal.SIGKILL)
-            except (FileNotFoundError, ProcessLookupError):
-                pass
+        halt_fixture_worker(container)
     if STATE.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
         if not removal.exists():
             removal.write_text('pending')

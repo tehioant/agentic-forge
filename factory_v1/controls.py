@@ -295,11 +295,16 @@ def stop_attempts(database, project, iteration, operator):
             outcome['controller_signal_error'] = 'stop_unconfirmed'
         try:
             docker = Docker()
-            # Removal precedes optional diagnostics: a hanging log must not defer a kill.
-            docker.remove(runtime['container'])
-            outcome['container_removed'] = True
-            if root is not None:
-                retain_logs(docker, runtime['container'], root)
+            try:
+                docker.call('kill', runtime['container'], optional=True)
+                observed = docker.inspect(runtime['container'], optional=True)
+                require(observed is None or observed.get('State', {}).get('Running') is False,
+                        'Execution halt was not verified; remove without delaying for diagnostics.', 'stop_unconfirmed')
+                if root is not None and observed is not None:
+                    retain_logs(docker, runtime['container'], root)
+            finally:
+                docker.remove(runtime['container'])
+                outcome['container_removed'] = True
         except (RepositoryError, OSError):
             outcome['error'] = 'stop_unconfirmed'
         with lane(database, project, iteration):

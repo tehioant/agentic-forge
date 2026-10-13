@@ -99,10 +99,11 @@ or chargeable fallback is used for interruption. Cancellation of an admitted mod
 request preserves its pending reservation and uncertain outcome.
 
 Emergency stop persists the hold first, touches each scoped attempt's stop marker,
-signals the exact PID/start-time-bound launcher, then removes and independently
-verifies absence of its actual container. Docker removal terminates the worker,
-container helpers and worker process tree. Removal precedes optional log capture;
-log/diagnostic failure cannot prevent the kill. The existing launcher, guard, relay
+signals the exact PID/start-time-bound launcher, then kills container execution and
+verifies it has halted before bounded best-effort log capture. Container removal
+and independent absence verification run regardless of halt/capture failures;
+optional diagnostics cannot delay the execution halt or suppress removal. The
+existing launcher, guard, relay
 and cancellable broker own teardown; a race, Docker failure, stale controller or
 failed helper join remains recoverable/unconfirmed rather than falsely completed.
 All cleanup is scope-bound. Shared provider services and unrelated processes are

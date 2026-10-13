@@ -24,7 +24,8 @@ class CleanupErrorTests(unittest.TestCase):
         self.addCleanup(self.database.close)
         self.database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
         self.database.execute('CREATE TABLE role_assignments (assignment_id TEXT, payload TEXT)')
-        item = {'approval': {'operator_id': 42, 'reference': 'LABELED_REVIEW_FIXTURE'},
+        item = {'project_id': 'p', 'iteration_id': 'i',
+                'approval': {'operator_id': 42, 'reference': 'LABELED_REVIEW_FIXTURE'},
                 'execution_allowed': False, 'status': 'active'}
         self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('p', 'i', json.dumps(item)))
         self.assignment = {'assignment_id': 'a', 'ticket_scope': {'project': 'p', 'iteration': 'i'},
@@ -39,6 +40,40 @@ class CleanupErrorTests(unittest.TestCase):
         with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=FileNotFoundError('injected executable vanished')):
             with self.assertRaises(RepositoryError):
                 docker.call('rm', '-f', 'fixture')
+
+
+    def test_emergency_stop_removes_independently_of_halt_and_diagnostic_failures(self):
+        from factory_v1 import controls
+        self.assignment['runtime'].update(controller_pid=123, controller_start='LABELED absent process')
+        self.database.execute('UPDATE role_assignments SET payload=?', (json.dumps(self.assignment),))
+        self.database.commit()
+        for defect in ('kill', 'inspect', 'logs', 'artifact', 'remove'):
+            with self.subTest(defect=defect), ExitStack() as stack:
+                docker = Mock()
+                calls = []
+                def call(command, *args, **kwargs):
+                    calls.append(command)
+                    if command == defect:
+                        raise RepositoryError('container_unavailable', 'LABELED injected Docker failure')
+                    return b'LABELED retained logs'
+                docker.call.side_effect = call
+                docker.inspect.return_value = {'State': {'Running': False}}
+                if defect == 'inspect':
+                    docker.inspect.side_effect = RepositoryError('container_unavailable', 'LABELED inspect failure')
+                if defect == 'remove':
+                    docker.remove.side_effect = RepositoryError('stop_unconfirmed', 'LABELED removal failure')
+                if defect == 'artifact':
+                    stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('LABELED log write failure')))
+                stack.enter_context(patch('factory_v1.sandbox_policy.Docker', return_value=docker))
+                result = controls.request(self.database, 'p', 'i', 42, 'emergency-stop', 'LABELED cleanup failure matrix')
+                outcome = result['cleanup']['a']
+                docker.remove.assert_called_once_with('fixture')
+                self.assertIn('kill', calls)
+                self.assertEqual(calls[0], 'kill')
+                self.assertEqual(outcome['container_removed'], defect != 'remove')
+                self.assertEqual(outcome['error'], 'stop_unconfirmed' if defect in {'kill', 'inspect', 'remove'} else None)
+                if defect in {'kill', 'inspect'}:
+                    self.assertNotIn('logs', calls, 'Do not defer fallback removal when halt is unconfirmed')
 
     def test_docker_inspect_normalizes_exec_oserror(self):
         with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
