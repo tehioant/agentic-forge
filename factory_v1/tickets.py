@@ -6,7 +6,7 @@ import re
 import uuid
 from pathlib import Path
 
-from .planning import require, reload_locked, transition
+from .planning import require, reload_locked, transition, checkpoint as admitted_checkpoint
 from .repositories import RepositoryError, reconcile, save_iteration
 from . import ticket_github as gh
 
@@ -91,6 +91,7 @@ def synthesize(database, item, request, github):
     inputs = pinned_inputs(database, item, github)
     previous = item.get('ticket_work')
     if previous and previous['request'] == request and previous['inputs'] == inputs:
+        active(item, database)
         return item
     require(previous is None, 'Ticket scope already assigned; material revision requires explicit planning reassignment.', 'ticket_conflict')
     # Schema access is checked at publication, so missing Projects never discards synthesis.
@@ -98,7 +99,7 @@ def synthesize(database, item, request, github):
                            'request': request, 'skill': selected, 'adaptation': ADAPTATION,
                            'inputs': inputs, 'input_digest': digest(inputs), 'instructions': INSTRUCTIONS}
     transition(item, 'ticket_synthesis_pending')
-    save_iteration(database, item)
+    admitted_checkpoint(database, item)
     return item
 
 
@@ -231,7 +232,7 @@ def complete_synthesis(database, item, request, github):
     if not already_completed:
         work['status'] = 'publication_pending'
     transition(item, 'ticket_publication_pending')
-    checkpoint(database, item)
+    admitted_checkpoint(database, item)
     return publish(database, item, github)
 
 
@@ -291,12 +292,12 @@ def publish(database, item, github):
     try:
         board = verified_board(work, github, item['repository'], item['iteration_id'])
         work['board'] = board
-        checkpoint(database, item)
+        admitted_checkpoint(database, item)
         if work.get('publication_complete'):
             item = frontier(database, item, github)
             item['ticket_work']['status'] = 'published'
             item['ticket_work'].pop('blocker', None)
-            checkpoint(database, item)
+            admitted_checkpoint(database, item)
             return item
         numbers = {k: v['number'] for k, v in work.get('published', {}).items()}
         for ticket in work['tickets']:
@@ -312,7 +313,7 @@ def publish(database, item, github):
             if not candidates:
                 require(not intent.get('issue'), 'Lost issue response/absent readback: investigate before retry; never create a duplicate.', 'publication_uncertain')
                 intent['issue'] = {'title': ticket['title'], 'body': expected_body}
-                checkpoint(database, item)  # BEFORE mutation, including lost response/process death.
+                admitted_checkpoint(database, item)  # BEFORE mutation, including lost response/process death.
                 payload = {'title': ticket['title'], 'body': expected_body, 'labels': [ticket['triage_label']]}
                 if 'milestone' in board:
                     payload['milestone'] = board['milestone']['number']
@@ -341,7 +342,7 @@ def publish(database, item, github):
                 require(blocker not in intent.get('dependencies', []),
                         'Lost native blocker write with absent relationship; investigate before retry.', 'publication_uncertain')
                 intent.setdefault('dependencies', []).append(blocker)
-                checkpoint(database, item)
+                admitted_checkpoint(database, item)
                 gh.add_dependency(github, item['repository'], issue['number'], blocker)
             observed = gh.dependencies(github, item['repository'], issue['number'])
             require({gh.issue_identity(d, item['repository'])['id'] for d in observed} == expected_ids and len(observed) == len(expected_ids),
@@ -350,7 +351,7 @@ def publish(database, item, github):
             if member is None:
                 require(not intent.get('membership'), 'Lost board write and absent membership; investigate before retry.', 'publication_uncertain')
                 intent['membership'] = True
-                checkpoint(database, item)
+                admitted_checkpoint(database, item)
                 gh.add_item(github, board['project_id'], issue['node_id'])
                 member = gh.membership(github, board, item['repository'], issue)
                 require(member is not None, 'Exact project membership missing after write.', 'publication_mismatch')
@@ -364,7 +365,7 @@ def publish(database, item, github):
                 require(member[role] in {None, option}, 'Existing board progress/scope conflicts; do not overwrite external work.', 'publication_mismatch')
                 if member[role] != option:
                     intent[role] = option
-                    checkpoint(database, item)
+                    admitted_checkpoint(database, item)
                     gh.set_field(github, board['project_id'], member['id'], board[role]['id'], option)
             member = gh.membership(github, board, item['repository'], issue)
             require(member is not None and all(member[k] == v for k, v in target.items()), 'Exact project scope/progress readback differs.', 'publication_mismatch')
@@ -374,9 +375,11 @@ def publish(database, item, github):
         work['publication_complete'] = True
         work.pop('blocker', None)
         transition(item, 'ticket_frontier_ready')
-        checkpoint(database, item)
+        admitted_checkpoint(database, item)
         return frontier(database, item, github)
     except RepositoryError as error:
+        if error.code in {'iteration_paused', 'invalid_control'}:
+            raise
         work['status'] = 'blocked'
         work['blocker'] = {'code': error.code, 'message': str(error)}
         transition(item, 'ticket_publication_blocked')
@@ -536,5 +539,5 @@ def reserve(database, item, github, number):
             'Exact eligible reservation progress did not read back.', 'publication_mismatch')
     item['reservation']['status'] = 'reserved'
     transition(item, 'ticket_reserved')
-    checkpoint(database, item)
+    admitted_checkpoint(database, item)
     return item
