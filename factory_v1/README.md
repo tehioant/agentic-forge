@@ -50,6 +50,18 @@ remains eligible. Routine health is silent. No production URL, deployment, repai
 execution, supervisor or live notification is invented or launched. See
 [configuration, lifecycle, evidence and real-path limits](DELIVERY.md).
 
+## Durable pause and emergency stop (#21)
+
+`pause`, `emergency-stop`, `inspect-control` and explicit `resume` are scope-bound
+trusted-host controls. A private durable interruption lane prevents queued/new
+admission and final merge mutation without waiting for long controller locks.
+Checkpoints retain assignments, pinned inputs, candidate artifacts, stage evidence
+and pending external intents; emergency stop owns actual worker/helper cleanup.
+Requested/acknowledged/completed readbacks distinguish interruption from uncertain
+external outcomes, never rollback or delivery. Back up `<state>.controls/` with
+SQLite and retained artifacts. See [control semantics, commands and acceptance
+limitations](CONTROLS.md). General restart reconciliation remains a later slice.
+
 ## Stuck-work diagnosis and operator direction (#16)
 
 `declare-stuck` retains the responsible worker's attempted fixes and exact failure
