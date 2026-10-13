@@ -20,6 +20,7 @@ from unittest.mock import patch
 from factory_v1 import controls, merge
 from factory_v1.repositories import RepositoryError, state_lock
 from factory_v1.sandbox_guard import process_identity
+from factory_v1.sandbox_policy import Docker
 from factory_v1.tests import test_assignments, test_merge, test_sandbox, test_spending_cancel
 from factory_v1.tests.test_model_access_cancel import StalledHTTPFixture, STALLS
 
@@ -217,6 +218,8 @@ class ActiveControlTests(unittest.TestCase):
         runtime = self.sandbox.wait_running(prepared)['runtime']
         root = Path(runtime['artifacts'])
         wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
+        wait(self, lambda: (Docker().inspect(runtime['container']) or {}).get('State', {}).get('Running') is True,
+             'Docker fixture start did not complete')
         tree = json.loads((root / 'scratch/process-tree.json').read_text())
         identities = {pid: process_identity(pid) for pid in tree.values()}
         guard = json.loads((root / 'guard-process.json').read_text())
@@ -226,6 +229,8 @@ class ActiveControlTests(unittest.TestCase):
                 os.kill(guard['pid'], signal.SIGCONT)
         self.addCleanup(release_guard)
         try:
+            wait(self, lambda: Path(f"/proc/{guard['pid']}/stat").read_text().rsplit(')', 1)[1].split()[0] == 'T',
+                 'Guard did not suspend')
             with closing(sqlite3.connect(self.state)) as db, state_lock(db):
                 available = subprocess.run([str(self.sandbox.bin / 'docker'), 'logs', runtime['container']],
                                            capture_output=True, timeout=3)
@@ -251,7 +256,6 @@ class ActiveControlTests(unittest.TestCase):
             release_guard()
 
     def test_log_timeout_cannot_delay_execution_halt_or_skip_removal(self):
-        from factory_v1.sandbox_policy import Docker
         self.sandbox.mode('process-tree')
         prepared = self.assignment.ok(self.assignment.command())
         controller = self.sandbox.started(prepared)
@@ -259,6 +263,8 @@ class ActiveControlTests(unittest.TestCase):
         runtime = self.sandbox.wait_running(prepared)['runtime']
         root = Path(runtime['artifacts'])
         wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
+        wait(self, lambda: (Docker().inspect(runtime['container']) or {}).get('State', {}).get('Running') is True,
+             'Docker fixture start did not complete')
         tree = json.loads((root / 'scratch/process-tree.json').read_text())
         identities = {pid: process_identity(pid) for pid in tree.values()}
         original = Docker.call
@@ -278,6 +284,8 @@ class ActiveControlTests(unittest.TestCase):
                 self.assertTrue((self.sandbox.bin / 'container.json').exists())
                 raise RepositoryError('container_unavailable', 'LABELED log timeout')
             return original(docker, *args, **kwargs)
+        wait(self, lambda: Path(f"/proc/{guard['pid']}/stat").read_text().rsplit(')', 1)[1].split()[0] == 'T',
+             'Guard did not suspend')
         with closing(sqlite3.connect(self.state)) as db, state_lock(db), patch.object(Docker, 'call', fail_logs):
             stopped = controls.request(db, 'product', 'm1', '42', 'emergency-stop', 'LABELED log timeout')
         self.assertEqual(captured, [True])
