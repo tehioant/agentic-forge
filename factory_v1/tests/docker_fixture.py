@@ -2,7 +2,9 @@
 """Deterministic external Docker seam, NOT a container or live isolation proof."""
 import json
 import os
+import signal
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -273,7 +275,7 @@ elif args[0] == 'inspect':
         container['State']['Status'] = 'removing'
     mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
     check_hang = mode == 'checks-hang' and 'check_report' in container
-    if container['State']['Running'] and mode not in ('hang', 'stop-race') and not check_hang:
+    if container['State']['Running'] and mode not in ('hang', 'stop-race', 'process-tree') and not check_hang:
         container['polls'] = container.get('polls', 0) + 1
         if container['polls'] >= 3:
             container['State']['Running'] = False
@@ -281,7 +283,25 @@ elif args[0] == 'inspect':
     print(json.dumps([container]))
 elif args[0] == 'start':
     container = json.loads(STATE.read_text())
-    if not ((ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race'):
+    mode = (ROOT / 'mode').read_text() if (ROOT / 'mode').exists() else ''
+    if mode == 'process-tree':
+        # Real OS process group; a labeled deterministic seam, NOT container isolation.
+        mounts = {m['Destination']: Path(m['Source']) for m in container['Mounts'] if m['Type'] == 'bind'}
+        evidence = mounts['/scratch'] / 'process-tree.json'
+        script = ('import json,os,subprocess,sys,time; from pathlib import Path; '
+                  'child=subprocess.Popen([sys.executable,"-c","import time; time.sleep(300)"]); '
+                  'Path(sys.argv[1]).write_text(json.dumps({"worker":os.getpid(),"child":child.pid})); '
+                  'time.sleep(300)')
+        worker = subprocess.Popen([sys.executable, '-c', script, str(evidence)], start_new_session=True,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        container['fixture_worker'] = {'pid': worker.pid,
+            'start': Path(f'/proc/{worker.pid}/stat').read_text().rsplit(')', 1)[1].split()[19]}
+        STATE.write_text(json.dumps(container))
+        (mounts['/workspace'] / 'hello.py').write_text('print("retained real process fixture candidate")\n')
+        deadline = time.monotonic() + 2
+        while not evidence.exists() and time.monotonic() < deadline:
+            time.sleep(.005)
+    elif mode != 'stop-race':
         run_fixture(container)
     container['State']['Running'] = True
     STATE.write_text(json.dumps(container))
@@ -294,6 +314,16 @@ elif args[0] == 'logs':
           'Labeled deterministic Docker fixture log. NOT live Hermes execution.')
 elif args[0] == 'rm':
     removal = ROOT / 'removal-in-progress'
+    if STATE.exists():
+        container = json.loads(STATE.read_text())
+        worker = container.get('fixture_worker')
+        if worker:
+            try:
+                identity = Path(f"/proc/{worker['pid']}/stat").read_text().rsplit(')', 1)[1].split()[19]
+                if identity == worker['start']:
+                    os.killpg(worker['pid'], signal.SIGKILL)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
     if STATE.exists() and (ROOT / 'mode').exists() and (ROOT / 'mode').read_text() == 'stop-race':
         if not removal.exists():
             removal.write_text('pending')
