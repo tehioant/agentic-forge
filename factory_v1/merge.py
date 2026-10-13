@@ -4,9 +4,7 @@ import json
 import os
 import re
 import stat
-import sqlite3
 import urllib.parse
-from contextlib import closing
 from pathlib import Path
 
 from . import assignments, publication, review, role_skills, simplification, tickets
@@ -330,12 +328,8 @@ def inspect_merge(database, project, iteration, operator, assignment_id):
 
 
 def require_publication(database, item, api, number):
-    # pinned_inputs reconciles onboarding; isolate its checkpoints from the trusted
-    # merge transaction (and never backup a connection with an uncommitted write).
-    with closing(sqlite3.connect(':memory:')) as observation:
-        database.backup(observation)
-        from .requirements import revalidate_inputs
-        revalidate_inputs(observation, json.loads(json.dumps(item)), assignments.ReadOnlyGitHub(api.github), number)
+    from .requirements import revalidate_inputs
+    revalidate_inputs(database, item, assignments.ReadOnlyGitHub(api.github), number)
 
 
 def lifecycle(database, project, iteration, operator, config_path, action):

@@ -359,4 +359,3 @@ class StuckRequirementRevisionTests(unittest.TestCase):
         self.assertEqual(resumed['stuck_work'][stuck['assignment_id']]['status'], 'released')
         self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
         self.assertEqual(resumed['ticket_work']['frontier']['eligible'], [10, 12])
-
