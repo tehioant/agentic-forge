@@ -92,6 +92,54 @@ class LeanContractTests(unittest.TestCase):
         self.assertTrue(body[spans['Blocked by'][1]:].startswith('<!-- fresh-factory-m1-ticket:'))
         self.assertIsNone(tickets.sections(body + '\r\n##\tBlocked  by \t\r\n\r\nNone.\r\n'))
 
+    def test_single_line_comment_tail_matrix_preserves_normalized_spans(self):
+        prefix, marker = self.issue['body'].split('<!--', 1)
+        marker = '<!--' + marker
+        comments = [('<!--' + left + 'neighbor' + right + '-->')
+                    for left in ('', ' ') for right in ('', ' ')] + ['<!---->', '<!-- -->']
+        for newline in ('\n', '\r\n'):
+            for heading in ('## Blocked by', '## \tBlocked  by \t###\t'):
+                content = prefix.replace('## Blocked by', heading).replace('\n', newline)
+                expected = tickets.sections(content)
+                assert expected is not None
+                for indent in ('', '  ', '   ', '\t'):
+                    for comment in comments:
+                        neighbor = indent + comment
+                        for sequence in (neighbor, marker + newline + neighbor,
+                                         marker + newline * 2 + neighbor + newline + '\t<!---->'):
+                            for ending in ('', '\t', ' \t', newline, newline * 2,
+                                           '\t' + newline * 2 + ' \t'):
+                                tail = sequence + ending
+                                body = content + tail
+                                with self.subTest(newline=newline, heading=heading, tail=tail):
+                                    spans = tickets.section_spans(body)
+                                    self.assertIsNotNone(spans)
+                                    assert spans is not None
+                                    start, end = spans['Blocked by']
+                                    self.assertEqual(end, len(content))
+                                    self.assertEqual(body[end:], tail)
+                                    self.assertEqual(body[start:end].strip(), expected['Blocked by'])
+                                    self.assertEqual(tickets.sections(body), expected)
+                                    self.assertEqual(tickets.external_contract(
+                                        {**self.issue, 'body': body}, self.inputs), 'contracted')
+                                    target = body[:start] + newline + '- #13' + newline * 2 + body[end:]
+                                    self.assertEqual(target[:start].encode(), body[:start].encode())
+                                    self.assertTrue(target.encode().endswith(tail.encode()))
+                                    target_parts = tickets.sections(target)
+                                    assert target_parts is not None
+                                    self.assertEqual(target_parts['Blocked by'], '- #13')
+
+    def test_nonterminal_inline_and_multiline_comments_are_not_footer_tails(self):
+        prefix = '## Blocked by\n\nNone.\n\n'
+        for tail in ('<!-- neighbor -->\nVisible prose\n', 'Text <!-- neighbor -->\n',
+                     '<!-- first\nsecond -->\n', '<!-- unclosed\n', ' \t\n\n'):
+            for newline in ('\n', '\r\n'):
+                body = (prefix + tail).replace('\n', newline)
+                with self.subTest(body=body):
+                    spans = tickets.section_spans(body)
+                    assert spans is not None
+                    self.assertEqual(spans['Blocked by'][1], len(body))
+
     def test_closing_atx_headings_share_contract_names_and_source_spans(self):
         body = self.issue['body']
         parts = tickets.sections(body)
@@ -200,6 +248,31 @@ class LeanAffectedMutationTests(unittest.TestCase):
                     body = (body + tail).replace('\n', '\r\n')
                     case.assert_normalized_affected_publication(
                         body, body.replace('None (can start immediately).', '- #13'), 'body')
+                finally:
+                    case.doCleanups()
+
+    def test_public_footer_spelling_neighbors_survive_lost_patch_replay(self):
+        for tail in ('\n  <!-- neighbor -->\n', '\n<!--neighbor-->\n'):
+            with self.subTest(tail=tail):
+                case = test_bugs.BugTests()
+                case.setUp()
+                try:
+                    body = lean_body(case.case.inspect()['ticket_work']['inputs']) + tail
+                    body = body.replace('## Blocked by', '## \tBlocked  by \t###\t').replace('\n', '\r\n')
+                    case.assert_normalized_affected_publication(
+                        body, body.replace('None (can start immediately).', '- #13'), 'body')
+                    after = case.case.issues[10]['body']
+                    self.assertEqual(after.encode(), body.replace('None (can start immediately).', '- #13').encode())
+                    self.assertIn('<!-- factory-ticket:lean-fixture:work -->', after)
+                    self.assertTrue(after.endswith(tail.replace('\n', '\r\n')))
+                    patches = [c for c in case.case.fixture.calls if c[0] == 'PATCH']
+                    self.assertEqual(len(patches), 1)
+                    call_count = len(case.case.fixture.calls)
+                    work = case.work(case.case.inspect())
+                    self.assertTrue(case.work(case.retry(work['assignment_id']))['publication_complete'])
+                    self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and
+                                         (c[1] != '/graphql' or c[2]['query'].lstrip().startswith('mutation '))
+                                         for c in case.case.fixture.calls[call_count:]))
                 finally:
                     case.doCleanups()
 

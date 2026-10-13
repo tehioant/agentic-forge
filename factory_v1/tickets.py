@@ -124,7 +124,7 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
 
 def section_spans(body):
     headings = list(re.finditer(r'^##[ \t]+([^\r\n]+)(?:\r?\n|$)', body, re.MULTILINE))
-    footer = re.search(r'(?:^<!-- [^\r\n]* -->[ \t]*(?:\r?\n[ \t]*)*)+\Z', body, re.MULTILINE)
+    footer = re.search(r'(?:^[ \t]*<!--[^\r\n]*-->[ \t]*(?:\r?\n[ \t]*)*)+\Z', body, re.MULTILINE)
     body_end = footer.start() if footer else len(body)
     result = {}
     for index, heading in enumerate(headings):
