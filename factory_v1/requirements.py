@@ -153,8 +153,18 @@ def sync_blocks(database, item, record, github, release=False):
         require(member is not None and member['id'] == record['memberships'][str(number)],
                 'Affected work left or replaced its pinned membership.', 'scope_mismatch')
         assert member is not None
-        desired = ('ready' if release and number not in other_holds else 'blocked')
+        desired = 'blocked'
+        if release and number not in other_holds:
+            previous = record['previous_statuses'][str(number)]
+            if previous in {'ready', 'active'}:
+                desired = 'ready'
+            elif previous == 'deferred':
+                desired = 'deferred'
         option = board['status']['options'][item['ticket_work']['request']['tracker']['statuses'][desired]]
+        if release:
+            blocked = board['status']['options'][item['ticket_work']['request']['tracker']['statuses']['blocked']]
+            require(member['status'] in {blocked, option},
+                    'External progress changed independently of the requirement release.', 'publication_mismatch')
         if member['status'] != option:
             tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
         member = tickets.gh.membership(github, board, item['repository'], issue)
@@ -223,12 +233,17 @@ def record_change(database, project, iteration, operator, request, github):
         stuck_revision = {'assignment_id': request['stuck_assignment'], 'event_id': stuck['event_id'],
                           'applied_response': response, 'affected': stuck['affected'], 'authorization': stuck['authorization']}
     preserved = validity(database, item, github, set(rows) - affected if request['kind'] == 'material' else set(rows))
+    previous_statuses = {str(n): rows[n]['status'] for n in affected}
+    for number in affected:
+        holds = [r for r in item.get('stuck_work', {}).values() if r['status'] != 'released' and number in r['affected']]
+        if holds and rows[number]['status'] == 'blocked':
+            previous_statuses[str(number)] = min(holds, key=lambda r: r['sequence'])['previous_statuses'][str(number)]
     record = {'request': request, 'kind': request['kind'], 'status': 'held' if request['kind'] == 'material' else 'clarified',
               'affected': sorted(affected), 'requirements': request['requirements'], 'direction': request['direction'],
               'issues': {str(n): issue_pin(issues[n]) for n in affected},
               'old_issues': {str(n): copy.deepcopy(issues[n]) for n in affected},
               'old_revision': {str(n): authority(item, n) for n in affected}, 'new_revision': None,
-              'previous_statuses': {str(n): rows[n]['status'] for n in affected},
+              'previous_statuses': previous_statuses,
               'memberships': {str(n): rows[n]['membership_id'] for n in affected},
               'blockers': {str(n): rows[n]['blockers'] for n in affected},
               'dependency_pins': {str(n): sorted([{k: d[k] for k in ('number', 'id', 'node_id')}

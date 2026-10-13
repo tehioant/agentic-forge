@@ -377,6 +377,46 @@ json.dump({'result': result, 'execution': {'run_id': 'SIMULATED-' + payload['sta
         self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'publication-pending')
         self.assertEqual(requirements.held_numbers(stored), {10, 11})
 
+    def assert_previous_progress_preserved(self, before, after):
+        self.tracker.members[12]['fields']['STATUS'] = before
+        if before == 'Done':
+            self.tracker.issues[12].update(state='closed', state_reason='completed')
+        self.change.update(issues=[12], old_revision={'12': requirements.authority(self.original, 12)})
+        published = self.publish()
+        resumed = self.ok(self.resume(published))
+        self.assertEqual(resumed['requirement_changes']['durable-notes']['previous_statuses']['12'], before.lower())
+        self.assertEqual(self.tracker.members[12]['fields']['STATUS'], after)
+        self.assertEqual(self.tracker.issues[12]['state'], 'open')
+        self.assertNotIn(12, resumed['ticket_work']['frontier']['eligible'])
+        self.assertEqual(self.tracker.control('reserve-ticket', issue=12).returncode, 2)
+        self.ok(self.resume(published))
+        self.assertEqual(self.tracker.members[12]['fields']['STATUS'], after)
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
+
+    def test_requirement_only_resume_preserves_prior_blocked_progress(self):
+        self.assert_previous_progress_preserved('Blocked', 'Blocked')
+
+    def test_requirement_only_resume_preserves_prior_deferred_progress(self):
+        self.assert_previous_progress_preserved('Deferred', 'Deferred')
+
+    def test_revised_delivered_work_is_reopened_without_restoring_done_or_admitting_it(self):
+        self.assert_previous_progress_preserved('Done', 'Blocked')
+
+    def test_requirement_resume_does_not_overwrite_new_external_deferred_progress(self):
+        published = self.publish()
+        self.tracker.members[10]['fields']['STATUS'] = 'Deferred'
+        response = self.resume(published)
+        self.assertEqual(response.returncode, 2, response.stderr)
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Deferred')
+        self.assertEqual(self.tracker.inspect()['requirement_changes']['durable-notes']['status'], 'resume-pending')
+
+    def test_requirement_resume_normalizes_prior_active_to_ready_not_active_dispatch(self):
+        self.tracker.members[10]['fields']['STATUS'] = 'Active'
+        resumed = self.ok(self.resume(self.publish()))
+        self.assertEqual(resumed['requirement_changes']['durable-notes']['previous_statuses']['10'], 'active')
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
+        self.assertEqual(resumed['ticket_work']['frontier']['active'], [])
+
     def test_publication_drift_prevents_resume_and_retains_hold_across_restart(self):
         item = self.publish()
         self.bad_documents = True
@@ -412,6 +452,8 @@ class StuckRequirementRevisionTests(unittest.TestCase):
         published = revision.publish()
         self.assertEqual(published['stuck_work'][stuck['assignment_id']]['status'], 'revision-required')
         resumed = revision.ok(revision.resume(published))
+        self.assertEqual(resumed['requirement_changes']['durable-notes']['previous_statuses'],
+                         resumed['stuck_work'][stuck['assignment_id']]['previous_statuses'])
         self.assertEqual(resumed['stuck_work'][stuck['assignment_id']]['status'], 'released')
         self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
         self.assertEqual(resumed['ticket_work']['frontier']['eligible'], [10, 12])

@@ -42,12 +42,17 @@ Every operation uses the existing state lock and durable SQLite record. `inspect
    read back before publication completes. Publication **does not resume** work.
 5. **`resume-requirement-change`** requires a fresh explicit operator direction and exact
    `new_revision`. It rereads publication and unchanged evidence, refuses live/unconfirmed
-   old workers, restores revised work to Ready, and retains the local hold throughout
-   partial status restoration. Retries reconcile exact effects; only a fully read-back
-   release becomes `resumed`. Fresh workers receive the current scoped spec/ticket inputs,
+   old workers, restores previously Ready/Active work to Ready, preserves independent
+   Blocked/Deferred progress, and retains the local hold throughout partial restoration.
+   Revised delivered work reopens but stays Blocked: old completion cannot restore Done
+   or silently authorize fresh dispatch. Independently changed progress refuses release.
+   Retries reconcile exact effects; only a release whose publication is reverified
+   **after** restoration becomes `resumed`. Fresh workers receive current scoped inputs,
    original/new pins, agreed direction and explicit resume context as staged load evidence.
    All ordinary implementation, simplification, independent review, publication, merge,
    integrated-check and delivery gates still apply.
+   Local diagnosis holds retain underlying progress rather than snapshotting another
+   hold's Blocked status; only the explicitly correlated revise hold can release here.
 
 A hold is cooperative at existing execution/admission boundaries: it denies launch,
 model admission, results, review, candidate publication and merge for obsolete assignments.
