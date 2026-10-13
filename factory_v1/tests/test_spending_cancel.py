@@ -123,6 +123,64 @@ class SpendingCancellationTests(unittest.TestCase):
                     self.assertEqual(error.exception.code, 'outcome_uncertain')
         self.assertEqual(len(fixture.calls), 1, 'Retry or fallback reached upstream')
 
+    def assert_control_database_failure_cancels(self, defect):
+        from factory_v1 import controls
+        fixture = StalledHTTPFixture(self.upstream, STALLS['body_close'])
+        self.addCleanup(fixture.close)
+        entered, release, arm = (threading.Event() for _ in range(3))
+        self.addCleanup(release.set)
+        connect, blocked = sqlite3.connect, controls.blocked
+        helper_errors = []
+        hook = threading.excepthook
+        def error_hook(args):
+            if args.thread.name == 'model-broker-canceller':
+                helper_errors.append(args.exc_value)
+            else:
+                hook(args)
+        def failed_connect(*args, **kwargs):
+            if defect == 'connect' and threading.current_thread().name == 'model-broker-canceller':
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('LABELED connect barrier timeout')
+                return connect(self.root / 'absent-directory/state.sqlite')
+            return connect(*args, **kwargs)
+        def failed_read(db, *args):
+            if defect == 'read' and arm.is_set() and threading.current_thread().name == 'model-broker-canceller':
+                entered.set()
+                if not release.wait(5):
+                    raise AssertionError('LABELED read barrier timeout')
+                db.execute('SELECT payload FROM labeled_missing_control_table')
+            return blocked(db, *args)
+        with patch.object(sqlite3, 'connect', failed_connect), patch.object(controls, 'blocked', failed_read), \
+                patch.object(threading, 'excepthook', error_hook):
+            self.start_broker(fixture)
+            self.client()
+            self.assertTrue(fixture.entered.wait(2), 'No actual in-flight UDS operation')
+            arm.set()
+            self.assertTrue(entered.wait(2))
+            helpers = [thread for thread in threading.enumerate() if thread.name == 'model-broker-canceller']
+            self.assertEqual(len(helpers), 1)
+            with closing(connect(self.state)) as db:
+                root, _ = controls.paths(db, 'product', 'm1')
+                assert root is not None
+                self.assertEqual(len(list(root.glob('broker-*.json'))), 1)
+            release.set()
+            self.assertTrue(self.stop.wait(1), 'Local database failure killed the helper without cancellation')
+            assert self.broker is not None
+            self.broker.join(2)
+            self.assertFalse(self.broker.is_alive(), self.errors)
+            self.assertFalse(helpers[0].is_alive(), 'Owned helper was not joined')
+            self.assertEqual(helper_errors, [])
+            self.assertFalse(self.path.exists())
+            self.assertEqual(list(root.glob('broker-*.json')), [])
+            self.assert_uncertain(fixture)
+
+    def test_control_database_connection_failure_cancels_active_uds_operation(self):
+        self.assert_control_database_failure_cancels('connect')
+
+    def test_control_database_read_failure_cancels_active_uds_operation(self):
+        self.assert_control_database_failure_cancels('read')
+
     def test_stop_interrupts_idle_accept_and_unlinks_capability(self):
         fixture = StalledHTTPFixture(self.upstream)
         self.addCleanup(fixture.close)

@@ -386,18 +386,19 @@ def _serve_unix_socket(path, database_path, scope, fixture_url, timeout, operato
 
     def cancel_io():
         from .controls import blocked
-        with closing(sqlite3.connect(uri, uri=True)) as control_database:
-            while not finished.is_set():
-                try:
-                    interrupted = blocked(control_database, scope[0], scope[1])
-                except (RepositoryError, OSError, ValueError, TypeError, RecursionError):
-                    interrupted = True
-                if stop_event.is_set() or interrupted or time.monotonic() >= deadline:
-                    stop_event.set()
-                    cancellation.cancel()
-                    adapter.cancel()
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as control_database:
+                while not finished.is_set():
+                    if stop_event.is_set() or blocked(control_database, scope[0], scope[1]) or time.monotonic() >= deadline:
+                        break
+                    finished.wait(min(.02, max(0, deadline - time.monotonic())))
+                else:
                     return
-                finished.wait(min(.02, max(0, deadline - time.monotonic())))
+        except (RepositoryError, OSError, ValueError, TypeError, RecursionError, sqlite3.Error):
+            pass  # Unreadable local control state cannot authorize continued I/O.
+        stop_event.set()
+        cancellation.cancel()
+        adapter.cancel()
 
     canceller = threading.Thread(target=cancel_io, name='model-broker-canceller', daemon=False)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:
