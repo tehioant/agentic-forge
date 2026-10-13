@@ -404,7 +404,8 @@ def store_result(database, project, iteration, operator, assignment_id, request,
         else:
             result_key = 'simplification_result'
         assignment[result_key] = stage_result
-    with database:
+    from .controls import admission
+    with admission(database, project, iteration), database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
         database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))

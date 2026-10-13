@@ -348,7 +348,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
                     checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
                     reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
-                save(database, assignment)
+                with admission(database, project, iteration):
+                    save(database, assignment)
             status = 'complete'
     except RepositoryError as error:
         error_code = error.code
@@ -388,6 +389,11 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             require(assignment['runtime']['run_id'] == run_id, 'Run changed during cleanup.', 'run_conflict')
             if status != 'unconfirmed' and (root / 'stop').exists():
                 status, error_code = 'stopped', 'cancelled'
+            if status != 'unconfirmed':
+                from .controls import blocked
+                if blocked(database, project, iteration):
+                    status = 'stopped'
+                    error_code = 'cancelled' if (root / 'stop').exists() else 'iteration_paused'
             assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                          container_removed=status != 'unconfirmed', recoverable=status != 'complete')
             save(database, assignment)
