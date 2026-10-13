@@ -158,7 +158,7 @@ def sync_blocks(database, item, record, github, release=False):
         if member['status'] != option:
             tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
         member = tickets.gh.membership(github, board, item['repository'], issue)
-        require(member is not None and member['status'] == option,
+        require(member is not None and member['id'] == record['memberships'][str(number)] and member['status'] == option,
                 'Exact revision hold/resume status did not read back.', 'publication_mismatch')
     record['blocks_verified'] = True
     checkpoint(database, item)
@@ -306,6 +306,7 @@ def resume_change(database, project, iteration, operator, request, github):
         record.update(status='resume-pending', resume_direction=request['direction'])
         checkpoint(database, item)
         sync_blocks(database, item, record, github, release=True)
+        verify_publication(database, item, record, github)
         record['status'] = 'resumed'
         checkpoint(database, item)
     return tickets.frontier(database, item, github)

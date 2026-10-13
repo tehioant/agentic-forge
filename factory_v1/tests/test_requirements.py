@@ -321,6 +321,62 @@ json.dump({'result': result, 'execution': {'run_id': 'SIMULATED-' + payload['sta
         self.fixture.server.RequestHandlerClass = original
         self.assertEqual(self.ok(self.resume(item))['requirement_changes']['durable-notes']['status'], 'resumed')
 
+    def drift_after_status_write(self, option, fault):
+        import io
+        parent = self.fixture.server.RequestHandlerClass
+        case = self
+        fired = []
+
+        class Handler(parent):
+            def do_POST(inner):
+                raw = inner.rfile.read(int(inner.headers['Content-Length']))
+                data = json.loads(raw)
+                inner.rfile = io.BytesIO(raw)
+                super().do_POST()
+                if (inner.path == '/graphql' and data['query'].startswith('mutation TicketField') and
+                        data['variables']['option'] == option and data['variables']['item'] == 'ITEM11'):
+                    fired.append(True)
+                    fault()
+
+        self.fixture.server.RequestHandlerClass = Handler
+        return fired
+
+    def assert_post_restoration_drift_held(self, fault):
+        item = self.publish()
+        fired = self.drift_after_status_write('Ready', fault)
+        response = self.resume(item)
+        self.assertTrue(fired)
+        self.assertEqual(response.returncode, 2, response.stdout + response.stderr)
+        stored = self.tracker.inspect()
+        self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'resume-pending')
+        self.assertEqual(requirements.held_numbers(stored), {10, 11})
+        request = self.assignment.configuration(11)
+        request.update(spec_commit=item['requirement_changes']['durable-notes']['new_revision']['spec']['commit'],
+                       claim_id='post-restoration-drift')
+        self.assignment.refused(self.assignment.command(request=request), 'requirements_held')
+        self.assertEqual(self.resume(item).returncode, 2)
+        self.assertEqual(self.tracker.inspect()['requirement_changes']['durable-notes']['status'], 'resume-pending')
+
+    def test_final_ready_write_membership_drift_retains_resume_pending_hold(self):
+        self.assert_post_restoration_drift_held(lambda: self.tracker.members[11].update(id='REPLACED-ITEM11'))
+
+    def test_final_ready_write_native_and_textual_drift_retains_resume_pending_hold(self):
+        def drift():
+            self.tracker.deps[11] = []
+            self.tracker.issues[11]['body'] = self.tracker.issues[11]['body'].replace('- #10', 'None (can start immediately).')
+        self.assert_post_restoration_drift_held(drift)
+
+    def test_final_blocked_write_publication_drift_cannot_become_published(self):
+        self.synthesize()
+        self.tracker.members[11]['fields']['STATUS'] = 'Ready'
+        fired = self.drift_after_status_write('Blocked', lambda: self.tracker.issues[10].update(title='Unexpected scope'))
+        response = self.control('publish-requirement-change', {'change_id': 'durable-notes'})
+        self.assertTrue(fired)
+        self.assertEqual(response.returncode, 2, response.stdout + response.stderr)
+        stored = self.tracker.inspect()
+        self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'publication-pending')
+        self.assertEqual(requirements.held_numbers(stored), {10, 11})
+
     def test_publication_drift_prevents_resume_and_retains_hold_across_restart(self):
         item = self.publish()
         self.bad_documents = True

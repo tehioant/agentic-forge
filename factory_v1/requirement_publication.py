@@ -211,6 +211,7 @@ def publish(database, project, iteration, operator, request, github):
         requirements.checkpoint(database, item)
     verify_publication(database, item, record, github)
     requirements.sync_blocks(database, item, record, github)
+    verify_publication(database, item, record, github)
     record['status'] = 'published'
     requirements.checkpoint(database, item)
     return item
