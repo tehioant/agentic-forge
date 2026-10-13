@@ -336,9 +336,10 @@ def resume(database, project, iteration, operator, reference):
                             for a in checkpoint['assignments']),
                     'Reconcile live/unconfirmed workers and pending external intents first.', 'control_busy')
             item = checkpoint['iteration']
-            require(not any(json.loads(r[0]).get('status') == 'active' and
-                            (json.loads(r[0])['project_id'], json.loads(r[0])['iteration_id']) != (project, iteration)
-                            for r in database.execute('SELECT payload FROM iterations')),
+            iterations = (json.loads(row[0]) for row in database.execute('SELECT payload FROM iterations'))
+            require(not any(other.get('status') == 'active' and
+                            (other['project_id'], other['iteration_id']) != (project, iteration)
+                            for other in iterations),
                     'Another iteration is active; resume cannot steal its scope.', 'control_conflict')
             with database:
                 item['status'] = 'active'

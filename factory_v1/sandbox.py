@@ -353,9 +353,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             status = 'complete'
     except RepositoryError as error:
         error_code = error.code
-        if error.code == 'cancelled':
-            status = 'stopped'
-        elif error.code == 'iteration_paused':
+        if error.code in {'cancelled', 'iteration_paused'}:
             status = 'stopped'
         elif status != 'stopped':
             status = 'failed'
