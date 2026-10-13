@@ -90,6 +90,71 @@ class PlanningTests(unittest.TestCase):
                     super().do_GET()
         self.fixture.server.RequestHandlerClass = Handler
 
+    def test_pause_blocks_planning_until_explicit_resume(self):
+        from factory_v1.tests.test_controls import cli
+        before = self.inspect()
+        self.assertEqual(cli(self.fixture.state, 'pause').returncode, 0)
+        for _ in range(2):
+            result = self.command('plan', self.plan_request)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertEqual(json.loads(result.stderr)['error'], 'iteration_paused')
+            paused = self.inspect()
+            self.assertEqual(paused['stage'], before['stage'])
+            self.assertNotIn('planning', paused)
+        self.assertEqual(cli(self.fixture.state, 'resume').returncode, 0)
+        self.assertEqual(self.start()['stage'], 'planning_pending')
+
+    def test_pause_during_planning_preparation_prevents_final_claim(self):
+        import sqlite3
+        from contextlib import closing
+        from unittest.mock import patch
+        from factory_v1 import planning
+        from factory_v1.tests.test_controls import cli
+        before = self.inspect()
+        resolve = planning.resolve
+        def pause_after_resolve(selected):
+            result = resolve(selected)
+            self.assertEqual(cli(self.fixture.state, 'pause').returncode, 0)
+            return result
+        with closing(sqlite3.connect(self.fixture.state)) as db, db:
+            with patch.object(planning, 'resolve', pause_after_resolve):
+                with self.assertRaises(planning.RepositoryError) as error:
+                    planning.plan(db, before, self.plan_request)
+                self.assertEqual(error.exception.code, 'iteration_paused')
+        self.assertEqual(self.inspect()['stage'], before['stage'])
+        self.assertNotIn('planning', self.inspect())
+
+    def test_pause_during_publication_read_prevents_planning_completion(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        from factory_v1.tests.test_controls import cli
+        request = self.completion()
+        self.publication(request)
+        before = self.inspect()
+        entered, release = threading.Event(), threading.Event()
+        parent = self.fixture.server.RequestHandlerClass
+        class Handler(parent):
+            def do_GET(handler):
+                if handler.path == '/repos/example/product/issues/7':
+                    entered.set()
+                    release.wait(5)
+                super().do_GET()
+        self.fixture.server.RequestHandlerClass = Handler
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(self.command, 'complete-planning', request)
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertEqual(cli(self.fixture.state, 'pause').returncode, 0)
+            finally:
+                release.set()
+            result = pending.result(timeout=10)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(json.loads(result.stderr)['error'], 'iteration_paused')
+        item = self.inspect()
+        self.assertEqual(item['planning'], before['planning'])
+        self.assertNotIn('handoff', item)
+        self.assertEqual(item['stage'], before['stage'])
+
     def test_assignment_uses_actual_selected_skills_in_same_conversation(self):
         item = self.start()
         planning = item['planning']
