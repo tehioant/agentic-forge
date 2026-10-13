@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 Implement the work described by the user in the spec or tickets.
 
-Run typechecking regularly, single test files regularly, and the full test suite once at the end.
+Run typechecking and focused tests during implementation and after each review correction. Run the final full suite on the stabilized, reviewed candidate; record its exact HEAD, command, runtime and completed exit. An interrupted earlier-head run is not a pass. If review changes source during a full run, keep that run's evidence separate and verify the final candidate rather than transferring the result to a new HEAD.
 
 Keep it simple and commit often on pull request.
 

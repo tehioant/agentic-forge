@@ -15,10 +15,10 @@ from factory_v1.tests import test_tickets
 
 SOURCE_ROOT = Path(os.environ.get('FACTORY_ROLE_SKILL_FIXTURES', str(Path(__file__).parent / 'role_skill_snapshots')))
 PINS = {
-    'implement': '6b13bcb6119df090c97be3c8a90560071a26f21f4fc6ad0facde97b25ecb1da0',
+    'implement': '290299fd286a7bab61001e3c0f0b898079332511e39b2772faac42ce99514288',
     'tdd': '93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc',
     'codebase-design': '2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2',
-    'code-review': '47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50',
+    'code-review': '0eec800da607853d6038c4fae3815896588b25a6ba84bcbcefb26218cef4df0f',
     'simplify-code': '9ee977c3362a1c07f2e327198e066ddb3c0ed67709706fc410165ee820b2ca01',
     'diagnosing-bugs': '9168404abda0967a5d32977e3498cd95fda6807018852f3de736a78357c82b40',
     'tdd/tests.md': '859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a',

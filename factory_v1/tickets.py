@@ -123,13 +123,15 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
 
 
 def section_spans(body):
-    headings = list(re.finditer(r'^## ([^\n]+)\n', body, re.MULTILINE))
+    headings = list(re.finditer(r'^##[ \t]+([^\r\n]+)(?:\r?\n|$)', body, re.MULTILINE))
+    footer = re.search(r'^<!-- [^\r\n]* -->[ \t]*(?:\r?\n)?\Z', body, re.MULTILINE)
+    body_end = footer.start() if footer else len(body)
     result = {}
     for index, heading in enumerate(headings):
-        name = heading[1].strip()
+        name = ' '.join(heading[1].split())
         if name in result:
             return None
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+        end = headings[index + 1].start() if index + 1 < len(headings) else body_end
         result[name] = (heading.end(), end)
     return result
 
@@ -141,38 +143,71 @@ def sections(body):
     return {name: body[start:end].strip() for name, (start, end) in spans.items()}
 
 
+def lean_references(context, inputs, document_names):
+    parents = re.findall(r'\bParent[ \t]+#([^;\s]+)', context)
+    parent = inputs.get('handoff', {}).get('issue', {}).get('number')
+    stories = re.findall(r'\bStories:[ \t]*([^.\r\n]+)\.', context)
+    if (type(parent) is not int or parents != [str(parent)] or len(stories) != 1 or
+            len(re.findall(r'\bStories:', context)) != 1):
+        return None
+    requirements = [value.strip() for value in stories[0].split(',')]
+    if (not all(re.fullmatch(r'US-[1-9][0-9]*', value) for value in requirements) or
+            len(set(requirements)) != len(requirements) or
+            re.findall(r'\bUS-[^\s,.;]+', context) != requirements):
+        return None
+    urls = set(re.findall(r'\[[^\]]+\]\(([^)]+)\)', context))
+    registered = {document['url'] for document in inputs['documents'].values()}
+    assigned = urls & {inputs['documents'][name]['url'] for name in document_names}
+    if not urls <= registered or len(assigned) != 1:
+        return None
+    spec = next(iter(assigned))
+    return [{'spec': spec, 'requirement': requirement} for requirement in requirements]
+
+
 def external_contract(issue, inputs, document_names=('milestone.md',)):
     parts = sections(issue['body'])
-    if parts is None:
+    if parts is None or not parts.get('Blocked by'):
         return False
-    if not all(parts.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Blocked by', 'Status')):
-        return False
-    status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', parts['Status'])
-    if status is None:
-        return False
-    refs = []
-    for line in parts['Requirement references'].splitlines():
-        if not line.strip():
-            continue
-        reference = re.fullmatch(r'- (.+) — (.+)', line)
-        if reference is None:
+    lean = 'Change' in parts or 'Done' in parts
+    if lean:
+        if (not all(parts.get(name) for name in ('Change', 'Done', 'Context')) or
+                any(name in parts for name in ('What to build', 'Requirement references', 'Acceptance criteria'))):
             return False
-        spec, requirement = reference.groups()
-        link = re.fullmatch(r'\[[^\]]+\]\(([^)]+)\)', spec)
-        refs.append({'spec': link[1] if link else spec, 'requirement': requirement})
+        refs = lean_references(parts['Context'], inputs, document_names)
+        behavior, criteria_section, criterion_pattern = parts['Change'], parts['Done'], r'- (.*)'
+    else:
+        if not all(parts.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Status')):
+            return False
+        refs = []
+        for line in parts['Requirement references'].splitlines():
+            if not line.strip():
+                continue
+            reference = re.fullmatch(r'- (.+) — (.+)', line)
+            if reference is None:
+                return False
+            spec, requirement = reference.groups()
+            link = re.fullmatch(r'\[[^\]]+\]\(([^)]+)\)', spec)
+            refs.append({'spec': link[1] if link else spec, 'requirement': requirement})
+        behavior, criteria_section, criterion_pattern = parts['What to build'], parts['Acceptance criteria'], r'- \[[ xX]\] (.*)'
+    progress = 'contracted'
+    if 'Status' in parts:
+        status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', parts['Status'])
+        if status is None:
+            return False
+        progress = status[1]
     criteria = []
-    for line in parts['Acceptance criteria'].splitlines():
+    for line in criteria_section.splitlines():
         if not line.strip():
             continue
-        criterion = re.fullmatch(r'- \[[ xX]\] (.*)', line)
+        criterion = re.fullmatch(criterion_pattern, line)
         if criterion is None:
             return False
         criteria.append(criterion[1])
     try:
-        validate_contract(issue['title'], parts['What to build'], criteria, refs, inputs, document_names)
+        validate_contract(issue['title'], behavior, criteria, refs, inputs, document_names)
     except RepositoryError:
         return False
-    return status[1]
+    return progress
 
 
 def validate_batch(batch, inputs, iteration, label):
