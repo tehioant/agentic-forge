@@ -124,11 +124,11 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
 
 def section_spans(body):
     headings = list(re.finditer(r'^##[ \t]+([^\r\n]+)(?:\r?\n|$)', body, re.MULTILINE))
-    footer = re.search(r'^<!-- [^\r\n]* -->[ \t]*(?:\r?\n)?\Z', body, re.MULTILINE)
+    footer = re.search(r'(?:^<!-- [^\r\n]* -->[ \t]*(?:\r?\n[ \t]*)*)+\Z', body, re.MULTILINE)
     body_end = footer.start() if footer else len(body)
     result = {}
     for index, heading in enumerate(headings):
-        name = ' '.join(heading[1].split())
+        name = ' '.join(re.sub(r'[ \t]+#+[ \t]*$', '', heading[1]).split())
         if name in result:
             return None
         end = headings[index + 1].start() if index + 1 < len(headings) else body_end
@@ -171,7 +171,8 @@ def external_contract(issue, inputs, document_names=('milestone.md',)):
     lean = 'Change' in parts or 'Done' in parts
     if lean:
         if (not all(parts.get(name) for name in ('Change', 'Done', 'Context')) or
-                any(name in parts for name in ('What to build', 'Requirement references', 'Acceptance criteria'))):
+                any(name in parts for name in ('Parent', 'What to build', 'Requirement references',
+                                               'Acceptance criteria', 'Iteration', 'Triage'))):
             return False
         refs = lean_references(parts['Context'], inputs, document_names)
         behavior, criteria_section, criterion_pattern = parts['Change'], parts['Done'], r'- (.*)'

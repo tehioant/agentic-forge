@@ -92,6 +92,21 @@ class LeanContractTests(unittest.TestCase):
         self.assertTrue(body[spans['Blocked by'][1]:].startswith('<!-- fresh-factory-m1-ticket:'))
         self.assertIsNone(tickets.sections(body + '\r\n##\tBlocked  by \t\r\n\r\nNone.\r\n'))
 
+    def test_closing_atx_headings_share_contract_names_and_source_spans(self):
+        body = self.issue['body']
+        parts = tickets.sections(body)
+        assert parts is not None
+        for name in parts:
+            body = body.replace('## ' + name + '\n', '## \t' + name + ' \t### \t\n')
+        body = body.replace('\n', '\r\n')
+        self.assertEqual(tickets.external_contract({**self.issue, 'body': body}, self.inputs), 'contracted')
+        self.assertEqual(tickets.sections(body), {name: value.replace('\n', '\r\n') for name, value in parts.items()})
+        spans = tickets.section_spans(body)
+        assert spans is not None
+        self.assertEqual(body[slice(*spans['Blocked by'])].strip(), parts['Blocked by'].replace('\n', '\r\n'))
+        self.assertIsNone(tickets.sections(body + '\r\n## Done ##\r\n\r\n- Duplicate.\r\n'))
+        self.assertEqual(tickets.sections('## Literal#\n\nx\n'), {'Literal#': 'x'})
+
 
 class LeanFrontierTests(unittest.TestCase):
     def setUp(self):
@@ -100,6 +115,7 @@ class LeanFrontierTests(unittest.TestCase):
         self.addCleanup(self.case.doCleanups)
         self.item = self.case.publish()
         self.inputs = self.item['ticket_work']['inputs']
+        self.canonical_body = self.case.issues[12]['body']
         self.case.issues[12]['body'] = lean_body(self.inputs)
 
     def test_public_frontier_and_reservation_use_board_progress_not_done_heading(self):
@@ -119,12 +135,7 @@ class LeanFrontierTests(unittest.TestCase):
         self.assertEqual(self.case.issues[12]['state'], 'open')
         self.assertFalse(reserved['execution_allowed'])
 
-    def test_public_refusals_preserve_independent_frontier_and_make_no_claim_or_write(self):
-        body = self.case.issues[12]['body']
-        variants = [body.replace('US-1.', 'US-999.'), body + '\n## Status\n\ndeferred\n',
-                    body + '\n## Status\n\nunknown\n', body + '\n## Bug scope\n\nrecovery\n',
-                    body.replace('## Done', '## Done\n\n- criterion\n\n## Done'),
-                    body.replace('## Blocked by', '## \tBlocked  by').replace('None (can start immediately).', '- #10')]
+    def assert_public_refusals(self, variants):
         for variant in variants:
             with self.subTest(body=variant):
                 self.case.issues[12]['body'] = variant
@@ -135,14 +146,63 @@ class LeanFrontierTests(unittest.TestCase):
                 self.assertIn(json.loads(result.stderr)['error'], {'ticket_ineligible', 'github_mismatch'})
                 self.assertNotIn('reservation', self.case.inspect())
                 self.assertEqual(self.case.members, members)
-                self.assertFalse(any(c[0] == 'POST' and c[1] == '/graphql' and
-                                     c[2]['query'].lstrip().startswith('mutation ') for c in self.case.fixture.calls))
+                self.assertEqual(self.case.issues[12]['body'], variant)
+                self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and
+                                     (c[1] != '/graphql' or c[2]['query'].lstrip().startswith('mutation '))
+                                     for c in self.case.fixture.calls))
+                frontier = self.case.inspect()['ticket_work']['frontier']
+                self.assertEqual(frontier['eligible'], [10])
+
+    def test_public_refusals_preserve_independent_frontier_and_make_no_claim_or_write(self):
+        body = lean_body(self.inputs)
+        self.assert_public_refusals([
+            body.replace('US-1.', 'US-999.'), body + '\n## Status\n\ndeferred\n',
+            body + '\n## Status\n\nunknown\n', body + '\n## Bug scope\n\nrecovery\n',
+            body.replace('## Done', '## Done\n\n- criterion\n\n## Done'),
+            body.replace('## Blocked by', '## \tBlocked  by').replace('None (can start immediately).', '- #10')])
         self.case.issues[12]['body'] = body + '\n## Status \t\n\ndeferred\n'
         self.assertEqual(self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']['eligible'], [10])
         self.assertEqual(self.case.ok(self.case.control('reserve-ticket', issue=10))['reservation']['status'], 'reserved')
 
+    def test_public_mixed_mechanical_scope_fields_refuse_without_claim_or_write(self):
+        body = lean_body(self.inputs)
+        self.assert_public_refusals([
+            body + f'\n## Parent\n\n{parent}\n' for parent in
+            ('#999', '#' + str(self.inputs['handoff']['issue']['number']), '')] + [
+            body + f'\n## {heading}\n\n{value}\n' for heading, value in
+            [('Iteration', 'other-milestone'), ('Triage', 'other-label')]])
+
+    def test_public_closing_atx_control_headings_cannot_evade_holds_or_duplicates(self):
+        body = lean_body(self.inputs)
+        self.assert_public_refusals([
+            body + f'\n## {heading}\n\n{value}\n' for heading, value in
+            [('Status ##', 'blocked'), ('Status \t### \t', 'deferred'),
+             ('Done ##', '- Conflicting criterion.'), ('Context ###', 'Parent #999; Stories: US-1.'),
+             ('Status ##', 'unknown'), ('Bug scope ##', 'recovery')]] + [
+            body + '\n## Status\n\nready\n\n## Status ##\n\nblocked\n',
+            self.canonical_body.replace('## Status\n', '## Status ##\n').replace(
+                'ready (GitHub Projects is authoritative for current progress).', 'blocked')])
+
 
 class LeanAffectedMutationTests(unittest.TestCase):
+    def test_public_terminal_comment_tail_survives_crlf_lost_patch_replay(self):
+        variants = [('lean', '\n\n \t\n'), ('lean', '\n<!-- unrelated footer -->\n\n \t'),
+                    ('lean', '<!-- another footer -->\t\n\n<!-- final footer -->\n'),
+                    ('canonical', '\n<!-- unrelated footer -->\n\n \t')]
+        for contract, tail in variants:
+            with self.subTest(contract=contract, tail=tail):
+                case = test_bugs.BugTests()
+                case.setUp()
+                try:
+                    body = case.case.issues[10]['body']
+                    if contract == 'lean':
+                        body = lean_body(case.case.inspect()['ticket_work']['inputs'])
+                    body = (body + tail).replace('\n', '\r\n')
+                    case.assert_normalized_affected_publication(
+                        body, body.replace('None (can start immediately).', '- #13'), 'body')
+                finally:
+                    case.doCleanups()
+
     def test_public_lean_affected_crlf_body_update_and_lost_response_replay(self):
         case = test_bugs.BugTests()
         case.setUp()

@@ -864,7 +864,8 @@ must be in the assigned requirement scope; each named story must exist there.
 Missing/ambiguous parent, stories or pins remain a setup blocker, not inferred
 metadata. No defaults select every story or admit unrelated/future scope.
 Canonical bodies and generated publication remain unchanged; mixed canonical/lean
-contracts are refused. A missing lean Status returns only `contracted`, not ready,
+contracts (including mechanical Parent, Iteration or Triage sections in a lean body)
+are refused. A missing lean Status returns only `contracted`, not ready,
 active or done: GitHub Projects progress and current iteration membership remain
 authoritative. An explicit Status must satisfy the existing status grammar, and
 blocked/deferred statuses retain their holds. The `Done` heading never proves
@@ -872,9 +873,10 @@ completion. Labels, native/textual blockers, issue identities/body pins, pause,
 single claims and downstream review/merge/security checks remain enforced.
 
 Admission, frontier, bug readback and affected-body mutation share the same
-section parser/source spans: horizontal heading whitespace is normalized, CRLF
-is accepted, and normalized duplicate headings are refused. A terminal single-line
-HTML footer (including the ticket identity marker) stays outside the last section
+section parser/source spans: horizontal heading whitespace and optional closing ATX
+hashes are normalized, CRLF is accepted, and normalized duplicate headings are refused.
+A terminal tail of single-line HTML comments and whitespace (including the ticket
+identity marker and trailing blank lines) stays outside the last section
 span, so a scoped blocker update preserves it and all other unrelated bytes.
 The original live #21 title/body is retained verbatim in the regression fixture;
 contract admission is not a claim that its native campaign or acceptance completed.
