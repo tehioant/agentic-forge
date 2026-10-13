@@ -269,8 +269,8 @@ class LocalStageEvidence:
             'adaptation': 'LABELED local validator adaptation', 'skills': [],
             'baseline': 'a' * 40, 'candidate': 'b' * 40, 'spec_commit': 'c' * 40,
             'issue': {'body_sha256': 'd' * 64}},
-            'ticket_scope': {'project': 'product', 'iteration': 'm1'},
-            'revision': {'spec': None, 'ticket_assignment': None, 'ticket_inputs': None},
+            'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
+            'revision': {'spec': {}, 'ticket_assignment': None, 'ticket_inputs': None},
             'result_disposition': {'checks_verified': True}, 'submitted_result': {'status': 'done', 'run_id': self.runtime['run_id']}}
         self.seal_handoff()
 
