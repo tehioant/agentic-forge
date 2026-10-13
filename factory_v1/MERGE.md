@@ -6,6 +6,12 @@ Standard-library Python 3.14, in the existing `factory_v1` controller. This exte
 fresh specification and interview pinned at
 `cccb21e35cc989a1ecd5a3c88f0689a694d77d9c`.
 
+[#23 scoped requirement changes](REQUIREMENTS.md) reuse these gates: material holds
+invalidate affected evidence without changing independent tickets' immutable authority.
+Resumed assignments use the exact new per-ticket spec/synthesis pin. Final admission
+rereads scoped requirement publication and the exact work issue after all protection,
+check and delivery reads; old scheduled/approved candidates remain inadmissible.
+
 ## Public lifecycle
 
 Run from the repository root, through the trusted host controller only. Set the
