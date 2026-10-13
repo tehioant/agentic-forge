@@ -3,7 +3,7 @@ import copy
 import json
 import unittest
 
-from factory_v1 import requirements, tickets
+from factory_v1 import bugs, requirements, tickets
 from factory_v1.tests import test_requirements
 
 
@@ -40,6 +40,18 @@ class RequirementBugTests(unittest.TestCase):
                           for source, sha in sources.items()],
                 'decomposition': 'SIMULATED selected to-tickets work, NOT native acceptance.', 'result_digest': tickets.digest(bug)}}
 
+    def assert_held(self, *numbers):
+        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
+        before = copy.deepcopy((self.tracker.issues, self.tracker.members, self.tracker.deps))
+        for number in numbers:
+            self.assertNotIn(number, frontier['eligible'])
+            self.assertTrue(next(r for r in frontier['items'] if r['number'] == number)['held'])
+            refusal = self.tracker.control('reserve-ticket', issue=number)
+            self.assertEqual(refusal.returncode, 2, refusal.stderr)
+            self.assertEqual(json.loads(refusal.stderr)['error'], 'ticket_ineligible')
+        self.assertEqual((self.tracker.issues, self.tracker.members, self.tracker.deps), before)
+        self.assertNotIn('reservation', self.tracker.inspect())
+
     def test_revision_retires_old_bug_assignment_and_replay_requires_fresh_synthesis(self):
         request = self.discovery()
         _, old = self.synthesize(request)
@@ -51,7 +63,8 @@ class RequirementBugTests(unittest.TestCase):
         self.assertEqual(retired['requirement_disposition']['change_id'], 'durable-notes')
         self.assertEqual(retired['discovery'], old['discovery'])
         resumed = self.case.ok(self.case.resume(published))
-        self.assertEqual(resumed['ticket_work']['frontier']['eligible'], [10, 12])
+        self.assertEqual(resumed['ticket_work']['frontier']['eligible'], [12])
+        self.assert_held(10)
         for command, payload in [('complete-bug', completion), ('publish-bug', {'assignment_id': old['assignment_id']})]:
             result = self.tracker.control(command, payload)
             self.assertEqual(result.returncode, 2, result.stderr)
@@ -66,6 +79,46 @@ class RequirementBugTests(unittest.TestCase):
         _, replay = self.synthesize(request)
         self.assertEqual(replay, fresh)
         self.assertEqual(self.tracker.inspect()['bug_work_history'][0], retired)
+
+    def test_mixed_pending_discovery_keeps_unrevised_sibling_held(self):
+        request = self.discovery(affected=[10, 12])
+        initial, old = self.synthesize(request)
+        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
+        self.assertEqual(frontier['eligible'], [])
+        resumed = self.case.ok(self.case.resume(self.case.publish()))
+        self.assertEqual(resumed['requirement_changes']['durable-notes']['affected'], [10, 11])
+        self.assertEqual(requirements.authority(initial, 12), requirements.authority(resumed, 12))
+        self.assert_held(10, 12)
+        item, fresh = self.synthesize(request)
+        self.assertEqual(item['bug_work_history'][0]['discovery'], old['discovery'])
+        self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
+        self.assert_held(10, 12)
+
+    def test_fresh_publication_settles_archived_discovery_without_reusing_old_result(self):
+        request = self.discovery()
+        _, old = self.synthesize(request)
+        self.case.ok(self.case.resume(self.case.publish()))
+        _, fresh = self.synthesize(request)
+        self.assert_held(10)
+        result = self.case.ok(self.tracker.control('complete-bug', self.completion(fresh)))
+        published = result['bug_work'][result['bug_discoveries'][request['discovery_id']]['key']]
+        number = published['identity']['number']
+        self.assertTrue(published['publication_complete'])
+        self.assertEqual(bugs.held_numbers(result), set())
+        self.assertEqual(result['ticket_work']['frontier']['eligible'], [12, number])
+        self.assertEqual(self.case.ok(self.tracker.control('publish-bug', {'assignment_id': fresh['assignment_id']}))
+                         ['bug_work'][result['bug_discoveries'][request['discovery_id']]['key']]['identity'], published['identity'])
+        for command, payload in [('complete-bug', self.completion(old)), ('publish-bug', {'assignment_id': old['assignment_id']})]:
+            refusal = self.tracker.control(command, payload)
+            self.assertEqual(refusal.returncode, 2)
+            self.assertEqual(json.loads(refusal.stderr)['error'], 'stale_requirements')
+        # SIMULATED authoritative delivery, not manufactured worker evidence.
+        self.tracker.issues[number].update(state='closed', state_reason='completed')
+        self.tracker.members[number]['fields']['STATUS'] = 'Done'
+        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
+        self.assertIn(10, frontier['eligible'])
+        self.assertFalse(next(r for r in frontier['items'] if r['number'] == 10)['held'])
+        self.assertEqual(self.case.ok(self.tracker.control('reserve-ticket', issue=10))['reservation']['status'], 'reserved')
 
     def assert_fresh_bug_publication(self, affected):
         self.case.ok(self.case.resume(self.case.publish()))
@@ -115,12 +168,46 @@ class RequirementBugTests(unittest.TestCase):
         self.assertFalse(uncertain['bug_work'][key].get('publication_complete'))
         self.tracker.omit_effect = False
         self.case.ok(self.case.resume(self.case.publish()))
+        self.assert_held(10)
         _, fresh = self.synthesize(request)
+        self.assert_held(10)
         self.tracker.fixture.calls.clear()
         item = self.case.ok(self.tracker.control('complete-bug', self.completion(fresh)))
         self.assertEqual(item['bug_work'][key]['blocker']['code'], 'publication_uncertain')
         self.assertTrue(item['bug_work_history'][0]['issue_intent'])
         self.assertFalse(any(c[:2] == ('POST', '/repos/example/product/issues') for c in self.tracker.fixture.calls))
+        self.assert_held(10)
+
+    def test_fresh_duplicate_settlement_cannot_erase_archived_unknown_creation(self):
+        independent = self.discovery('independent-index-bug', [12])
+        independent['discovery']['symptoms'] = 'SIMULATED note index inconsistency'
+        _, seed = self.synthesize(independent)
+        tracked = self.case.ok(self.tracker.control('complete-bug', self.completion(seed)))
+        number = tracked['bug_work'][tracked['bug_discoveries'][independent['discovery_id']]['key']]['identity']['number']
+        request = self.discovery(affected=[12, 10])
+        _, old = self.synthesize(request)
+        self.tracker.drop, self.tracker.omit_effect = 'issue', True
+        uncertain = self.case.ok(self.tracker.control('complete-bug', self.completion(old)))
+        key = uncertain['bug_discoveries'][request['discovery_id']]['key']
+        self.assertTrue(uncertain['bug_work'][key]['issue_intent'])
+        self.tracker.omit_effect = False
+        self.case.ok(self.case.resume(self.case.publish()))
+        _, fresh = self.synthesize(request)
+        completion = self.completion(fresh)
+        next(c for c in completion['bug']['comparisons'] if c['number'] == number).update(
+            symptoms_match=True, scope_match=True, rationale='SIMULATED fresh investigation identifies the existing scoped defect.')
+        completion['execution']['result_digest'] = tickets.digest(completion['bug'])
+        self.tracker.fixture.calls.clear()
+        result = self.case.ok(self.tracker.control('complete-bug', completion))
+        self.assertEqual(result['bug_work'][key]['status'], 'duplicate', result['bug_work'][key].get('blocker'))
+        self.assertTrue(result['bug_work'][key]['publication_complete'])
+        self.assertTrue(result['bug_work_history'][0]['issue_intent'])
+        self.assertEqual(bugs.held_numbers(result), {10, 12})
+        self.assertFalse(any(c[:2] == ('POST', '/repos/example/product/issues') for c in self.tracker.fixture.calls))
+        self.tracker.issues[number].update(state='closed', state_reason='completed')
+        self.tracker.members[number]['fields']['STATUS'] = 'Done'
+        self.assert_held(10, 12)
+        self.assertEqual(self.tracker.control('publish-bug', {'assignment_id': old['assignment_id']}).returncode, 2)
 
     def test_retired_discovery_cannot_silently_drop_an_affected_issue_on_refresh(self):
         _, old = self.synthesize(self.discovery(affected=[10, 12]))
@@ -134,3 +221,43 @@ class RequirementBugTests(unittest.TestCase):
         self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
         self.assertEqual(fresh['discovery']['affected'], [10, 12])
         self.assertEqual(fresh['scoped_inputs']['12'], requirements.inputs(item, 12))
+
+
+class BugHistoryHoldTests(unittest.TestCase):
+    """Pure admission records, not native execution/publication evidence."""
+
+    def record(self, affected, retired=True, published=False):
+        work = {'discovery': {'scope': 'current', 'affected': affected, 'symptoms': 'Lost note',
+                             'expected': 'Note survives', 'actual': 'Note disappears'},
+                'status': 'published' if published else 'synthesis_pending', 'publication_complete': published}
+        if retired:
+            work['requirement_disposition'] = {'status': 'obsolete'}
+            work['status'] = 'obsolete'
+        return work
+
+    def item(self, history, current=None):
+        return {'repository': 'example/product', 'iteration_id': 'm1', 'bug_work_history': history,
+                'bug_work': {'current': current} if current else {}}
+
+    def test_archived_discovery_holds_without_a_current_record(self):
+        self.assertEqual(bugs.held_numbers(self.item([self.record([10, 12])])), {10, 12})
+
+    def test_every_archived_pending_effect_survives_fresh_settlement(self):
+        effects = {'issue_intent': {'title': 'Lost note'}, 'membership_intent': True,
+                   'edge_intents': [[13, 1010]], 'affected_intents': {'10': {'body': 'Pending update'}},
+                   'field_intents': {'status': 'Ready'}}
+        for field, intent in effects.items():
+            with self.subTest(field=field):
+                old = self.record([10])
+                old.update(identity={'number': 13}, **{field: intent})
+                fresh = self.record([10], retired=False, published=True)
+                self.assertEqual(bugs.held_numbers(self.item([old], fresh)), {10, 13})
+
+    def test_fresh_settlement_cannot_drop_uncovered_scope(self):
+        fresh = self.record([10], retired=False, published=True)
+        self.assertEqual(bugs.held_numbers(self.item([self.record([10, 12])], fresh)), {10, 12})
+
+    def test_known_settlement_survives_retirement_but_cannot_settle_newer_discovery(self):
+        pending, published = self.record([10]), self.record([10], published=True)
+        self.assertEqual(bugs.held_numbers(self.item([pending], published)), set())
+        self.assertEqual(bugs.held_numbers(self.item([pending, published], self.record([10]))), {10})

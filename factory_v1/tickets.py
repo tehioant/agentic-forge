@@ -442,12 +442,7 @@ def frontier(database, item, github):
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
                                 'contract_valid': bool(contract and triaged),
                                 'held': contract in {'blocked', 'deferred'} or
-                                    parts.get('Bug scope') not in {None, 'current'} or any(
-                                    not bug.get('requirement_disposition') and bug['discovery']['scope'] == 'current' and
-                                    bug['status'] not in {'published', 'duplicate'} and
-                                    (issue['number'] in bug['discovery']['affected'] or
-                                     bug.get('identity', {}).get('number') == issue['number'])
-                                    for bug in item.get('bug_work', {}).values())}
+                                    parts.get('Bug scope') not in {None, 'current'}}
     for dependencies in native_blockers.values():
         for dependency in dependencies:
             row = rows.get(dependency['number'])
@@ -479,7 +474,8 @@ def frontier(database, item, github):
         return row is not None and number not in holds and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
     from .diagnosis import held_numbers
     from .requirements import held_numbers as requirement_holds
-    holds = held_numbers(item) | requirement_holds(item)
+    from .bugs import held_numbers as bug_holds
+    holds = held_numbers(item) | requirement_holds(item) | bug_holds(item)
     for row in rows.values():
         row['held'] = row['held'] or row['number'] in holds
         row['admissible'] = bool(row['contract_valid'] and not row['held'] and row['issue_state'] == 'open' and

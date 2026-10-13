@@ -171,8 +171,17 @@ creates a fresh selected-skill assignment rather than accepting obsolete complet
 Each affected issue contributes its current scoped inputs and revision pins to the load
 contract. The bug's own references/authority use the first affected issue's specification;
 downstream body updates preserve each affected issue's own references. Independent bugs
-keep their authority. Retired uncertain creation still denies blind duplicate writes and
-requires investigation; retirement is not reconciliation of an unknown external effect.
+keep their authority. Retirement invalidates assignment/result IDs, not the underlying
+current discovery: the frontier retains its affected scope (including unchanged siblings)
+and any known bug identity across both `bug_work` and `bug_work_history`. Requirement-only
+resume cannot settle it. A later fully read-back publication for the same normalized
+discovery and every affected issue settles discovery-only predecessors; native blockers
+then govern ordinary eligibility. That known settlement remains historical if its execution
+is later retired, but cannot settle a newer pending discovery. Unverified issue, edge,
+membership, field or affected-body intents remain held independently even when fresh
+synthesis adopts a duplicate successfully. Retired uncertain creation still denies blind
+duplicate writes and requires correlated investigation; retirement or a replacement
+assignment is not reconciliation. This slice adds no uncertainty override/discard command.
 
 ## Verification and remaining acceptance
 

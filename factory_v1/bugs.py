@@ -48,6 +48,31 @@ def fingerprint(discovery, item):
     return tickets.digest([scope, *[normalized(discovery[k]) for k in ('symptoms', 'expected', 'actual')]])
 
 
+def held_numbers(item):
+    """Retirement invalidates execution, not discoveries or unverified effects."""
+    records = [*item.get('bug_work_history', []), *item.get('bug_work', {}).values()]
+    settled = {}
+    held = set()
+    for work in reversed(records):
+        discovery = work['discovery']
+        if discovery['scope'] != 'current':
+            continue
+        key = fingerprint(discovery, item)
+        affected = set(discovery['affected'])
+        retired = bool(work.get('requirement_disposition'))
+        if work.get('publication_complete') and (retired or work['status'] in {'published', 'duplicate'}):
+            settled.setdefault(key, set()).update(affected)
+            continue
+        pending_effect = any(work.get(field) for field in
+                             ('issue_intent', 'membership_intent', 'edge_intents', 'affected_intents', 'field_intents'))
+        if retired and not pending_effect and affected <= settled.get(key, set()):
+            continue
+        held.update(affected)
+        if work.get('identity'):
+            held.add(work['identity']['number'])
+    return held
+
+
 def validate_discovery(value):
     keys = {'symptoms', 'reproduction', 'evidence', 'expected', 'actual', 'environment', 'scope', 'scope_reason', 'affected'}
     require(isinstance(value, dict) and set(value) == keys and
