@@ -238,9 +238,47 @@ def main():
         control = commands.add_parser(name, help='Host-only gated merge and exact integrated delivery verification.')
         for option in ('project', 'iteration', 'merge-config'):
             control.add_argument('--' + option, required=True)
+    for name in ('observe-delivery', 'watch-delivery', 'inspect-delivery'):
+        control = commands.add_parser(name, help='Host-only deterministic main CI/CD and pinned deployment health.')
+        for option in ('project', 'iteration'):
+            control.add_argument('--' + option, required=True)
+        if name != 'inspect-delivery':
+            control.add_argument('--delivery-config', required=True, help='Private operator-approved pinned product contract.')
+        if name == 'watch-delivery':
+            control.add_argument('--samples', type=int, default=100, help='Bounded repeated observations (1..10000).')
+            control.add_argument('--interval', type=float, default=30, help='Seconds between observations (1..3600).')
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'observe-delivery', 'watch-delivery', 'inspect-delivery'}:
+        from . import delivery
+        from .repositories import RepositoryError, state_lock
+        import math
+        import time
+        try:
+            samples = args.samples if args.command == 'watch-delivery' else 1
+            interval = args.interval if args.command == 'watch-delivery' else 1
+            if not 1 <= samples <= 10000 or not math.isfinite(interval) or not 1 <= interval <= 3600:
+                raise IntakeError('invalid_delivery', 'Watcher requires 1..10000 samples and finite interval in [1, 3600].')
+            config = None if args.command == 'inspect-delivery' else delivery.load_config(args.delivery_config, args.operator_id)
+            uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if args.command == 'inspect-delivery' else '?mode=rw')
+            with closing(sqlite3.connect(uri, uri=True)) as database:
+                for index in range(samples):
+                    with state_lock(database):
+                        # Apply the same worker-mount exclusion as controlled merge configuration.
+                        if config is not None:
+                            from .merge import controller_paths
+                            controller_paths(database, args.delivery_config)
+                        result = delivery.inspect(database, args.project, args.iteration, args.operator_id) if config is None else delivery.sample(
+                            database, args.project, args.iteration, args.operator_id, config)
+                    print(json.dumps(result, sort_keys=True), flush=True)
+                    if index + 1 < samples:
+                        time.sleep(interval)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_delivery', 'Malformed delivery state/configuration; no health claim permitted.') from error
+        return
     if args.command in {'merge-preflight', 'merge-candidate', 'verify-delivery', 'inspect-merge'}:
         from .merge import lifecycle, inspect_merge
         from .repositories import RepositoryError

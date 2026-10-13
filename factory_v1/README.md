@@ -39,6 +39,17 @@ repository now has strict app-bound quality/security checks installed. A fresh n
 stage chain on that baseline, live gated merge and integrated delivery remain unverified;
 fixtures and baseline CI do not satisfy them.
 
+## Main CI/CD and deployment observation (#18)
+
+`observe-delivery`, bounded `watch-delivery` and `inspect-delivery` observe exact
+main checks/workflows and an explicitly configured, pinned deployment/acceptance
+contract. Failed **or unknown** delivery atomically records a correlated incident,
+freezes ordinary merges and enqueues durable exact-origin attention. The merge
+boundary re-observes installed health before mutation; exact gated recovery scope
+remains eligible. Routine health is silent. No production URL, deployment, repair
+execution, supervisor or live notification is invented or launched. See
+[configuration, lifecycle, evidence and real-path limits](DELIVERY.md).
+
 ## Stuck-work diagnosis and operator direction (#16)
 
 `declare-stuck` retains the responsible worker's attempted fixes and exact failure
