@@ -1,4 +1,5 @@
 """Host-only deterministic main delivery readback and atomic incident/outbox state."""
+import copy
 import http.client
 import json
 import math
@@ -344,6 +345,16 @@ def validate_persisted(database, item, saved):
 def sample(database, project, iteration, operator, config=None):
     """Caller holds shared lock. Evidence + incident + outbox commit in ONE transaction."""
     item = context(database, project, iteration, operator)
+    visited = {iteration}
+    while item.get('next_iteration'):
+        successor = context(database, project, item['next_iteration']['iteration_id'], operator)
+        require(successor['iteration_id'] not in visited and successor['repository'] == item['repository'] and
+                successor['origin'] == item['origin'] and
+                successor.get('previous_iteration', {}).get('iteration_id') == item['iteration_id'],
+                'Delivery continuation must retain exact same-product lineage.', 'invalid_delivery')
+        item = successor
+        iteration = item['iteration_id']
+        visited.add(iteration)
     saved = monitor_state(item, operator)
     validate_persisted(database, item, saved)
     config = validate_config(config, operator) if config is not None else (saved['config'] if saved else None)
@@ -358,6 +369,14 @@ def sample(database, project, iteration, operator, config=None):
         require(incident['status'] == 'active', 'Only active incident can hold the freeze.', 'invalid_delivery')
     notifications = attention.records(database, project, iteration, item)
     if incident is not None:
+        predecessor = item
+        visited = {iteration}
+        while predecessor.get('previous_iteration'):
+            predecessor = context(database, project, predecessor['previous_iteration']['iteration_id'], operator)
+            require(predecessor['iteration_id'] not in visited and predecessor['repository'] == item['repository'] and
+                    predecessor['origin'] == item['origin'], 'Invalid inherited delivery attention lineage.', 'invalid_delivery')
+            visited.add(predecessor['iteration_id'])
+            notifications += attention.records(database, project, predecessor['iteration_id'], predecessor)
         require(any(r['event']['event_id'] == incident['incident_id'] and r['event']['kind'] == 'incident' and
                 r['event']['evidence_ids'] == [incident['first_evidence']] and r['event']['issue_number'] == config['issue'] and
                 r['destination'] == item['origin'] for r in notifications),
@@ -400,6 +419,24 @@ def sample(database, project, iteration, operator, config=None):
         validate_persisted(database, durable_item, monitor_state(durable_item, operator))
         save_iteration(database, item)
     return {'monitor': item['delivery_monitor'], 'incident': item.get('main_incident'), 'evidence': evidence}
+
+
+def inherit_monitor(database, previous, successor, operator):
+    """Transfer exact delivery evidence without clearing freezes or duplicating attention."""
+    saved = monitor_state(previous, operator)
+    require(saved is not None or previous.get('main_incident') is None,
+            'An incident requires its configured monitor.', 'invalid_delivery')
+    if saved is None:
+        return
+    validate_persisted(database, previous, saved)
+    successor['delivery_monitor'] = copy.deepcopy(saved)
+    if previous.get('main_incident') is not None:
+        successor['main_incident'] = copy.deepcopy(previous['main_incident'])
+    for table in ('delivery_observations', 'delivery_incidents'):
+        database.execute('INSERT INTO ' + table + ' SELECT project, ?, id, payload FROM ' + table +
+                         ' WHERE project=? AND iteration=?',
+                         (successor['iteration_id'], previous['project_id'], previous['iteration_id']))
+    validate_persisted(database, successor, saved)
 
 
 def inspect(database, project, iteration, operator):

@@ -10,6 +10,16 @@ Keep SQLite state, journals/backups, request files, receipts and output in a pri
 
 The configured GitHub endpoint must be an approved narrow controller capability. Use a credential-blind broker, not a worker's personal token. HTTPS and loopback HTTP endpoints are supported. URL credentials, query/fragment, remote plaintext HTTP, redirects, environment proxies and invalid timeouts are refused. Endpoint and immutable repository identity are pinned by onboarding. The adapter does not itself prove OS isolation or broker authorization. Ticket publication requires a separately authorized Issues/dependencies/Projects capability at that same endpoint; metadata-only bootstrap access does not grant mutation authority. No credential bridge, paid fallback, protection bypass or gate weakening is introduced here. Independent review, required security/CI checks, controlled integration and integrated-main verification remain mandatory.
 
+## Healthy milestone completion and next interview (#24)
+
+`complete-iteration` revalidates the complete authoritative milestone, original
+independent review/integration evidence and fresh configured CI/CD/deployment
+acceptance, then atomically retains a report, exact-origin outbox intent and
+`waiting-for-operator`. It starts no follow-on work. Only a verified report delivery
+and Antoine's later explicit same-origin input admit `next-iteration`, which stages
+selected installed `grill-me` → `grilling` and correlated `to-spec` work for the
+same product. See [contracts, commands and deterministic verification](ITERATION.md).
+
 ## Independent review and corrections (#13)
 
 `prepare-review` creates separate fresh read-only Standards and Spec assignments from

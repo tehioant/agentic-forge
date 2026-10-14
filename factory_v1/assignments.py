@@ -133,12 +133,29 @@ def current(database, project, iteration, operator, require_active=True):
     return item
 
 
+def completed_iteration_claim(database, assignment):
+    """Only verified finite completion retires old engineering ownership, not tracker closure."""
+    scope = assignment['ticket_scope']
+    row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
+                           (scope['project'], scope['iteration'])).fetchone()
+    item = json.loads(row[0]) if row else {}
+    completion = item.get('completion', {})
+    report = completion.get('report', {})
+    runtime = assignment.get('runtime', {})
+    return bool(item.get('status') == 'waiting-for-operator' and
+                completion.get('report_id') == digest(report) and
+                runtime.get('status') == 'complete' and runtime.get('container_removed') is True and
+                any(work['issue']['number'] == scope['issue_number'] and work['issue']['id'] == scope['issue_id']
+                    for work in report.get('delivered', [])))
+
+
 def ticket_claims(database, scope):
     """Check durable role ownership for every supplied ticket identity field."""
     from .diagnosis import released_claim
     from .requirements import released_claim as revised_claim
     existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
-                not released_claim(database, old) and not revised_claim(database, old)]
+                not released_claim(database, old) and not revised_claim(database, old) and
+                not completed_iteration_claim(database, old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
                 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
@@ -151,7 +168,7 @@ def claims(database, request, scope, assignment_id):
         ticket_claims(database, scope)
     from .requirements import released_claim as revised_claim
     for old in existing:
-        if revised_claim(database, old):
+        if revised_claim(database, old) or completed_iteration_claim(database, old):
             continue
         if old['assignment_id'] == assignment_id:
             continue

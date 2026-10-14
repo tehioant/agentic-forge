@@ -222,7 +222,7 @@ class RequirementChangeTests(unittest.TestCase):
         with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
                 patch.object(requirement_publication, 'version_documents', return_value=record['publication']), \
                 patch.object(requirement_publication, 'spec_issue', return_value=8), \
-                patch('factory_v1.planning.complete', side_effect=lambda _d, i, *_: i):
+                patch('factory_v1.planning.read_publication', return_value=record['new_inputs']['handoff']):
             with self.assertRaises(repositories.RepositoryError) as caught:
                 requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
         self.assertEqual(caught.exception.code, 'stale_requirements'); self.database.rollback()
@@ -243,7 +243,7 @@ class RequirementChangeTests(unittest.TestCase):
         with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
                 patch.object(requirement_publication, 'version_documents', return_value=record['publication']), \
                 patch.object(requirement_publication, 'spec_issue', return_value=8), \
-                patch('factory_v1.planning.complete', side_effect=lambda _d, i, *_: i):
+                patch('factory_v1.planning.read_publication', return_value=record['new_inputs']['handoff']):
             result = requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
             self.assertEqual(result['requirement_changes']['durable-notes']['status'], 'published')
             self.github.request.assert_called_once(); self.github.request.reset_mock()
