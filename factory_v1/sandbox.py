@@ -145,7 +145,7 @@ def check_worker_evidence(assignment, root, inputs):
     return result
 
 
-def launch(state, project, iteration, operator, assignment_id, config_path, github):
+def launch(state, project, iteration, operator, assignment_id, config_path, github, *, stop_event=None):
     config = load_config(config_path)
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         from .restart import before_dispatch
@@ -199,6 +199,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     capability = None
     def cancel(signum, frame):
         stop.set()
+        if stop_event is not None:
+            stop_event.set()
         (root / 'stop').touch()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signals[signum] = signal.signal(signum, cancel)

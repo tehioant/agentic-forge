@@ -24,11 +24,20 @@ FIELDS = {'version', 'state', 'operator_id', 'project', 'iteration', 'api_base',
           'delivery_config', 'transport_config', 'dispatch_config'}
 
 
+def isolated_root(root):
+    source = Path(__file__).resolve().parent.parent
+    profiles = Path.home() / '.hermes/profiles'
+    require(all(not root.is_relative_to(scope) and not scope.is_relative_to(root) for scope in (source, profiles)),
+            'Service state must be isolated from profiles and controller source.', 'invalid_service')
+
+
 def initialize(root, operator, project, iteration, api_base):
     """Create an empty isolated envelope, not intake, grants or authorization."""
     root = Path(root)
     require(root.is_absolute() and all(assignments.identifier(v) for v in (operator, project, iteration)),
             'Absolute fresh root and exact operator/project/iteration required.', 'invalid_service')
+    isolated_root(root)
+    GitHub(api_base, 'credential-blind-controller', 10)
     physical(root.parent, directory=True)
     require(not root.exists() and not root.is_symlink(), 'Use a fresh service root.', 'invalid_service')
     root.mkdir(mode=0o700)
@@ -72,9 +81,7 @@ def load(path):
             type(config['interval']) is int and 1 <= config['interval'] <= 3600 and
             config['state'] == str(root / 'controller.sqlite'), 'Malformed service scope/state.', 'invalid_service')
     controls.private(physical(config['state']))
-    require(not root.is_relative_to(Path.home() / '.hermes/profiles') and
-            not root.is_relative_to(Path(__file__).resolve().parent.parent),
-            'Service state must be isolated from profiles and controller source.', 'invalid_service')
+    isolated_root(root)
     for key in ('delivery_config', 'transport_config', 'dispatch_config'):
         require(config[key] is None or (isinstance(config[key], str) and Path(config[key]).is_absolute()),
                 'Use explicit private capability paths or null.', 'invalid_service')
@@ -104,26 +111,22 @@ def startup(config, github):
             return restart.reconcile(db, *scope(config), github)
 
 
-def dispatch(config, github):
+def dispatch(config, github, *, stop_event=None):
     from .service_dispatch import tick
-    return tick(config, github)
+    return tick(config, github, stop_event=stop_event)
 
 
-def cycle(config, github):
+def cycle(config, github, *, stop_event=None):
     with connect(config) as db:
         controls.owner(db, *scope(config))
-        if controls.blocked(db, config['project'], config['iteration']):
-            return {'status': 'paused', 'dispatch_allowed': False, 'blockers': ['explicit_resume_required']}
         item = assignments.current(db, *scope(config), require_active=False)
-        if item['status'] != 'active':
-            return {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['iteration_not_active']}
+        healthy = True
         if config['delivery_config'] is not None:
             with state_lock(db):
                 from .merge import controller_paths
                 controller_paths(db, config['delivery_config'])
                 observed = delivery.sample(db, *scope(config), delivery.load_config(config['delivery_config'], config['operator_id']))
-                if observed['evidence']['status'] != 'healthy':
-                    return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['delivery_not_healthy']}
+                healthy = observed['evidence']['status'] == 'healthy'
         if config['transport_config'] is not None:
             with state_lock(db):
                 from .merge import controller_paths
@@ -132,9 +135,15 @@ def cycle(config, github):
                 for record in attention.records(db, config['project'], config['iteration'], item):
                     if record['state'] == 'pending':
                         attention.deliver(db, item, record['event']['event_id'], config['transport_config'])
+        if controls.blocked(db, config['project'], config['iteration']):
+            return {'status': 'paused', 'dispatch_allowed': False, 'blockers': ['explicit_resume_required']}
+        if not healthy:
+            return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['delivery_not_healthy']}
+        if item['status'] != 'active':
+            return {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['iteration_not_active']}
     if config['dispatch_config'] is None:
         return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['dispatch_capability_unavailable']}
-    return dispatch(config, github)
+    return dispatch(config, github, stop_event=stop_event)
 
 
 def status(config):
@@ -173,6 +182,28 @@ def install(config, directory):
     return path
 
 
+def supervisor(config, action):
+    require(action in {'start', 'stop', 'restart', 'status'}, 'Unsupported supervisor action.', 'invalid_service')
+    result = subprocess.run(['systemctl', '--user', 'show', UNIT, '--property=FragmentPath', '--property=DropInPaths'],
+                            check=True, capture_output=True, text=True, timeout=30)
+    properties = dict(line.split('=', 1) for line in result.stdout.splitlines())
+    require(set(properties) == {'FragmentPath', 'DropInPaths'} and not properties['DropInPaths'] and
+            assignments.absolute(properties['FragmentPath']),
+            'Missing unit or unreviewed supervisor overrides.', 'invalid_service')
+    unit = physical(properties['FragmentPath'])
+    require(unit.name == UNIT and unit.stat().st_uid == os.getuid() and not unit.stat().st_mode & 0o022 and
+            unit.read_text() == unit_text(config), 'Installed source/config differs from selected unit.', 'invalid_service')
+    if action == 'status':
+        result = subprocess.run(['systemctl', '--user', 'show', UNIT, '--property=ActiveState', '--property=SubState', '--property=MainPID'],
+                                check=True, capture_output=True, text=True, timeout=30)
+        return dict(line.split('=', 1) for line in result.stdout.splitlines())
+    if action in {'stop', 'restart'}:
+        with connect(config) as db:
+            controls.request(db, *scope(config), 'emergency-stop', 'supervisor-' + action)
+    subprocess.run(['systemctl', '--user', action, UNIT], check=True, timeout=60)
+    return None
+
+
 def run(config, stop=None):
     stop = threading.Event() if stop is None else stop
     root = Path(config['state']).parent
@@ -191,7 +222,7 @@ def run(config, stop=None):
             startup(config, github)
             while not stop.is_set():
                 try:
-                    result = cycle(config, github)
+                    result = cycle(config, github, stop_event=stop)
                 except (RepositoryError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
                     result = {'status': 'blocked', 'dispatch_allowed': False,
                               'blockers': [error.code if isinstance(error, RepositoryError) else 'service_observation_unavailable']}
@@ -238,12 +269,9 @@ def main():
         if args.command == 'install':
             print(install(config, args.unit_directory))
         elif args.command in {'start', 'stop', 'restart'}:
-            # Refuse controlling an unrelated existing unit under our fixed name.
-            observed = subprocess.run(['systemctl', '--user', 'cat', UNIT], check=True, capture_output=True, text=True, timeout=30)
-            require(unit_text(config) in observed.stdout, 'Installed unit does not match selected source/config.', 'invalid_service')
-            subprocess.run(['systemctl', '--user', args.command, UNIT], check=True, timeout=60)
+            supervisor(config, args.command)
         elif args.command == 'status':
-            print(json.dumps(status(config), sort_keys=True))
+            print(json.dumps({**status(config), 'supervisor': supervisor(config, 'status')}, sort_keys=True))
         elif args.command == 'run':
             run(config)
         else:
