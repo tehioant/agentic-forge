@@ -163,8 +163,6 @@ class IterationComponents(unittest.TestCase):
             save_iteration(self.db, changed)
             self.db.commit()
             return self.health
-        self.mocks['delivery.observe'].side_effect = [self.health, pause_after_io]
-        # A side-effect list returns callables, so inject by count instead.
         count = 0
         def observe(config):
             nonlocal count
@@ -186,6 +184,36 @@ class IterationComponents(unittest.TestCase):
             planning.complete(self.db, item, {}, self.github)
         with self.db, self.assertRaises(IntakeError):
             register_iteration(self.db, dict(context(), iteration_id='m2'))
+
+    def test_every_required_item_gets_two_fresh_delivery_checks(self):
+        self.observed['items'].append(work_row(2))
+        self.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
+        def delivered(database, item, row, *args):
+            value = copy.deepcopy(self.delivered)
+            value['issue']['number'] = row['number']
+            return value
+        self.mocks['iteration.delivered_item'].side_effect = delivered
+        report = self.complete({'merge_configs': ['one.json', 'two.json']})
+        self.assertEqual([r['issue']['number'] for r in report['report']['delivered']], [1, 2])
+        self.assertEqual([c.args[2]['number'] for c in self.mocks['iteration.delivered_item'].call_args_list], [1, 2, 1, 2])
+
+    def test_unreconciled_worker_or_required_hold_prevents_completion(self):
+        assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1'},
+                      'runtime': {'status': 'running', 'container_removed': False}}
+        with patch.object(assignments, 'rows', return_value=[assignment]), self.assertRaises(RepositoryError):
+            self.complete()
+        for source in ('requirements', 'diagnosis', 'bugs'):
+            with patch('factory_v1.' + source + '.held_numbers', return_value={1}), self.assertRaises(RepositoryError):
+                self.complete()
+        self.assertNotIn('completion', self.stored())
+
+    def test_reservation_is_archived_not_left_as_an_executable_claim(self):
+        self.item['reservation'] = {'issue_number': 1, 'status': 'reserved'}
+        self.store()
+        self.complete()
+        stored = self.stored()
+        self.assertNotIn('reservation', stored)
+        self.assertEqual(stored['reservation_history'], [self.item['reservation']])
 
     def test_public_cli_routes_completion_and_structured_malformed_refusals(self):
         path = self.root / 'request.json'
@@ -275,10 +303,13 @@ class ContinuationComponents(unittest.TestCase):
         self.db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
         self.db.execute('CREATE TABLE notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
         self.item = context()
-        self.item.update(status='waiting-for-operator', completion={'report_id': 'c' * 64, 'event_id': 'completion-event', 'report': {}})
+        report = {k: self.item[k] for k in ('project_id', 'iteration_id', 'repository')}
+        report_id = assignments.digest(report)
+        self.item.update(status='waiting-for-operator', completion={'report_id': report_id,
+                         'event_id': 'completion-' + report_id, 'report': report})
         self.db.execute('INSERT INTO iterations VALUES (?, ?, ?)', ('product', 'm1', json.dumps(self.item)))
         self.db.commit()
-        self.request = {'iteration_id': 'm2', 'event_id': 'completion-event', 'operator_id': '42', 'origin': ORIGIN,
+        self.request = {'iteration_id': 'm2', 'event_id': self.item['completion']['event_id'], 'operator_id': '42', 'origin': ORIGIN,
                         'reference': 'later-user-message', 'message_id': '102', 'input': 'Add search to this product', 'skills': []}
         # Independent immutable fixture snapshots, not actual host skill discovery.
         snapshots = Path(__file__).parent / 'planning_skill_snapshots'
@@ -379,6 +410,67 @@ class ContinuationComponents(unittest.TestCase):
             if defect == 'adaptation': evidence['adaptation'] = 'invented'
             with self.subTest(defect=defect), self.assertRaises(RepositoryError):
                 planning.continuation_evidence(item['planning'], bad, item['planning']['skills'])
+
+    def test_pending_interview_never_reads_publication_and_complete_updates_spec_pointers(self):
+        item = self.start()
+        request = self.evidence(item, sufficient=False)
+        request.pop('documents')
+        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
+                       rationale='Need the actual answer', reference='agent-pending', pending_questions=['Which search?'])
+        request['execution']['result_digest'] = assignments.digest(request['pending_questions'])
+        question = request['execution']['rounds'][0]['questions'][0]
+        question.update(answer=None, operator_id=None, reference=None)
+        request['execution']['rounds'][0]['complete'] = False
+        github = Mock(base='http://127.0.0.1:9876')
+        with self.db:
+            pending = planning.complete(self.db, item, request, github)
+        self.assertEqual(pending['planning']['pending_questions'], ['Which search?'])
+        self.assertNotIn('handoff', pending)
+        github.request.assert_not_called()
+        request = self.evidence(item)
+        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
+                       rationale='Answered current frontier', reference='agent-sufficient', commit='e' * 40, issue_number=8)
+        request['documents']['milestone.md'] = '\n'.join('## ' + section + '\nSubstantive agreed text.\n' for section in planning.SECTIONS)
+        request['execution']['result_digest'] = assignments.digest(request['documents'])
+        def read(path):
+            if '/git/commits/' in path:
+                return {'sha': request['commit']}
+            if '/contents/' in path:
+                name = path.split('/')[-1].split('?')[0]
+                raw = request['documents'][name].encode()
+                return {'type': 'file', 'path': item['planning']['docs_path'] + '/' + name, 'encoding': 'base64',
+                        'content': base64.b64encode(raw).decode(),
+                        'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()}
+            return {'number': 8, 'id': 80, 'state': 'open', 'body': request['documents']['milestone.md'],
+                    'html_url': 'https://github.com/example/product/issues/8',
+                    'repository_url': 'https://api.github.com/repos/example/product', 'labels': [{'name': 'ready-for-agent'}]}
+        github.request.side_effect = read
+        with patch.object(planning, 'reconcile'), self.db:
+            completed = planning.complete(self.db, pending, request, github)
+        self.assertEqual(completed['stage'], 'planning_complete')
+        self.assertEqual(completed['handoff']['commit'], 'e' * 40)
+        self.assertEqual(completed['handoff']['issue']['number'], 8)
+        self.assertEqual(completed['planning']['execution'], request['execution'])
+        previous = json.loads(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m1'").fetchone()[0])
+        self.assertEqual(previous['handoff'], self.item['handoff'])
+        self.assertNotIn('ticket_work', completed)
+        self.assertFalse(completed['execution_allowed'])
+
+    def test_stale_spec_pointer_catalog_only_and_conflicting_next_input_refuse(self):
+        item = self.start()
+        request = self.evidence(item)
+        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
+                       rationale='Ready', reference='agent', commit=SHA, issue_number=7)
+        request['documents']['milestone.md'] = '\n'.join('## ' + section + '\nReal text.\n' for section in planning.SECTIONS)
+        request['execution']['result_digest'] = assignments.digest(request['documents'])
+        with self.db, self.assertRaises(RepositoryError):
+            planning.complete(self.db, item, request, Mock())
+        request.pop('execution')
+        with self.db, self.assertRaises(RepositoryError):
+            planning.complete(self.db, item, request, Mock())
+        with self.assertRaises(RepositoryError):
+            self.start(dict(self.request, input='Conflicting new batch'))
+        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM iterations').fetchone()[0], 2)
 
     def test_completed_iteration_claim_retirement_is_not_issue_closure(self):
         assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 1, 'issue_id': 10},

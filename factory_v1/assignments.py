@@ -182,7 +182,7 @@ def claims(database, request, scope, assignment_id):
     for row in database.execute('SELECT payload FROM iterations'):
         item = json.loads(row[0])
         reservation = item.get('reservation')
-        if reservation and not item.get('completion'):
+        if reservation:
             require((item['project_id'], item['iteration_id'], item['repository'], reservation.get('issue_number')) ==
                     (scope['project'], scope['iteration'], scope['repository'], scope['issue_number']) and
                     reservation.get('status') != 'invalidated' and

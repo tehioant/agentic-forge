@@ -94,8 +94,9 @@ def complete(database, project, iteration, operator, request, github):
     item = delivery.context(database, project, iteration, operator)
     require(item['status'] in {'active', 'waiting-for-operator'} and not item.get('next_iteration'),
             'Paused or continued iteration cannot complete.', 'iteration_paused')
-    require(all(not a.get('runtime') or (a['runtime'].get('status') in {'complete', 'failed', 'stopped'} and
-                a['runtime'].get('container_removed') is True) for a in assignments.rows(database)
+    require(all(requirements.released_claim(database, a) or diagnosis.released_claim(database, a) or
+                (a.get('runtime', {}).get('status') in {'complete', 'failed', 'stopped'} and
+                 a['runtime'].get('container_removed') is True) for a in assignments.rows(database)
                 if a['ticket_scope']['project'] == project and a['ticket_scope']['iteration'] == iteration),
             'Workers must be reconciled and absent before completion.', 'iteration_incomplete')
     require(isinstance(request, dict) and set(request) == {'merge_configs'} and
@@ -120,9 +121,10 @@ def complete(database, project, iteration, operator, request, github):
     require(health['status'] == 'healthy', 'Actual configured CI/CD and deployment health unknown/failed.', 'iteration_incomplete')
     delivered = [delivered_item(database, item, row, configs[row['number']], operator, github, health['main']) for row in required]
     bug_records = [{'discovery': w['discovery'], 'identity': w.get('identity'), 'status': w['status'],
-                    'publication_complete': w.get('publication_complete', False)}
-                   for w in item.get('bug_work', {}).values()]
-    require(all(w['discovery']['scope'] == 'deferred' or (w['publication_complete'] and w['identity'] and
+                    'archived': archived, 'publication_complete': w.get('publication_complete', False)}
+                   for archived, records in ((False, item.get('bug_work', {}).values()), (True, item.get('bug_work_history', [])))
+                   for w in records]
+    require(all(w['archived'] or w['discovery']['scope'] == 'deferred' or (w['publication_complete'] and w['identity'] and
                 w['identity']['number'] in configs) for w in bug_records),
             'Blocking/recovery bugs must have verified delivery.', 'iteration_incomplete')
     require(delivery.observe(saved['config']) == health and
@@ -143,6 +145,8 @@ def complete(database, project, iteration, operator, request, github):
     require(latest == item, 'Iteration changed across external verification; no report admitted.', 'completion_race')
     if 'completion' not in item:
         item['completion'] = completion
+        if item.get('reservation'):
+            item.setdefault('reservation_history', []).append(item.pop('reservation'))
         item['status'] = 'waiting-for-operator'
         transition(item, 'waiting-for-operator')
         database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
@@ -174,6 +178,10 @@ def next_iteration(database, project, iteration, operator, request):
     require(completion is not None and item['status'] == 'waiting-for-operator' and
             request['event_id'] == completion['event_id'], 'Bind the completed iteration invitation.', 'iteration_wait_required')
     assert completion is not None
+    require(completion['report_id'] == assignments.digest(completion['report']) and
+            completion['event_id'] == 'completion-' + completion['report_id'] and
+            all(completion['report'].get(k) == item[k] for k in ('project_id', 'iteration_id', 'repository')),
+            'Exact immutable completion report required.', 'invalid_completion')
     record = attention.get_record(database, item, completion['event_id'])
     require(record['state'] == 'delivered' and text(request['message_id']) and request['message_id'].isascii() and
             request['message_id'].isdigit() and not request['message_id'].startswith('0') and len(request['message_id']) <= 20 and

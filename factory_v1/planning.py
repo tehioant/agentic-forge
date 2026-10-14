@@ -174,7 +174,7 @@ def continuation_evidence(planning, request, skills):
                 'Respect explicit round-completion gates before synthesis.', 'execution_evidence_required')
     work = evidence['work']
     require(isinstance(work, list) and [w.get('skill') for w in work if isinstance(w, dict)] == required_names and
-            all(set(w) == {'skill', 'tool_reference', 'result'} and text(w['tool_reference']) and text(w['result']) for w in work),
+            all(isinstance(w, dict) and set(w) == {'skill', 'tool_reference', 'result'} and text(w['tool_reference']) and text(w['result']) for w in work),
             'Retain ordered grill-me → grilling → to-spec work, not a catalog assertion.', 'execution_evidence_required')
     return evidence
 
