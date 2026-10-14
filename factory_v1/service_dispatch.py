@@ -5,6 +5,7 @@ One configured ticket is driven from the authoritative frontier; a missing host
 capability is a hold, never a fabricated executor or permission to fall back.
 """
 from pathlib import Path
+from contextlib import contextmanager
 import os
 import signal
 import subprocess
@@ -129,9 +130,15 @@ def synthesize(database, item, config, github, *, stop_event=None):
     require('service_attempt' not in work, 'Reconcile the retained synthesis attempt; no blind retry.', 'execution_uncertain')
     work['service_attempt'] = {'input_digest': work['input_digest'], 'capability': capability}
     checkpoint(database, item)
+    @contextmanager
+    def spawn_admission():
+        with controls.admission(database, item['project_id'], item['iteration_id']):
+            require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+            yield
     produced = requirement_execution.invoke(capability, work,
         cancelled=lambda: (stop_event is not None and stop_event.is_set()) or
-                          controls.blocked(database, item['project_id'], item['iteration_id']))
+                          controls.blocked(database, item['project_id'], item['iteration_id']),
+        admission=spawn_admission)
     # Keep raw output even if semantic validation/refreshed admission fails.
     work['service_receipt'] = produced
     from .repositories import save_iteration
