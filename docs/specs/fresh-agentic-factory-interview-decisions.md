@@ -186,3 +186,15 @@ Exact controller storage/schema, supervisor configuration, GitHub Projects board
 **Settled clarification:** The factory must run the existing server skills for their corresponding stages, not merely reproduce similar outcomes or validate their availability. Bind grilling to `grill-me`/`grilling`, specification synthesis to `to-spec`, ticket synthesis to `to-tickets`, implementation/corrections to `implement`, simplification to the installed non-Matt `simplify-code`, independent Standards/Spec review to `code-review`, and diagnosis to `diagnosing-bugs`. Repair uses these same diagnosis and engineering stages. Select exact installed sources/dependencies, retain pinned inputs and actual execution evidence, and apply the explicit factory stage adaptations in the specification.
 
 **Scope:** Update the specification and relevant ticket acceptance requirements. This instruction does not resume workers, merge implementation PRs, close delivery tickets, modify shared skill files, authorize spending or weaken gates. Original Q1–Q39 answers are preserved.
+
+## Subsequent operator clarification — Project verification contract
+
+**Source:** Issue #18 Discord thread `1559512357305065524`, after discussion of a proposed live deployment/outage/recovery acceptance exercise.
+
+**Operator wording:**
+
+> add in the project config specs, not acceptance test of this sort
+
+**Settled clarification:** Record verification and deployment requirements in project configuration/specifications. For Agentic Forge implementation tickets, retain meaningful automated behavior tests, independent Standards/Spec review, merge and integrated CI without an additional live deployment/outage/recovery completion gate or default manual user testing. This revises the live test-target completion requirement for #18, not the runtime requirement to observe actual configured deployment health before clearing an incident. Report simulated and live evidence separately.
+
+**Scope:** Project instructions and specification policy only. Preserve the original interview answers and the separately agreed whole-factory live validation. This clarification does not itself run tests or deployments, change controller gates, publish changes, merge code, close issues or authorize spending.
