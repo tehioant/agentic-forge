@@ -79,6 +79,10 @@ def register_iteration(database, item):
         if any(existing.get(key) != item.get(key) for key in ['work_item_number', 'repository_intent']) or any(existing.get(key) != value for key, value in item.items()):
             raise IntakeError('intake_conflict', 'This iteration is already registered with different provenance or scope.')
         return existing
+    waiting = database.execute("SELECT 1 FROM iterations WHERE project_id=? AND "
+                               "json_extract(payload, '$.status')='waiting-for-operator'", (item['project_id'],)).fetchone()
+    if waiting:
+        raise IntakeError('iteration_wait_required', 'Use authenticated next-iteration input for this same product, not fresh intake.')
     active = database.execute(
         "SELECT 1 FROM iterations WHERE json_extract(payload, '$.status')='active' LIMIT 1"
     ).fetchone()
@@ -262,9 +266,36 @@ def main():
         if name == 'watch-delivery':
             control.add_argument('--samples', type=int, default=100, help='Bounded repeated observations (1..10000).')
             control.add_argument('--interval', type=float, default=30, help='Seconds between observations (1..3600).')
+    for name in ('complete-iteration', 'next-iteration'):
+        control = commands.add_parser(name, help='Verified milestone report/wait or explicit same-product interview input.')
+        for option in ('project', 'iteration', 'request'):
+            control.add_argument('--' + option, required=True)
+        if name == 'complete-iteration':
+            control.add_argument('--api-base', required=True)
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
+    if args.command in {'complete-iteration', 'next-iteration'}:
+        from . import iteration
+        from .repositories import GitHub, RepositoryError, state_lock
+        try:
+            with open(args.request, encoding='utf-8') as source:
+                request = json.load(source, object_pairs_hook=unique_fields)
+            uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+            with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database), database:
+                if args.command == 'complete-iteration':
+                    result = iteration.complete(database, args.project, args.iteration, args.operator_id, request,
+                                                GitHub(args.api_base, args.bearer, args.timeout))
+                else:
+                    result = iteration.next_iteration(database, args.project, args.iteration, args.operator_id, request)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_completion', 'Malformed or unavailable iteration input/evidence; no completion or continuation admitted.') from error
+        print(json.dumps(result, sort_keys=True))
+        return
     if args.command in {'observe-delivery', 'watch-delivery', 'inspect-delivery'}:
         from . import delivery
         from .repositories import RepositoryError, state_lock

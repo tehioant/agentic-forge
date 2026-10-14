@@ -61,10 +61,30 @@ def reload_locked(database, item):
     return json.loads(row[0])
 
 
+NEXT_ADAPTATION = 'factory-next-interview-v1:same-product;explicit-input;preserve-round-gates;automatic-synthesis;host-publication'
+
+
+def assign(item, request, skills):
+    previous = item.get('planning')
+    if previous:
+        item.setdefault('planning_history', []).append(previous)
+    assignment_id = str(uuid.uuid4())
+    item['planning'] = {'assignment_id': assignment_id, 'revision': request['expected_revision'] + 1,
+                        'request': request, 'origin': item['origin'], 'status': 'pending',
+                        'skills': skills, 'instructions': INSTRUCTIONS,
+                        'docs_path': f"docs/factory/{item['iteration_id']}/{assignment_id}",
+                        'pending_questions': []}
+    transition(item, 'planning_pending')
+
+
 def plan(database, item, request):
     from .controls import require_active
     item = reload_locked(database, item)
     require_active(database, item['project_id'], item['iteration_id'])
+    require(item.get('status') == 'active' and not item.get('completion') and
+            not item.get('previous_iteration'),
+            'Use explicit next-iteration input after completion; continuation assignments cannot be replaced by plan.',
+            'iteration_wait_required')
     require(item.get('repository_onboarding', {}).get('status') == 'verified',
             'Onboard the explicitly selected repository first.', 'onboarding_required')
     require(isinstance(request, dict) and set(request) == {'origin', 'expected_revision', 'skills'},
@@ -81,14 +101,7 @@ def plan(database, item, request):
         return item
     require(request['expected_revision'] == (previous['revision'] if previous else 0),
             'Inspect the current revision before changing planning scope.', 'planning_conflict')
-    if previous:
-        item.setdefault('planning_history', []).append(previous)
-    assignment_id = str(uuid.uuid4())
-    item['planning'] = {'assignment_id': assignment_id, 'revision': request['expected_revision'] + 1,
-                        'request': request, 'origin': item['origin'], 'status': 'pending',
-                        'skills': skills, 'instructions': INSTRUCTIONS,
-                        'docs_path': f"docs/factory/{item['iteration_id']}/{assignment_id}",
-                        'pending_questions': []}
+    assign(item, request, skills)
     item.pop('handoff', None)
     if item.get('ticket_work'):
         item.setdefault('ticket_history', []).append(item.pop('ticket_work'))
@@ -123,13 +136,60 @@ def checkpoint(database, item):
         database.commit()
 
 
+def continuation_evidence(planning, request, skills):
+    """Correlate selected instruction loads, real answers and observable synthesis work."""
+    from .assignments import digest
+    context = planning['continuation']
+    evidence = request.get('execution')
+    required_names = ['grill-me', 'grilling'] + (['to-spec'] if request['sufficient'] else [])
+    expected = {skills[name]['path']: skills[name]['sha256'] for name in required_names}
+    expected.update(context['input_loads'])
+    expected['planning:input'] = digest(context['input'])
+    expected['planning:adaptation'] = hashlib.sha256(NEXT_ADAPTATION.encode()).hexdigest()
+    require(isinstance(evidence, dict) and set(evidence) == {'assignment_id', 'run_id', 'origin', 'adaptation', 'loads', 'rounds', 'work', 'result_digest'} and
+            evidence['assignment_id'] == planning['assignment_id'] and text(evidence['run_id']) and
+            evidence['origin'] == planning['origin'] and evidence['adaptation'] == NEXT_ADAPTATION and
+            evidence['result_digest'] == digest(request.get('documents', request['pending_questions'])),
+            'Retain correlated actual interview/synthesis evidence.', 'execution_evidence_required')
+    loads = evidence['loads']
+    require(isinstance(loads, list) and len(loads) == len(expected) and all(isinstance(row, dict) and
+            set(row) == {'source', 'sha256', 'tool_reference'} and text(row['source']) and
+            row['source'] in expected and row['sha256'] == expected[row['source']] and text(row['tool_reference']) for row in loads) and
+            {row['source'] for row in loads} == set(expected),
+            'Load the selected installed instructions, previous specs, actual input and adaptation.', 'execution_evidence_required')
+    rounds = evidence['rounds']
+    require(isinstance(rounds, list) and rounds, 'Retain actual interview rounds.', 'execution_evidence_required')
+    for round_ in rounds:
+        require(isinstance(round_, dict) and set(round_) == {'reference', 'complete', 'questions'} and
+                text(round_['reference']) and type(round_['complete']) is bool and isinstance(round_['questions'], list) and round_['questions'],
+                'Retain numbered questions, recommendations and actual operator answers.', 'execution_evidence_required')
+        for question in round_['questions']:
+            require(isinstance(question, dict) and set(question) == {'number', 'question', 'recommendation', 'answer', 'operator_id', 'reference'} and
+                    type(question['number']) is int and question['number'] > 0 and text(question['question']) and text(question['recommendation']) and
+                    ((question['answer'] is None and question['operator_id'] is None and question['reference'] is None and not request['sufficient']) or
+                     (text(question['answer']) and question['operator_id'] == context['input']['operator_id'] and text(question['reference']))),
+                    'Missing input cannot become an invented answer.', 'execution_evidence_required')
+        require(len({q['number'] for q in round_['questions']}) == len(round_['questions']) and
+                (not request['sufficient'] or round_['complete']),
+                'Respect explicit round-completion gates before synthesis.', 'execution_evidence_required')
+    work = evidence['work']
+    require(isinstance(work, list) and [w.get('skill') for w in work if isinstance(w, dict)] == required_names and
+            all(set(w) == {'skill', 'tool_reference', 'result'} and text(w['tool_reference']) and text(w['result']) for w in work),
+            'Retain ordered grill-me → grilling → to-spec work, not a catalog assertion.', 'execution_evidence_required')
+    return evidence
+
+
 def complete(database, item, request, github):
     from .controls import require_active
     item = reload_locked(database, item)
     require_active(database, item['project_id'], item['iteration_id'])
+    require(item.get('status') == 'active' and not item.get('completion'),
+            'Completed/paused work cannot restart planning.', 'iteration_wait_required')
     planning = item.get('planning')
     require(planning is not None, 'Start a same-conversation planning assignment first.', 'planning_required')
     common = {'assignment_id', 'origin', 'sufficient', 'rationale', 'reference', 'pending_questions'}
+    if planning.get('continuation'):
+        common.add('execution')
     require(isinstance(request, dict) and common <= request.keys() and type(request['sufficient']) is bool,
             'Provide exact assignment identity and agent clarification judgment.')
     require(set(request) == (common | {'documents', 'commit', 'issue_number'} if request['sufficient'] else common),
@@ -139,7 +199,14 @@ def complete(database, item, request, github):
     require(text(request['rationale']) and text(request['reference']), 'Retain agent judgment and its reference.')
     pending = request['pending_questions']
     require(isinstance(pending, list) and all(text(q) for q in pending), 'Pending questions must be a list of actual open questions.')
-    resolve(planning['request']['skills'])  # Revalidate even on restart/retry.
+    if planning.get('continuation'):
+        from .skills import resolve_installed
+        selected = resolve_installed(planning['request']['skills'])
+        require(selected == planning['skills'], 'Selected source pins changed.', 'skill_blocked')
+        evidence = continuation_evidence(planning, request, selected)
+        planning['execution'] = evidence
+    else:
+        resolve(planning['request']['skills'])  # Revalidate even on restart/retry.
     if not request['sufficient']:
         require(planning['status'] != 'complete', 'Reassign explicitly before changing a completed milestone.', 'planning_conflict')
         planning['pending_questions'] = pending
@@ -156,6 +223,10 @@ def complete(database, item, request, github):
     require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit) is not None and
             type(number) is int and number > 0, 'Use an exact immutable full commit SHA and positive issue number.')
     require(number != item.get('work_item_number'), 'Do not repurpose the unchanged parent work/spec issue.')
+    if planning.get('continuation'):
+        previous = planning['continuation']['previous_spec']
+        require(number != previous['issue']['number'] and commit != previous['commit'],
+                'Publish new next-iteration specification pointers, preserving the delivered milestone.', 'planning_conflict')
     digest = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
     require(planning.get('completion_digest', digest) == digest,
             'Completed publication cannot be silently replaced; reassign explicitly.', 'planning_conflict')
