@@ -171,6 +171,8 @@ def claims(database, request, scope, assignment_id):
         ticket_claims(database, scope)
     from .requirements import released_claim as revised_claim
     from .restart import released_claim as recovered_claim
+    from .recovery import released_claim as recovery_claim
+    from .diagnosis import released_claim as directed_claim
     for old in existing:
         if recovered_claim(old):
             require(old['assignment_id'] == assignment_id or old['claim_id'] != request['claim_id'],
@@ -180,7 +182,8 @@ def claims(database, request, scope, assignment_id):
             continue
         if old['assignment_id'] == assignment_id:
             continue
-        require(not (request['stage'] in {'implementation', 'corrections', 'simplify', 'repair'} and
+        require(not (not recovery_claim(database, old) and not directed_claim(database, old) and
+                     request['stage'] in {'implementation', 'corrections', 'simplify', 'repair'} and
                      old['handoff']['stage'] in {'implementation', 'corrections', 'simplify', 'repair'} and
                      old.get('runtime', {}).get('status') in {'preparing', 'running', 'unconfirmed', 'stopped', 'failed'}),
                 'Existing modifying attempt needs exact cleanup and explicit recovery, not a concurrent writer.', 'claim_conflict')
@@ -212,7 +215,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     item = current(database, project, iteration, operator)
     if not dry_run:
         from .restart import before_dispatch
-        before_dispatch(database, project, iteration, operator, github)
+        before_dispatch(database, project, iteration, operator, github, request=request)
         item = current(database, project, iteration, operator)
     from . import recovery
     recovery.admission(item, request['stage'], request['issue']['number'])

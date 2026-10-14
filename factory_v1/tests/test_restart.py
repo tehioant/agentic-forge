@@ -302,7 +302,7 @@ class RestartTests(unittest.TestCase):
              patch.object(restart, 'before_dispatch', side_effect=RepositoryError('reconciliation_required', 'unknown')) as admission, \
              patch.object(sandbox, 'Docker') as docker, self.assertRaises(RepositoryError):
             sandbox.launch(self.state, 'p', 'i', 'operator', 'assignment', '/SIMULATED-config', self.github)
-        admission.assert_called_once_with(ANY, 'p', 'i', 'operator', self.github, force=True)
+        admission.assert_called_once_with(ANY, 'p', 'i', 'operator', self.github, force=True, assignment_id='assignment')
         docker.assert_not_called()
 
     def test_public_prepare_and_reserve_use_restart_boundary_before_claims(self):

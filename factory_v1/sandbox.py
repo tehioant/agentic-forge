@@ -149,7 +149,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     config = load_config(config_path)
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         from .restart import before_dispatch
-        before_dispatch(database, project, iteration, operator, github, force=True)
+        before_dispatch(database, project, iteration, operator, github, force=True, assignment_id=assignment_id)
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
         if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec', 'corrections'}:

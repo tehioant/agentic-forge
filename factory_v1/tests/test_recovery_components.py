@@ -84,6 +84,9 @@ class RecoveryComponentFixture(RecoveryFixture):
         stack.enter_context(patch.object(role_skills, 'snapshots', return_value=selected))
         stack.enter_context(patch.object(assignments, 'admission_preview', return_value={'scope': 'test'}))
         stack.enter_context(patch.object(tickets, 'frontier', side_effect=frontier))
+        # Restart inventory is an independent precursor to these recovery guards;
+        # its real integration is covered by test_restart_recovery.
+        stack.enter_context(patch('factory_v1.restart.before_dispatch'))
         return stack
 
     def prepare(self, claim='repair-1', dry_run=False):

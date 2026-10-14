@@ -225,7 +225,9 @@ def inspect(database, project, iteration, operator):
         checkpoint = snapshot(database, project, iteration)
         validate_owner(checkpoint, operator)
         record = read(database, project, iteration)
-        restart_ready = checkpoint['iteration'].get('restart_reconciliation', {}).get('status', 'ready') == 'ready'
+        from .recovery import pending_registration
+        restart_ready = (checkpoint['iteration'].get('restart_reconciliation', {}).get('status', 'ready') == 'ready' and
+                         not checkpoint['iteration'].get('main_incident') and not pending_registration(checkpoint['iteration']))
         if record is None:
             return {'project': project, 'iteration': iteration, 'action': None, 'state': None,
                     'dispatch_allowed': restart_ready and checkpoint['iteration']['status'] == 'active', 'checkpoint': checkpoint}

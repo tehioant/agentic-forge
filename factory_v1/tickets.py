@@ -549,7 +549,8 @@ def reserve(database, item, github, number):
     from .assignments import ticket_claims
     from .restart import before_dispatch
 
-    before_dispatch(database, item['project_id'], item['iteration_id'], item['approval']['operator_id'], github)
+    before_dispatch(database, item['project_id'], item['iteration_id'], item['approval']['operator_id'], github,
+                    request={'stage': 'reservation', 'issue': {'number': number}})
 
     row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
                            (item['project_id'], item['iteration_id'])).fetchone()
