@@ -54,6 +54,9 @@ def inputs_for(assignment, root):
     values = [(s['source'], s['sha256'], s['instructions']) for s in handoff['skills']]
     values += [(handoff['tracker']['issue_url'], handoff['issue']['body_sha256'], handoff['issue_body'])]
     values += [(d['url'], d['sha256'], d['content']) for d in handoff['specification']['documents'].values()]
+    if 'requirement_change' in handoff:
+        values.append(('handoff:requirement-change', assignments.digest(handoff['requirement_change']),
+                       json.dumps(handoff['requirement_change'], sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)))
     for group in ('standards', 'preceding'):
         values += [('handoff:' + group + ':' + a['name'], a['sha256'], a['content']) for a in handoff[group]]
     for index, (source, pin, content) in enumerate(values):

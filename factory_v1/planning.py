@@ -72,6 +72,9 @@ def plan(database, item, request):
             'Use a nonnegative integer planning revision.')
     skills = resolve(request['skills'])
     previous = item.get('planning')
+    from .requirements import held_numbers
+    require(not held_numbers(item) and not item.get('requirement_authority'),
+            'Use scoped requirement resynthesis; global reassignment cannot bypass revision holds.', 'requirements_held')
     if previous and previous['request'] == request:
         return item
     require(request['expected_revision'] == (previous['revision'] if previous else 0),
@@ -100,6 +103,16 @@ def transition(item, stage):
     item['execution_allowed'] = False
 
 
+def validate_documents(docs):
+    require(isinstance(docs, dict) and set(docs) == {'milestone.md', 'vision.md', 'provenance.md'} and
+            all(text(value) for value in docs.values()), 'Provide three separate synthesized Markdown snapshots.')
+    milestone = docs['milestone.md']
+    headings = list(re.finditer(r'^## (.+)\s*$', milestone, re.MULTILINE))
+    require(tuple(h.group(1).strip() for h in headings) == SECTIONS and
+            all(milestone[h.end():headings[i + 1].start() if i + 1 < len(headings) else len(milestone)].strip()
+                for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
+
+
 def complete(database, item, request, github):
     item = reload_locked(database, item)
     planning = item.get('planning')
@@ -124,15 +137,8 @@ def complete(database, item, request, github):
         return item
     require(not pending, 'Missing answers cannot be replaced by an agent sufficiency assertion.')
     docs = request['documents']
-    require(isinstance(docs, dict) and set(docs) == {'milestone.md', 'vision.md', 'provenance.md'} and
-            all(text(value) for value in docs.values()), 'Provide three separate synthesized Markdown snapshots.')
+    validate_documents(docs)
     milestone = docs['milestone.md']
-    # This checks the upstream document shape, not natural-language truth. The
-    # trusted conversational agent owns semantic synthesis and provenance review.
-    headings = list(re.finditer(r'^## (.+)\s*$', milestone, re.MULTILINE))
-    require(tuple(h.group(1).strip() for h in headings) == SECTIONS and
-            all(milestone[h.end():headings[i + 1].start() if i + 1 < len(headings) else len(milestone)].strip()
-                for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
     commit = request['commit']
     number = request['issue_number']
     require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit) is not None and

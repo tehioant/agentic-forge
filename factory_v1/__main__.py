@@ -179,6 +179,15 @@ def main():
             control.add_argument('--request', required=True)
         if name == 'reserve-ticket':
             control.add_argument('--issue', type=int, required=True)
+    for name in ('record-requirement-change', 'resolve-requirement-change', 'resynthesize-requirements',
+                 'publish-requirement-change', 'resume-requirement-change'):
+        control = commands.add_parser(name, help='Scoped material revisions, selected synthesis, exact publication and explicit resume.')
+        for option in ('project', 'iteration', 'request', 'api-base'):
+            control.add_argument('--' + option, required=True)
+        control.add_argument('--bearer', default='credential-blind-controller')
+        control.add_argument('--timeout', type=float, default=10)
+        if name == 'resynthesize-requirements':
+            control.add_argument('--synthesis-config', required=True, help='Private independently verified host synthesis capability.')
     for name in ('declare-stuck', 'prepare-diagnosis', 'request-direction', 'apply-direction'):
         control = commands.add_parser(name, help='Explicit stuckness, read-only debug and exact operator direction.')
         for option in ('project', 'iteration', 'request', 'api-base'):
@@ -296,6 +305,30 @@ def main():
             raise IntakeError(error.code, str(error)) from error
         except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
             raise IntakeError('invalid_merge', 'Malformed merge state or evidence; no admission permitted.') from error
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.command in {'record-requirement-change', 'resolve-requirement-change', 'resynthesize-requirements',
+                        'publish-requirement-change', 'resume-requirement-change'}:
+        from . import requirements, requirement_execution, requirement_publication
+        from .repositories import GitHub, RepositoryError, state_lock
+        try:
+            with open(args.request, encoding='utf-8') as source:
+                request = json.load(source, object_pairs_hook=unique_fields)
+            uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+            with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database):
+                github = GitHub(args.api_base, args.bearer, args.timeout)
+                operation = {'record-requirement-change': requirements.record_change,
+                             'resolve-requirement-change': requirements.resolve_change,
+                             'resynthesize-requirements': requirement_execution.execute,
+                             'publish-requirement-change': requirement_publication.publish,
+                             'resume-requirement-change': requirements.resume_change}[args.command]
+                extra = {'config_path': args.synthesis_config} if args.command == 'resynthesize-requirements' else {}
+                result = operation(database, args.project, args.iteration, args.operator_id, request, github, **extra)
+                database.commit()
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_change', 'Malformed or unavailable requirement change; no resumption or evidence validity granted.') from error
         print(json.dumps(result, sort_keys=True))
         return
     if args.command in {'declare-stuck', 'prepare-diagnosis', 'request-direction', 'apply-direction'}:

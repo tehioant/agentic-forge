@@ -64,6 +64,18 @@ revision stays held for versioned resynthesis. Run limits, green assertions,
 message delivery and silence are never stuckness, fixes or direction grants.
 See [contracts, commands, replay boundaries and remaining live acceptance](../docs/fresh-stuck-diagnosis.md).
 
+## Material requirement revisions (#23)
+
+`record-requirement-change`, `resolve-requirement-change`, `resynthesize-requirements`,
+`publish-requirement-change` and `resume-requirement-change` hold affected issues and
+transitive dependents, retire obsolete evidence and preserve independently revalidated
+work. Selected `to-spec`/`to-tickets` execution uses a separately approved host capability,
+not manually supplied revision artifacts. Exact versioned publication precedes explicit
+resume and fresh scoped worker inputs. Existing merge gates recheck current scoped
+requirements at their final mutation boundary. Minor annotations cannot bless changed
+review/check evidence. No production synthesis adapter or native acceptance campaign is
+installed by this slice. See [contracts, verification and remaining gaps](REQUIREMENTS.md).
+
 ## Intake and repository onboarding
 
 Example placeholders are not evidence:

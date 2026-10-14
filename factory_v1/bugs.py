@@ -11,6 +11,8 @@ ADAPTATION = 'factory-to-tickets-bug-v1:one-defect;compare-symptoms-and-scope;no
 INSTRUCTIONS = '''Load the selected to-tickets instructions, pinned documents, discovery and
 complete exact-repository issue observations. Follow context gathering and draft one
 complete, independently verifiable bug slice using the common ticket contract.
+Load every affected issue's scoped inputs; bug references use the first affected issue's
+current specification while downstream updates preserve each issue's own authority.
 Compare observable symptoms AND scope against every observed issue, retaining each
 comparison and rationale. Do not equate titles or discovery IDs with duplicate identity.
 Preserve reproduction/evidence, expected/actual behavior and available environment.
@@ -46,6 +48,31 @@ def fingerprint(discovery, item):
     return tickets.digest([scope, *[normalized(discovery[k]) for k in ('symptoms', 'expected', 'actual')]])
 
 
+def held_numbers(item):
+    """Retirement invalidates execution, not discoveries or unverified effects."""
+    records = [*item.get('bug_work_history', []), *item.get('bug_work', {}).values()]
+    settled = {}
+    held = set()
+    for work in reversed(records):
+        discovery = work['discovery']
+        if discovery['scope'] != 'current':
+            continue
+        key = fingerprint(discovery, item)
+        affected = set(discovery['affected'])
+        retired = bool(work.get('requirement_disposition'))
+        if work.get('publication_complete') and (retired or work['status'] in {'published', 'duplicate'}):
+            settled.setdefault(key, set()).update(affected)
+            continue
+        pending_effect = any(work.get(field) for field in
+                             ('issue_intent', 'membership_intent', 'edge_intents', 'affected_intents', 'field_intents'))
+        if retired and not pending_effect and affected <= settled.get(key, set()):
+            continue
+        held.update(affected)
+        if work.get('identity'):
+            held.add(work['identity']['number'])
+    return held
+
+
 def validate_discovery(value):
     keys = {'symptoms', 'reproduction', 'evidence', 'expected', 'actual', 'environment', 'scope', 'scope_reason', 'affected'}
     require(isinstance(value, dict) and set(value) == keys and
@@ -60,14 +87,33 @@ def validate_discovery(value):
             'Current blockers name affected work; deferred/recovery cannot extend the ordinary milestone.', 'invalid_bug')
 
 
-def context(database, item, github):
+def context(database, item, github, affected=(), check_board=True):
     tickets.active(item)
     work = item.get('ticket_work')
     require(work is not None and work.get('publication_complete'), 'Publish current-milestone tickets first.', 'tickets_required')
     tickets.skill(work['request']['skill'])
-    inputs = tickets.pinned_inputs(database, item, github)
-    require(inputs == work['inputs'], 'Pinned ticket scope changed.', 'bug_conflict')
-    return inputs, tickets.verified_board(work, github, item['repository'], item['iteration_id'])
+    database.commit()  # End reload_locked's transaction before read-only SQLite backups.
+    from .requirements import revalidate_inputs
+    scoped = {str(n): revalidate_inputs(database, item, github, n) for n in affected}
+    if scoped:
+        inputs = scoped[str(affected[0])]
+    else:
+        inputs = tickets.pinned_inputs(database, item, github)
+        require(inputs == work['inputs'], 'Pinned ticket scope changed.', 'bug_conflict')
+    board = tickets.verified_board(work, github, item['repository'], item['iteration_id']) if check_board else work['board']
+    return inputs, board, scoped
+
+
+def work_context(database, item, work, github, check_board=True):
+    inputs, board, scoped = context(database, item, github, work['discovery']['affected'], check_board)
+    expected = work.get('scoped_inputs', {str(n): work['inputs'] for n in work['discovery']['affected']})
+    require(inputs == work['inputs'] and board == work['board'] and scoped == expected,
+            'Pinned bug scope changed.', 'bug_conflict')
+    from .requirements import authority
+    require('scoped_revisions' not in work or work['scoped_revisions'] ==
+            {str(n): authority(item, n) for n in work['discovery']['affected']},
+            'Affected bug revision pins changed.', 'bug_conflict')
+    return inputs, board
 
 
 def observations(item, github, board):
@@ -101,8 +147,11 @@ def synthesize(database, item, request, github):
             isinstance(request['discovery_id'], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', request['discovery_id']),
             'Provide stable discovery identity, selected skill and defect.', 'invalid_bug')
     validate_discovery(request['discovery'])
+    from .requirements import held_numbers
+    require(not set(request['discovery']['affected']).intersection(held_numbers(item)),
+            'Affected revision scope cannot admit stale bug synthesis.', 'requirements_held')
     selected = tickets.skill(request['skill'])
-    inputs, board = context(database, item, github)
+    inputs, board, scoped = context(database, item, github, request['discovery']['affected'])
     require(request['skill'] == item['ticket_work']['request']['skill'], 'Use the current selected to-tickets source.', 'skill_blocked')
     key = fingerprint(request['discovery'], item)
     ids = item.setdefault('bug_discoveries', {})
@@ -111,12 +160,17 @@ def synthesize(database, item, request, github):
             'Discovery identity cannot change evidence or scope.', 'bug_conflict')
     ids[request['discovery_id']] = receipt
     work = item.setdefault('bug_work', {}).get(key)
-    if work:
-        require(work['inputs'] == inputs and work['board'] == board, 'Bug assignment scope changed.', 'bug_conflict')
+    if work and not work.get('requirement_disposition'):
+        expected = work.get('scoped_inputs', {str(n): work['inputs'] for n in work['discovery']['affected']})
+        require(work['inputs'] == inputs and work['board'] == board and
+                all(expected.get(n) == pin for n, pin in scoped.items()), 'Bug assignment scope changed.', 'bug_conflict')
         require(set(request['discovery']['affected']) <= set(work['discovery']['affected']),
                 'Additional affected edges require explicit controller investigation; never silently drop them.', 'bug_conflict')
         tickets.checkpoint(database, item)
         return item
+    if work:
+        require(request['discovery']['affected'] == work['discovery']['affected'],
+                'Refreshing retired synthesis must preserve every affected issue; scope changes require investigation.', 'bug_conflict')
     candidates = observations(item, github, board)
     affected = request['discovery']['affected']
     current_option = board['milestone']['id'] if 'milestone' in board else board['scope']['options'][item['iteration_id']]
@@ -124,25 +178,37 @@ def synthesize(database, item, request, github):
         matches = [o for o in candidates if o['issue']['number'] == number]
         require(len(matches) == 1 and matches[0]['scope'] == current_option and
                 matches[0]['issue']['state'] == 'open' and
-                tickets.external_contract(matches[0]['issue'], inputs),
+                tickets.external_contract(matches[0]['issue'], scoped[str(number)]),
                 'Affected work must be an open contracted current-milestone issue.', 'invalid_bug')
     assignment = str(uuid.uuid4())
+    from .requirements import authority
+    revisions = {str(n): authority(item, n) for n in affected}
     sources = {f'bug-discovery:{assignment}': tickets.digest(request['discovery']),
+               f'bug-revisions:{assignment}': tickets.digest(revisions),
                f'bug-comparisons:{assignment}': tickets.digest(candidates),
                f'bug-adaptation:{assignment}': tickets.digest({'adaptation': ADAPTATION, 'instructions': INSTRUCTIONS})}
+    sources.update({d['url']: d['sha256'] for pin in scoped.values() for d in pin['documents'].values()})
+    if work:
+        item.setdefault('bug_work_history', []).append(work)
     item['bug_work'][key] = {'assignment_id': assignment, 'stage': 'to-tickets', 'status': 'synthesis_pending',
                              'skill': selected, 'request': request, 'adaptation': ADAPTATION, 'inputs': inputs,
+                             'scoped_inputs': scoped, 'scoped_revisions': revisions,
                              'board': board, 'discovery': request['discovery'], 'candidates': candidates,
                              'load_sources': sources, 'instructions': INSTRUCTIONS,
-                             'input_digest': tickets.digest([inputs, request['discovery'], candidates, board])}
+                             'input_digest': tickets.digest([inputs, scoped, revisions, request['discovery'], candidates, board])}
     transition(item, 'bug_synthesis_pending')
     tickets.checkpoint(database, item)
     return item
 
 
 def assigned(item, assignment):
-    matches = [w for w in item.get('bug_work', {}).values() if w['assignment_id'] == assignment]
+    matches = [w for w in [*item.get('bug_work', {}).values(), *item.get('bug_work_history', [])]
+               if w['assignment_id'] == assignment]
     require(len(matches) == 1, 'Use a current correlated bug assignment.', 'synthesis_required')
+    require(not matches[0].get('requirement_disposition'), 'Material revision retired this bug synthesis.', 'stale_requirements')
+    from .requirements import held_numbers
+    require(not set(matches[0]['discovery']['affected']).intersection(held_numbers(item)),
+            'Affected revision invalidated bug synthesis/publication.', 'requirements_held')
     return matches[0]
 
 
@@ -195,9 +261,9 @@ def complete(database, item, request, github):
     work = assigned(item, request['assignment_id'])
     tickets.active(item)
     tickets.skill(work['request']['skill'])
-    inputs = tickets.pinned_inputs(database, item, github)
+    inputs, _ = work_context(database, item, work, github, check_board=False)
     require(request['input_digest'] == work['input_digest'] and request['adaptation'] == ADAPTATION and
-            inputs == work['inputs'] and item.get('ticket_work', {}).get('inputs') == inputs,
+            inputs == work['inputs'],
             'Bug synthesis is stale or uncorrelated.', 'bug_conflict')
     evidence = tickets.validate_execution(work, request['execution'], request['bug'])
     duplicate = validate_result(work, request['bug'], item)
@@ -264,7 +330,7 @@ def affected_edges(database, item, work, github, issue):
             intents[key] = {'before': dependent['body'], 'body': target}
             tickets.checkpoint(database, item)
         intent = intents[key]
-        require(tickets.external_contract({**dependent, 'body': intent['body']}, work['inputs']) and
+        require(tickets.external_contract({**dependent, 'body': intent['body']}, work.get('scoped_inputs', {}).get(key, work['inputs'])) and
                 set(re.findall(r'#([1-9][0-9]*)', sections(intent['body']).get('Blocked by', ''))) ==
                 {str(n) for n in expected_numbers},
                 'Affected text intent does not contain the exact desired blockers.', 'publication_mismatch')
@@ -329,7 +395,7 @@ def publish_locked(database, item, work, github):
     tickets.skill(work['request']['skill'])
     tickets.active(item)
     try:
-        inputs, board = context(database, item, github)
+        inputs, board = work_context(database, item, work, github)
         require(inputs == work['inputs'] and board == work['board'], 'Pinned bug scope changed.', 'bug_conflict')
         if work.get('publication_complete'):
             issue = gh.read_issue(github, item['repository'], work['identity']['number'])
@@ -359,7 +425,7 @@ def publish_locked(database, item, work, github):
             require(len(matches) <= 1, 'Duplicate publication marker requires investigation.', 'publication_uncertain')
             if not matches:
                 require(not work.get('issue_intent'), 'Uncertain issue is absent; never retry creation.', 'publication_uncertain')
-                unresolved = [bug for bug in item.get('bug_work', {}).values() if bug is not work and
+                unresolved = [bug for bug in [*item.get('bug_work', {}).values(), *item.get('bug_work_history', [])] if bug is not work and
                               bug.get('issue_intent') and not bug.get('publication_complete')]
                 require(not unresolved, 'Another uncertain bug creation must reconcile before any new issue write.', 'publication_uncertain')
                 require(observed == work['candidates'], 'Duplicate-search observations changed; do not create blindly.', 'bug_conflict')
@@ -412,6 +478,12 @@ def publish_locked(database, item, work, github):
         observation = observe(item, github, board, gh.read_issue(github, item['repository'], issue['number']))
         verify_observation(item, work, observation)
         verify_affected(item, work, github, issue)
+        if work['bug']['scope'] == 'current' and work.get('scoped_revisions'):
+            revision = work['scoped_revisions'][str(work['discovery']['affected'][0])]
+            authorities = item.setdefault('requirement_authority', {})
+            require(authorities.get(str(issue['number']), revision) == revision,
+                    'Published bug already has a different scoped authority.', 'bug_conflict')
+            authorities[str(issue['number'])] = revision
         work.update(status='duplicate' if duplicate is not None else 'published', publication_complete=True, observation=observation)
         work.pop('blocker', None)
         transition(item, 'bug_tracked')
