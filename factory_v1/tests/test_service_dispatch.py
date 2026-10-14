@@ -3,7 +3,9 @@ from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
 
-import os
+from pathlib import Path
+import tempfile
+import threading
 import signal
 import subprocess
 
@@ -74,6 +76,15 @@ class DispatchBoundaryTests(unittest.TestCase):
             result = dispatch.evaluate(db, config, Mock(), axes)
         self.assertEqual(result['blockers'], ['review_execution-unverified'])
         evaluate.assert_called_once()
+
+    def test_signal_cancellation_marks_both_attempt_and_supervisor_shutdown(self):
+        local, supervisor = threading.Event(), threading.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dispatch.sandbox.cancel_attempt(local, root, supervisor)
+            self.assertTrue((root / 'stop').is_file())
+        self.assertTrue(local.is_set())
+        self.assertTrue(supervisor.is_set())
 
     def test_host_synthesis_cancellation_joins_owned_process_group(self):
         process = Mock(pid=12345)

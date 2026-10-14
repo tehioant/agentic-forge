@@ -145,6 +145,13 @@ def check_worker_evidence(assignment, root, inputs):
     return result
 
 
+def cancel_attempt(stop, root, supervisor_stop=None):
+    stop.set()
+    if supervisor_stop is not None:
+        supervisor_stop.set()
+    (root / 'stop').touch()
+
+
 def launch(state, project, iteration, operator, assignment_id, config_path, github, *, stop_event=None):
     config = load_config(config_path)
     with closing(sqlite3.connect(state)) as database, state_lock(database):
@@ -198,10 +205,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     mounts = {}
     capability = None
     def cancel(signum, frame):
-        stop.set()
-        if stop_event is not None:
-            stop_event.set()
-        (root / 'stop').touch()
+        cancel_attempt(stop, root, stop_event)
     for signum in (signal.SIGTERM, signal.SIGINT):
         signals[signum] = signal.signal(signum, cancel)
     try:

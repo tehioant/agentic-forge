@@ -75,6 +75,7 @@ class DispatchComponentTests(unittest.TestCase):
              patch.object(dispatch, 'installed'), patch.object(dispatch.sandbox, 'launch') as launch:
             result = dispatch.tick(self.service, github, stop_event=event)
         self.assertEqual(result['stage'], 'launch')
+        self.assertEqual(result['blockers'], ['attempt_requires_reconciliation'])
         before.assert_called_once()
         launch.assert_called_once_with(self.service['state'], 'p', 'i', 'operator', self.seed['assignment_id'],
                                        str(launcher), github, stop_event=event)
@@ -97,6 +98,50 @@ class DispatchComponentTests(unittest.TestCase):
                 dispatch.tick(self.service, Mock())
         self.assertEqual(error.exception.code, 'implementation_unverified')
         self.assertEqual(prepare.call_args.args[4]['implementation_assignment'], self.seed['assignment_id'])
+        launch.assert_not_called()
+
+    def test_publication_seam_owns_its_lock_without_nested_service_lock(self):
+        self.config['publication_config'] = str(self.root / 'publication.json')
+        self.persist()
+        axes = {'standards_assignment': 'b' * 64, 'spec_assignment': 'c' * 64}
+        axis = {'handoff': {'review': {'pins': {'candidate_assignment': 'd' * 64}}}}
+        candidate = {'assignment_id': 'd' * 64}
+        def publish(db, *args):
+            with controls.quiescent_lock(db) as quiet:
+                self.assertTrue(quiet, 'publisher must acquire its own lock without deadlock')
+        with patch.object(dispatch, 'select', return_value=('evaluate', axes)), \
+             patch.object(restart, 'before_dispatch'), patch.object(dispatch, 'evaluate', return_value={'status': 'review-accepted'}), \
+             patch.object(dispatch.assignments, 'inspect', side_effect=[axis, candidate]), \
+             patch.object(dispatch.publication, 'publish', side_effect=publish) as publish:
+            dispatch.tick(self.service, Mock())
+        publish.assert_called_once()
+
+    def test_merge_authority_cannot_target_a_different_reviewed_candidate(self):
+        self.config['merge_config'] = str(self.root / 'merge.json')
+        self.persist()
+        axes = {'standards_assignment': 'b' * 64, 'spec_assignment': 'c' * 64}
+        axis = {'handoff': {'review': {'pins': {'candidate_assignment': 'd' * 64}}}}
+        candidate = {'assignment_id': 'd' * 64, 'publication': {'status': 'published'}}
+        with patch.object(dispatch, 'select', return_value=('evaluate', axes)), \
+             patch.object(restart, 'before_dispatch'), patch.object(dispatch, 'evaluate', return_value={'status': 'review-accepted'}), \
+             patch.object(dispatch.assignments, 'inspect', side_effect=[axis, candidate]), \
+             patch.object(dispatch.merge, 'load_config', return_value={'candidate_assignment': 'e' * 64}), \
+             patch.object(dispatch.merge, 'lifecycle') as merge:
+            with self.assertRaises(RepositoryError) as error:
+                dispatch.tick(self.service, Mock())
+        self.assertEqual(error.exception.code, 'scope_mismatch')
+        merge.assert_not_called()
+
+    def test_stage_change_during_reconciliation_cannot_use_stale_selection(self):
+        def change(db, *args, **kwargs):
+            item = deepcopy(self.item)
+            item['planning']['status'] = 'pending'
+            db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+            db.commit()
+        with patch.object(restart, 'before_dispatch', side_effect=change), \
+             patch.object(dispatch.sandbox, 'launch') as launch:
+            result = dispatch.tick(self.service, Mock())
+        self.assertEqual(result['blockers'], ['stage_changed_during_reconciliation'])
         launch.assert_not_called()
 
     def test_shutdown_before_tick_never_reads_or_dispatches(self):

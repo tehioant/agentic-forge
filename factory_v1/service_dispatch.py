@@ -147,6 +147,7 @@ def tick(service, github, *, stop_event=None):
     if stop_event is not None and stop_event.is_set():
         return blocked('service_stopping')
     launch = None
+    publish = None
     with connect(service) as database, state_lock(database):
         path = service['dispatch_config']
         merge.controller_paths(database, path)
@@ -162,6 +163,11 @@ def tick(service, github, *, stop_event=None):
         from .restart import before_dispatch
         before_dispatch(database, *scope(service), github, force=True)
         item = assignments.current(database, *scope(service))
+        refreshed_rows = [row for row in assignments.rows(database) if
+                          row['ticket_scope']['project'] == service['project'] and
+                          row['ticket_scope']['iteration'] == service['iteration']]
+        if select(item, refreshed_rows, config) != (action, target):
+            return blocked('stage_changed_during_reconciliation')
         if stop_event is not None and stop_event.is_set():
             return blocked('service_stopping')
         if action == 'synthesize':
@@ -209,19 +215,33 @@ def tick(service, github, *, stop_event=None):
             if not candidate.get('publication') or candidate['publication']['status'] != 'published':
                 if publication_config is None:
                     return blocked('candidate_publication_authority_unavailable')
-                publication.publish(database, *scope(service), candidate['assignment_id'], publication_config)
+                publish = candidate['assignment_id'], publication_config
             else:
                 if config['merge_config'] is None:
                     return blocked('merge_authority_unavailable')
+                authority = merge.load_config(config['merge_config'], service['operator_id'])
+                require(authority['candidate_assignment'] == candidate['assignment_id'],
+                        'Merge authority targets a different candidate.', 'scope_mismatch')
                 journal = candidate.get('merge', {})
                 if journal.get('status') == 'delivered':
                     return {'status': 'delivered', 'dispatch_allowed': False, 'blockers': []}
                 merge.lifecycle(database, *scope(service), config['merge_config'],
                                 'verify-delivery' if journal.get('status') in {'merged', 'incomplete', 'revalidation-required'} else 'merge-candidate')
+    if publish is not None:
+        if stop_event is not None and stop_event.is_set():
+            return blocked('service_stopping')
+        # Publication owns its own shared lock and final pause/effect gates.
+        with connect(service) as database:
+            publication.publish(database, *scope(service), *publish)
     if launch is not None:
         # Launcher takes the shared lock itself, rechecks fresh restart/control,
         # owns signal cancellation, verified checks and mandatory cleanup.
         if stop_event is not None and stop_event.is_set():
             return blocked('service_stopping')
         sandbox.launch(service['state'], *scope(service), *launch, github, stop_event=stop_event)
+        with connect(service) as database, state_lock(database):
+            observed = assignments.inspect(database, *scope(service), launch[0])
+            runtime = observed.get('runtime', {})
+            if runtime.get('status') != 'complete' or runtime.get('container_removed') is not True:
+                return {**blocked('attempt_requires_reconciliation'), 'stage': action}
     return {'status': 'progress', 'stage': action, 'dispatch_allowed': False, 'blockers': []}

@@ -14,9 +14,11 @@ import threading
 import uuid
 
 from . import attention, assignments, controls, delivery, restart
+from .errors import IntakeError
+from .spending import SpendingError
 from .planning import require
 from .publication import read_json
-from .repositories import GitHub, RepositoryError, state_lock, unambiguous_fields
+from .repositories import GitHub, RepositoryError, state_lock
 from .sandbox_source import physical
 
 UNIT = 'agentic-forge.service'
@@ -34,11 +36,13 @@ def isolated_root(root):
 def initialize(root, operator, project, iteration, api_base):
     """Create an empty isolated envelope, not intake, grants or authorization."""
     root = Path(root)
-    require(root.is_absolute() and all(assignments.identifier(v) for v in (operator, project, iteration)),
+    require(assignments.absolute(str(root)) and all(assignments.identifier(v) for v in (operator, project, iteration)),
             'Absolute fresh root and exact operator/project/iteration required.', 'invalid_service')
     isolated_root(root)
     GitHub(api_base, 'credential-blind-controller', 10)
-    physical(root.parent, directory=True)
+    parent = physical(root.parent, directory=True)
+    require(parent.stat().st_uid == os.getuid() and not parent.stat().st_mode & 0o022,
+            'Use an operator-owned non-shared parent directory.', 'invalid_service')
     require(not root.exists() and not root.is_symlink(), 'Use a fresh service root.', 'invalid_service')
     root.mkdir(mode=0o700)
     config = {'version': 1, 'state': str(root / 'controller.sqlite'), 'operator_id': operator,
@@ -223,10 +227,10 @@ def run(config, stop=None):
             while not stop.is_set():
                 try:
                     result = cycle(config, github, stop_event=stop)
-                except (RepositoryError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+                except (RepositoryError, IntakeError, SpendingError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, sqlite3.Error) as error:
                     result = {'status': 'blocked', 'dispatch_allowed': False,
-                              'blockers': [error.code if isinstance(error, RepositoryError) else 'service_observation_unavailable']}
-                result = {**result, 'run_id': run_id}
+                              'blockers': [error.code if isinstance(error, (RepositoryError, IntakeError, SpendingError)) else 'service_observation_unavailable']}
+                result = {**result, 'run_id': run_id, 'project': config['project'], 'iteration': config['iteration']}
                 atomic(root / 'status.json', result)
                 if result != previous:
                     descriptor = os.open(root / 'events.jsonl', os.O_CREAT | os.O_APPEND | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -279,8 +283,8 @@ def main():
                 result = controls.resume(db, *scope(config), args.reference, GitHub(config['api_base'], 'credential-blind-controller', 10)) if args.command == 'resume' else controls.request(db, *scope(config), args.command, args.reference)
             print(json.dumps({'action': result['action'], 'state': result['state'],
                               'dispatch_allowed': result['dispatch_allowed']}, sort_keys=True))
-    except (RepositoryError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, sqlite3.Error, subprocess.SubprocessError) as error:
-        print(json.dumps({'error': error.code if isinstance(error, RepositoryError) else 'invalid_service',
+    except (RepositoryError, IntakeError, SpendingError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, sqlite3.Error, subprocess.SubprocessError) as error:
+        print(json.dumps({'error': error.code if isinstance(error, (RepositoryError, IntakeError, SpendingError)) else 'invalid_service',
                           'message': 'Service operation refused; inspect isolated state and prerequisites.'}), file=sys.stderr)
         raise SystemExit(1) from None
 
