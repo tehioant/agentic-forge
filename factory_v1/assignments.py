@@ -219,9 +219,14 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         from .simplification import handoff as simplify_handoff
         simplification = simplify_handoff(database, project, iteration, operator, request)
     if recovery_contract is None and recovery.recovery_number(item) == request['issue']['number'] and request['stage'] != 'diagnosis':
-        parent = (simplification['implementation_assignment'] if simplification else
-                  review_contract['pins']['candidate_assignment'] if review_contract else
-                  corrections_contract['pins']['candidate_assignment'] if corrections_contract else None)
+        if simplification:
+            parent = simplification['implementation_assignment']
+        elif review_contract:
+            parent = review_contract['pins']['candidate_assignment']
+        elif corrections_contract:
+            parent = corrections_contract['pins']['candidate_assignment']
+        else:
+            parent = None
         require(parent is not None, 'Recovery stage requires controller-prepared ancestry.', 'recovery_held')
         prior = inspect(database, project, iteration, operator, parent)
         root = recovery.lineage(database, prior)

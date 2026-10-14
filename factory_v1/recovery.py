@@ -191,9 +191,14 @@ def lineage(database, assignment):
         require(assignment['assignment_id'] not in seen, 'Cyclic recovery ancestry.', 'scope_mismatch')
         seen.add(assignment['assignment_id'])
         h = assignment['handoff']
-        identity = (h['simplification']['implementation_assignment'] if h['stage'] == 'simplify' else
-                    h['review']['pins']['candidate_assignment'] if h['stage'] in {'review-spec', 'review-standards'} else
-                    h['corrections']['pins']['candidate_assignment'] if h['stage'] == 'corrections' else None)
+        if h['stage'] == 'simplify':
+            identity = h['simplification']['implementation_assignment']
+        elif h['stage'] in {'review-spec', 'review-standards'}:
+            identity = h['review']['pins']['candidate_assignment']
+        elif h['stage'] == 'corrections':
+            identity = h['corrections']['pins']['candidate_assignment']
+        else:
+            identity = None
         require(identity in rows, 'Recovery ancestry missing.', 'scope_mismatch')
         assignment = rows[identity]
     return assignment
