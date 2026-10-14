@@ -82,9 +82,26 @@ def exact_issue(github, repository, pin):
     return issue
 
 
+def registration_current(database, project, iteration, operator, number):
+    """Host registration alone may resolve a reconciled unregistered health freeze."""
+    from . import restart, requirements
+    item = assignments.current(database, project, iteration, operator, require_active=False)
+    require(item['status'] == 'active' and not controls.blocked(database, project, iteration),
+            'Operator interruption prevents recovery registration.', 'iteration_paused')
+    require(number not in requirements.held_numbers(item),
+            'Affected recovery requirements remain held.', 'requirements_held')
+    try:
+        restart.require_reconciled(database, project, iteration)
+    except RepositoryError as error:
+        if error.code != 'reconciliation_required' or (item.get('restart_reconciliation') or {}).get('blockers') != [
+                {'boundary': 'delivery', 'code': 'main_frozen'}]:
+            raise
+    return item
+
+
 def register(database, project, iteration, operator, config_path, github):
     config = load_config(database, config_path, operator)
-    item = assignments.current(database, project, iteration, operator)
+    item = registration_current(database, project, iteration, operator, config['issue']['number'])
     saved = delivery.monitor_state(item, operator)
     require(saved is not None, 'Configured delivery observer required.', 'recovery_held')
     assert saved is not None
@@ -120,13 +137,14 @@ def register(database, project, iteration, operator, config_path, github):
         assert prior is not None
         exact_issue(github, item['repository'], prior['handoff']['issue'])
         removable[identity] = {'issue': prior['handoff']['issue'], 'delivery': prior['merge']}
-    record = {'status': 'registered', 'config': config, 'evidence': evidence, 'assignment': None,
-              'parked': [a['assignment_id'] for a in related], 'reservation': item.pop('reservation', None),
-              'removable': removable, 'removed': {}, 'clearance': None}
-    item.setdefault('main_recoveries', {})[incident['incident_id']] = record
-    # A registration sentinel keeps health polling frozen even before assignment preparation.
-    incident.update(recovery_assignment=assignments.digest(config), recovery_issue=config['issue']['number'])
-    with controls.admission(database, project, iteration), database:
+    with controls.lane(database, project, iteration), database:
+        require(registration_current(database, project, iteration, operator, config['issue']['number']) == item,
+                'Incident registration inputs changed during readback.', 'stale_admission')
+        record = {'status': 'registered', 'config': config, 'evidence': evidence, 'assignment': None,
+                  'parked': [a['assignment_id'] for a in related], 'reservation': item.pop('reservation', None),
+                  'removable': removable, 'removed': {}, 'clearance': None}
+        item.setdefault('main_recoveries', {})[incident['incident_id']] = record
+        incident.update(recovery_assignment=assignments.digest(config), recovery_issue=config['issue']['number'])
         for prior in related:
             prior['recovery_disposition'] = incident['incident_id']
             database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
