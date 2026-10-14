@@ -1,76 +1,93 @@
-"""Bounded CI sharding preserves the test inventory and real subprocess failures."""
+"""The serial component runner preserves inventory, failures and execution boundaries."""
 from contextlib import redirect_stderr, redirect_stdout
 import io
-from pathlib import Path
-import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import run_factory_tests
 
 
-class ShardRunnerTests(unittest.TestCase):
-    def test_partition_covers_nested_suite_exactly_once_without_reordering_identity(self):
-        cases = [unittest.FunctionTestCase(lambda: None, description=str(i)) for i in range(7)]
-        for index, case in enumerate(cases):
-            case.id = lambda index=index: f'fixture.Tests.test_{index}'
-        suite = unittest.TestSuite([unittest.TestSuite(cases[:3]), unittest.TestSuite(cases[3:])])
-        shards = run_factory_tests.partition(suite)
-        flattened = [identity for shard in shards for identity in shard]
-        self.assertCountEqual(flattened, [case.id() for case in cases])
-        self.assertEqual(len(flattened), len(set(flattened)))
-        self.assertEqual([len(shard) for shard in shards], [4, 3])
-        self.assertEqual(shards, run_factory_tests.partition(unittest.TestSuite(reversed(cases))))
+class ComponentRunnerTests(unittest.TestCase):
+    def suite(self, *, fail=False):
+        ran = []
+        def first():
+            ran.append('first')
+            if fail:
+                raise AssertionError('LABELED expected component failure')
+        def second():
+            ran.append('second')
+        cases = [unittest.FunctionTestCase(first), unittest.FunctionTestCase(second)]
+        return unittest.TestSuite([unittest.TestSuite(cases[:1]), unittest.TestSuite(cases[1:])]), ran
 
-    def test_empty_and_duplicate_inventories_fail_instead_of_silently_dropping_tests(self):
+    def test_nested_inventory_covers_every_identity_exactly_once(self):
+        suite, _ = self.suite()
+        self.assertEqual(run_factory_tests.inventory(suite), list(run_factory_tests.test_ids(suite)))
+        self.assertEqual(len(run_factory_tests.inventory(suite)), 2)
+
+    def test_empty_and_duplicate_inventories_fail_without_dropping_tests(self):
         with self.assertRaises(ValueError):
-            run_factory_tests.partition(unittest.TestSuite())
+            run_factory_tests.inventory(unittest.TestSuite())
         case = unittest.FunctionTestCase(lambda: None)
         with self.assertRaises(ValueError):
-            run_factory_tests.partition(unittest.TestSuite([case, case]))
+            run_factory_tests.inventory(unittest.TestSuite([case, case]))
 
-    def test_discovery_errors_refuse_before_subprocess_execution(self):
-        loader = unittest.TestLoader()
-        with patch.object(loader, 'errors', ['LABELED discovery error']), \
-                patch.object(run_factory_tests.unittest, 'TestLoader', return_value=loader), \
-                patch.object(loader, 'discover', return_value=unittest.TestSuite()), \
-                patch.object(run_factory_tests, 'run_shards') as run, redirect_stderr(io.StringIO()) as output:
+    def test_discovery_errors_refuse_before_execution(self):
+        loader = Mock(errors=['LABELED discovery error'])
+        loader.discover.return_value = unittest.TestSuite()
+        with patch.object(run_factory_tests.unittest, 'TestLoader', return_value=loader), \
+                patch.object(run_factory_tests.unittest, 'TextTestRunner') as runner, \
+                redirect_stderr(io.StringIO()) as output:
             self.assertEqual(run_factory_tests.main(), 1)
-        run.assert_not_called()
+        runner.assert_not_called()
         self.assertIn('LABELED discovery error', output.getvalue())
 
-    def test_real_shards_run_both_groups_and_propagate_failure_without_omission(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            root.joinpath('test_fixture.py').write_text(
-                'import unittest\n'
-                'class Cases(unittest.TestCase):\n'
-                '    def test_pass(self):\n'
-                '        self.assertTrue(True)\n'
-                '    def test_fail(self):\n'
-                '        self.fail("LABELED expected shard failure")\n')
-            with redirect_stdout(io.StringIO()) as output:
-                result = run_factory_tests.run_shards(
-                    [['test_fixture.Cases.test_fail'], ['test_fixture.Cases.test_pass']], root, root)
-            self.assertEqual(result, 1)
-            self.assertIn('LABELED expected shard failure', output.getvalue())
-            self.assertIn('=== Shard 1; exit 1 ===', output.getvalue())
-            self.assertIn('=== Shard 2; exit 0 ===', output.getvalue())
-            self.assertEqual(output.getvalue().count('Ran 1 test'), 2)
+    def test_all_tests_run_after_failure_and_return_nonzero(self):
+        suite, ran = self.suite(fail=True)
+        loader = Mock(errors=[], discover=Mock(return_value=suite))
+        with patch.object(run_factory_tests.unittest, 'TestLoader', return_value=loader), \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(run_factory_tests.main(), 1)
+        self.assertEqual(ran, ['first', 'second'])
+        self.assertIn('2 unique tests', output.getvalue())
+        self.assertIn('LABELED expected component failure', errors.getvalue())
+        self.assertIn('Ran 2 tests', errors.getvalue())
 
-    def test_real_passing_shards_and_single_test_empty_shard_do_not_autodiscover(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            root.joinpath('test_fixture.py').write_text(
-                'import unittest\n'
-                'class Cases(unittest.TestCase):\n'
-                '    def test_pass(self):\n'
-                '        self.assertTrue(True)\n'
-                '    def test_unselected_fail(self):\n'
-                '        self.fail("Must not be automatically discovered")\n')
-            for shards in ([['test_fixture.Cases.test_pass'], []],
-                           [['test_fixture.Cases.test_pass'], ['test_fixture.Cases.test_pass']]):
-                with redirect_stdout(io.StringIO()) as output:
-                    self.assertEqual(run_factory_tests.run_shards(shards, root, root), 0)
-                self.assertNotIn('test_unselected_fail', output.getvalue())
-                self.assertEqual(output.getvalue().count('Ran 1 test'), sum(bool(s) for s in shards))
+    def test_single_passing_test_runs_without_empty_shards_or_autodiscovery(self):
+        ran = []
+        suite = unittest.TestSuite([unittest.FunctionTestCase(lambda: ran.append(True))])
+        loader = Mock(errors=[], discover=Mock(return_value=suite))
+        with patch.object(run_factory_tests.unittest, 'TestLoader', return_value=loader), \
+                redirect_stdout(io.StringIO()) as output, redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(run_factory_tests.main(), 0)
+        self.assertEqual(ran, [True])
+        self.assertIn('1 unique tests', output.getvalue())
+        self.assertIn('Ran 1 test', errors.getvalue())
+        loader.discover.assert_called_once_with(str(run_factory_tests.TESTS))
+
+    def test_execution_guard_denies_boundaries_and_retires_after_scope(self):
+        hooks = []
+        with patch.object(run_factory_tests.sys, 'addaudithook', side_effect=hooks.append):
+            with run_factory_tests.no_external_execution() as attempts:
+                for event in ('socket.__new__', 'socket.connect', 'subprocess.Popen', 'os.system',
+                              'os.posix_spawn', 'os.fork', 'os.forkpty', 'os.exec', 'os.kill', 'os.killpg'):
+                    with self.subTest(event=event), self.assertRaisesRegex(RuntimeError, 'mock external execution'):
+                        hooks[0](event, ())
+                hooks[0]('open', ())
+                self.assertEqual(len(attempts), 10)
+            hooks[0]('subprocess.Popen', ())
+            self.assertEqual(len(attempts), 10)
+
+    def test_caught_external_attempt_still_fails_the_run(self):
+        hooks = []
+        def catches_guard():
+            try:
+                hooks[-1]('socket.connect', ())
+            except RuntimeError:
+                pass
+        suite = unittest.TestSuite([unittest.FunctionTestCase(catches_guard)])
+        loader = Mock(errors=[], discover=Mock(return_value=suite))
+        with patch.object(run_factory_tests.sys, 'addaudithook', side_effect=hooks.append), \
+                patch.object(run_factory_tests.unittest, 'TestLoader', return_value=loader), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(run_factory_tests.main(), 1)
+        self.assertIn('Unmocked external execution attempted: socket.connect', errors.getvalue())

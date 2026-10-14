@@ -6,7 +6,7 @@ import re
 import uuid
 from pathlib import Path
 
-from .planning import require, reload_locked, transition
+from .planning import require, reload_locked, transition, checkpoint as admitted_checkpoint
 from .repositories import RepositoryError, reconcile, save_iteration
 from . import ticket_github as gh
 
@@ -75,13 +75,15 @@ def pinned_inputs(database, item, github):
     return {'handoff': handoff, 'documents': docs}
 
 
-def active(item):
+def active(item, database):
     require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
+    from .controls import require_active
+    require_active(database, item['project_id'], item['iteration_id'])
 
 
 def synthesize(database, item, request, github):
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     require(isinstance(request, dict) and set(request) == {'skill', 'tracker'}, 'Provide only selected skill and tracker configuration.')
     require(isinstance(request['tracker'], dict) and isinstance(request['tracker'].get('triage_label'), str) and
             request['tracker']['triage_label'].strip(), 'Configured tracker and triage label required.')
@@ -89,6 +91,7 @@ def synthesize(database, item, request, github):
     inputs = pinned_inputs(database, item, github)
     previous = item.get('ticket_work')
     if previous and previous['request'] == request and previous['inputs'] == inputs:
+        active(item, database)
         return item
     require(previous is None, 'Ticket scope already assigned; material revision requires explicit planning reassignment.', 'ticket_conflict')
     # Schema access is checked at publication, so missing Projects never discards synthesis.
@@ -96,7 +99,7 @@ def synthesize(database, item, request, github):
                            'request': request, 'skill': selected, 'adaptation': ADAPTATION,
                            'inputs': inputs, 'input_digest': digest(inputs), 'instructions': INSTRUCTIONS}
     transition(item, 'ticket_synthesis_pending')
-    save_iteration(database, item)
+    admitted_checkpoint(database, item)
     return item
 
 
@@ -120,13 +123,15 @@ def validate_contract(title, behavior, criteria, refs, inputs, document_names=('
 
 
 def section_spans(body):
-    headings = list(re.finditer(r'^## ([^\n]+)\n', body, re.MULTILINE))
+    headings = list(re.finditer(r'^##[ \t]+([^\r\n]+)(?:\r?\n|$)', body, re.MULTILINE))
+    footer = re.search(r'(?:^[ \t]*<!--[^\r\n]*-->[ \t]*(?:\r?\n[ \t]*)*)+\Z', body, re.MULTILINE)
+    body_end = footer.start() if footer else len(body)
     result = {}
     for index, heading in enumerate(headings):
-        name = heading[1].strip()
+        name = ' '.join(re.sub(r'[ \t]+#+[ \t]*$', '', heading[1]).split())
         if name in result:
             return None
-        end = headings[index + 1].start() if index + 1 < len(headings) else len(body)
+        end = headings[index + 1].start() if index + 1 < len(headings) else body_end
         result[name] = (heading.end(), end)
     return result
 
@@ -138,38 +143,72 @@ def sections(body):
     return {name: body[start:end].strip() for name, (start, end) in spans.items()}
 
 
+def lean_references(context, inputs, document_names):
+    parents = re.findall(r'\bParent[ \t]+#([^;\s]+)', context)
+    parent = inputs.get('handoff', {}).get('issue', {}).get('number')
+    stories = re.findall(r'\bStories:[ \t]*([^.\r\n]+)\.', context)
+    if (type(parent) is not int or parents != [str(parent)] or len(stories) != 1 or
+            len(re.findall(r'\bStories:', context)) != 1):
+        return None
+    requirements = [value.strip() for value in stories[0].split(',')]
+    if (not all(re.fullmatch(r'US-[1-9][0-9]*', value) for value in requirements) or
+            len(set(requirements)) != len(requirements) or
+            re.findall(r'\bUS-[^\s,.;]+', context) != requirements):
+        return None
+    urls = set(re.findall(r'\[[^\]]+\]\(([^)]+)\)', context))
+    registered = {document['url'] for document in inputs['documents'].values()}
+    assigned = urls & {inputs['documents'][name]['url'] for name in document_names}
+    if not urls <= registered or len(assigned) != 1:
+        return None
+    spec = next(iter(assigned))
+    return [{'spec': spec, 'requirement': requirement} for requirement in requirements]
+
+
 def external_contract(issue, inputs, document_names=('milestone.md',)):
     parts = sections(issue['body'])
-    if parts is None:
+    if parts is None or not parts.get('Blocked by'):
         return False
-    if not all(parts.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Blocked by', 'Status')):
-        return False
-    status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', parts['Status'])
-    if status is None:
-        return False
-    refs = []
-    for line in parts['Requirement references'].splitlines():
-        if not line.strip():
-            continue
-        reference = re.fullmatch(r'- (.+) — (.+)', line)
-        if reference is None:
+    lean = 'Change' in parts or 'Done' in parts
+    if lean:
+        if (not all(parts.get(name) for name in ('Change', 'Done', 'Context')) or
+                any(name in parts for name in ('Parent', 'What to build', 'Requirement references',
+                                               'Acceptance criteria', 'Iteration', 'Triage'))):
             return False
-        spec, requirement = reference.groups()
-        link = re.fullmatch(r'\[[^\]]+\]\(([^)]+)\)', spec)
-        refs.append({'spec': link[1] if link else spec, 'requirement': requirement})
+        refs = lean_references(parts['Context'], inputs, document_names)
+        behavior, criteria_section, criterion_pattern = parts['Change'], parts['Done'], r'- (.*)'
+    else:
+        if not all(parts.get(name) for name in ('What to build', 'Requirement references', 'Acceptance criteria', 'Status')):
+            return False
+        refs = []
+        for line in parts['Requirement references'].splitlines():
+            if not line.strip():
+                continue
+            reference = re.fullmatch(r'- (.+) — (.+)', line)
+            if reference is None:
+                return False
+            spec, requirement = reference.groups()
+            link = re.fullmatch(r'\[[^\]]+\]\(([^)]+)\)', spec)
+            refs.append({'spec': link[1] if link else spec, 'requirement': requirement})
+        behavior, criteria_section, criterion_pattern = parts['What to build'], parts['Acceptance criteria'], r'- \[[ xX]\] (.*)'
+    progress = 'contracted'
+    if 'Status' in parts:
+        status = re.fullmatch(r'(ready|active|done|blocked|deferred)(?: \([^\n()]+\)\.?)?', parts['Status'])
+        if status is None:
+            return False
+        progress = status[1]
     criteria = []
-    for line in parts['Acceptance criteria'].splitlines():
+    for line in criteria_section.splitlines():
         if not line.strip():
             continue
-        criterion = re.fullmatch(r'- \[[ xX]\] (.*)', line)
+        criterion = re.fullmatch(criterion_pattern, line)
         if criterion is None:
             return False
         criteria.append(criterion[1])
     try:
-        validate_contract(issue['title'], parts['What to build'], criteria, refs, inputs, document_names)
+        validate_contract(issue['title'], behavior, criteria, refs, inputs, document_names)
     except RepositoryError:
         return False
-    return status[1]
+    return progress
 
 
 def validate_batch(batch, inputs, iteration, label):
@@ -212,7 +251,7 @@ def validate_batch(batch, inputs, iteration, label):
 
 def complete_synthesis(database, item, request, github):
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     work = item.get('ticket_work')
     require(work is not None, 'Start the correlated to-tickets stage first.', 'synthesis_required')
     require(isinstance(request, dict) and set(request) == {'assignment_id', 'input_digest', 'adaptation', 'execution', 'tickets'} and
@@ -229,7 +268,7 @@ def complete_synthesis(database, item, request, github):
     if not already_completed:
         work['status'] = 'publication_pending'
     transition(item, 'ticket_publication_pending')
-    checkpoint(database, item)
+    admitted_checkpoint(database, item)
     return publish(database, item, github)
 
 
@@ -281,7 +320,7 @@ def verified_board(work, github, repository, iteration):
 def publish(database, item, github):
     # Caller holds repository/state lock across every durable network intent.
     item = reload_locked(database, item)
-    active(item)
+    active(item, database)
     work = item.get('ticket_work')
     require(work is not None and work.get('tickets') and work.get('execution'), 'Actual ticket synthesis must complete first.', 'synthesis_required')
     skill(work['request']['skill'])
@@ -289,12 +328,12 @@ def publish(database, item, github):
     try:
         board = verified_board(work, github, item['repository'], item['iteration_id'])
         work['board'] = board
-        checkpoint(database, item)
+        admitted_checkpoint(database, item)
         if work.get('publication_complete'):
             item = frontier(database, item, github)
             item['ticket_work']['status'] = 'published'
             item['ticket_work'].pop('blocker', None)
-            checkpoint(database, item)
+            admitted_checkpoint(database, item)
             return item
         numbers = {k: v['number'] for k, v in work.get('published', {}).items()}
         for ticket in work['tickets']:
@@ -310,7 +349,7 @@ def publish(database, item, github):
             if not candidates:
                 require(not intent.get('issue'), 'Lost issue response/absent readback: investigate before retry; never create a duplicate.', 'publication_uncertain')
                 intent['issue'] = {'title': ticket['title'], 'body': expected_body}
-                checkpoint(database, item)  # BEFORE mutation, including lost response/process death.
+                admitted_checkpoint(database, item)  # BEFORE mutation, including lost response/process death.
                 payload = {'title': ticket['title'], 'body': expected_body, 'labels': [ticket['triage_label']]}
                 if 'milestone' in board:
                     payload['milestone'] = board['milestone']['number']
@@ -339,7 +378,7 @@ def publish(database, item, github):
                 require(blocker not in intent.get('dependencies', []),
                         'Lost native blocker write with absent relationship; investigate before retry.', 'publication_uncertain')
                 intent.setdefault('dependencies', []).append(blocker)
-                checkpoint(database, item)
+                admitted_checkpoint(database, item)
                 gh.add_dependency(github, item['repository'], issue['number'], blocker)
             observed = gh.dependencies(github, item['repository'], issue['number'])
             require({gh.issue_identity(d, item['repository'])['id'] for d in observed} == expected_ids and len(observed) == len(expected_ids),
@@ -348,7 +387,7 @@ def publish(database, item, github):
             if member is None:
                 require(not intent.get('membership'), 'Lost board write and absent membership; investigate before retry.', 'publication_uncertain')
                 intent['membership'] = True
-                checkpoint(database, item)
+                admitted_checkpoint(database, item)
                 gh.add_item(github, board['project_id'], issue['node_id'])
                 member = gh.membership(github, board, item['repository'], issue)
                 require(member is not None, 'Exact project membership missing after write.', 'publication_mismatch')
@@ -362,7 +401,7 @@ def publish(database, item, github):
                 require(member[role] in {None, option}, 'Existing board progress/scope conflicts; do not overwrite external work.', 'publication_mismatch')
                 if member[role] != option:
                     intent[role] = option
-                    checkpoint(database, item)
+                    admitted_checkpoint(database, item)
                     gh.set_field(github, board['project_id'], member['id'], board[role]['id'], option)
             member = gh.membership(github, board, item['repository'], issue)
             require(member is not None and all(member[k] == v for k, v in target.items()), 'Exact project scope/progress readback differs.', 'publication_mismatch')
@@ -372,9 +411,11 @@ def publish(database, item, github):
         work['publication_complete'] = True
         work.pop('blocker', None)
         transition(item, 'ticket_frontier_ready')
-        checkpoint(database, item)
+        admitted_checkpoint(database, item)
         return frontier(database, item, github)
     except RepositoryError as error:
+        if error.code in {'iteration_paused', 'invalid_control'}:
+            raise
         work['status'] = 'blocked'
         work['blocker'] = {'code': error.code, 'message': str(error)}
         transition(item, 'ticket_publication_blocked')
@@ -499,7 +540,7 @@ def reserve(database, item, github, number):
              'repository_id': item.get('repository_onboarding', {}).get('metadata', {}).get('id')}
     ticket_claims(database, scope)
     item = frontier(database, item, github)
-    active(item)
+    active(item, database)
     work = item['ticket_work']
     require(work.get('publication_complete'), 'Partial/unverified publication cannot admit work.', 'publication_pending')
     require(not work['frontier']['foreign_active'], 'Out-of-iteration work is already active on GitHub.', 'reservation_conflict')
@@ -517,11 +558,14 @@ def reserve(database, item, github, number):
         require(not any(i.get('reservation') for i in all_items), 'One implementation reservation across the factory.', 'reservation_conflict')
         item['reservation'] = {'issue_number': number, 'run_id': str(uuid.uuid4()), 'status': 'pending',
                                'assignment_id': work['assignment_id'], 'input_digest': work['input_digest']}
-        checkpoint(database, item)
+        from .controls import admission
+        with admission(database, item['project_id'], item['iteration_id']):
+            checkpoint(database, item)
     row = next(r for r in work['frontier']['items'] if r['number'] == number)
     require(row['admissible'], 'Reserved ticket has unresolved authoritative blockers or invalid contract.', 'ticket_ineligible')
     require(set(work['frontier']['active']) <= {number}, 'Conflicting authoritative active work.', 'reservation_conflict')
     if row['status'] != 'active':
+        active(item, database)
         gh.set_field(github, work['board']['project_id'], row['membership_id'], work['board']['status']['id'],
                      work['board']['status']['options'][work['request']['tracker']['statuses']['active']])
     item = frontier(database, item, github)
@@ -531,5 +575,5 @@ def reserve(database, item, github, number):
             'Exact eligible reservation progress did not read back.', 'publication_mismatch')
     item['reservation']['status'] = 'reserved'
     transition(item, 'ticket_reserved')
-    checkpoint(database, item)
+    admitted_checkpoint(database, item)
     return item

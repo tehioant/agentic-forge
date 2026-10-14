@@ -36,7 +36,13 @@ python -m factory_v1 --state /controller/state.sqlite --operator-id 42 \
     "name": "code-review",
     "source": "/home/ops/.hermes/skills/code-review/SKILL.md",
     "path": "/home/ops/.hermes/skills/code-review/SKILL.md",
-    "sha256": "47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50",
+    "sha256": "1ff8f642af17fe58110d991738b8d881cb8ae3a1b5bc6b1abddc380f8b26212e",
+    "dependencies": ["code-review/references/structured-text-contracts.md"]
+  }, {
+    "name": "code-review/references/structured-text-contracts.md",
+    "source": "/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md",
+    "path": "/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md",
+    "sha256": "3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530ddfa0031b02a8",
     "dependencies": []
   }],
   "claim_id": "standards-attempt-1"
@@ -51,6 +57,23 @@ conversation or its persuasive summary. Each runs only its assigned code-review
 axis, using the full skill instructions (including Standards' smell baseline).
 Serial execution is supported; separate read-only assignments may run concurrently
 when the host's enforced resources permit it. This slice does not add scheduling.
+
+The approved current installed revision adds the bounded structured-text review
+recipe, relevant to #21's Markdown admission and source-span mutation. Both axes
+explicitly load `code-review` and `code-review/references/structured-text-contracts.md`
+with the exact pins above; the existing loader stages and checks both inputs.
+Apply the recipe when structured text is in scope: one semantic grammar, byte-exact
+unrelated spans, a cheap formatting/negative matrix and bounded public replay
+evidence. Its conditional applicability does not permit omitting its descriptor or
+dependency edge. The whole-repository release-readiness branch and its separate
+conditional reference remain **not selected**. Tracker/standards/requirements are
+pinned handoff inputs, not ambient skill discovery. Revision-v3 adaptations preserve
+reports and exact pins on corrections,
+review only the correction delta when prior assumptions are unchanged, and retain
+separate fresh verdicts for both axes. Final full-suite evidence belongs to the
+controller's stabilized reviewed candidate; interrupted or older-head checks and
+code approval alone do not establish native/live acceptance. Later source-byte or
+caller-selected pin/dependency drift still fails closed.
 
 `--dry-run` writes no state/claim; exact preparation replay keeps its identity.
 `prepare-assignment` enforces these same contracts, not a bypass. The precursor

@@ -1,7 +1,18 @@
 ---
 name: code-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Use when reviewing code or public-release readiness. Review diffs along Standards and Spec axes, or audit a pinned repository snapshot for release gaps with executable evidence."
 ---
+
+## Choose the review scope
+
+- For a branch, PR, or "review since" request, use the two-axis diff process below.
+- For "review this repository/chart" or a public-release gap analysis, review the whole default-branch snapshot: pin `git rev-parse HEAD`, do not ask for a comparison ref or invent a diff requirement, and load `references/release-readiness.md`.
+- Keep a review read-only unless Antoine also asks for changes. A readiness request does not authorize publishing, changing visibility, creating tickets, or clearing a licensing gate.
+- Verify existing remediation tickets independently and map findings to them rather than creating a duplicate backlog.
+- Ground findings in exact file/line references and executed checks. Distinguish manifest validation, pinned-runtime execution, real-cluster evidence, and unverified risks; success at one layer does not establish another.
+- For release analysis, lead with the verdict, then prioritized blockers and the smallest complete release checklist. Keep passing checks and remaining evidence gaps visible; do not bury the result under raw logs.
+
+## Diff review
 
 Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
 
@@ -10,7 +21,7 @@ Two-axis review of the diff between `HEAD` and a fixed point the user supplies:
 
 Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
 
-The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing, tell the user to run `/setup-matt-pocock-skills`.
+Use `docs/agents/issue-tracker.md` when present. Otherwise infer the tracker from the repository remote and use the matching integration skill; a missing agent setup document is not a prerequisite for reviewing an existing repository.
 
 ## Process
 
@@ -71,7 +82,15 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 
 If the spec is missing, skip the Spec sub-agent and note this in the final report.
 
-### 5. Aggregate
+### 5. Review corrections without restarting completed work
+
+1. Preserve each original axis report and its exact baseline, candidate/tree and requirement pins. For a confirmed defect, run the retained reproducer before correction, then add the narrow regression and audit sibling sites with the same failure shape; an isolated call-site fix can leave another public lifecycle bypass. Test the supported input family, not only the reported spelling: exercise cheap semantic variants before sending the correction back to review, and retain one or two public-path cases for mutation/replay proof. For structured Markdown admission or source-span updates, follow `references/structured-text-contracts.md`; a green canonical marker case can hide neighboring formatting that deletes identity or bypasses a hold.
+2. On the corrected candidate, distinguish a defect-confirmation script from a positive acceptance test. A script whose assertions prove broken behavior should fail after the repair; retain that result separately and use explicit safe-behavior assertions for green acceptance.
+3. Dispatch independent axis-specific continuations with the previous report, unresolved finding IDs, exact correction diff (`git diff PREVIOUS_CANDIDATE..NEW_CANDIDATE`) and relevant caller context. Verify previously reviewed source and requirement pins are unchanged before limiting review to the delta; otherwise widen only to the changed assumptions. For a test-only scheduling correction, compare assertion ASTs, discovered test IDs, wait limits and fixture/production bytes with the approved candidate; a tiny diff or unchanged method count alone does not prove acceptance stayed intact. Review the new readiness condition and retained deterministic red/green schedule rather than repeating the whole source review. Produce fresh candidate-bound verdicts for both axes without pretending an earlier approval covers changed code.
+4. Reuse completed exact-candidate checks rather than repeating them. Count module-suite evidence by unique test IDs, keeping standalone reproducers separate; adding their counts can double-count coverage. Label older-head suite evidence explicitly and require a fresh canonical suite on the final stabilized candidate. Preserve content/mode fingerprints before and after checks so test-induced edits cannot be silently blessed.
+5. Keep optional smell suggestions nonblocking unless their impact makes them an actual documented or correctness violation. Report code-review disposition separately from unverified native/runtime/live acceptance; a code pass does not supply missing execution evidence.
+
+### 6. Aggregate
 
 Present the two reports under `## Standards` and `## Spec` headings, verbatim or lightly cleaned. Do **not** merge or rerank findings, because the two axes are deliberately separate (see _Why two axes_).
 

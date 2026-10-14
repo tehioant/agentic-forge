@@ -127,6 +127,9 @@ def current(database, project, iteration, operator, require_active=True):
             'Trusted configured operator approval required.', 'approval_required')
     require(item.get('execution_allowed') is False and (not require_active or item.get('status') == 'active'),
             'Paused or unsafe iteration cannot admit assignments.', 'iteration_paused')
+    if require_active:
+        from .controls import require_active as control_active
+        control_active(database, project, iteration)
     return item
 
 
@@ -308,10 +311,12 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                 'Assignment inputs changed; original claim remains held for controller reconciliation.', 'stale_assignment')
         result = previous
     if not dry_run and previous is None:
-        database.execute('BEGIN IMMEDIATE')
-        database.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
-        database.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment_id, json.dumps(result, sort_keys=True)))
-        database.commit()
+        from .controls import admission
+        with admission(database, project, iteration):
+            database.execute('BEGIN IMMEDIATE')
+            database.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
+            database.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment_id, json.dumps(result, sort_keys=True)))
+            database.commit()
     return {**result, 'dry_run': dry_run, 'spending_admission': policy, 'claim_persisted': not dry_run or previous is not None}
 
 
@@ -399,7 +404,8 @@ def store_result(database, project, iteration, operator, assignment_id, request,
         else:
             result_key = 'simplification_result'
         assignment[result_key] = stage_result
-    with database:
+    from .controls import admission
+    with admission(database, project, iteration), database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
         database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))

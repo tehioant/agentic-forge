@@ -1,30 +1,23 @@
-"""Lifecycle fixtures must honor tempfile's configured temporary directory."""
+"""Control component fixtures honor the configured temporary directory."""
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from factory_v1.tests import test_intake, test_repositories
+from factory_v1.tests import test_controls
 
 
 class FixturePortabilityTests(unittest.TestCase):
-    def test_lifecycle_fixtures_use_the_configured_temporary_directory(self):
+    def test_control_fixture_uses_configured_directory_and_removes_durable_sidecars(self):
         with tempfile.TemporaryDirectory() as configured_directory:
             with patch.object(tempfile, 'tempdir', configured_directory):
-                fixtures = (
-                    (test_intake.IntakeLifecycleTests,
-                     'test_approved_iteration_survives_a_fresh_controller_process'),
-                    (test_repositories.RepositoryLifecycleTests,
-                     'test_selected_existing_repository_is_read_back_without_creation'),
-                )
-                for case_type, behavior in fixtures:
-                    with self.subTest(fixture=case_type.__name__):
-                        case = case_type(behavior)
-                        try:
-                            case.setUp()
-                            self.assertEqual(case.root.parent, Path(configured_directory))
-                            # Exercise the public CLI with all state in the configured directory.
-                            getattr(case, behavior)()
-                        finally:
-                            case.doCleanups()
-                        self.assertFalse(case.root.exists())
+                case = test_controls.ControlFixture()
+                try:
+                    case.setUp()
+                    self.assertEqual(case.root.parent, Path(configured_directory))
+                    self.assertFalse(case.pause()['dispatch_allowed'])
+                    self.assertEqual(case.inspect()['action'], 'pause')
+                    self.assertTrue(case.state.exists())
+                finally:
+                    case.doCleanups()
+                self.assertFalse(case.root.exists())

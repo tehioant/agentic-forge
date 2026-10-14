@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import stat
@@ -14,7 +15,7 @@ from contextlib import closing
 from pathlib import Path
 
 from .model_access import MAX_RESPONSE, ModelAccessError, SocketCancellation, transport
-from .repositories import state_lock
+from .repositories import RepositoryError, state_lock
 
 MAX_REQUEST = 32768
 SANDBOX_MAX_REQUEST = 2_000_000
@@ -75,8 +76,14 @@ def _iteration(database, project, iteration, operator_id=None, require_active=Fa
         raise SpendingError('unsafe_iteration', 'This slice cannot enable factory execution.')
     if operator_id is not None and (item.get('approval', {}).get('operator_id') != operator_id or not item.get('approval', {}).get('reference')):
         raise SpendingError('approval_required', 'Broker requires the configured operator and registered approval.')
-    if require_active and item.get('status') != 'active':
-        raise SpendingError('iteration_paused', 'Paused iterations cannot admit model operations.')
+    from .controls import blocked
+    if require_active:
+        try:
+            interrupted = item.get('status') != 'active' or blocked(database, project, iteration)
+        except RepositoryError as error:
+            raise SpendingError(error.code, str(error)) from error
+        if interrupted:
+            raise SpendingError('iteration_paused', 'Paused iterations cannot admit model operations.')
     return item
 
 
@@ -256,7 +263,8 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
     if adapter.payload_fields is not None and (set(payload) - adapter.payload_fields or 'input' not in payload):
         raise SpendingError('invalid_request', 'Subscription payload has unsupported fields or no input.')
     allowance_only = scope[2] != 'fixture-provider'
-    with state_lock(database), database:
+    from .controls import admission
+    with state_lock(database), admission(database, scope[0], scope[1], SpendingError), database:
         if admission_check:
             admission_check(database)
         admitted = _prepare(database, scope, operation_id, body, reserve, now, allowance_only, deadline, stop_event)
@@ -319,6 +327,35 @@ def resume_quota(database, scope, reference):
 
 def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, operator_id=None, subscription_socket=None, reservation=3, ttl=300, max_calls=100, worker_uid=None, max_request=MAX_REQUEST, stop_event=None, authorize=None, observe=None):
     """Fixed per-attempt capability; host state/upstream never enter the worker mount."""
+    from .controls import broker_lease
+    scope = _scope(*scope)
+    uri = Path(database_path).resolve().as_uri() + '?mode=rw'
+    with closing(sqlite3.connect(uri, uri=True)) as database:
+        initialize(database)
+        # Authorize before creating any controller ownership files.
+        try:
+            _iteration(database, scope[0], scope[1], operator_id, require_active=True)
+        except SpendingError as error:
+            record_refusal(database, scope, None, error)
+            raise
+        stop_event = stop_event if stop_event is not None else threading.Event()
+        handlers = {}
+        if threading.current_thread() is threading.main_thread():
+            for number in (signal.SIGTERM, signal.SIGINT):
+                handlers[number] = signal.signal(number, lambda signum, frame: stop_event.set())
+        try:
+            with broker_lease(database, scope[0], scope[1], path):
+                return _serve_unix_socket(path, database_path, scope, fixture_url, timeout, operator_id,
+                    subscription_socket, reservation, ttl, max_calls, worker_uid, max_request, stop_event, authorize, observe)
+        except RepositoryError as error:
+            raise SpendingError(error.code, str(error)) from error
+        finally:
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
+
+
+def _serve_unix_socket(path, database_path, scope, fixture_url, timeout, operator_id, subscription_socket,
+                       reservation, ttl, max_calls, worker_uid, max_request, stop_event, authorize, observe):
     scope = _scope(*scope)
     worker_uid = os.getuid() if worker_uid is None else worker_uid
     uri = Path(database_path).resolve().as_uri() + '?mode=rw'
@@ -348,12 +385,20 @@ def serve_unix_socket(path, database_path, scope, fixture_url=None, timeout=10, 
     finished = threading.Event()
 
     def cancel_io():
-        while not finished.is_set():
-            if stop_event.is_set() or time.monotonic() >= deadline:
-                cancellation.cancel()
-                adapter.cancel()
-                return
-            finished.wait(min(.02, max(0, deadline - time.monotonic())))
+        from .controls import blocked
+        try:
+            with closing(sqlite3.connect(uri, uri=True)) as control_database:
+                while not finished.is_set():
+                    if stop_event.is_set() or blocked(control_database, scope[0], scope[1]) or time.monotonic() >= deadline:
+                        break
+                    finished.wait(min(.02, max(0, deadline - time.monotonic())))
+                else:
+                    return
+        except (RepositoryError, OSError, ValueError, TypeError, RecursionError, sqlite3.Error):
+            pass  # Unreadable local control state cannot authorize continued I/O.
+        stop_event.set()
+        cancellation.cancel()
+        adapter.cancel()
 
     canceller = threading.Thread(target=cancel_io, name='model-broker-canceller', daemon=False)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as server:

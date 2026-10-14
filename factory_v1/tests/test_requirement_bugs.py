@@ -1,226 +1,130 @@
-"""Public bug revision regressions; all tracker/execution precursors are SIMULATED."""
+"""Current/archive discovery holds and obsolete-result admission with explicit state."""
 import copy
-import json
 import unittest
+from unittest.mock import patch
 
-from factory_v1 import bugs, requirements, tickets
-from factory_v1.tests import test_requirements
+from factory_v1 import bugs, repositories, requirements, tickets
+from factory_v1.tests import test_tickets
+
+
+def discovery(affected):
+    return {'scope': 'current', 'affected': affected, 'symptoms': 'Lost note', 'expected': 'Note survives',
+            'actual': 'Note disappears', 'reproduction': ['Save', 'Read'], 'evidence': ['fixture-output'],
+            'environment': None, 'scope_reason': 'Current note retention.'}
+
+
+def work_record(fixture, affected=(10,), retired=False, published=False, assignment='bug-old'):
+    value = {'assignment_id': assignment, 'discovery': discovery(list(affected)),
+             'status': 'published' if published else 'synthesis_pending', 'publication_complete': published,
+             'inputs': fixture.inputs, 'scoped_inputs': {str(n): fixture.inputs for n in affected},
+             'board': fixture.board, 'skill': fixture.work['skill'], 'request': {'skill': fixture.start_request['skill']},
+             'scoped_revisions': {str(n): requirements.authority(fixture.item, n) for n in affected},
+             'candidates': [], 'load_sources': {}, 'input_digest': 'a' * 64, 'adaptation': bugs.ADAPTATION}
+    if retired:
+        value.update(status='obsolete', requirement_disposition={'status': 'obsolete', 'change_id': 'durable-notes'})
+    return value
 
 
 class RequirementBugTests(unittest.TestCase):
     def setUp(self):
-        self.case = test_requirements.RequirementChangeTests()
-        self.case.setUp()
-        self.addCleanup(self.case.doCleanups)
-        self.tracker = self.case.tracker
-
-    def discovery(self, discovery_id='notes-bug', affected=None):
-        return {'discovery_id': discovery_id, 'skill': self.tracker.start_request['skill'], 'discovery': {
-            'symptoms': 'SIMULATED durable notes disappear', 'reproduction': ['Create note', 'Restart'],
-            'evidence': ['SIMULATED symptom, NOT native execution'], 'expected': 'Note survives', 'actual': 'Note disappears',
-            'environment': 'Offline loopback fixture', 'scope': 'current', 'scope_reason': 'Violates durable-note retention',
-            'affected': [10] if affected is None else affected}}
-
-    def synthesize(self, request):
-        item = self.case.ok(self.tracker.control('synthesize-bug', request))
-        return item, item['bug_work'][item['bug_discoveries'][request['discovery_id']]['key']]
-
-    def completion(self, work):
-        bug = {'title': 'Preserve durable notes after restart', 'desired_behavior': 'Readers reopen the retained note.',
-            'references': [{'spec': work['inputs']['documents']['milestone.md']['url'], 'requirement': 'US-1'}],
-            'acceptance_criteria': ['SIMULATED exact round-trip after restart.'], 'blockers': [], 'status': 'ready',
-            'scope': 'current', 'affected': work['discovery']['affected'], 'triage_label': 'agent-triage',
-            'comparisons': [{'number': o['issue']['number'], 'symptoms_match': False, 'scope_match': False,
-                            'rationale': 'SIMULATED feature/spec observation, not this defect.'} for o in work['candidates']]}
-        sources = {work['skill']['path']: work['skill']['sha256'],
-                   **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()}, **work['load_sources']}
-        return {'assignment_id': work['assignment_id'], 'input_digest': work['input_digest'], 'adaptation': work['adaptation'],
-            'bug': bug, 'execution': {'run_id': 'SIMULATED bug synthesis',
-                'loads': [{'source': source, 'sha256': sha, 'tool_reference': 'SIMULATED load, NOT native execution'}
-                          for source, sha in sources.items()],
-                'decomposition': 'SIMULATED selected to-tickets work, NOT native acceptance.', 'result_digest': tickets.digest(bug)}}
+        self.fixture = test_tickets.FrontierFixture(self)
+        self.database, self.item, self.github = self.fixture.database, self.fixture.item, self.fixture.github
 
     def assert_held(self, *numbers):
-        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
-        before = copy.deepcopy((self.tracker.issues, self.tracker.members, self.tracker.deps))
+        before = copy.deepcopy((self.fixture.issues, self.fixture.members, self.fixture.deps))
+        snapshot = tickets.frontier(self.database, self.fixture.stored(), self.github)['ticket_work']['frontier']
         for number in numbers:
-            self.assertNotIn(number, frontier['eligible'])
-            self.assertTrue(next(r for r in frontier['items'] if r['number'] == number)['held'])
-            refusal = self.tracker.control('reserve-ticket', issue=number)
-            self.assertEqual(refusal.returncode, 2, refusal.stderr)
-            self.assertEqual(json.loads(refusal.stderr)['error'], 'ticket_ineligible')
-        self.assertEqual((self.tracker.issues, self.tracker.members, self.tracker.deps), before)
-        self.assertNotIn('reservation', self.tracker.inspect())
+            self.assertNotIn(number, snapshot['eligible']); self.assertTrue(next(r for r in snapshot['items'] if r['number'] == number)['held'])
+            with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, number)
+            self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback()
+        self.assertEqual((self.fixture.issues, self.fixture.members, self.fixture.deps), before)
+        self.assertNotIn('reservation', self.fixture.stored()); self.fixture.set_field.assert_not_called()
 
-    def test_revision_retires_old_bug_assignment_and_replay_requires_fresh_synthesis(self):
-        request = self.discovery()
-        _, old = self.synthesize(request)
-        completion = self.completion(old)
-        published = self.case.publish()
-        held = self.tracker.inspect()
-        retired = held['bug_work'][held['bug_discoveries'][request['discovery_id']]['key']]
-        self.assertEqual(retired['status'], 'obsolete')
-        self.assertEqual(retired['requirement_disposition']['change_id'], 'durable-notes')
-        self.assertEqual(retired['discovery'], old['discovery'])
-        resumed = self.case.ok(self.case.resume(published))
-        self.assertEqual(resumed['ticket_work']['frontier']['eligible'], [12])
-        self.assert_held(10)
-        for command, payload in [('complete-bug', completion), ('publish-bug', {'assignment_id': old['assignment_id']})]:
-            result = self.tracker.control(command, payload)
-            self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn('error', json.loads(result.stderr))
-        item, fresh = self.synthesize(request)
-        self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
-        self.assertEqual(fresh['inputs'], requirements.inputs(item, 10))
-        self.assertNotEqual(fresh['inputs'], old['inputs'])
-        self.assertEqual(item['bug_work_history'][0], retired)
-        for command, payload in [('complete-bug', completion), ('publish-bug', {'assignment_id': old['assignment_id']})]:
-            self.assertEqual(self.tracker.control(command, payload).returncode, 2)
-        _, replay = self.synthesize(request)
-        self.assertEqual(replay, fresh)
-        self.assertEqual(self.tracker.inspect()['bug_work_history'][0], retired)
+    def test_archived_and_current_pending_discoveries_hold_every_affected_issue(self):
+        for archived in (False, True):
+            old = work_record(self.fixture, (10, 12), retired=archived)
+            self.item.update(bug_work={} if archived else {'old': old}, bug_work_history=[old] if archived else [])
+            self.fixture.persist(); self.assert_held(10, 12)
+            self.assertEqual(bugs.held_numbers(self.fixture.stored()), {10, 12})
 
-    def test_mixed_pending_discovery_keeps_unrevised_sibling_held(self):
-        request = self.discovery(affected=[10, 12])
-        initial, old = self.synthesize(request)
-        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
-        self.assertEqual(frontier['eligible'], [])
-        resumed = self.case.ok(self.case.resume(self.case.publish()))
-        self.assertEqual(resumed['requirement_changes']['durable-notes']['affected'], [10, 11])
-        self.assertEqual(requirements.authority(initial, 12), requirements.authority(resumed, 12))
+    def test_obsolete_result_ids_refused_current_and_archived_after_restart(self):
+        for archived in (False, True):
+            old = work_record(self.fixture, retired=True)
+            self.item.update(bug_work={} if archived else {'old': old}, bug_work_history=[old] if archived else []); self.fixture.persist()
+            for function, request in ((bugs.publish, {'assignment_id': 'bug-old'}), (bugs.complete, {'assignment_id': 'bug-old',
+                'input_digest': old['input_digest'], 'adaptation': bugs.ADAPTATION, 'execution': {}, 'bug': {}})):
+                with self.subTest(archived=archived, function=function.__name__), self.assertRaises(repositories.RepositoryError) as caught:
+                    function(self.database, self.fixture.stored(), request, self.github)
+                self.assertEqual(caught.exception.code, 'stale_requirements'); self.database.rollback()
+                self.assertEqual(self.fixture.stored()['bug_work_history'] if archived else list(self.fixture.stored()['bug_work'].values()), [old])
+        self.github.request.assert_not_called()
+
+    def test_retired_refresh_preserves_history_scope_and_uses_each_scoped_authority(self):
+        affected = [10, 12]; old = work_record(self.fixture, affected, retired=True)
+        key = bugs.fingerprint(old['discovery'], self.item); self.item['bug_work'] = {key: old}
+        revised = copy.deepcopy(self.fixture.inputs); revised['documents']['milestone.md']['url'] += '-revision'
+        revised['handoff'] = {'revision': 'new'}
+        revised['documents']['milestone.md']['sha256'] = 'c' * 64
+        record = {'new_inputs': revised, 'kind': 'material', 'status': 'resumed', 'affected': [10]}
+        self.item['requirement_changes'] = {'durable-notes': record}
+        self.item['requirement_authority'] = {'10': {'spec': {'revision': 'new'}, 'ticket_assignment': 'durable-notes', 'ticket_inputs': 'b' * 64}}
+        self.fixture.persist()
+        self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace(self.fixture.inputs['documents']['milestone.md']['url'], revised['documents']['milestone.md']['url'])
+        candidates = [{'issue': copy.deepcopy(self.fixture.issues[n]), 'scope': 'M1'} for n in affected]
+        request = {'discovery_id': 'refresh', 'skill': self.fixture.start_request['skill'], 'discovery': discovery(affected)}
+        scoped = {'10': revised, '12': self.fixture.inputs}
+        with patch.object(bugs, 'context', return_value=(revised, self.fixture.board, scoped)), patch.object(bugs, 'observations', return_value=candidates):
+            result = bugs.synthesize(self.database, self.item, request, self.github)
+            fresh = result['bug_work'][key]
+            self.assertNotEqual(fresh['assignment_id'], old['assignment_id']); self.assertEqual(result['bug_work_history'], [old])
+            self.assertEqual(fresh['inputs'], requirements.inputs(result, 10)); self.assertEqual(fresh['scoped_inputs']['12'], requirements.inputs(result, 12))
+            for pin in scoped.values():
+                for doc in pin['documents'].values(): self.assertEqual(fresh['load_sources'][doc['url']], doc['sha256'])
+            self.assertEqual(bugs.synthesize(self.database, result, request, self.github)['bug_work'][key], fresh)
+            self.assertEqual(self.fixture.stored()['bug_work_history'], [old])
+        with patch.object(tickets, 'pinned_inputs', side_effect=lambda _d, i, _g: revised if i['handoff'] == {'revision': 'new'} else self.fixture.inputs):
+            self.assert_held(10, 12)
+
+    def test_retired_refresh_cannot_drop_affected_scope(self):
+        old = work_record(self.fixture, (10, 12), retired=True); key = bugs.fingerprint(old['discovery'], self.item)
+        self.item['bug_work'] = {key: old}; self.fixture.persist(); before = self.fixture.stored()
+        request = {'discovery_id': 'narrow', 'skill': self.fixture.start_request['skill'], 'discovery': discovery([10])}
+        with patch.object(bugs, 'context', return_value=(self.fixture.inputs, self.fixture.board, {'10': self.fixture.inputs})):
+            with self.assertRaises(repositories.RepositoryError) as caught: bugs.synthesize(self.database, self.item, request, self.github)
+        self.assertEqual(caught.exception.code, 'bug_conflict'); self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
         self.assert_held(10, 12)
-        item, fresh = self.synthesize(request)
-        self.assertEqual(item['bug_work_history'][0]['discovery'], old['discovery'])
-        self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
-        self.assert_held(10, 12)
 
-    def test_fresh_publication_settles_archived_discovery_without_reusing_old_result(self):
-        request = self.discovery()
-        _, old = self.synthesize(request)
-        self.case.ok(self.case.resume(self.case.publish()))
-        _, fresh = self.synthesize(request)
-        self.assert_held(10)
-        result = self.case.ok(self.tracker.control('complete-bug', self.completion(fresh)))
-        published = result['bug_work'][result['bug_discoveries'][request['discovery_id']]['key']]
-        number = published['identity']['number']
-        self.assertTrue(published['publication_complete'])
-        self.assertEqual(bugs.held_numbers(result), set())
-        self.assertEqual(result['ticket_work']['frontier']['eligible'], [12, number])
-        self.assertEqual(self.case.ok(self.tracker.control('publish-bug', {'assignment_id': fresh['assignment_id']}))
-                         ['bug_work'][result['bug_discoveries'][request['discovery_id']]['key']]['identity'], published['identity'])
-        for command, payload in [('complete-bug', self.completion(old)), ('publish-bug', {'assignment_id': old['assignment_id']})]:
-            refusal = self.tracker.control(command, payload)
-            self.assertEqual(refusal.returncode, 2)
-            self.assertEqual(json.loads(refusal.stderr)['error'], 'stale_requirements')
-        # SIMULATED authoritative delivery, not manufactured worker evidence.
-        self.tracker.issues[number].update(state='closed', state_reason='completed')
-        self.tracker.members[number]['fields']['STATUS'] = 'Done'
-        frontier = self.case.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
-        self.assertIn(10, frontier['eligible'])
-        self.assertFalse(next(r for r in frontier['items'] if r['number'] == 10)['held'])
-        self.assertEqual(self.case.ok(self.tracker.control('reserve-ticket', issue=10))['reservation']['status'], 'reserved')
+    def test_independent_current_assignment_is_not_invalidated_by_unrelated_authority(self):
+        old = work_record(self.fixture, (12,)); key = bugs.fingerprint(old['discovery'], self.item)
+        self.item.update(bug_work={key: old}, requirement_changes={'durable-notes': {'kind': 'material', 'status': 'resumed', 'affected': [10]}})
+        self.fixture.persist()
+        request = {'discovery_id': 'independent', 'skill': self.fixture.start_request['skill'], 'discovery': discovery([12])}
+        with patch.object(bugs, 'context', return_value=(self.fixture.inputs, self.fixture.board, {'12': self.fixture.inputs})):
+            result = bugs.synthesize(self.database, self.item, request, self.github)
+        self.assertEqual(result['bug_work'][key], old); self.assertNotIn('requirement_disposition', result['bug_work'][key])
 
-    def assert_fresh_bug_publication(self, affected):
-        self.case.ok(self.case.resume(self.case.publish()))
-        before = copy.deepcopy(self.tracker.issues)
-        item, work = self.synthesize(self.discovery(affected=affected))
-        self.assertEqual(work['inputs'], requirements.inputs(item, affected[0]))
-        for number in affected:
-            self.assertEqual(work['scoped_inputs'][str(number)], requirements.inputs(item, number))
-            for doc in work['scoped_inputs'][str(number)]['documents'].values():
-                self.assertEqual(work['load_sources'][doc['url']], doc['sha256'])
-        result = self.case.ok(self.tracker.control('complete-bug', self.completion(work)))
-        published = result['bug_work'][result['bug_discoveries']['notes-bug']['key']]
-        self.assertEqual(published['status'], 'published', published.get('blocker'))
-        number = published['identity']['number']
-        self.assertIn(number, result['ticket_work']['frontier']['eligible'])
-        self.assertEqual(requirements.inputs(result, number), work['inputs'])
-        for affected_number in affected:
-            self.assertIn(number, self.tracker.deps[affected_number])
-            self.assertIn('- #' + str(number), self.tracker.issues[affected_number]['body'])
-            self.assertIn(requirements.inputs(item, affected_number)['documents']['milestone.md']['url'],
-                          self.tracker.issues[affected_number]['body'])
-        self.assertEqual(self.tracker.issues[11], before[11])
-        replay = self.case.ok(self.tracker.control('publish-bug', {'assignment_id': work['assignment_id']}))
-        self.assertEqual(replay['bug_work'][replay['bug_discoveries']['notes-bug']['key']]['identity'], published['identity'])
+    def test_archived_unknown_creation_survives_later_settlement_and_closed_blocker(self):
+        old = work_record(self.fixture, (10, 12), retired=True); old.update(issue_intent={'title': 'unknown'}, identity={'number': 13})
+        fresh = work_record(self.fixture, (10, 12), published=True, assignment='fresh')
+        self.item.update(bug_work_history=[old], bug_work={'fresh': fresh}); self.fixture.persist()
+        self.assert_held(10, 12); self.assertEqual(bugs.held_numbers(self.fixture.stored()), {10, 12, 13})
+        self.fixture.issues[10].update(state='closed', state_reason='completed'); self.fixture.members[10]['fields']['STATUS'] = 'Done'
+        snapshot = tickets.frontier(self.database, self.item, self.github)['ticket_work']['frontier']
+        self.assertNotIn(11, snapshot['eligible'])
+        with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 11)
+        self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback()
+        self.assertNotIn('reservation', self.fixture.stored()); self.assertEqual(self.fixture.stored()['bug_work_history'], [old])
 
-    def test_new_bug_for_revised_issue_completes_and_publishes_with_current_inputs(self):
-        self.assert_fresh_bug_publication([10])
-
-    def test_mixed_original_and_revised_affected_issues_keep_each_scoped_authority(self):
-        self.assert_fresh_bug_publication([10, 12])
-
-    def test_independent_bug_synthesis_is_not_retired_by_unrelated_revision(self):
-        request = self.discovery('independent-bug', [12])
-        _, old = self.synthesize(request)
-        self.case.ok(self.case.resume(self.case.publish()))
-        _, replay = self.synthesize(request)
-        self.assertEqual(replay, old)
-        self.assertNotIn('requirement_disposition', replay)
-
-    def test_retired_uncertain_creation_remains_a_no_duplicate_write_guard(self):
-        request = self.discovery()
-        _, old = self.synthesize(request)
-        self.tracker.drop, self.tracker.omit_effect = 'issue', True
-        uncertain = self.case.ok(self.tracker.control('complete-bug', self.completion(old)))
-        key = uncertain['bug_discoveries'][request['discovery_id']]['key']
-        self.assertTrue(uncertain['bug_work'][key]['issue_intent'])
-        self.assertFalse(uncertain['bug_work'][key].get('publication_complete'))
-        self.tracker.omit_effect = False
-        self.case.ok(self.case.resume(self.case.publish()))
-        self.assert_held(10)
-        _, fresh = self.synthesize(request)
-        self.assert_held(10)
-        self.tracker.fixture.calls.clear()
-        item = self.case.ok(self.tracker.control('complete-bug', self.completion(fresh)))
-        self.assertEqual(item['bug_work'][key]['blocker']['code'], 'publication_uncertain')
-        self.assertTrue(item['bug_work_history'][0]['issue_intent'])
-        self.assertFalse(any(c[:2] == ('POST', '/repos/example/product/issues') for c in self.tracker.fixture.calls))
-        self.assert_held(10)
-
-    def test_fresh_duplicate_settlement_cannot_erase_archived_unknown_creation(self):
-        independent = self.discovery('independent-index-bug', [12])
-        independent['discovery']['symptoms'] = 'SIMULATED note index inconsistency'
-        _, seed = self.synthesize(independent)
-        tracked = self.case.ok(self.tracker.control('complete-bug', self.completion(seed)))
-        number = tracked['bug_work'][tracked['bug_discoveries'][independent['discovery_id']]['key']]['identity']['number']
-        request = self.discovery(affected=[12, 10])
-        _, old = self.synthesize(request)
-        self.tracker.drop, self.tracker.omit_effect = 'issue', True
-        uncertain = self.case.ok(self.tracker.control('complete-bug', self.completion(old)))
-        key = uncertain['bug_discoveries'][request['discovery_id']]['key']
-        self.assertTrue(uncertain['bug_work'][key]['issue_intent'])
-        self.tracker.omit_effect = False
-        self.case.ok(self.case.resume(self.case.publish()))
-        _, fresh = self.synthesize(request)
-        completion = self.completion(fresh)
-        next(c for c in completion['bug']['comparisons'] if c['number'] == number).update(
-            symptoms_match=True, scope_match=True, rationale='SIMULATED fresh investigation identifies the existing scoped defect.')
-        completion['execution']['result_digest'] = tickets.digest(completion['bug'])
-        self.tracker.fixture.calls.clear()
-        result = self.case.ok(self.tracker.control('complete-bug', completion))
-        self.assertEqual(result['bug_work'][key]['status'], 'duplicate', result['bug_work'][key].get('blocker'))
-        self.assertTrue(result['bug_work'][key]['publication_complete'])
-        self.assertTrue(result['bug_work_history'][0]['issue_intent'])
-        self.assertEqual(bugs.held_numbers(result), {10, 12})
-        self.assertFalse(any(c[:2] == ('POST', '/repos/example/product/issues') for c in self.tracker.fixture.calls))
-        self.tracker.issues[number].update(state='closed', state_reason='completed')
-        self.tracker.members[number]['fields']['STATUS'] = 'Done'
-        self.assert_held(10, 12)
-        self.assertEqual(self.tracker.control('publish-bug', {'assignment_id': old['assignment_id']}).returncode, 2)
-
-    def test_retired_discovery_cannot_silently_drop_an_affected_issue_on_refresh(self):
-        _, old = self.synthesize(self.discovery(affected=[10, 12]))
-        self.case.ok(self.case.resume(self.case.publish()))
-        before = self.tracker.inspect()
-        result = self.tracker.control('synthesize-bug', self.discovery('narrowed-observer', [10]))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'bug_conflict')
-        self.assertEqual(self.tracker.inspect(), before)
-        item, fresh = self.synthesize(self.discovery(affected=[10, 12]))
-        self.assertNotEqual(fresh['assignment_id'], old['assignment_id'])
-        self.assertEqual(fresh['discovery']['affected'], [10, 12])
-        self.assertEqual(fresh['scoped_inputs']['12'], requirements.inputs(item, 12))
+    def test_fresh_settlement_releases_discovery_only_not_older_unknown_effect(self):
+        old = work_record(self.fixture, retired=True); fresh = work_record(self.fixture, published=True, assignment='fresh')
+        self.item.update(bug_work_history=[old], bug_work={'fresh': fresh}); self.fixture.persist()
+        self.assertEqual(bugs.held_numbers(self.fixture.stored()), set())
+        self.assertEqual(tickets.frontier(self.database, self.item, self.github)['ticket_work']['frontier']['eligible'], [10, 12])
+        for field, intent in {'issue_intent': {'title': 'unknown'}, 'membership_intent': True, 'edge_intents': [[13, 1010]],
+                              'affected_intents': {'10': {'body': 'pending'}}, 'field_intents': {'status': 'Ready'}}.items():
+            with self.subTest(field=field):
+                uncertain = {**old, field: intent}; self.item['bug_work_history'] = [uncertain]; self.fixture.persist(); self.assert_held(10)
+                self.assertEqual(self.fixture.stored()['bug_work_history'][0][field], intent)
 
 
 class BugHistoryHoldTests(unittest.TestCase):

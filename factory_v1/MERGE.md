@@ -16,8 +16,10 @@ check and delivery reads; old scheduled/approved candidates remain inadmissible.
 
 Run from the repository root, through the trusted host controller only. Set the
 variables below to actual registered IDs and private paths; examples are not evidence.
-The same existing `.onboarding.lock` serializes admission, publication, pause/revision
-operations and reconciliation. Missing state/lock does not create replacement state.
+The existing `.onboarding.lock` serializes admission, publication, revision operations
+and reconciliation. [Public pause/stop](CONTROLS.md) persist a separate short-lived
+control-lane hold without waiting for this long lock; admission and the final merge
+boundary recheck it. Missing state/lock does not create replacement product state.
 
 ```sh
 mise exec -- python -m factory_v1 --state "$FACTORY_STATE" --operator-id "$FACTORY_OPERATOR" \

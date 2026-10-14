@@ -62,7 +62,9 @@ def reload_locked(database, item):
 
 
 def plan(database, item, request):
+    from .controls import require_active
     item = reload_locked(database, item)
+    require_active(database, item['project_id'], item['iteration_id'])
     require(item.get('repository_onboarding', {}).get('status') == 'verified',
             'Onboard the explicitly selected repository first.', 'onboarding_required')
     require(isinstance(request, dict) and set(request) == {'origin', 'expected_revision', 'skills'},
@@ -93,7 +95,7 @@ def plan(database, item, request):
     if item.get('reservation'):
         item['reservation']['status'] = 'invalidated'
     transition(item, 'planning_pending')
-    save_iteration(database, item)
+    checkpoint(database, item)
     return item
 
 
@@ -113,8 +115,18 @@ def validate_documents(docs):
                 for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
 
 
+def checkpoint(database, item):
+    from .controls import admission
+    with admission(database, item['project_id'], item['iteration_id']):
+        require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
+        save_iteration(database, item)
+        database.commit()
+
+
 def complete(database, item, request, github):
+    from .controls import require_active
     item = reload_locked(database, item)
+    require_active(database, item['project_id'], item['iteration_id'])
     planning = item.get('planning')
     require(planning is not None, 'Start a same-conversation planning assignment first.', 'planning_required')
     common = {'assignment_id', 'origin', 'sufficient', 'rationale', 'reference', 'pending_questions'}
@@ -133,7 +145,7 @@ def complete(database, item, request, github):
         planning['pending_questions'] = pending
         planning['judgment'] = {key: request[key] for key in ('sufficient', 'rationale', 'reference')}
         transition(item, 'planning_pending')
-        save_iteration(database, item)
+        checkpoint(database, item)
         return item
     require(not pending, 'Missing answers cannot be replaced by an agent sufficiency assertion.')
     docs = request['documents']
@@ -188,5 +200,5 @@ def complete(database, item, request, github):
                        'issue': {'number': number, 'id': issue['id'], 'url': url},
                        'documents': references, 'api_base': github.base}
     transition(item, 'planning_complete')
-    save_iteration(database, item)
+    checkpoint(database, item)
     return item

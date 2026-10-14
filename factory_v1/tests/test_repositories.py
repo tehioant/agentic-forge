@@ -1,4 +1,4 @@
-"""Public CLI repository onboarding; HTTP fixtures are deterministic, not live evidence."""
+"""Direct repository state and adapter checks; legacy helper APIs remain compatible."""
 import json
 import os
 import subprocess
@@ -129,445 +129,318 @@ class RepositoryLifecycleTests(unittest.TestCase):
         return self.cli('onboard', '--project', 'product', '--iteration', 'm1',
                         '--api-base', self.base, '--creation-receipt', path)
 
-    def test_null_successful_preflight_never_authorizes_creation(self):
-        self.raw_metadata = 'null'
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Legacy helper APIs above are intentionally undiscovered and unused below.
+import copy
+import io
+import sqlite3
+import http.client
+import urllib.error
+from email.message import Message
+from contextlib import closing
+from unittest import mock
+from factory_v1 import repositories
+
+
+class RepositoryComponentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.state = self.root / 'state.sqlite'
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product',
+                     'approval': {'operator_id': '42', 'reference': 'approved'},
+                     'execution_allowed': False}
+        self.metadata = {'id': 123, 'full_name': 'example/product', 'name': 'product',
+                         'owner': {'login': 'example'}, 'private': True, 'description': 'marker-123'}
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+            db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+        self.api = mock.Mock(spec=repositories.GitHub)
+        self.api.base = 'https://api.github.com'
+        self.api.request.return_value = copy.deepcopy(self.metadata)
+        for target in ('socket.socket', 'subprocess.Popen'):
+            patcher = mock.patch(target, side_effect=AssertionError('external creation denied'))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def persist(self):
+        with closing(sqlite3.connect(self.state)) as db, db:
+            repositories.save_iteration(db, self.item)
+
+    def stored(self):
+        with closing(sqlite3.connect(self.state)) as db:
+            return json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+
+    def onboard(self, receipt=None):
+        with closing(sqlite3.connect(self.state)) as db:
+            return repositories.onboard(db, self.item, self.api, receipt)
+
+    def new(self):
+        self.item['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
+        self.persist()
+
+    def receipt(self, **changes):
+        return dict({'repository': 'example/product', 'repository_id': 123, 'marker': 'marker-123',
+                     'api_base': self.api.base, 'reference': 'trusted receipt'}, **changes)
+
+    def refuse(self, code, receipt=None):
+        with self.assertRaises(repositories.RepositoryError) as raised:
+            self.onboard(receipt)
+        self.assertEqual(raised.exception.code, code)
+
+    def test_existing_exact_metadata_reopens_without_creation_or_secret_retention(self):
+        self.api.request.return_value['temp_clone_token'] = 'secret-never-retain'
         result = self.onboard()
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls), self.calls)
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'github_unavailable')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
+        self.assertEqual(result, self.stored())
+        self.assertEqual(result['repository_onboarding']['metadata'], self.metadata)
+        self.assertEqual(result['repository_onboarding']['mode'], 'existing')
+        self.assertFalse(result['execution_allowed'])
+        self.assertNotIn(b'secret-never-retain', self.state.read_bytes())
+        self.api.request.assert_called_once_with('/repos/example/product')
+        self.assertEqual(self.onboard(), result)
 
-    def test_nonpositive_metadata_identity_is_refused(self):
-        for invalid_id in [0, -1]:
-            with self.subTest(repository_id=invalid_id):
-                self.state = self.root / f'invalid-metadata-{invalid_id}.sqlite'
-                self.register()
-                self.repo['id'] = invalid_id
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-                inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-                self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
+    def test_existing_absent_or_invalid_identity_never_creates_replacement(self):
+        original = self.state.read_bytes()
+        cases = [None, [], dict(self.metadata, owner=None)]
+        cases += [dict(self.metadata, id=v) for v in (0, -1, True, '123')]
+        cases += [dict(self.metadata, **{field: value}) for field, value in
+                  (('full_name', 'other/product'), ('name', 'other'), ('owner', {'login': 'other'}), ('private', 1))]
+        for metadata in cases:
+            with self.subTest(metadata=metadata):
+                self.api.request.return_value = metadata
+                self.refuse('repository_mismatch')
+                self.assertEqual(self.state.read_bytes(), original)
+        self.assertTrue(all(call.args == ('/repos/example/product',) for call in self.api.request.call_args_list))
 
-    def test_truncated_preflight_is_an_actionable_blocker(self):
-        self.truncated_path = '/repos/example/product'
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'github_unavailable')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-
-    def test_truncated_creation_response_reconciles_without_second_post(self):
-        self.repo = None
-        self.truncated_path = '/user/repos'
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertEqual(json.loads(inspected.stdout)['repository_onboarding']['status'], 'pending')
-        self.assertEqual(self.onboard().returncode, 0)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_truncated_readback_preserves_returned_creation_id(self):
-        self.repo = None
-        self.truncated_path = '/repos/example/product'
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        pending = json.loads(inspected.stdout)['repository_onboarding']
-        self.assertEqual(pending['status'], 'pending')
-        self.assertEqual(pending['created_repository_id'], 123)
-        self.truncated_path = None
-        self.assertEqual(self.onboard().returncode, 0)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_nonpositive_identity_cannot_reconcile_lost_creation_response(self):
-        self.repo = None
-        self.drop_creation_response = True
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        self.assertEqual(json.loads(self.onboard().stderr)['error'], 'creation_uncertain')
-        for invalid_id in [0, -1]:
-            with self.subTest(repository_id=invalid_id):
-                self.repo['id'] = invalid_id
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-                inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-                self.assertEqual(json.loads(inspected.stdout)['repository_onboarding']['status'], 'pending')
-        self.repo['id'] = 123
-        self.assertEqual(self.onboard().returncode, 0)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_trusted_creation_receipt_recovers_lost_state_with_exact_id_readback(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.restore(self.receipt_path())
-        self.assertEqual(result.returncode, 0, result.stderr)
-        record = json.loads(result.stdout)
+    def test_created_private_account_and_intent_are_durable_before_write(self):
+        self.new()
+        def request(path, body=None):
+            if path == '/user':
+                return {'login': 'example'}
+            if body is not None:
+                pending = self.stored()['repository_onboarding']
+                self.assertEqual(pending['status'], 'pending')
+                self.assertEqual(pending['marker'], 'marker-123')
+                self.assertEqual(body, {'name': 'product', 'private': True, 'description': 'marker-123', 'auto_init': False})
+                return {'id': 123}
+            if self.api.request.call_count == 1:
+                return None
+            self.assertEqual(self.stored()['repository_onboarding']['created_repository_id'], 123)
+            return self.metadata
+        self.api.request.side_effect = request
+        record = self.onboard()
+        self.assertEqual(record['repository_onboarding']['status'], 'verified')
+        self.assertEqual(record['repository_onboarding']['mode'], 'new')
         self.assertEqual(record['repository_onboarding']['metadata'], self.metadata)
-        self.assertEqual(record['repository_onboarding']['creation_receipt']['reference'],
-                         'trusted-controller-creation-receipt')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-        self.assertEqual(self.onboard().returncode, 0)
+        self.assertEqual(record, self.stored())
 
-    def test_receipt_requires_exact_trusted_scope_before_network(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        for changes in [{'repository': 'other/product'}, {'marker': 'wrong'},
-                        {'api_base': self.base + '/other'}, {'repository_id': True},
-                        {'repository_id': 0}, {'reference': ''}, {'extra': 'untrusted'}]:
-            with self.subTest(changes=changes):
-                result = self.restore(self.receipt_path(**changes))
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'invalid_receipt')
-        self.assertEqual(self.calls, [])
+    def test_collision_and_unresolved_account_refuse_before_mutation(self):
+        self.new()
+        self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+        self.refuse('repository_collision')
+        self.assertNotIn('repository_onboarding', self.stored())
+        self.api.request.reset_mock()
+        self.api.request.side_effect = [None, {'login': 'other'}]
+        self.refuse('account_capability_required')
+        self.assertEqual(self.api.request.call_count, 2)
+        self.assertTrue(all(len(call.args) == 1 for call in self.api.request.call_args_list))
 
-    def test_receipt_recovery_never_creates_an_absent_target(self):
-        self.repo = None
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.restore(self.receipt_path())
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
+    def test_lost_or_interrupted_creation_retains_intent_and_never_reposts(self):
+        for error in (repositories.RepositoryError('github_unavailable', 'lost response'), SystemExit('interrupted at effect return')):
+            with self.subTest(error=type(error).__name__):
+                self.item.pop('repository_onboarding', None)
+                self.new()
+                self.api.request.reset_mock()
+                self.api.request.side_effect = [None, {'login': 'example'}, error]
+                with self.assertRaises(type(error) if isinstance(error, SystemExit) else repositories.RepositoryError):
+                    self.onboard()
+                self.assertEqual(self.stored()['repository_onboarding']['status'], 'pending')
+                self.api.request.side_effect = [None, {'login': 'example'}]
+                self.refuse('creation_uncertain')
+                self.api.request.side_effect = [dict(self.metadata, id=0), {'login': 'example'}]
+                self.refuse('repository_mismatch')
+                self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+                self.assertEqual(self.onboard()['repository_onboarding']['status'], 'verified')
+                self.assertEqual(sum(len(call.args) == 2 for call in self.api.request.call_args_list), 1)
 
-    def test_successful_post_id_must_match_readback_and_restart(self):
-        self.repo = None
-        self.post_creation_repo = dict(self.metadata, id=999)
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        pending = json.loads(inspected.stdout)['repository_onboarding']
-        self.assertEqual(pending['status'], 'pending')
-        self.assertEqual(pending['created_repository_id'], 123)
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        self.repo = dict(self.metadata)
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)['repository_onboarding']['metadata']['id'], 123)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
+    def test_successful_post_identity_survives_failed_readback_and_replacement(self):
+        self.new()
+        self.api.request.side_effect = [None, {'login': 'example'}, {'id': 123},
+                                       repositories.RepositoryError('github_blocked', 'denied', 403)]
+        self.refuse('creation_uncertain')
+        self.assertEqual(self.stored()['repository_onboarding']['created_repository_id'], 123)
+        for metadata in (dict(self.metadata, id=999), dict(self.metadata, private=False),
+                         dict(self.metadata, owner={'login': 'other'}), dict(self.metadata, name='other'),
+                         dict(self.metadata, full_name='other/product'), dict(self.metadata, description='other')):
+            self.api.request.side_effect = [metadata, {'login': 'example'}]
+            self.refuse('repository_mismatch')
+            self.assertEqual(self.stored()['repository_onboarding']['status'], 'pending')
+        self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+        self.assertEqual(self.onboard()['repository_onboarding']['status'], 'verified')
+        self.assertEqual(sum(len(c.args) == 2 for c in self.api.request.call_args_list), 1)
 
-    def test_invalid_successful_post_id_cannot_authorize_later_adoption(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        for index, invalid_id in enumerate([None, True, 0, -1, '123', []]):
-            with self.subTest(repository_id=invalid_id):
-                self.state = self.root / f'invalid-post-{index}.sqlite'
-                self.repo = None
-                self.creation_id = invalid_id
-                self.register()
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-                inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-                self.assertEqual(json.loads(inspected.stdout)['repository_onboarding']['status'], 'blocked')
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 6)
+    def test_invalid_post_identity_and_definitive_rejection_remain_blocked(self):
+        for value in (None, True, 0, -1, '123', []):
+            self.item.pop('repository_onboarding', None)
+            self.new()
+            self.api.request.reset_mock()
+            self.api.request.side_effect = [None, {'login': 'example'}, {'id': value}]
+            self.refuse('repository_mismatch')
+            self.assertEqual(self.stored()['repository_onboarding']['status'], 'blocked')
+            self.refuse('repository_mismatch')
+            self.assertEqual(self.api.request.call_count, 3)
+        for status in (401, 403, 404, 409, 422):
+            self.item.pop('repository_onboarding', None)
+            self.persist()
+            self.api.request.reset_mock()
+            self.api.request.side_effect = [None, {'login': 'example'}, repositories.RepositoryError('github_blocked', 'refused', status)]
+            self.refuse('github_blocked')
+            self.refuse('github_blocked')
+            self.assertEqual(self.api.request.call_count, 3)
 
-    def test_successful_creation_with_denied_readback_remains_reconcilable(self):
-        self.repo = None
-        self.readback_status = 403
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        self.readback_status = 200
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
+    def test_receipt_shape_binding_absence_and_immutable_id(self):
+        self.new()
+        for changes in ({'repository': 'other/product'}, {'marker': 'other'}, {'api_base': self.api.base + '/other'},
+                        {'repository_id': True}, {'repository_id': 0}, {'reference': ''}, {'extra': 'untrusted'}):
+            self.refuse('invalid_receipt', self.receipt(**changes))
+        self.api.request.assert_not_called()
+        self.api.request.side_effect = [None, {'login': 'example'}]
+        self.refuse('creation_uncertain', self.receipt())
+        self.assertNotIn('repository_onboarding', self.stored())
+        self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+        self.refuse('repository_mismatch', self.receipt(repository_id=999))
+        self.assertNotIn('repository_onboarding', self.stored())
+        self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+        record = self.onboard(self.receipt())
+        self.assertEqual(record, self.stored())
+        self.assertEqual(record['repository_onboarding']['creation_receipt'], self.receipt())
+        self.api.request.side_effect = [self.metadata, {'login': 'example'}]
+        self.assertEqual(self.onboard(), record)
+        self.assertTrue(all(len(c.args) == 1 for c in self.api.request.call_args_list))
 
-    def test_process_death_after_creation_reconciles_committed_intent(self):
-        self.repo = None
-        self.release_response = threading.Event()
-        self.addCleanup(self.release_response.set)
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        process = subprocess.Popen(
-            [sys.executable, '-m', 'factory_v1', '--state', str(self.state),
-             '--operator-id', '42', 'onboard', '--project', 'product', '--iteration', 'm1',
-             '--api-base', self.base, '--timeout', '10'],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-        try:
-            self.assertTrue(self.creation_event.wait(timeout=5))
-        finally:
-            process.kill()
-            process.communicate(timeout=5)
-            self.release_response.set()
-        pending = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertEqual(json.loads(pending.stdout)['repository_onboarding']['status'], 'pending')
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
+    def test_verified_identity_and_endpoint_cannot_be_replaced(self):
+        self.onboard()
+        original = self.stored()
+        self.api.request.return_value = dict(self.metadata, id=999)
+        self.refuse('repository_mismatch')
+        self.assertEqual(self.stored(), original)
+        self.api.request.reset_mock()
+        self.api.base += '/other'
+        self.refuse('capability_conflict')
+        self.api.request.assert_not_called()
 
-    def test_colliding_new_target_is_not_adopted_even_with_matching_marker(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_collision')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-
-    def test_receipt_cannot_adopt_another_repository_id(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.restore(self.receipt_path(repository_id=999))
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-
-    def test_created_target_requires_exact_private_owner_name_marker_readback(self):
-        self.repo = None
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.metadata['private'] = False
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-        self.repo = dict(self.metadata, private=True)
-        for field, value in [('owner', {'login': 'other'}), ('name', 'other'),
-                             ('full_name', 'other/product'), ('description', 'other')]:
-            original = self.repo[field]
-            self.repo[field] = value
-            result = self.onboard()
-            self.assertEqual(result.returncode, 2, result.stdout)
-            self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-            self.repo[field] = original
-        self.assertEqual(self.onboard().returncode, 0)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_alternative_account_is_not_guessed_or_created(self):
-        self.repo = None
-        self.request['repository'] = 'other/product'
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'account_capability_required')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-
-    def test_missing_selected_existing_target_never_creates_a_replacement(self):
-        self.repo = None
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-
-    def test_ambiguous_or_parser_limit_metadata_is_a_structured_blocker(self):
-        self.register()
-        for raw in [json.dumps(self.metadata)[:-1] + ', "private": false, "private": true}',
-                    '{"id":' + '9' * 5000 + '}']:
-            with self.subTest(raw=raw[:80]):
-                self.raw_metadata = raw
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'github_unavailable')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-
-    def test_deep_external_json_is_an_actionable_blocker(self):
-        self.register()
-        deep_json = '[' * 10000 + '0' + ']' * 10000
-        for raw in [deep_json, deep_json[:-1]]:
-            with self.subTest(complete=raw == deep_json):
-                # Python 3.14 can decode valid nesting that older versions reject.
-                try:
-                    json.loads(raw)
-                except (ValueError, RecursionError):
-                    expected_error = 'github_unavailable'
-                    expected_message = 'configured capability'
-                else:
-                    expected_error = 'repository_mismatch'
-                    expected_message = 'selected repository'
-                self.raw_metadata = raw
-                result = self.onboard()
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(result.stdout, '')
-                blocker = json.loads(result.stderr)
-                self.assertEqual(blocker['error'], expected_error)
-                self.assertIn(expected_message, blocker['message'])
-                inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-                self.assertNotIn('repository_onboarding', json.loads(inspected.stdout))
-                self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-
-    def test_invalid_adapter_configuration_is_refused_before_network(self):
-        self.register()
-        for base, timeout in [('not-a-url', '1'), (self.base, '0'), (self.base, 'nan'),
-                              (self.base, 'inf'), ('http://remote.invalid', '1'),
-                              (self.base + '?scope=other', '1')]:
-            with self.subTest(base=base, timeout=timeout):
-                result = self.cli('onboard', '--project', 'product', '--iteration', 'm1',
-                                  '--api-base', base, '--timeout', timeout)
-                self.assertEqual(result.returncode, 2)
-                self.assertEqual(json.loads(result.stderr)['error'], 'invalid_capability')
-        self.assertEqual(self.calls, [])
-
-    def test_reconciliation_refuses_a_different_capability_endpoint(self):
-        self.register()
-        self.assertEqual(self.onboard().returncode, 0)
-        self.calls.clear()
-        result = self.cli('onboard', '--project', 'product', '--iteration', 'm1',
-                          '--api-base', self.base + '/different')
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'capability_conflict')
-        self.assertEqual(self.calls, [])
-
-    def test_definitive_creation_rejection_cannot_adopt_a_colliding_repository(self):
-        self.repo = None
-        self.creation_status = 422
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'github_blocked')
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'github_blocked')
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_only_required_metadata_is_retained_not_server_credentials(self):
-        self.repo['temp_clone_token'] = 'fixture-secret-never-retain'
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn('fixture-secret-never-retain', result.stdout)
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertNotIn('fixture-secret-never-retain', inspected.stdout)
-        self.assertNotIn(b'fixture-secret-never-retain', self.state.read_bytes())
-
-    def test_malformed_repository_metadata_is_a_structured_refusal(self):
-        self.register()
-        self.repo['owner'] = None
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(result.stdout, '')
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-
-    def test_removing_creation_intent_on_replay_is_a_scope_conflict(self):
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        self.request.pop('repository_intent')
-        path = self.root / 'replay.json'
-        path.write_text(json.dumps(self.request))
-        result = self.cli('register', '--request', str(path))
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'intake_conflict')
-
-    def test_verified_repository_cannot_be_replaced_by_same_name_and_marker(self):
-        self.register()
-        self.assertEqual(self.onboard().returncode, 0)
-        self.repo['id'] = 999
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'repository_mismatch')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertEqual(json.loads(inspected.stdout)['repository_onboarding']['metadata']['id'], 123)
-
-    def test_concurrent_onboarding_serializes_the_creation_boundary(self):
+    def test_concurrent_direct_onboarding_has_one_creation(self):
         from concurrent.futures import ThreadPoolExecutor
-        self.repo = None
-        self.preflight_barrier = threading.Barrier(2)
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
+        self.new()
+        observed = None
+        def request(path, body=None):
+            nonlocal observed
+            if path == '/user':
+                return {'login': 'example'}
+            if body is not None:
+                observed = self.metadata
+                return {'id': 123}
+            return observed
+        self.api.request.side_effect = request
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda _: self.onboard('2'), range(2)))
-        for result in results:
-            self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
+            futures = [pool.submit(self.onboard) for _ in range(2)]
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(sum(len(c.args) == 2 for c in self.api.request.call_args_list), 1)
 
-    def test_wrong_operator_cannot_use_recorded_creation_approval(self):
-        self.repo = None
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = subprocess.run([sys.executable, '-m', 'factory_v1', '--state', str(self.state),
-                                '--operator-id', '99', 'onboard', '--project', 'product',
-                                '--iteration', 'm1', '--api-base', self.base],
-                               text=True, capture_output=True, timeout=15,
-                               env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'approval_required')
-        self.assertEqual(self.calls, [])
+    def test_adapter_configuration_and_raw_response_refusals_without_network(self):
+        for base, timeout in (('not-a-url', 1), (self.api.base, 0), (self.api.base, float('nan')),
+                              (self.api.base, float('inf')), ('http://remote.invalid', 1),
+                              (self.api.base + '?scope=other', 1)):
+            with self.assertRaises(repositories.RepositoryError) as raised:
+                repositories.GitHub(base, 'unused', timeout)
+            self.assertEqual(raised.exception.code, 'invalid_capability')
+        self.assertIsNone(repositories.NoRedirect().redirect_request(mock.Mock(), io.BytesIO(), 302, 'redirect', mock.Mock(), 'https://other.invalid'))
+        api = repositories.GitHub(self.api.base, 'unused', 1)
+        for raw in ('null', '{"id":1,"id":2}', '{"id":' + '9' * 5000 + '}', '{', '[' * 10000 + '0' + ']' * 9999):
+            api.opener = mock.Mock()
+            api.opener.open.return_value = io.StringIO(raw)
+            with self.assertRaises(repositories.RepositoryError) as raised:
+                api.request('/repos/example/product')
+            self.assertEqual(raised.exception.code, 'github_unavailable')
+        api.opener.open.side_effect = None
+        api.opener.open.return_value = io.StringIO('[' * 10000 + '0' + ']' * 10000)
+        try:
+            nested = api.request('/repos/example/product')
+        except repositories.RepositoryError as error:
+            self.assertEqual(error.code, 'github_unavailable')
+        else:
+            self.api.request.return_value = nested
+            self.refuse('repository_mismatch')
+        for error in (http.client.IncompleteRead(b'{"id":'), OSError('unreachable')):
+            api.opener.open.side_effect = error
+            with self.assertRaises(repositories.RepositoryError) as raised:
+                api.request('/repos/example/product')
+            self.assertEqual(raised.exception.code, 'github_unavailable')
+        missing = urllib.error.HTTPError('https://api.github.com', 404, 'missing', Message(), None)
+        self.addCleanup(missing.close)
+        api.opener.open.side_effect = missing
+        self.assertIsNone(api.request('/repos/example/product'))
+        with self.assertRaises(repositories.RepositoryError):
+            api.request('/user/repos', {'name': 'product'})
 
-    def test_reconciliation_cannot_recreate_a_missing_uncertain_target(self):
-        self.repo = None
-        self.drop_creation_response = True
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        self.assertEqual(self.onboard().returncode, 2)
-        self.repo = None  # A 404 is not proof a timed-out mutation cannot complete later.
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
+    def test_creation_identity_guard_sensitivity(self):
+        self.new()
+        self.item['repository_onboarding'] = {'status': 'pending', 'mode': 'new', 'marker': 'marker-123',
+                                             'api_base': self.api.base, 'created_repository_id': 123}
+        self.persist()
+        self.api.request.side_effect = [dict(self.metadata, id=999), {'login': 'example'}]
+        self.refuse('repository_mismatch')
+        # The exact ID check is inline: run an isolated code object with only that guard removed.
+        import inspect
+        source = inspect.getsource(repositories.reconcile)
+        source = source.replace("if previous and 'created_repository_id' in previous and metadata['id'] != previous['created_repository_id']:", 'if False:')
+        namespace = dict(vars(repositories))
+        exec(compile(source, '<identity-guard-probe>', 'exec'), namespace)
+        self.api.request.side_effect = [dict(self.metadata, id=999), {'login': 'example'}]
+        with closing(sqlite3.connect(self.state)) as db, db:
+            broken = namespace['reconcile'](db, self.stored(), self.api)
+        self.assertEqual(broken['repository_onboarding']['metadata']['id'], 999)
 
-    def test_lost_creation_response_is_durable_and_reconciled_before_retry(self):
-        self.repo = None
-        self.drop_creation_response = True
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'creation_uncertain')
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        pending = json.loads(inspected.stdout)['repository_onboarding']
-        self.assertEqual(pending['status'], 'pending')
-        self.assertEqual(pending['marker'], 'marker-123')
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)['repository_onboarding']['status'], 'verified')
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-        self.assertEqual(self.onboard().returncode, 0)
-        self.assertEqual(len([call for call in self.calls if call[0] == 'POST']), 1)
-
-    def test_approved_new_product_creates_private_in_resolved_account(self):
-        self.repo = None
-        self.request['repository_intent'] = {'mode': 'new', 'marker': 'marker-123'}
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        item = json.loads(result.stdout)
-        self.assertEqual(item['repository_onboarding']['metadata'], self.metadata)
-        self.assertEqual(item['repository_onboarding']['mode'], 'new')
-        self.assertIn(('GET', '/user'), self.calls)
-        self.assertIn(('POST', '/user/repos', {'name': 'product', 'private': True,
-                                             'description': 'marker-123', 'auto_init': False}), self.calls)
-        self.assertEqual(self.calls[-1], ('GET', '/repos/example/product'))
-
-    def test_selected_existing_repository_is_read_back_without_creation(self):
-        self.register()
-        result = self.onboard()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        item = json.loads(result.stdout)
-        self.assertEqual(item['repository_onboarding']['status'], 'verified')
-        self.assertEqual(item['repository_onboarding']['metadata'], self.metadata)
-        self.assertFalse(item['execution_allowed'])
-        self.assertFalse(any(call[0] == 'POST' for call in self.calls))
-        inspected = self.cli('inspect', '--project', 'product', '--iteration', 'm1')
-        self.assertEqual(json.loads(inspected.stdout), item)
+    def test_wrong_operator_onboarding_refuses_before_capability_use(self):
+        from factory_v1 import __main__ as cli
+        from factory_v1.errors import IntakeError
+        with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '99',
+            'onboard', '--project', 'product', '--iteration', 'm1', '--api-base', self.api.base]), mock.patch.object(repositories.GitHub, 'request') as request, self.assertRaises(IntakeError) as raised:
+            cli.main()
+        self.assertEqual(raised.exception.code, 'approval_required')
+        request.assert_not_called()
+        self.assertNotIn('repository_onboarding', self.stored())

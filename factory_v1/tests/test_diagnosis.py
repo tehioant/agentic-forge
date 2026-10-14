@@ -1,4 +1,4 @@
-"""Focused report-policy units plus two public CLI smokes. External execution is LABELED simulation."""
+"""Direct engineering seams; legacy sibling fixture helpers are not discovered."""
 import copy
 import json
 import os
@@ -271,221 +271,516 @@ class DiagnosisLifecycleTests(unittest.TestCase):
         path.write_text(json.dumps(response))
         return self.fixture.cli('respond', '--project', 'product', '--iteration', 'm1', '--request', str(path))
 
-    def test_public_stuck_debug_direction_retry_and_independent_progress(self):
-        stuck = self.stuck()
-        held = self.assignment.ok(self.command('declare-stuck', self.identity))
-        self.assertEqual(held['affected'], [10, 11])
-        self.assertTrue(held['blocks_verified'])
-        frontier = self.assignment.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
-        self.assertEqual(frontier['eligible'], [12])
-        self.assertEqual(frontier['active'], [])
-        for number in (10, 11):
-            self.assertEqual(self.tracker.members[number]['fields']['STATUS'], 'Blocked')
-            self.assertEqual(self.tracker.issues[number]['state'], 'open')
-        self.assertNotIn('reservation', self.tracker.inspect())
-        writes = len(self.fixture.calls)
-        self.assertEqual(self.assignment.ok(self.command('declare-stuck', self.identity)), held)
-        self.assertFalse(any(c[0] != 'GET' and c[1] != '/graphql' for c in self.fixture.calls[writes:]))
-        dependent = self.assignment.configuration(11)
-        dependent['profile'].update(name='dependent-builder', home=str(self.root / 'dependent-home'))
-        dependent['claim_id'] = 'dependent-claim'
-        self.assignment.refused(self.assignment.command(request=dependent), 'ticket_ineligible')
-        before = self.fixture.state.read_bytes()
-        dry = self.assignment.ok(self.command('prepare-diagnosis', self.debug_request(), dry=True))
-        self.assertEqual(self.fixture.state.read_bytes(), before)
-        debug = self.assignment.ok(self.command('prepare-diagnosis', self.debug_request()))
-        self.assertEqual(debug['assignment_id'], dry['assignment_id'])
-        self.assignment.refused(self.assignment.command('assignment-result', self.assignment.result(debug), debug['assignment_id']), 'invalid_result')
-        # A held primary does not monopolize the implementation slot while debug runs.
-        self.assignment.ok(self.tracker.control('reserve-ticket', issue=12))
-        independent = self.assignment.configuration(12)
-        independent['baseline'] = self.assignment.request['baseline']
-        independent['profile'].update(name='independent-builder', home=str(self.root / 'independent-home'))
-        independent['claim_id'] = 'independent-claim'
-        ready = self.assignment.ok(self.assignment.command(request=independent))
-        self.case.mode('')
-        progress = self.assignment.ok(self.case.launch(ready))
-        self.assertEqual(progress['runtime']['status'], 'complete', progress)
-        axis = self.assignment.ok(self.case.launch(debug))
-        self.assertEqual(axis['runtime']['status'], 'complete', axis)
-        self.assertEqual(axis['handoff']['skill_entry_points'], ['diagnosing-bugs'])
-        self.assertEqual(axis['handoff']['capabilities'], ['read_workspace', 'scratch', 'model'])
-        self.assertEqual(axis['handoff']['diagnosis']['pins'], held['pins'])
-        root = Path(axis['runtime']['artifacts'])
-        inspection = json.loads((root / 'container-inspection.json').read_text())
-        self.assertFalse(next(m['RW'] for m in inspection['Mounts'] if m['Destination'] == '/workspace'))
-        self.assertEqual((root / 'workspace/hello.py').read_bytes(), (Path(stuck['runtime']['artifacts']) / 'workspace/hello.py').read_bytes())
-        self.assertIn('AssertionError', axis['diagnosis_result']['feedback_loop']['result'])
-        self.assertIn('exit_code=1', axis['diagnosis_result']['feedback_loop']['result'])
-        self.assertFalse(axis['diagnosis_result']['advance_allowed'])
-        self.assertFalse(axis['diagnosis_result']['native_execution_trusted'])
-        self.assignment.refused(self.command('request-direction', self.identity), 'execution_required')
-        path = self.authorization(axis)
-        path.chmod(0o644)
-        self.assignment.refused(self.command('request-direction', self.identity, path), 'approval_required')
-        path.chmod(0o600)
-        mounted_by_builder = Path(stuck['runtime']['artifacts']) / 'scratch/fake-host-grant.json'
-        mounted_by_builder.write_bytes(path.read_bytes())
-        mounted_by_builder.chmod(0o600)
-        self.assignment.refused(self.command('request-direction', self.identity, mounted_by_builder), 'approval_required')
-        notified = self.assignment.ok(self.command('request-direction', self.identity, path))
-        event = notified['attention']
-        self.assertEqual(event['destination'], self.tracker.inspect()['origin'])
-        self.assertEqual(event['state'], 'pending')
-        self.assertIsNone(event['decision_response'])
-        self.assertEqual(self.assignment.ok(self.command('request-direction', self.identity))['attention'], event)
-        apply = {**self.identity, 'event_id': event['event']['event_id']}
-        self.assignment.refused(self.command('apply-direction', apply), 'decision_required')
-        self.assignment.refused(self.respond(event, operator_id='99'), 'invalid_decision')
-        self.assignment.refused(self.respond(event, response='Looks good; unrelated chat is not a direction'), 'invalid_decision')
-        self.assignment.refused(self.respond(event, origin={**event['destination'], 'thread_id': '999'}), 'invalid_decision')
-        self.assignment.refused(self.command('apply-direction', {**apply, 'event_id': 'unrelated'}), 'invalid_decision')
-        transcript = root / 'scratch/conversation.json'
-        actual = transcript.read_bytes()
-        transcript.write_bytes(actual + b'\n')
-        self.assignment.refused(self.command('request-direction', self.identity), 'execution_required')
-        transcript.write_bytes(actual)
-        self.assignment.ok(self.respond(event))
-        dependent_body = self.tracker.issues[11]['body']
-        self.tracker.issues[11]['body'] += '\nExternally changed dependent scope'
-        self.assignment.refused(self.command('apply-direction', apply), 'scope_mismatch')
-        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
-        self.assertEqual(self.tracker.members[12]['fields']['STATUS'], 'Active')
-        self.tracker.issues[11]['body'] = dependent_body
-        # Lose the response after restoring the root; the dependent remains held.
-        self.tracker.drop = 'field'
-        interrupted = self.command('apply-direction', apply)
-        self.assertEqual(interrupted.returncode, 2, interrupted.stdout)
-        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
-        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
-        pending = self.tracker.inspect()['stuck_work'][stuck['assignment_id']]
-        self.assertEqual(pending['status'], 'release-pending')
-        self.assertIsNotNone(pending['applied_response'])
-        frontier = self.assignment.ok(self.tracker.control('frontier'))['ticket_work']['frontier']
-        self.assertNotIn(10, frontier['eligible'])
-        self.assertNotIn(11, frontier['eligible'])
-        self.assertEqual(self.assignment.ok(self.assignment.inspect(stuck))['stuck_disposition'], 'held')
-        self.assertNotIn('stuck_disposition', self.assignment.ok(self.assignment.inspect(axis)))
-        self.assignment.refused(self.case.launch(debug), 'ticket_ineligible')
-        self.assignment.refused(self.command('prepare-diagnosis', self.debug_request()), 'diagnosis_held')
-        replacement = copy.deepcopy(axis['handoff'])
-        replacement = {k: replacement[k] for k in diagnosis.assignments.REQUEST_FIELDS}
-        replacement['skills'] = self.assignment.configuration(stage='diagnosis')['skills']
-        replacement['profile'].update(name='replacement-debug', home=str(self.root / 'replacement-debug'))
-        replacement['claim_id'] = 'replacement-debug'
-        self.assignment.refused(self.assignment.command(request=replacement), 'claim_conflict')
-        transcript.write_bytes(actual + b'\n')
-        refused = self.command('apply-direction', apply)
-        self.assertEqual(refused.returncode, 2, refused.stdout)
-        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
-        transcript.write_bytes(actual)
-        released = self.assignment.ok(self.command('apply-direction', apply))
+from unittest.mock import Mock, patch
+from factory_v1.tests import test_simplification
+
+
+class DiagnosisComponentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        evidence = self.root / 'responsible'
+        evidence.mkdir(mode=0o700)
+        self.e = test_simplification.LocalStageEvidence(evidence)
+        self.prior = self.e.assignment
+        self.prior['handoff'].update(stage='implementation', repository='example/product',
+            repository_id=123, workspace=str(evidence / 'workspace'), standards=[],
+            profile={'name': 'responsible', 'home': str(self.root / 'responsible-home')})
+        self.prior['handoff']['issue'].update(number=10, id=110, node_id='ISSUE10')
+        self.e.seal_handoff()
+        declaration = {'reason': 'Local explicit responsible stuckness',
+            'attempted_fixes': [{'change': 'Literal repair', 'command': 'python symptom.py', 'result': 'Local red output'}],
+            'findings': ['Local unresolved mismatch']}
+        self.prior['submitted_result'] = {'status': 'stuck', 'run_id': self.e.runtime['run_id'],
+            'artifacts': [diagnosis.simplification.artifact('stuck-declaration', json.dumps(declaration))],
+            'tests': [{'command': 'python symptom.py', 'result': 'Local red output'}]}
+        self.prior['result_disposition'] = {'isolated_execution': True}
+        (evidence / 'scratch').mkdir()
+        (evidence / 'scratch/result.json').write_text(json.dumps(self.prior['submitted_result']))
+        self.database = sqlite3.connect(self.root / 'state.sqlite')
+        self.addCleanup(self.database.close)
+        self.database.executescript('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT);'
+                                   'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+            'repository': 'example/product', 'approval': {'operator_id': '42', 'reference': 'Local diagnosis fixture'},
+            'ticket_work': {'board': {'project_id': 'BOARD', 'status': {'id': 'STATUS', 'options': {'Ready': 'READY', 'Blocked': 'BLOCKED'}}},
+                            'request': {'tracker': {'statuses': {'ready': 'Ready', 'blocked': 'Blocked'}}}}}
+        self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+        self.store(self.prior)
+        self.rows = [{'number': n, 'id': 100+n, 'node_id': 'ISSUE'+str(n), 'membership_id': 'MEM'+str(n),
+                      'issue_state': 'open', 'status': 'ready', 'blockers': blockers}
+                     for n, blockers in [(10, []), (11, [10]), (12, []), (13, [11])]]
+        self.github = Mock(base='https://api.github.com')
+        # Only external board/issue reads and status writes are simulated.
+        self.enterContext(patch.object(diagnosis.tickets, 'frontier', side_effect=self.frontier))
+        self.enterContext(patch.object(diagnosis.tickets.gh, 'read_issue', side_effect=self.read_issue))
+        self.set_field = self.enterContext(patch.object(diagnosis.tickets.gh, 'set_field', side_effect=self.change_status))
+
+    def store(self, row):
+        self.database.execute('INSERT OR REPLACE INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.database.commit()
+
+    def frontier(self, database, item, github):
+        observed = copy.deepcopy(item)
+        observed['ticket_work']['frontier'] = {'items': copy.deepcopy(self.rows)}
+        return observed
+
+    def read_issue(self, github, repository, number):
+        return {'body': 'Local issue ' + str(number)}
+
+    def change_status(self, github, project, member, field, value):
+        row = next(r for r in self.rows if r['membership_id'] == member)
+        row['status'] = 'ready' if value == 'READY' else 'blocked'
+
+    def declare(self):
+        # The handoff body pin binds the actual external fixture body, not a self-validating constant.
+        self.prior['handoff']['issue']['body_sha256'] = diagnosis.hashlib.sha256(b'Local issue 10').hexdigest()
+        self.prior['handoff_digest'] = diagnosis.assignments.digest(self.prior['handoff'])
+        self.store(self.prior)
+        return diagnosis.declare(self.database, 'product', 'm1', '42', {'stuck_assignment': self.prior['assignment_id']}, self.github)
+
+    def test_responsible_stuck_source_retains_attempts_and_refuses_crash_or_forgery(self):
+        good = copy.deepcopy(self.prior)
+        diagnosis.source(self.database, 'product', 'm1', '42', good['assignment_id'])
+        for group, field, value in [('runtime', 'status', 'failed'), ('runtime', 'container_removed', False),
+            ('submitted_result', 'status', 'done'), ('result_disposition', 'isolated_execution', False)]:
+            row = copy.deepcopy(good)
+            row[group][field] = value
+            self.store(row)
+            with self.subTest(field=field):
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.source(self.database, 'product', 'm1', '42', row['assignment_id'])
+                self.assertEqual(refusal.exception.code, 'stuck_required')
+        self.store(good)
+        (self.e.root / 'scratch/result.json').write_text('{}')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.source(self.database, 'product', 'm1', '42', good['assignment_id'])
+        self.assertEqual(refusal.exception.code, 'stale_assignment')
+
+    def test_declare_transitive_scope_durable_retirement_and_independent_progress(self):
+        record = self.declare()
+        self.assertEqual(record['affected'], [10, 11, 13])
+        self.assertTrue(record['blocks_verified'])
+        self.assertEqual(record['status'], 'diagnosis')
+        self.assertEqual(self.rows[2]['status'], 'ready')
+        self.assertEqual([r['status'] for r in self.rows if r['number'] != 12], ['blocked'] * 3)
+        held = diagnosis.assignments.rows(self.database)[0]
+        self.assertEqual(held['stuck_disposition'], 'held')
+        self.assertTrue(diagnosis.released_claim(self.database, held))
+        writes = self.set_field.call_count
+        self.assertEqual(diagnosis.declare(self.database, 'product', 'm1', '42', {'stuck_assignment': held['assignment_id']}, self.github), record)
+        self.assertEqual(self.set_field.call_count, writes)
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            self.assertEqual(diagnosis.assignments.current(restarted, 'product', 'm1', '42')['stuck_work'][held['assignment_id']], record)
+
+    def test_exact_independent_handoff_and_real_staging(self):
+        record = self.declare()
+        request = copy.deepcopy(self.prior['handoff'])
+        request['preceding'] = diagnosis.preceding(record, record['declaration'], self.prior)
+        contract = diagnosis.handoff(self.database, 'product', 'm1', '42', request)
+        self.assertTrue(contract['read_only'])
+        self.assertFalse(contract['native_execution_trusted'])
+        destination = self.root / 'debug'
+        destination.mkdir()
+        (destination / 'workspace').mkdir()
+        pins = {'baseline': self.e.baseline}
+        diagnosis.copy_candidate(self.database, 'product', 'm1', '42', {'handoff': {'diagnosis': contract}}, destination, pins)
+        self.assertEqual(diagnosis.manifest(destination / 'workspace'), self.e.initial)
+        request['baseline'] = 'f' * 40
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.handoff(self.database, 'product', 'm1', '42', request)
+        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+
+    def test_overlapping_release_preserves_other_hold_and_exact_issue_body(self):
+        record = self.declare()
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        item['stuck_work']['other'] = {'pins': {'other': True}, 'status': 'awaiting-direction', 'affected': [11]}
+        released = diagnosis.sync_blocks(self.database, item, record, self.github, release=True)
+        statuses = {r['number']: r['status'] for r in released['ticket_work']['frontier']['items']}
+        self.assertEqual(statuses, {10: 'ready', 11: 'blocked', 12: 'ready', 13: 'ready'})
+        record['issues']['11']['body_sha256'] = '0' * 64
+        writes = self.set_field.call_count
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.sync_blocks(self.database, item, record, self.github, release=True)
+        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+        self.assertEqual(self.set_field.call_count, writes)
+
+    def direction_inputs(self, action='retry'):
+        record = self.declare()
+        root = self.root / 'independent-debug'
+        root.mkdir(mode=0o700)
+        e = test_simplification.LocalStageEvidence(root)
+        axis = copy.deepcopy(self.prior)
+        axis.update(assignment_id='b' * 64, claim_id='independent-debug', runtime=e.runtime)
+        axis['handoff'].update(stage='diagnosis', diagnosis={'pins': record['pins']}, skills=[],
+            profile={'name': 'independent-debug', 'home': str(self.root / 'debug-home')},
+            adaptation='LABELED independent diagnosis input')
+        axis['handoff_digest'] = diagnosis.assignments.digest(axis['handoff'])
+        axis['submitted_result'] = {'loads': [], 'work': ['LABELED read-only investigation']}
+        axis['diagnosis_result'] = {'report_sha256': 'c' * 64}
+        files = ['scratch/result.json', 'scratch/loads.json', 'scratch/events.jsonl', 'scratch/conversation.json',
+            'scratch/probes.json', 'inputs/worker.py', 'inputs/sandbox_relay.py', 'inputs/assignment.json',
+            'inputs/handoff.json', 'container-inspection.json', 'launch-command.json', 'source-artifacts.json',
+            'worker-reported-tests.json', 'model-evidence/response-local.json']
+        for name in files:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('LABELED execution-binding input; not native execution\n')
+        self.store(axis)
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        record = item['stuck_work'][self.prior['assignment_id']]
+        record.update(status='awaiting-direction', event_id='direction-event', diagnosis_assignment=axis['assignment_id'],
+                      authorization={'diagnosis': diagnosis.execution_binding(axis)})
+        diagnosis.tickets.checkpoint(self.database, item)
+        origin = {'platform': 'telegram', 'chat_id': '42'}
+        response = {'event_id': 'direction-event', 'decision_id': 'direction-event', 'operator_id': '42',
+            'origin': origin, 'reference': 'Local authenticated operator input',
+            'response': json.dumps({'action': action, 'direction': 'Preserve original scope; investigate greeting'})}
+        notification = {'event': {'event_id': 'direction-event', 'decision_id': 'direction-event', 'kind': 'decision'},
+                        'destination': origin, 'decision_response': response}
+        # Completed native diagnosis and authenticated transport retrieval are prerequisites,
+        # not the direction/release/retirement invariant. Bindings and response validation remain real.
+        self.enterContext(patch.object(diagnosis, 'completed', return_value=axis))
+        self.enterContext(patch.object(diagnosis.attention, 'get_record', return_value=notification))
+        return {'stuck_assignment': self.prior['assignment_id'], 'event_id': 'direction-event'}, notification
+
+    def test_direction_silence_revise_and_exact_replay_never_imply_retry(self):
+        request, notification = self.direction_inputs('revise')
+        response = notification['decision_response']
+        notification['decision_response'] = None
+        writes = self.set_field.call_count
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'decision_required')
+        notification['decision_response'] = response
+        record = diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(record['status'], 'revision-required')
+        self.assertEqual(self.set_field.call_count, writes)
+        self.assertEqual(diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github), record)
+        notification['decision_response'] = {**response, 'response': json.dumps({'action': 'retry', 'direction': 'Changed scope'})}
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'decision_conflict')
+
+    def test_retry_release_intent_survives_partial_external_effect_then_reconciles(self):
+        request, _ = self.direction_inputs()
+        fail_once = True
+        def effect(github, project, member, field, value):
+            nonlocal fail_once
+            durable = diagnosis.assignments.current(self.database, 'product', 'm1', '42')['stuck_work'][self.prior['assignment_id']]
+            self.assertEqual(durable['status'], 'release-pending')
+            self.change_status(github, project, member, field, value)
+            if fail_once:
+                fail_once = False
+                raise RepositoryError('transport_error', 'Local lost status response')
+        self.set_field.side_effect = effect
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'transport_error')
+        saved = diagnosis.assignments.current(self.database, 'product', 'm1', '42')['stuck_work'][self.prior['assignment_id']]
+        self.assertEqual(saved['status'], 'release-pending')
+        self.assertIsNotNone(saved['applied_response'])
+        released = diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
         self.assertEqual(released['status'], 'released')
-        self.assertEqual(self.assignment.ok(self.command('apply-direction', apply)), released)
-        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Ready')
-        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Ready')
-        self.assertEqual(self.tracker.members[12]['fields']['STATUS'], 'Active')
-        self.assertEqual(self.tracker.issues[10]['state'], 'open')
-        self.assertFalse(self.assignment.ok(self.assignment.inspect(axis))['diagnosis_result']['advance_allowed'])
-        # A direction is not authority to overlap the independent implementation ticket.
-        retry = copy.deepcopy(self.assignment.request)
-        retry['profile'].update(name='retry-builder', home=str(self.root / 'retry-home'))
-        retry['claim_id'] = 'retry-claim'
-        self.assignment.refused(self.assignment.command(request=retry), 'claim_conflict')
+        self.assertEqual(self.set_field.call_count, 6)  # Three Blocked writes, then three distinct Ready writes.
+        self.assertEqual({r['status'] for r in self.rows}, {'ready'})
+        for row in diagnosis.assignments.rows(self.database):
+            self.assertEqual(row['stuck_disposition'], 'superseded')
+        writes = self.set_field.call_count
+        self.assertEqual(diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github), released)
+        self.assertEqual(self.set_field.call_count, writes)
 
-    def test_public_diagnosis_rejects_green_claim_contradicting_retained_red_output(self):
-        from factory_v1 import sandbox
+    def test_pause_blocks_declaration_without_retiring_or_status_mutation(self):
+        from factory_v1 import controls
+        controls.request(self.database, 'product', 'm1', '42', 'pause', 'local diagnosis pause')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.declare(self.database, 'product', 'm1', '42', {'stuck_assignment': self.prior['assignment_id']}, self.github)
+        self.assertEqual(refusal.exception.code, 'iteration_paused')
+        self.set_field.assert_not_called()
+        self.assertNotIn('stuck_disposition', diagnosis.assignments.rows(self.database)[0])
 
-        self.stuck()
-        self.assignment.ok(self.command('declare-stuck', self.identity))
-        debug = self.assignment.ok(self.command('prepare-diagnosis', self.debug_request()))
-        self.case.mode('diagnosis-false-green')
-        axis = self.assignment.ok(self.case.launch(debug))
-        self.assertEqual(axis['runtime']['status'], 'failed', axis.get('runtime'))
-        self.assertEqual(axis['runtime']['error'], 'invalid_result')
-        self.assertTrue(axis['runtime']['container_removed'])
-        self.assertNotIn('submitted_result', axis)
-        self.assertNotIn('diagnosis_result', axis)
+    def completed_inputs(self):
+        """Direct local records/artifacts, not a native worker or stage execution."""
+        record = self.declare()
+        root = self.root / 'completed-debug'
+        root.mkdir(mode=0o700)
+        e = test_simplification.LocalStageEvidence(root)
+        axis = copy.deepcopy(self.prior)
+        axis.pop('stuck_disposition', None)
+        axis.update(assignment_id='b' * 64, claim_id='completed-debug', runtime=e.runtime,
+                    result_disposition={'isolated_execution': True})
+        axis['handoff'].update(stage='diagnosis', diagnosis={'pins': record['pins']}, skills=[],
+            workspace=str(root / 'workspace'), profile={'name': 'completed-debug', 'home': str(self.root / 'debug-home')},
+            adaptation='LABELED local read-only diagnosis input; no native execution', preceding=[],
+            capabilities=['read_workspace', 'scratch', 'model'], result_contract=diagnosis.assignments.CONTRACT,
+            claim_id=axis['claim_id'])
+        axis['handoff_digest'] = diagnosis.assignments.digest(axis['handoff'])
+        command = {'command': 'python symptom.py', 'result': 'LABELED local red feedback; exit_code=1'}
+        report = {'contract': diagnosis.CONTRACT, 'adaptation': axis['handoff']['adaptation'], 'pins': record['pins'],
+            'feedback_loop': {**command, 'symptom': 'Wrong greeting'}, 'commands': [command],
+            'hypotheses': [{'hypothesis': 'Wrong literal', 'prediction': 'Greeting assertion is red', 'evidence': 'Local mismatch'}],
+            'attempted_repairs': ['Responsible literal repair stayed red'], 'findings': ['Local mismatch'],
+            'cause_or_uncertainty': 'Wrong literal or hidden transform', 'blockers': [],
+            'directions': [{'id': 'retry', 'direction': 'Investigate original requirement', 'tradeoff': 'More investigation'}],
+            'recommendation': 'retry'}
+        result = {'status': 'done', 'run_id': e.runtime['run_id'], 'loads': [],
+            'work': ['LABELED local read-only investigation input'], 'tests': [command],
+            'artifacts': [diagnosis.simplification.artifact('diagnosis-report', json.dumps(report))]}
+        conversation = {'messages': [
+            {'role': 'assistant', 'tool_calls': [{'id': 'repro', 'function': {
+                'name': 'terminal', 'arguments': json.dumps({'command': command['command']})}}]},
+            {'role': 'tool', 'tool_call_id': 'repro', 'content': command['result']}]}
+        files = {'scratch/result.json': result, 'scratch/loads.json': [], 'scratch/events.jsonl': {},
+            'scratch/conversation.json': conversation, 'scratch/probes.json': {}, 'inputs/worker.py': {},
+            'inputs/sandbox_relay.py': {}, 'inputs/assignment.json': {'assignment_id': axis['assignment_id']},
+            'inputs/handoff.json': axis['handoff'], 'container-inspection.json': {}, 'launch-command.json': {},
+            'source-artifacts.json': {}, 'worker-reported-tests.json': [command],
+            'model-evidence/response-local.json': {'label': 'Local binding input; no native/model execution'}}
+        for name, content in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(content))
+        axis['submitted_result'] = result
+        axis['diagnosis_result'] = diagnosis.validate_result(axis, result)
+        self.store(axis)
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        record = item['stuck_work'][self.prior['assignment_id']]
+        record['diagnosis_assignment'] = axis['assignment_id']
+        item.update(origin={'platform': 'discord', 'chat_id': '42', 'thread_id': '42',
+                            'parent_chat_id': '41', 'scope_id': '40'},
+                    correlation={'project_id': 'product', 'iteration_id': 'm1', 'control_run_id': 'local-control',
+                                 'evidence_id': 'local-evidence', 'stage': 'diagnosis'})
+        diagnosis.tickets.checkpoint(self.database, item)
+        # Assignment eligibility is an outside prerequisite. Completed/report/auth readers stay real.
+        self.eligibility = self.enterContext(patch.object(diagnosis.assignments, 'prepare', return_value=axis))
+        return record, axis
+
+    def host_grant(self, axis, path=None):
+        path = path or self.root / 'host-authorization.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config = {'operator_id': '42', 'execution_reference': 'LABELED local host grant; not native acceptance',
+                  'diagnosis': diagnosis.execution_binding(axis)}
+        path.write_text(json.dumps(config))
+        path.chmod(0o600)
+        return path, config
+
+    def durable_snapshot(self):
+        return {table: self.database.execute('SELECT * FROM ' + table + ' ORDER BY rowid').fetchall()
+                for table in ('iterations', 'role_assignments', 'notifications')
+                if self.database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()}
+
+    def test_completed_reader_requires_isolation_terminal_removal_and_exact_report(self):
+        record, good = self.completed_inputs()
+        self.assertEqual(diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github), good)
+        self.assertFalse(good['diagnosis_result']['native_execution_trusted'])
+        self.eligibility.assert_called_once()
+        self.assertTrue(self.eligibility.call_args.kwargs['dry_run'])
+        for group, field, value in [('runtime', 'status', 'running'), ('runtime', 'container_removed', False),
+                                    ('result_disposition', 'isolated_execution', False),
+                                    ('diagnosis_result', 'cause_or_uncertainty', 'Changed stored report')]:
+            with self.subTest(group=group, field=field):
+                row = copy.deepcopy(good)
+                row[group][field] = value
+                self.store(row)
+                before = self.durable_snapshot()
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github)
+                self.assertEqual(refusal.exception.code, 'invalid_result' if group == 'diagnosis_result' else 'diagnosis_incomplete')
+                self.assertEqual(self.durable_snapshot(), before)
+        row = copy.deepcopy(good)
+        del row['diagnosis_result']
+        self.store(row)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github)
+        self.assertEqual(refusal.exception.code, 'diagnosis_incomplete')
+        self.store(good)
+        before = self.durable_snapshot()
+        self.assertEqual(diagnosis.completed(self.database, 'product', 'm1', '42', {**record, 'status': 'release-pending'}, self.github), good)
+        self.assertEqual(self.eligibility.call_args.kwargs['diagnosis_revalidation'], good['assignment_id'])
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+
+    def test_authorization_reader_requires_private_exact_host_grant_outside_every_worker_scope(self):
+        _, axis = self.completed_inputs()
+        path, config = self.host_grant(axis)
+        before = self.durable_snapshot()
+        self.assertEqual(diagnosis.authorization(self.database, path, '42', axis), config)
+        for mode in (0o400, 0o640, 0o644):
+            with self.subTest(mode=mode):
+                path.chmod(mode)
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.authorization(self.database, path, '42', axis)
+                self.assertEqual(refusal.exception.code, 'approval_required')
+        path.chmod(0o600)
+        link = self.root / 'linked-grant.json'
+        os.link(path, link)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'approval_required')
+        link.unlink()
+        for assignment in (self.prior, axis):
+            for scope in (assignment['handoff']['workspace'], assignment['handoff']['profile']['home'],
+                          assignment['runtime']['artifacts']):
+                with self.subTest(assignment=assignment['assignment_id'], scope=scope):
+                    mounted, _ = self.host_grant(axis, Path(scope) / 'mounted-grant.json')
+                    with self.assertRaises(RepositoryError) as refusal:
+                        diagnosis.authorization(self.database, mounted, '42', axis)
+                    self.assertEqual(refusal.exception.code, 'approval_required')
+                    mounted.unlink()
         root = Path(axis['runtime']['artifacts'])
-        conversation = (root / 'scratch/conversation.json').read_bytes()
-        self.assertIn(b'AssertionError', conversation)
-        self.assertIn(b'exit_code=1', conversation)
-        result = json.loads((root / 'scratch/result.json').read_text())
-        self.assertEqual(result['tests'][0]['result'], 'ALL PASSED\nexit_code=0')
-        envelope = json.loads((root / 'inputs/assignment.json').read_text())
-        for validate in (lambda: sandbox.check_worker_evidence(axis, root, envelope['inputs']),
-                         lambda: diagnosis.validate_result(axis, result)):
+        root.chmod(0o755)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        root.chmod(0o700)
+        for change in ({'operator_id': 'other'}, {'execution_reference': ''}, {'extra': True},
+                       {'diagnosis': {**config['diagnosis'], 'report_sha256': '0' * 64}},
+                       {'diagnosis': {**config['diagnosis'], 'pins': {}}}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps({**config, **change}))
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.authorization(self.database, path, '42', axis)
+                self.assertEqual(refusal.exception.code, 'execution_required')
+        path.write_text(json.dumps(config))
+        evidence = root / 'model-evidence/response-local.json'
+        original = evidence.read_bytes()
+        evidence.write_bytes(original + b'\n')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        evidence.write_bytes(original)
+        self.assertEqual(diagnosis.authorization(self.database, path, '42', axis), config)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+
+    def test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay(self):
+        _, axis = self.completed_inputs()
+        request = {'stuck_assignment': self.prior['assignment_id']}
+        path, config = self.host_grant(axis)
+        before = self.durable_snapshot()
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.assertEqual(self.durable_snapshot(), before)
+        for config_change in ({'operator_id': 'other'}, {'diagnosis': {**config['diagnosis'], 'run_id': 'stale-run'}}):
+            item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+            item['stuck_work'][self.prior['assignment_id']]['authorization'] = {**config, **config_change}
+            diagnosis.tickets.checkpoint(self.database, item)
+            before = self.durable_snapshot()
             with self.assertRaises(RepositoryError) as refusal:
-                validate()
-            self.assertEqual(refusal.exception.code, 'invalid_result')
-        self.assertEqual((root / 'scratch/conversation.json').read_bytes(), conversation)
-        self.assignment.refused(self.command('request-direction', self.identity), 'diagnosis_incomplete')
-        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
-        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
+                diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+            self.assertEqual(refusal.exception.code, 'execution_required')
+            self.assertEqual(self.durable_snapshot(), before)
+        result = diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github, path)
+        notification = result['attention']
+        event = notification['event']
+        self.assertEqual(result['stuck']['authorization'], config)
+        self.assertEqual(result['stuck']['status'], 'awaiting-direction')
+        self.assertEqual(event['event_id'], 'stuck-' + self.prior['assignment_id'])
+        self.assertEqual(event['decision_id'], event['event_id'])
+        self.assertEqual(event['evidence_ids'], [self.prior['assignment_id'], axis['assignment_id'], axis['diagnosis_result']['report_sha256']])
+        self.assertEqual(json.loads(event['message'])['directions'], axis['diagnosis_result']['directions'])
+        self.assertEqual((notification['state'], notification['attempts'], notification['decision_response']), ('pending', 0, None))
+        before = self.durable_snapshot()
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            item = diagnosis.assignments.current(restarted, 'product', 'm1', '42')
+            self.assertEqual(diagnosis.attention.get_record(restarted, item, event['event_id']), notification)
+            self.assertEqual(diagnosis.request_direction(restarted, 'product', 'm1', '42', request, self.github), result)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.database.execute('SELECT count(*) FROM notifications').fetchone()[0], 1)
+        evidence = Path(axis['runtime']['artifacts']) / 'model-evidence/response-local.json'
+        evidence.write_bytes(evidence.read_bytes() + b'\n')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
 
-    def test_missing_capability_material_direction_and_pause_stale_replay_fail_closed(self):
-        prepared = self.assignment.ok(self.assignment.command())
-        self.assignment.refused(self.command('declare-stuck', {'stuck_assignment': prepared['assignment_id']}), 'stuck_required')
-        # An infrastructure failure/limit without a responsible stuck result never escalates.
-        self.case.mode('malformed')
-        failed = self.assignment.ok(self.case.launch(prepared))
-        self.assertEqual(failed['runtime']['status'], 'failed')
-        self.assignment.refused(self.command('declare-stuck', {'stuck_assignment': prepared['assignment_id']}), 'stuck_required')
-        request = copy.deepcopy(self.assignment.request)
-        request['profile'].update(name='second-builder', home=str(self.root / 'second-home'))
-        request['claim_id'] = 'second-claim'
-        prepared = self.assignment.ok(self.assignment.command(request=request))
-        self.case.mode('implementation-stuck')
-        stuck = self.assignment.ok(self.case.launch(prepared))
-        self.identity = {'stuck_assignment': stuck['assignment_id']}
-        self.tracker.omit_effect = True
-        self.assignment.refused(self.command('declare-stuck', self.identity), 'publication_mismatch')
-        independent = self.assignment.configuration(12)
-        independent['profile'].update(name='third-builder', home=str(self.root / 'third-home'))
-        independent['claim_id'] = 'third-claim'
-        self.assignment.refused(self.assignment.command(request=independent), 'claim_conflict')
-        self.tracker.omit_effect = False
-        held = self.assignment.ok(self.command('declare-stuck', self.identity))
-        self.assertEqual(held['affected'], [10, 11])
-        debug_request = self.debug_request()
-        prepared = self.assignment.ok(self.command('prepare-diagnosis', debug_request))
-        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
-        self.assignment.refused(self.case.launch(prepared), 'iteration_paused')
-        self.assignment.refused(self.command('request-direction', self.identity), 'iteration_paused')
-        self.assignment.mutate_iteration(lambda item: item.update(status='active'))
-        self.case.mode('diagnosis-blocker')
-        axis = self.assignment.ok(self.case.launch(prepared))
-        self.assertEqual(axis['runtime']['status'], 'complete', axis)
-        self.assertEqual(axis['submitted_result']['status'], 'blocked')
-        self.assertIsNone(axis['diagnosis_result']['feedback_loop'])
-        self.assertTrue(axis['diagnosis_result']['blockers'])
-        config = self.authorization(axis)
-        raw = config.read_text()
-        invalid = json.loads(raw)
-        invalid['diagnosis']['pins']['spec_commit'] = 'f' * 40
-        config.write_text(json.dumps(invalid))
-        self.assignment.refused(self.command('request-direction', self.identity, config), 'execution_required')
-        config.write_text(raw)
-        mounted = Path(axis['runtime']['artifacts']) / 'scratch/grant.json'
-        mounted.write_text(raw)
-        mounted.chmod(0o600)
-        self.assignment.refused(self.command('request-direction', self.identity, mounted), 'approval_required')
-        event = self.assignment.ok(self.command('request-direction', self.identity, config))['attention']
-        self.assignment.ok(self.respond(event, 'revise'))
-        apply = {**self.identity, 'event_id': event['event']['event_id']}
-        self.assignment.mutate_iteration(lambda item: item.update(status='paused'))
-        self.assignment.refused(self.command('apply-direction', apply), 'iteration_paused')
-        self.assignment.mutate_iteration(lambda item: item.update(status='active'))
-        decision = self.assignment.ok(self.command('apply-direction', apply))
-        self.assertEqual(decision['status'], 'revision-required')
-        self.assertEqual(self.assignment.ok(self.command('apply-direction', apply)), decision)
-        self.assertEqual(self.assignment.ok(self.tracker.control('frontier'))['ticket_work']['frontier']['eligible'], [12])
-        self.assignment.refused(self.respond(event, 'retry'), 'decision_conflict')
-        self.tracker.issues[10]['body'] += '\nChanged requirement'
-        self.assignment.refused(self.command('declare-stuck', self.identity), 'scope_mismatch')
-        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
-        self.assertEqual(self.tracker.issues[10]['state'], 'open')
+    def test_unrelated_direction_event_refuses_before_response_read_or_release_effect(self):
+        _, axis = self.completed_inputs()
+        path, _ = self.host_grant(axis)
+        request = {'stuck_assignment': self.prior['assignment_id']}
+        result = diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github, path)
+        notification = result['attention']
+        notification['decision_response'] = {'event_id': notification['event']['event_id'],
+            'decision_id': notification['event']['decision_id'], 'operator_id': '42', 'origin': notification['destination'],
+            'reference': 'LABELED local authenticated operator input',
+            'response': json.dumps({'action': 'revise', 'direction': 'Version original requirements explicitly'})}
+        diagnosis.attention.save(self.database, notification)
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        unrelated = diagnosis.attention.enqueue(self.database, item,
+            {**notification['event'], 'event_id': 'unrelated', 'decision_id': 'unrelated'})
+        unrelated['decision_response'] = {**notification['decision_response'],
+                                          'event_id': 'unrelated', 'decision_id': 'unrelated'}
+        diagnosis.attention.save(self.database, unrelated)
+        self.database.commit()
+        before = self.durable_snapshot()
+        with patch.object(diagnosis.attention, 'get_record', wraps=diagnosis.attention.get_record) as read:
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.apply_direction(self.database, 'product', 'm1', '42', {**request, 'event_id': 'unrelated'}, self.github)
+            self.assertEqual(refusal.exception.code, 'invalid_decision')
+            read.assert_not_called()
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+        revised = diagnosis.apply_direction(self.database, 'product', 'm1', '42',
+                                           {**request, 'event_id': notification['event']['event_id']}, self.github)
+        self.assertEqual(revised['status'], 'revision-required')
+        self.assertEqual(revised['applied_response'], notification['decision_response'])
+        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual([r['status'] for r in self.rows], ['blocked', 'blocked', 'ready', 'blocked'])
+
+    def test_declaration_ack_without_block_readback_keeps_durable_claim_owned_until_reconciliation(self):
+        self.set_field.side_effect = None  # External acknowledgement deliberately omits its status effect.
+        with self.assertRaises(RepositoryError) as refusal:
+            self.declare()
+        self.assertEqual(refusal.exception.code, 'publication_mismatch')
+        self.assertEqual(self.set_field.call_count, 1)  # Refuse before any dependent status effects.
+        self.assertEqual({r['status'] for r in self.rows}, {'ready'})
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            item = diagnosis.assignments.current(restarted, 'product', 'm1', '42')
+            held = diagnosis.assignments.rows(restarted)[0]
+            record = item['stuck_work'][held['assignment_id']]
+            self.assertEqual(record['status'], 'blocking')
+            self.assertFalse(record['blocks_verified'])
+            self.assertEqual(record['retired_assignments'], [held['assignment_id']])
+            self.assertEqual(held['stuck_disposition'], 'held')
+            self.assertFalse(diagnosis.released_claim(restarted, held))
+            self.assertEqual(diagnosis.held_numbers(item), {10, 11, 13})
+        self.set_field.side_effect = self.change_status
+        reconciled = diagnosis.declare(self.database, 'product', 'm1', '42',
+                                       {'stuck_assignment': self.prior['assignment_id']}, self.github)
+        self.assertTrue(reconciled['blocks_verified'])
+        self.assertEqual(reconciled['status'], 'diagnosis')
+        self.assertTrue(diagnosis.released_claim(self.database, diagnosis.assignments.rows(self.database)[0]))
+        self.assertEqual(self.set_field.call_count, 4)
+        self.assertEqual(self.rows[2]['status'], 'ready')
+
+    def test_declaration_replay_after_live_body_revision_refuses_without_new_effect_or_ownership_change(self):
+        record = self.declare()
+        before = self.durable_snapshot()
+        reads = 0
+        def revised_at_replay_admission(github, repository, number):
+            nonlocal reads
+            reads += 1
+            # Isolate declare's first body read; a later sync_blocks check must not mask it.
+            return {'body': 'Revised original requirement'} if reads == 1 else self.read_issue(github, repository, number)
+        with patch.object(diagnosis.tickets.gh, 'read_issue', side_effect=revised_at_replay_admission):
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.declare(self.database, 'product', 'm1', '42',
+                                  {'stuck_assignment': self.prior['assignment_id']}, self.github)
+        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+        self.assertEqual(reads, 1)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual([r['status'] for r in self.rows], ['blocked', 'blocked', 'ready', 'blocked'])
+        held = diagnosis.assignments.rows(self.database)[0]
+        self.assertEqual(held['stuck_disposition'], 'held')
+        self.assertEqual(diagnosis.assignments.current(self.database, 'product', 'm1', '42')['stuck_work'][held['assignment_id']], record)
+        self.assertEqual(diagnosis.declare(self.database, 'product', 'm1', '42',
+                                        {'stuck_assignment': held['assignment_id']}, self.github), record)
+        self.assertEqual(self.set_field.call_count, 3)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

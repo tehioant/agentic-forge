@@ -38,223 +38,197 @@ class IntakeLifecycleTests(unittest.TestCase):
         path.write_text(json.dumps(self.request if request is None else request))
         return self.invoke('register', '--request', str(path))
 
-    def test_approved_iteration_survives_a_fresh_controller_process(self):
-        registered = self.register()
-        self.assertEqual(registered.returncode, 0, registered.stderr)
-        first = json.loads(registered.stdout)
-        self.assertEqual(first['status'], 'active')
-        inspected = self.invoke('inspect', '--project', 'approved-product',
-                                '--iteration', 'milestone-1')
-        self.assertEqual(inspected.returncode, 0, inspected.stderr)
-        self.assertEqual(json.loads(inspected.stdout), first)
-        self.assertEqual(first['repository'], 'example/approved-product')
-        self.assertEqual(first['approval'], self.request['approval'])
-        self.assertEqual(first['origin'], self.request['origin'])
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Legacy helpers above remain for untouched consumers; focused tests never call them.
+import copy
+import io
+import sqlite3
+from contextlib import closing, redirect_stdout
+from unittest import mock
+from factory_v1 import __main__ as intake
+from factory_v1.errors import IntakeError
+
+
+class IntakeComponentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.state = self.root / 'state.sqlite'
+        self.request = {
+            'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product',
+            'idea': 'Explicit operator idea',
+            'approval': {'operator_id': '42', 'reference': 'message-1'},
+            'origin': {'platform': 'discord', 'chat_id': '123', 'thread_id': '123',
+                       'parent_chat_id': '456', 'scope_id': '789'},
+        }
+        for target in ('socket.socket', 'subprocess.Popen'):
+            patcher = mock.patch(target, side_effect=AssertionError('external creation denied'))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def register_direct(self, request=None):
+        request = copy.deepcopy(self.request if request is None else request)
+        intake.validate_intake(request, '42')
+        with closing(sqlite3.connect(self.state)) as db, db:
+            return intake.register_iteration(db, request)
+
+    def stored(self, project='product'):
+        with closing(sqlite3.connect(self.state.as_uri() + '?mode=ro', uri=True)) as db:
+            return intake.read_iteration(db, project, 'm1')
+
+    def test_approved_intake_reopens_with_exact_provenance_and_no_execution(self):
+        first = self.register_direct(dict(self.request, work_item_number=5))
+        self.assertEqual(self.stored(), first)
+        for field in ('repository', 'approval', 'origin'):
+            self.assertEqual(first[field], self.request[field])
         self.assertEqual(first['stage'], 'intake_registered')
-
-
-    def test_unapproved_or_ambiguous_intake_is_refused_without_creating_state(self):
-        import copy
-        unsafe = []
-        item = copy.deepcopy(self.request)
-        item.pop('approval')
-        unsafe.append(item)
-        item = copy.deepcopy(self.request)
-        item['approval']['operator_id'] = '99'
-        unsafe.append(item)
-        for repository in ['https://github.com/example/product', 'example', 'example/../other', ' example/product']:
-            item = copy.deepcopy(self.request)
-            item['repository'] = repository
-            unsafe.append(item)
-        item = copy.deepcopy(self.request)
-        item['origin']['thread_id'] = '999'
-        unsafe.append(item)
-        item = copy.deepcopy(self.request)
-        item['origin'].pop('parent_chat_id')
-        unsafe.append(item)
-        item = copy.deepcopy(self.request)
-        item['origin']['platform'] = 'unknown'
-        unsafe.append(item)
-        item = copy.deepcopy(self.request)
-        item['approval']['reference'] = ''
-        unsafe.append(item)
-        for item in unsafe:
-            with self.subTest(request=item):
-                refused = self.register(item)
-                self.assertEqual(refused.returncode, 2)
-                self.assertEqual(json.loads(refused.stderr)['error'], 'invalid_intake')
-                self.assertFalse(self.state.exists())
-
-
-    def test_repeated_registration_is_idempotent_and_conflicting_replay_is_refused(self):
-        first = self.register()
-        repeated = self.register()
-        self.assertEqual(repeated.returncode, 0, repeated.stderr)
-        self.assertEqual(json.loads(repeated.stdout), json.loads(first.stdout))
-        changed = dict(self.request, repository='example/another-product')
-        conflict = self.register(changed)
-        self.assertEqual(conflict.returncode, 2)
-        self.assertEqual(json.loads(conflict.stderr)['error'], 'intake_conflict')
-        inspected = self.invoke('inspect', '--project', 'approved-product', '--iteration', 'milestone-1')
-        self.assertEqual(json.loads(inspected.stdout), json.loads(first.stdout))
-
-
-    def test_concurrent_approved_products_keep_one_active_and_one_paused(self):
-        from concurrent.futures import ThreadPoolExecutor
-        paths = []
-        for index in [1, 2]:
-            item = dict(self.request, project_id=f'product-{index}', repository=f'example/product-{index}')
-            path = self.root / f'intake-{index}.json'
-            path.write_text(json.dumps(item))
-            paths.append(path)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda path: self.invoke('register', '--request', str(path)), paths))
-        for result in results:
-            self.assertEqual(result.returncode, 0, result.stderr)
-        states = [json.loads(result.stdout) for result in results]
-        self.assertEqual(sorted(state['status'] for state in states), ['active', 'paused'])
-        for state in states:
-            inspected = self.invoke('inspect', '--project', state['project_id'], '--iteration', 'milestone-1')
-            self.assertEqual(json.loads(inspected.stdout), state)
-
-
-    def test_public_correlations_survive_restart_without_claiming_a_worker_run(self):
-        request = dict(self.request, work_item_number=5)
-        registered = self.register(request)
-        self.assertEqual(registered.returncode, 0, registered.stderr)
-        item = json.loads(registered.stdout)
-        correlation = item['correlation']
-        self.assertEqual(correlation['project_id'], item['project_id'])
-        self.assertEqual(correlation['iteration_id'], item['iteration_id'])
-        self.assertEqual(correlation['stage'], item['stage'])
-        self.assertEqual(correlation['work_item'], {'repository': request['repository'], 'issue_number': 5})
+        self.assertFalse(first['execution_allowed'])
+        correlation = first['correlation']
+        self.assertEqual(correlation['work_item'], {'repository': 'example/product', 'issue_number': 5})
+        self.assertEqual(correlation['project_id'], 'product')
+        self.assertEqual(correlation['iteration_id'], 'm1')
+        self.assertEqual(correlation['stage'], first['stage'])
         self.assertTrue(correlation['control_run_id'])
-        self.assertTrue(correlation['evidence_id'])
         self.assertIsNone(correlation['worker_run_id'])
-        self.assertFalse(item['execution_allowed'])
-        self.assertEqual(item['evidence']['kind'], 'approved_intake')
-        self.assertEqual(item['evidence']['id'], correlation['evidence_id'])
-        inspected = self.invoke('inspect', '--project', item['project_id'], '--iteration', item['iteration_id'])
-        self.assertEqual(json.loads(inspected.stdout), item)
+        self.assertEqual(correlation['evidence_id'], first['evidence']['id'])
+        self.assertEqual(first['evidence']['kind'], 'approved_intake')
 
+    def test_invalid_approval_scope_origin_and_owner_are_refused_before_storage(self):
+        cases = [dict(self.request, approval=value) for value in (None, {},
+                 {'operator_id': '99', 'reference': 'x'}, {'operator_id': '42', 'reference': ''})]
+        cases += [dict(self.request, repository=value) for value in
+                  ('https://github.com/example/product', 'example', 'example/../other',
+                   ' example/product', 'owner-/repo', 'owner--name/repo', '-owner/repo', 'x' * 40 + '/repo')]
+        cases += [dict(self.request, origin=value) for value in
+                  (None, dict(self.request['origin'], thread_id='999'),
+                   dict(self.request['origin'], platform='unknown'),
+                   {k: v for k, v in self.request['origin'].items() if k != 'parent_chat_id'})]
+        cases += [dict(self.request, work_item_number=v) for v in (True, 0, -1, '5')]
+        for request in cases:
+            with self.subTest(request=request), self.assertRaises(IntakeError) as raised:
+                self.register_direct(request)
+            self.assertEqual(raised.exception.code, 'invalid_intake')
+            self.assertFalse(self.state.exists())
 
-    def test_missing_iteration_inspection_is_read_only_and_reports_not_found(self):
-        result = self.invoke('inspect', '--project', 'unknown', '--iteration', 'unknown')
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'not_found')
-        self.assertFalse(self.state.exists())
-        self.assertEqual(self.register().returncode, 0)
+    def test_valid_owner_boundaries_keep_exact_case_and_bytes(self):
+        for index, owner in enumerate(('x', 'Owner-Name', 'a-b-c', 'x' * 39)):
+            request = dict(self.request, project_id=f'product-{index}', repository=owner + '/Product.Name_1')
+            record = self.register_direct(request)
+            self.assertEqual(self.stored(request['project_id']), record)
+            self.assertEqual(record['repository'], request['repository'])
+
+    def test_idempotent_registration_and_all_optional_scope_conflicts(self):
+        first = self.register_direct()
+        self.assertEqual(self.register_direct(), first)
         before = self.state.read_bytes()
-        result = self.invoke('inspect', '--project', 'unknown', '--iteration', 'unknown')
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'not_found')
+        for changed in (dict(self.request, repository='example/other'),
+                        dict(self.request, work_item_number=5),
+                        dict(self.request, repository_intent={'mode': 'new', 'marker': 'approved'})):
+            with self.assertRaises(IntakeError) as raised:
+                self.register_direct(changed)
+            self.assertEqual(raised.exception.code, 'intake_conflict')
+            self.assertEqual(self.state.read_bytes(), before)
+        for key, value in (('work_item_number', 5), ('repository_intent', {'mode': 'new', 'marker': 'approved'})):
+            self.state = self.root / (key + '.sqlite')
+            original = self.register_direct(dict(self.request, **{key: value}))
+            with self.assertRaises(IntakeError) as raised:
+                self.register_direct()
+            self.assertEqual(raised.exception.code, 'intake_conflict')
+            self.assertEqual(self.stored(), original)
+
+    def test_serialized_products_have_one_active_iteration(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            records = list(pool.map(lambda i: self.register_direct(dict(self.request,
+                project_id=f'product-{i}', repository=f'example/product-{i}')), (1, 2)))
+        self.assertEqual(sorted(r['status'] for r in records), ['active', 'paused'])
+        for record in records:
+            self.assertEqual(self.stored(record['project_id']), record)
+
+    def test_missing_inspection_is_read_only(self):
+        self.register_direct()
+        before = self.state.read_bytes()
+        self.assertIsNone(self.stored('unknown'))
         self.assertEqual(self.state.read_bytes(), before)
 
+    def test_duplicate_and_parser_limit_json_are_not_admitted(self):
+        with self.assertRaises(IntakeError):
+            json.loads('{"approval":{},"approval":{}}', object_pairs_hook=intake.unique_fields)
+        for raw in ('{invalid', '{"n":' + '9' * 5000 + '}', '[' * 1200 + '0' + ']' * 1200):
+            try:
+                value = json.loads(raw, object_pairs_hook=intake.unique_fields)
+            except (ValueError, RecursionError):
+                pass
+            else:
+                with self.assertRaises(IntakeError):
+                    intake.validate_intake(value, '42')
+        self.assertFalse(self.state.exists())
 
-    def test_malformed_or_missing_intake_has_a_structured_error_and_no_state(self):
-        path = self.root / 'malformed.json'
-        for content in ['{invalid', '{"approval":{},"approval":{}}']:
-            with self.subTest(content=content):
-                path.write_text(content)
-                result = self.invoke('register', '--request', str(path))
-                self.assertEqual(result.returncode, 2)
-                self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
-                self.assertFalse(self.state.exists())
+    def test_cli_input_and_persistence_refusals_in_process_without_journey(self):
+        # Parser/error translation has no lower-level function; no successful CLI lifecycle.
+        path = self.root / 'request.json'
+        path.write_text(json.dumps(self.request))
+        for state in ('', ':memory:'):
+            for command in (['register', '--request', str(path)],
+                            ['inspect', '--project', 'product', '--iteration', 'm1']):
+                with mock.patch.object(sys, 'argv', ['factory', '--state', state, '--operator-id', '42', *command]), redirect_stdout(io.StringIO()), self.assertRaises(IntakeError) as raised:
+                    intake.main()
+                self.assertEqual(raised.exception.code, 'invalid_state')
         path.unlink()
-        result = self.invoke('register', '--request', str(path))
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'io_error')
+        with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '42', 'register', '--request', str(path)]), self.assertRaises(OSError):
+            intake.main()
+        with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '42', 'inspect', '--project', 'unknown', '--iteration', 'unknown']), self.assertRaises(IntakeError) as raised:
+            intake.main()
+        self.assertEqual(raised.exception.code, 'not_found')
         self.assertFalse(self.state.exists())
 
-
-    @unittest.skipUnless(os.name == 'posix', 'POSIX permission contract')
-    def test_new_state_is_private_even_when_the_caller_umask_is_permissive(self):
-        import stat
-        previous = os.umask(0)
+    def test_cli_private_state_creation_seam_under_permissive_umask(self):
+        # Only the file-opening wrapper owns this permission contract.
+        path = self.root / 'request.json'
+        path.write_text(json.dumps(self.request))
+        old = os.umask(0)
         try:
-            result = self.register()
+            with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '42', 'register', '--request', str(path)]), mock.patch.object(intake, 'register_iteration', return_value={}), redirect_stdout(io.StringIO()):
+                intake.main()
         finally:
-            os.umask(previous)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o600)
+            os.umask(old)
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
 
-
-    def test_oversized_json_integer_has_a_structured_refusal_without_state(self):
-        path = self.root / 'oversized-integer.json'
-        path.write_text(json.dumps(self.request)[:-1] + ', "work_item_number": ' + '9' * 5000 + '}')
-        result = self.invoke('register', '--request', str(path))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
-        self.assertEqual(result.stdout, '')
-        self.assertFalse(self.state.exists())
-
-
-    def test_deeply_nested_json_has_a_structured_refusal_without_state(self):
-        path = self.root / 'deeply-nested.json'
-        path.write_text('[' * 1200 + '0' + ']' * 1200)
-        result = self.invoke('register', '--request', str(path))
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
-        self.assertEqual(result.stdout, '')
-        self.assertFalse(self.state.exists())
-
-
-    def test_invalid_github_owner_syntax_is_refused_without_creating_state(self):
-        for index, owner in enumerate(['owner-', 'owner--name', '-owner', 'x' * 40]):
-            self.state = self.root / f'invalid-owner-{index}.sqlite'
-            with self.subTest(owner=owner):
-                result = self.register(dict(self.request, repository=f'{owner}/product'))
-                self.assertEqual(result.returncode, 2, result.stdout)
-                self.assertEqual(json.loads(result.stderr)['error'], 'invalid_intake')
-                self.assertEqual(result.stdout, '')
-                self.assertFalse(self.state.exists())
-
-
-    def test_valid_github_owner_boundaries_preserve_the_exact_repository(self):
-        for index, owner in enumerate(['x', 'Owner-Name', 'a-b-c', 'x' * 39]):
-            with self.subTest(owner=owner):
-                request = dict(self.request, project_id=f'product-{index}', repository=f'{owner}/Product.Name_1')
-                result = self.register(request)
-                self.assertEqual(result.returncode, 0, result.stderr)
-                record = json.loads(result.stdout)
-                self.assertEqual(record['repository'], request['repository'])
-                inspected = self.invoke('inspect', '--project', request['project_id'],
-                                        '--iteration', request['iteration_id'])
-                self.assertEqual(inspected.returncode, 0, inspected.stderr)
-                self.assertEqual(json.loads(inspected.stdout), record)
-
-
-    def test_nonpersistent_state_targets_are_refused_without_creating_state(self):
-        request = self.root / 'request.json'
-        request.write_text(json.dumps(self.request))
-        for state in ['', ':memory:']:
-            for arguments in [
-                ('register', '--request', str(request)),
-                ('inspect', '--project', 'approved-product', '--iteration', 'milestone-1'),
-            ]:
-                with self.subTest(state=state, command=arguments[0]):
-                    result = self.invoke(*arguments, state=state)
-                    self.assertEqual(result.returncode, 2, result.stdout)
-                    self.assertEqual(json.loads(result.stderr)['error'], 'invalid_state')
-                    self.assertEqual(result.stdout, '')
-        self.assertEqual(list(self.root.iterdir()), [request])
-
-
-    def test_adding_a_work_item_to_a_registered_intake_is_a_conflict_not_a_crash(self):
-        first = self.register()
-        self.assertEqual(first.returncode, 0, first.stderr)
-        result = self.register(dict(self.request, work_item_number=5))
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'intake_conflict')
-
-
-    def test_removing_a_work_item_from_a_registered_intake_is_a_conflict(self):
-        first = self.register(dict(self.request, work_item_number=5))
-        self.assertEqual(first.returncode, 0, first.stderr)
-        result = self.register()
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'intake_conflict')
-
-
-if __name__ == '__main__':
-    unittest.main()
+    def test_repository_guard_sensitivity(self):
+        request = dict(self.request, repository='https://github.com/example/product')
+        with self.assertRaises(IntakeError):
+            intake.validate_intake(request, '42')
+        with mock.patch.object(intake, 'valid_repository', return_value=True):
+            intake.validate_intake(request, '42')

@@ -50,6 +50,18 @@ remains eligible. Routine health is silent. No production URL, deployment, repai
 execution, supervisor or live notification is invented or launched. See
 [configuration, lifecycle, evidence and real-path limits](DELIVERY.md).
 
+## Durable pause and emergency stop (#21)
+
+`pause`, `emergency-stop`, `inspect-control` and explicit `resume` are scope-bound
+trusted-host controls. A private durable interruption lane prevents queued/new
+admission and final merge mutation without waiting for long controller locks.
+Checkpoints retain assignments, pinned inputs, candidate artifacts, stage evidence
+and pending external intents; emergency stop owns actual worker/helper cleanup.
+Requested/acknowledged/completed readbacks distinguish interruption from uncertain
+external outcomes, never rollback or delivery. Back up `<state>.controls/` with
+SQLite and retained artifacts. See [control semantics, commands and acceptance
+limitations](CONTROLS.md). General restart reconciliation remains a later slice.
+
 ## Stuck-work diagnosis and operator direction (#16)
 
 `declare-stuck` retains the responsible worker's attempted fixes and exact failure
@@ -329,7 +341,7 @@ caller-selected new pins are not accepted. For example, the implementation entry
   "name": "implement",
   "source": "/home/ops/.hermes/skills/implement/SKILL.md",
   "path": "/absolute/selected-snapshots/implement/SKILL.md",
-  "sha256": "6b13bcb6119df090c97be3c8a90560071a26f21f4fc6ad0facde97b25ecb1da0",
+  "sha256": "136a8987143241a0229952a56d9c41042646073769fcad466d808bd5e40bb4f0",
   "dependencies": []
 }
 ```
@@ -339,10 +351,23 @@ engineering stages use that one input, without forcing the previous `tdd` closur
 Its `/code-simplifier` instruction maps explicitly to the existing later
 `simplify-code` assignment, then separate Standards and Spec assignments.
 Those are controller-sequenced stages, not nested worker dependencies.
-Repair additionally uses diagnosis;
-simplification, each review axis and diagnosis use only their own entry.
+The approved current revision requires typechecking and focused tests during work
+and after corrections; the controller retains the completed final full-suite
+command, runtime, exit and exact stabilized reviewed HEAD/tree. Interrupted or
+older-head runs do not qualify a later candidate. Engineering/correction/repair
+adaptations are revision v3; mandatory meaningful tests and optional test-first
+ordering are unchanged. Tightened assignment/persisted-state contracts require a
+test-tree audit of hand-built records and local validator fixtures before review.
+For failed-suite fixture repairs, preserve the complete trace, reproduce the exact
+failing test before changes, retain red/green evidence, verify unchanged production
+bytes and assertion ASTs, and obtain narrow review continuation. A targeted repair
+does not turn an earlier failed suite into a pass; final canonical verification
+remains controller-owned on the new stabilized reviewed candidate.
+Repair additionally uses diagnosis; simplification and diagnosis use only their
+own entry, while each review axis also loads the explicit reference below.
 Matt's installed identities are `/home/ops/.hermes/skills/<name>/SKILL.md`, with
-the two support files under `tdd/`; the non-Matt simplifier is
+the two support files under `tdd/` and the selected reference under `code-review/`;
+the non-Matt simplifier is
 `/home/ops/.hermes/skills/software-development/simplify-code/SKILL.md`.
 `role_skills.py` retains all exact reviewed pins and dependency lists from the
 selected sources; test snapshots retain those bytes unchanged. Unknown, duplicate,
@@ -358,7 +383,22 @@ move to later dedicated assignments, and the controller owns commits/publication
 `simplify-code` covers reuse, quality, efficiency and altitude inline in one fresh
 context without fan-out, preserving behavior or retaining evidence-backed no-op.
 Standards and Spec receive separate fresh read-only assignments and separate
-verdicts; they cannot share a top-level profile name or home. Diagnosis is read-only
+verdicts; they cannot share a top-level profile name or home.
+Code-review's approved current pin is
+`1ff8f642af17fe58110d991738b8d881cb8ae3a1b5bc6b1abddc380f8b26212e`.
+Only its diff-review branch is selected, with pinned tracker, requirements and
+standards supplied by the handoff. Both axes explicitly require
+`code-review/references/structured-text-contracts.md`, installed at
+`/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md`, pin
+`3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530ddfa0031b02a8`.
+The reference's bounded recipe applies when structured Markdown admission or
+source-span mutation is in scope (including #21); it is always in the reviewed
+two-axis closure, never discovered from ambient files. The whole-repository
+release-readiness workflow and its different conditional reference remain
+unselected. Revision-v3 review adaptations preserve prior reports/pins,
+use correction-only review when assumptions are unchanged, and distinguish code
+disposition from native/live acceptance. No new review bypass or source updater
+is introduced. Diagnosis is read-only
 and stops before modifying phases. Repair diagnoses then implements within incident
 scope and still requires later simplification, both review axes and unchanged gates.
 Optional codebase-design deepening/design-it-twice workflows and the unavailable
@@ -827,6 +867,32 @@ python -m factory_v1 --state <state> --operator-id 42 \
 ```
 
 `frontier` refreshes exact repository-linked board membership, iteration, native/textual blockers, issue identity/contract/label and progress from GitHub. It is not the local generated batch as a competing backlog: independently added current contracted issues are considered too. A blocker is complete only when its issue is closed for `completed` and its authoritative board status is Done in this scope; unknown/out-of-scope blockers remain blocking. Cycles, mismatched native/textual references and malformed metadata fail closed. Ready/open/contracted/current work with complete blockers is eligible; deferred/blocked/foreign work is not. `inspect` is only a durable local snapshot of the last observation, **not a fresh GitHub claim**.
+
+External admission also accepts the approved lean body: substantive `## Change`,
+`## Done` with nonempty `- ` observable criteria, `## Context` and `## Blocked by`;
+`## Constraint` is optional. Context must explicitly name `Parent #N;` matching
+the registered planning handoff, a single `Stories: US-N, US-M.` declaration, and
+Markdown links to registered immutable documents. Exactly one linked document
+must be in the assigned requirement scope; each named story must exist there.
+Missing/ambiguous parent, stories or pins remain a setup blocker, not inferred
+metadata. No defaults select every story or admit unrelated/future scope.
+Canonical bodies and generated publication remain unchanged; mixed canonical/lean
+contracts (including mechanical Parent, Iteration or Triage sections in a lean body)
+are refused. A missing lean Status returns only `contracted`, not ready,
+active or done: GitHub Projects progress and current iteration membership remain
+authoritative. An explicit Status must satisfy the existing status grammar, and
+blocked/deferred statuses retain their holds. The `Done` heading never proves
+completion. Labels, native/textual blockers, issue identities/body pins, pause,
+single claims and downstream review/merge/security checks remain enforced.
+
+Admission, frontier, bug readback and affected-body mutation share the same
+section parser/source spans: horizontal heading whitespace and optional closing ATX
+hashes are normalized, CRLF is accepted, and normalized duplicate headings are refused.
+A terminal tail of single-line HTML comments and whitespace (including the ticket
+identity marker and trailing blank lines) stays outside the last section
+span, so a scoped blocker update preserves it and all other unrelated bytes.
+The original live #21 title/body is retained verbatim in the regression fixture;
+contract admission is not a claim that its native campaign or acceptance completed.
 
 Reservation first refreshes GitHub and refuses partial publication, paused iterations, existing active work (including foreign iteration work) and an existing different global reservation. It persists one pending reservation before setting the exact board progress to active, then verifies the exact eligible active issue. Lost responses preserve the reservation and reconcile the same run on retry. Competing commands are serialized. No release, dispatch, implementation worker, merge or issue-close operation is supplied here; `execution_allowed` stays false and worker-run correlation stays null.
 
