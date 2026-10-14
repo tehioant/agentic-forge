@@ -198,21 +198,23 @@ class IterationComponents(unittest.TestCase):
         report = self.complete({'merge_configs': ['one.json', 'two.json']})
         self.assertEqual([r['issue']['number'] for r in report['report']['delivered']], [1, 2])
         self.assertEqual(report['report']['delivered'], [dict(self.delivered, issue=dict(self.delivered['issue'], number=n)) for n in (1, 2)])
-        self.db.execute('DELETE FROM notifications')
-        self.item = context()
-        self.store()
-        seen = set()
-        def changed_delivery(database, item, row, *args):
-            value = delivered(database, item, row)
-            if row['number'] in seen:
-                value['integration'] = {'integrated': 'e' * 40}
-            seen.add(row['number'])
-            return value
-        self.mocks['iteration.delivered_item'].side_effect = changed_delivery
-        with self.assertRaisesRegex(RepositoryError, 'changed during verification'):
-            self.complete({'merge_configs': ['one.json', 'two.json']})
-        self.assertNotIn('completion', self.stored())
-        self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
+        for changed_number in (1, 2):
+            with self.subTest(changed_number=changed_number):
+                self.db.execute('DELETE FROM notifications')
+                self.item = context()
+                self.store()
+                seen = set()
+                def changed_delivery(database, item, row, *args):
+                    value = delivered(database, item, row)
+                    if row['number'] == changed_number and row['number'] in seen:
+                        value['integration'] = {'integrated': 'e' * 40}
+                    seen.add(row['number'])
+                    return value
+                self.mocks['iteration.delivered_item'].side_effect = changed_delivery
+                with self.assertRaisesRegex(RepositoryError, 'changed during verification'):
+                    self.complete({'merge_configs': ['one.json', 'two.json']})
+                self.assertNotIn('completion', self.stored())
+                self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
 
     def test_unreconciled_worker_or_required_hold_prevents_completion(self):
         assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1'},
