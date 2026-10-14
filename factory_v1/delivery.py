@@ -332,7 +332,7 @@ def validate_persisted(database, item, saved):
     require(all(evidence[k] == saved['latest'][k] for k in ('main', 'status')),
             'Latest observation pointer inconsistent.', 'invalid_delivery')
     incident = item.get('main_incident')
-    require((incident is None) == (evidence['status'] == 'healthy'), 'Incident/freeze pointer inconsistent.', 'invalid_delivery')
+    require(incident is not None or evidence['status'] == 'healthy', 'Incident/freeze pointer inconsistent.', 'invalid_delivery')
     if incident is not None:
         validate_incident(incident, saved['config'])
         require(incident['status'] == 'active' and incident['latest_evidence'] == saved['latest']['evidence_id'],
@@ -407,8 +407,10 @@ def sample(database, project, iteration, operator, config=None):
             incident['latest_evidence'] = evidence_id
             item['main_incident'] = incident
         elif incident is not None:
-            incident.update(status='cleared', clearance_evidence=evidence_id)
-            item.pop('main_incident')
+            incident['latest_evidence'] = evidence_id
+            if incident['recovery_issue'] is None:
+                incident.update(status='cleared', clearance_evidence=evidence_id)
+                item.pop('main_incident')
         if incident is not None:
             incident_payload = json.dumps(incident)
             validate_incident(decode(incident_payload), config)

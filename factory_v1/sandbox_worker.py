@@ -147,6 +147,31 @@ def main():
                    json.dumps({'adaptation': handoff['adaptation'], **handoff['review']}))
     if 'operator_direction' in handoff:
         prompt += '\nExplicit Antoine direction for fresh scoped retry (not acceptance or relaxed gates):\n' + json.dumps(handoff['operator_direction'])
+    if handoff['stage'] == 'repair':
+        prompt += ('\nRECOVERY REPORT: Run diagnosing-bugs first, then implement only the authorized paths. '
+                   'Retain recovery-report artifact with exactly contract, scope (the recovery handoff), mode '
+                   '(roll-forward or safe-revert), rationale (evidence-backed choice/tradeoffs), diagnosis, '
+                   'removed_assignments (exact IDs of delivered behavior removed, including indirect removal), '
+                   'regression and cleanup (concrete evidence strings). diagnosis uses the separate debug '
+                   'report schema: contract=factory-stuck-diagnosis-v1, adaptation=this handoff adaptation, '
+                   'pins=scope, feedback_loop=command/symptom/result, commands=command/result objects, '
+                   'hypotheses=hypothesis/prediction/evidence objects, attempted_repairs and findings=nonempty '
+                   'string arrays, cause_or_uncertainty, directions=id/direction/tradeoff objects, '
+                   'recommendation=one direction ID, blockers=[]. Copy complete executing terminal result '
+                   'strings verbatim into tests, commands and feedback_loop. Missing capability is not '
+                   'successful recovery. If genuinely stuck use stuck-declaration instead. Never mutate '
+                   'main, bypass gates or claim health. Simplification and both review axes follow separately.\n' +
+                   json.dumps({'contract': 'factory-main-recovery-v1', 'scope': handoff['recovery']}))
+    if handoff['stage'] == 'corrections' and 'recovery' in handoff:
+        prompt += ('\nRECOVERY CORRECTIONS: Execute implement for the exact independent findings. Retain '
+                   'a recovery-choice artifact with exactly contract=factory-main-recovery-v1, scope (below), '
+                   'mode=roll-forward or safe-revert, evidence-backed rationale, removed_assignments (IDs), '
+                   'regression and cleanup (nonempty concrete evidence). Reassess removals against your '
+                   'resulting candidate, including corrected previous declarations; the host independently '
+                   'resolves them before merge. Original diagnosis is separately retained and verified; '
+                   'do not claim a new diagnosing-bugs invocation in this implement-only correction stage. '
+                   'Tests copy retained terminal result strings verbatim. Stay inside authorized paths.\n' +
+                   json.dumps(handoff['recovery']))
     if handoff['stage'] != 'diagnosis':
         prompt += ('\nIf genuinely stuck after attempted fixes, return status=stuck and a stuck-declaration artifact. '
                    'Its content is JSON with exactly reason (string), attempted_fixes (nonempty array of objects '

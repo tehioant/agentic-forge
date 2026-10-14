@@ -153,9 +153,10 @@ def ticket_claims(database, scope):
     """Check durable role ownership for every supplied ticket identity field."""
     from .diagnosis import released_claim
     from .requirements import released_claim as revised_claim
+    from .recovery import released_claim as recovery_claim
     existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
                 not released_claim(database, old) and not revised_claim(database, old) and
-                not completed_iteration_claim(database, old)]
+                not completed_iteration_claim(database, old) and not recovery_claim(database, old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
                 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
@@ -198,6 +199,9 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     # two entry points; caller descriptor order cannot change a claim identity.
     request = {**request, 'skills': [{k: v for k, v in s.items() if k != 'instructions'} for s in selected]}
     item = current(database, project, iteration, operator)
+    from . import recovery
+    recovery.admission(item, request['stage'], request['issue']['number'])
+    recovery_contract = recovery.handoff(database, item, request) if request['stage'] == 'repair' else None
     simplification = None
     review_contract = None
     corrections_contract = None
@@ -214,6 +218,17 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     if request['stage'] == 'simplify':
         from .simplification import handoff as simplify_handoff
         simplification = simplify_handoff(database, project, iteration, operator, request)
+    if recovery_contract is None and recovery.recovery_number(item) == request['issue']['number'] and request['stage'] != 'diagnosis':
+        parent = (simplification['implementation_assignment'] if simplification else
+                  review_contract['pins']['candidate_assignment'] if review_contract else
+                  corrections_contract['pins']['candidate_assignment'] if corrections_contract else None)
+        require(parent is not None, 'Recovery stage requires controller-prepared ancestry.', 'recovery_held')
+        prior = inspect(database, project, iteration, operator, parent)
+        root = recovery.lineage(database, prior)
+        recovery_record = recovery.active(item)
+        assert recovery_record is not None
+        require(root['assignment_id'] == recovery_record['assignment'], 'Obsolete recovery ancestor.', 'recovery_held')
+        recovery_contract = root['handoff']['recovery']
     from .requirements import authority, inputs, held_numbers
     number = request['issue']['number']
     require(number not in held_numbers(item), 'Affected requirements await explicit revision resumption.', 'requirements_held')
@@ -262,7 +277,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     frontier = work['frontier']
     number = request['issue']['number']
     require(work.get('publication_complete') and not frontier['foreign_active'] and
-            (request['stage'] == 'diagnosis' or set(frontier['active']) <= {number}), 'Conflicting or incomplete authoritative work frontier.', 'ticket_ineligible')
+            (request['stage'] == 'diagnosis' or recovery_contract is not None or set(frontier['active']) <= {number}), 'Conflicting or incomplete authoritative work frontier.', 'ticket_ineligible')
     row = next((row for row in frontier['items'] if row['number'] == number), None)
     require(row is not None and (row['admissible'] if request['stage'] != 'diagnosis' else
             row['issue_state'] == 'open' and row['held'] and row['status'] in diagnosis_statuses) and
@@ -279,7 +294,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                   number in record['affected'] and all(record['issues'][str(number)][key] == request['issue'][key]
                                                        for key in ('id', 'node_id', 'body_sha256'))]
     operator_direction = (max(directions, key=lambda record: record['sequence'])['applied_response']
-                          if directions and request['stage'] == 'implementation' else None)
+                          if directions and request['stage'] in {'implementation', 'repair'} else None)
     input_loads = {issue['html_url']: request['issue']['body_sha256']}
     input_loads.update({document['url']: document['sha256'] for document in scoped_inputs['documents'].values()})
     for group in ('standards', 'preceding'):
@@ -304,6 +319,8 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
                    'advancement': 'disabled-without-trusted-whole-process-evidence'}}
     if operator_direction is not None:
         handoff['operator_direction'] = operator_direction
+    if recovery_contract is not None:
+        handoff['recovery'] = recovery_contract
     if revision['spec'] != item['handoff']:
         change = item['requirement_changes'][revision['ticket_assignment']]
         handoff['requirement_change'] = {k: change[k] for k in
@@ -329,11 +346,16 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         result = previous
     if not dry_run and previous is None:
         from .controls import admission
-        with admission(database, project, iteration):
+        with admission(database, project, iteration), database:
             database.execute('BEGIN IMMEDIATE')
             database.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
             database.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment_id, json.dumps(result, sort_keys=True)))
-            database.commit()
+            if request['stage'] == 'repair':
+                record = recovery.active(item)
+                assert record is not None
+                record.update(assignment=assignment_id, status='repair')
+                item['main_incident']['recovery_assignment'] = assignment_id
+                recovery.checkpoint(database, item)
     return {**result, 'dry_run': dry_run, 'spending_admission': policy, 'claim_persisted': not dry_run or previous is not None}
 
 
@@ -357,6 +379,7 @@ def inspect(database, project, iteration, operator, assignment_id):
 
 
 def require_result_active(assignment):
+    require(not assignment.get('recovery_disposition'), 'Ordinary work parked for main recovery.', 'main_frozen')
     require(not assignment.get('requirement_disposition'), 'Obsolete work cannot admit results or merge.', 'requirements_held')
     require(not assignment.get('stuck_disposition'), 'Held or superseded work requires fresh scoped implementation.', 'stuck_held')
     runtime = assignment.get('runtime')
@@ -391,7 +414,8 @@ def store_result(database, project, iteration, operator, assignment_id, request,
     original['skills'] = [{key: value for key, value in s.items() if key != 'instructions'} for s in handoff['skills']]
     prepare(database, project, iteration, operator, original, github, dry_run=True)
     stage_result = None
-    if handoff['stage'] in {'simplify', 'review-standards', 'review-spec', 'diagnosis'}:
+    recovery_modification = handoff['stage'] in {'repair', 'corrections'} and 'recovery' in handoff
+    if (handoff['stage'] in {'simplify', 'review-standards', 'review-spec', 'diagnosis'} or recovery_modification) and not (recovery_modification and request['status'] == 'stuck'):
         runtime = assignment.get('runtime') or {}
         launcher_submission = (runtime.get('status') == 'running' and
                                sandbox_run_id == request['run_id'] == runtime.get('run_id'))
@@ -399,7 +423,9 @@ def store_result(database, project, iteration, operator, assignment_id, request,
                             assignment.get('submitted_result') == request)
         require(launcher_submission or completed_replay,
                 'Stage accepts only launcher-validated output or exact completed replay.', 'invalid_result')
-        if handoff['stage'] == 'diagnosis':
+        if recovery_modification:
+            from .recovery import validate_result
+        elif handoff['stage'] == 'diagnosis':
             from .diagnosis import validate_result
         elif handoff['stage'] == 'simplify':
             from .simplification import validate_result
@@ -414,7 +440,9 @@ def store_result(database, project, iteration, operator, assignment_id, request,
                                        'reason': 'trusted_whole_process_execution_evidence_unavailable'}
     if stage_result is not None:
         assert assignment is not None
-        if 'diagnosis' in handoff:
+        if recovery_modification:
+            result_key = 'recovery_result'
+        elif 'diagnosis' in handoff:
             result_key = 'diagnosis_result'
         elif 'review' in handoff:
             result_key = 'review_result'

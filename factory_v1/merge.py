@@ -84,9 +84,14 @@ def load_config(path, operator):
             len({c['context'] for c in checks}) == len(checks),
             'Explicit authoritative app-bound quality/security checks required.', 'checks_required')
     recovery = config['recovery']
-    require(recovery is None or (isinstance(recovery, dict) and set(recovery) == {'incident_id', 'implementation_assignment', 'issue'} and
+    recovery_fields = {'incident_id', 'implementation_assignment', 'issue', 'removed_assignments'}
+    require(recovery is None or (isinstance(recovery, dict) and set(recovery) in (recovery_fields, recovery_fields | {'root_execution'}) and
             assignments.identifier(recovery['incident_id']) and assignments.sha(recovery['implementation_assignment']) and
-            recovery['issue'] == config['issue']), 'Explicit incident/recovery binding required.', 'scope_mismatch')
+            recovery['issue'] == config['issue'] and isinstance(recovery['removed_assignments'], list) and
+            all(assignments.sha(v) for v in recovery['removed_assignments']) and
+            ('root_execution' not in recovery or isinstance(recovery['root_execution'], dict)) and
+            len(set(recovery['removed_assignments'])) == len(recovery['removed_assignments'])),
+            'Explicit incident/recovery and independently resolved removal binding required.', 'scope_mismatch')
     return config
 
 
@@ -380,12 +385,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             item = delivery.mutation_boundary(database, project, iteration, operator)
             incident = item.get('main_incident')
             if incident is not None:
-                recovery = config['recovery']
-                require(isinstance(incident, dict) and incident.get('status') == 'active' and recovery is not None and
-                        incident.get('incident_id') == recovery['incident_id'] and
-                        incident.get('recovery_assignment') == recovery['implementation_assignment'] == builder['assignment_id'] and
-                        incident.get('recovery_issue') == config['issue'] and builder['handoff']['stage'] == 'repair',
-                        'Ordinary merges frozen; exact incident-scoped repair only.', 'main_frozen')
+                from .recovery import merge_boundary
+                merge_boundary(database, item, config, builder, root)
             else:
                 require(config['recovery'] is None, 'Recovery authorization has no current incident.', 'scope_mismatch')
                 try:
@@ -431,12 +432,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             latest = delivery.mutation_boundary(database, project, iteration, operator)
             boundary_incident = latest.get('main_incident')
             if boundary_incident is not None:
-                recovery = config['recovery']
-                require(isinstance(boundary_incident, dict) and boundary_incident.get('status') == 'active' and
-                        recovery is not None and boundary_incident.get('incident_id') == recovery['incident_id'] and
-                        boundary_incident.get('recovery_assignment') == recovery['implementation_assignment'] == builder['assignment_id'] and
-                        boundary_incident.get('recovery_issue') == config['issue'] and builder['handoff']['stage'] == 'repair',
-                        'Delivery changed at mutation boundary; ordinary merges frozen.', 'main_frozen')
+                from .recovery import merge_boundary
+                merge_boundary(database, latest, config, builder, root)
             else:
                 require(config['recovery'] is None, 'Recovery scope no longer has an active incident.', 'scope_mismatch')
             # Delivery reads can change admission too. Revalidate AFTER sampling,
@@ -447,6 +444,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require_publication(database, latest, api, config['issue'])
             require(issue(api, prior, config) == observed_issue,
                     'Exact work issue changed at final requirement boundary.', 'stale_requirements')
+            if boundary_incident is not None:
+                from .recovery import merge_boundary
+                prior, builder, root = chain(database, project, iteration, operator, config, config_path)
+                merge_boundary(database, latest, config, builder, root)
             from .controls import admission, require_active
             require_active(database, project, iteration)
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,

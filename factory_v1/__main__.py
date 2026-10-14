@@ -274,6 +274,19 @@ def main():
             control.add_argument('--api-base', required=True)
             control.add_argument('--bearer', default='credential-blind-controller')
             control.add_argument('--timeout', type=float, default=10)
+    for name in ('register-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'):
+        control = commands.add_parser(name, help='Host-owned incident recovery through unchanged worker/review/delivery gates.')
+        for option in ('project', 'iteration'):
+            control.add_argument('--' + option, required=True)
+        if name != 'inspect-recovery':
+            control.add_argument('--api-base', required=True)
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
+        if name in {'register-recovery', 'verify-recovery'}:
+            control.add_argument('--recovery-config' if name == 'register-recovery' else '--merge-config', required=True)
+        if name == 'prepare-recovery':
+            control.add_argument('--request', required=True)
+            control.add_argument('--dry-run', action='store_true')
     args = parser.parse_args()
     if args.state in {'', ':memory:'}:
         raise IntakeError('invalid_state', 'State must name a persistent SQLite file.')
@@ -294,6 +307,32 @@ def main():
             raise IntakeError(error.code, str(error)) from error
         except (OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
             raise IntakeError('invalid_completion', 'Malformed or unavailable iteration input/evidence; no completion or continuation admitted.') from error
+        print(json.dumps(result, sort_keys=True))
+        return
+    if args.command in {'register-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'}:
+        from . import recovery, assignments
+        from .repositories import GitHub, RepositoryError, state_lock
+        try:
+            read_only = args.command == 'inspect-recovery' or getattr(args, 'dry_run', False)
+            uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if read_only else '?mode=rw')
+            with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database):
+                if args.command == 'inspect-recovery':
+                    item = assignments.current(database, args.project, args.iteration, args.operator_id, require_active=False)
+                    result = {'incident': item.get('main_incident'), 'recoveries': item.get('main_recoveries', {})}
+                else:
+                    github = GitHub(args.api_base, args.bearer, args.timeout)
+                    if args.command == 'register-recovery':
+                        result = recovery.register(database, args.project, args.iteration, args.operator_id, args.recovery_config, github)
+                    elif args.command == 'verify-recovery':
+                        result = recovery.verify(database, args.project, args.iteration, args.operator_id, args.merge_config, github)
+                    else:
+                        with open(args.request, encoding='utf-8') as source:
+                            request = json.load(source, object_pairs_hook=unique_fields)
+                        result = recovery.prepare(database, args.project, args.iteration, args.operator_id, request, github, args.dry_run)
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_recovery', 'Malformed recovery evidence; freeze remains in force.') from error
         print(json.dumps(result, sort_keys=True))
         return
     if args.command in {'observe-delivery', 'watch-delivery', 'inspect-delivery'}:
