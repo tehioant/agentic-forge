@@ -70,7 +70,19 @@ and pending external intents; emergency stop owns actual worker/helper cleanup.
 Requested/acknowledged/completed readbacks distinguish interruption from uncertain
 external outcomes, never rollback or delivery. Back up `<state>.controls/` with
 SQLite and retained artifacts. See [control semantics, commands and acceptance
-limitations](CONTROLS.md). General restart reconciliation remains a later slice.
+limitations](CONTROLS.md).
+
+## Interrupted execution recovery (#22)
+
+`reconcile-restart` reads the exact tracker, requirements, worktrees, named-worker
+liveness, publication/merge effects, configured delivery health and attention
+intents. It persists an interrupted-observation hold before reading and refuses
+unknown or contradictory transitions without repeating remote writes or sends.
+Launch forces fresh readback; explicit `resume` now requires the exact tracker
+capability and revalidates before releasing the intentional hold. Verified absent
+lost attempts retain artifacts; exact operator-authorized infrastructure recovery
+can retire only their scoped claim so a fresh owner can pass existing gates.
+See [commands, readback/ownership semantics and focused evidence](RESTART.md).
 
 ## Gated main recovery (#20)
 
