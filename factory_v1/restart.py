@@ -34,7 +34,7 @@ def scoped(database, project, iteration):
             (a['ticket_scope']['project'], a['ticket_scope']['iteration']) == (project, iteration)]
 
 
-def require_reconciled(database, project, iteration):
+def require_reconciled(database, project, iteration, *, resolution=None):
     row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
                            (project, iteration)).fetchone()
     if row:
@@ -44,7 +44,11 @@ def require_reconciled(database, project, iteration):
                 record['status'] in {'ready', 'blocked'} and isinstance(record['observations'], dict) and
                 isinstance(record['blockers'], list) and (record['status'] == 'ready') == (not record['blockers'])),
                 'Malformed restart evidence cannot grant admission.', 'invalid_restart')
-        require(record is None or record.get('status') == 'ready',
+        allowed = set()
+        if resolution is not None:
+            from .effect_resolution import permitted
+            allowed = permitted(database, project, iteration, resolution)
+        require(record is None or all(isinstance(b, dict) and (b.get('boundary'), b.get('code')) in allowed for b in record['blockers']),
                 'Restart observations remain unresolved; inspect/reconcile the exact scope.', 'reconciliation_required')
         if database.execute('PRAGMA database_list').fetchone()[2]:
             for assignment in scoped(database, project, iteration):
@@ -143,10 +147,20 @@ def candidate(assignment, api):
             'Publication authority or target changed.', 'publication_conflict')
     root = physical(assignment['runtime']['artifacts'], directory=True)
     plan, _ = publication.assemble(api, config, assignment, root)
-    require(plan['candidate'] == journal['candidate'] and
-            publication.ref_sha(api.read('/git/ref/heads/' + config['branch']), config['branch']) == plan['candidate'],
+    require(plan['candidate'] == journal['candidate'],
             'Publication is absent, partial or contradictory; never replay writes.', 'publication_uncertain')
     publication.verify_commit(api, plan, config)
+    branch = api.read('/git/ref/heads/' + config['branch'])
+    if branch is None and assignment.get('merge') is not None:
+        authority = assignment['merge']['authority']
+        require(authority.get('head') == plan['candidate'] and authority.get('branch') == config['branch'] and
+                authority.get('base') == config['base'] and authority.get('baseline') == config['binding']['baseline'] and
+                authority.get('pr_number') == journal['pr_number'],
+                'Historical publication and merge authority disagree.', 'integration_mismatch')
+        integration(assignment, api)
+    else:
+        require(publication.ref_sha(branch, config['branch']) == plan['candidate'],
+                'Exact candidate branch required before proven integration.', 'publication_uncertain')
     # A merge intent owns the PR after publication; its validator accepts closed PRs.
     if assignment.get('merge') is not None:
         return {'candidate': plan['candidate'], 'tree': plan['tree'], 'pr_number': journal['pr_number']}

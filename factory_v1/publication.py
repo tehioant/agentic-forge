@@ -248,8 +248,14 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         for table in ('iterations', 'role_assignments'):
             for row in database.execute('SELECT payload FROM ' + table):
                 json.loads(row[0], object_pairs_hook=unambiguous_fields)
-        item = assignments.current(database, project, iteration, operator)
+        item = assignments.current(database, project, iteration, operator, require_active=False)
+        require(item['status'] == 'active', 'Paused iteration cannot publish candidates.', 'iteration_paused')
         assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
+        from . import controls
+        from .effect_resolution import bound
+        resolution = (bound(database, item, 'candidate-publication', assignment_id)
+                      if assignment.get('publication') and item.get('restart_reconciliation', {}).get('status') == 'blocked' else None)
+        controls.require_active(database, project, iteration, resolution=resolution)
         handoff = assignment['handoff']
         assignments.ticket_claims(database, assignment['ticket_scope'])
         require(config['binding'] == binding(assignment) and handoff['stage'] in {'implementation', 'corrections', 'simplify'} and
@@ -295,6 +301,8 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(plan['candidate'] == config['candidate'], 'Candidate differs from exact approval.', 'scope_mismatch')
         approval = {k: v for k, v in config.items() if k != 'bearer'}
         old = assignment.get('publication')
+        if resolution is not None and item.get('restart_reconciliation', {}).get('status') == 'blocked':
+            require(old['approval'] == approval, 'Resolving intent cannot admit a different candidate.', 'publication_conflict')
         if old is not None:
             require(isinstance(old, dict) and set(old) == {'status', 'approval', 'candidate', 'pr_number'} and
                     old['status'] in ('pending', 'published') and isinstance(old['approval'], dict) and
@@ -340,25 +348,29 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         else:
             require(publication['pr_number'] is None, 'Fixed PR disappeared.', 'publication_conflict')
         api.approve(plan, content, pr_payload)
-        assignment['publication'] = publication
-        save(database, assignment)  # Intent is durable before any object/ref/PR write.
+        def write(path, payload, method='POST'):
+            controls.require_active(database, project, iteration, resolution=resolution)
+            return api.write(path, payload, method)
+        with controls.admission(database, project, iteration, resolution=resolution):
+            assignment['publication'] = publication
+            save(database, assignment)  # Intent is durable before any object/ref/PR write.
         if head != plan['candidate']:
             for path, data in content.items():
                 expected = object_sha('blob', data)
-                result = api.write('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
+                result = write('/git/blobs', {'content': base64.b64encode(data).decode(), 'encoding': 'base64'})
                 require(isinstance(result, dict) and result.get('sha') == expected, 'Blob mismatch.', 'github_mismatch')
-            result = api.write('/git/trees', {'base_tree': plan['base_tree'], 'tree': plan['changes']})
+            result = write('/git/trees', {'base_tree': plan['base_tree'], 'tree': plan['changes']})
             require(isinstance(result, dict) and result.get('sha') == plan['tree'], 'Tree mismatch.', 'github_mismatch')
-            result = api.write('/git/commits', commit_payload(plan, config))
+            result = write('/git/commits', commit_payload(plan, config))
             require(isinstance(result, dict) and result.get('sha') == plan['candidate'], 'Commit mismatch.', 'github_mismatch')
             verify_commit(api, plan, config)
             current = api.read(ref_path)
             require((None if current is None else ref_sha(current, config['branch'])) == head,
                     'Branch changed before publication.', 'publication_conflict')
             if head is None:
-                api.write('/git/refs', {'ref': 'refs/heads/' + config['branch'], 'sha': plan['candidate']})
+                write('/git/refs', {'ref': 'refs/heads/' + config['branch'], 'sha': plan['candidate']})
             else:
-                api.write('/git/refs/heads/' + config['branch'], {'sha': plan['candidate'], 'force': False}, 'PATCH')
+                write('/git/refs/heads/' + config['branch'], {'sha': plan['candidate'], 'force': False}, 'PATCH')
         require(ref_sha(api.read(ref_path), config['branch']) == plan['candidate'], 'Exact ref readback failed.', 'github_mismatch')
         verify_commit(api, plan, config)
         query = pr_query(config)
@@ -372,7 +384,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
             verify_pr(pr, config, plan, title, body)
         else:
             require(publication['pr_number'] is None, 'Published PR disappeared.', 'publication_conflict')
-            api.write('/pulls', pr_payload)
+            write('/pulls', pr_payload)
             prs = api.read(query)
             require(isinstance(prs, list) and len(prs) == 1, 'PR creation needs exact reconciliation.', 'github_mismatch')
             number = prs[0].get('number')
@@ -391,8 +403,9 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(ref_sha(api.read(ref_path), config['branch']) == plan['candidate'], 'Ref moved during PR verification.', 'github_mismatch')
         require(ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == handoff['baseline'],
                 'Base moved during publication.', 'github_mismatch')
-        publication['status'] = 'published'
-        save(database, assignment)
+        with controls.admission(database, project, iteration, resolution=resolution):
+            publication['status'] = 'published'
+            save(database, assignment)
         return {k: publication[k] for k in ('status', 'candidate', 'pr_number')} | {'close_allowed': False, 'merge_allowed': False}
 
 
