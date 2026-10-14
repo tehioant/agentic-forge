@@ -185,7 +185,7 @@ class IterationComponents(unittest.TestCase):
         with self.db, self.assertRaises(IntakeError):
             register_iteration(self.db, dict(context(), iteration_id='m2'))
 
-    def test_every_required_item_gets_two_fresh_delivery_checks(self):
+    def test_every_required_item_has_exact_delivery_evidence_and_drift_refuses(self):
         self.observed['items'].append(work_row(2))
         self.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
         def delivered(database, item, row, *args):
@@ -195,7 +195,22 @@ class IterationComponents(unittest.TestCase):
         self.mocks['iteration.delivered_item'].side_effect = delivered
         report = self.complete({'merge_configs': ['one.json', 'two.json']})
         self.assertEqual([r['issue']['number'] for r in report['report']['delivered']], [1, 2])
-        self.assertEqual([c.args[2]['number'] for c in self.mocks['iteration.delivered_item'].call_args_list], [1, 2, 1, 2])
+        self.assertEqual(report['report']['delivered'], [dict(self.delivered, issue=dict(self.delivered['issue'], number=n)) for n in (1, 2)])
+        self.db.execute('DELETE FROM notifications')
+        self.item = context()
+        self.store()
+        seen = set()
+        def changed_delivery(database, item, row, *args):
+            value = delivered(database, item, row)
+            if row['number'] in seen:
+                value['integration'] = {'integrated': 'e' * 40}
+            seen.add(row['number'])
+            return value
+        self.mocks['iteration.delivered_item'].side_effect = changed_delivery
+        with self.assertRaisesRegex(RepositoryError, 'changed during verification'):
+            self.complete({'merge_configs': ['one.json', 'two.json']})
+        self.assertNotIn('completion', self.stored())
+        self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
 
     def test_unreconciled_worker_or_required_hold_prevents_completion(self):
         assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1'},
@@ -257,11 +272,11 @@ class DeliveredEvidenceComponents(unittest.TestCase):
 
     def test_external_evidence_and_original_chain_are_revalidated(self):
         result = self.check()
-        self.assertEqual(result['integration']['integrated'], SHA)
-        self.assertEqual(result['reviews'], ['s', 'p'])
-        self.mocks['chain'].assert_called_once()
-        self.mocks['require_publication'].assert_called_once()
-        self.mocks['checks'].assert_called_once_with(self.mocks['MergeGitHub'].return_value, self.config, SHA)
+        self.assertEqual(result, {
+            'issue': {'number': 1, 'id': 10, 'url': 'https://github.com/example/product/issues/1'},
+            'pr': {'number': 2, 'url': 'https://github.com/example/product/pull/2'},
+            'assignment_id': self.prior['assignment_id'], 'requirements': self.prior['revision'],
+            'reviews': ['s', 'p'], 'integration': self.evidence, 'checks': ['exact-integrated-check']})
 
     def test_closed_issue_and_delivered_boolean_never_replace_original_proof(self):
         for boundary in ('chain', 'mapped_candidate', 'target', 'merged_evidence', 'protection', 'checks', 'require_publication'):
