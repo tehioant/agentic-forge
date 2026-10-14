@@ -114,6 +114,8 @@ class CleanupErrorTests(unittest.TestCase):
                       'handoff': {'stage': 'implementation', 'profile': {'home': str(self.root / 'absent-home')},
                                   'workspace': str(self.root / 'source'), 'baseline': 'b' * 40,
                                   'candidate': None}}
+        self.database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment), 'a'))
+        self.database.commit()
         config = {'subscription_socket': str(self.root / 'unused-socket'),
                   'artifacts_root': str(artifacts), 'image': 'fixture', 'limits': {'seconds': 1}}
         (self.root / 'source').mkdir()

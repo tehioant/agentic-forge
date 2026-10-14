@@ -307,7 +307,8 @@ class ReviewComponentTests(unittest.TestCase):
         exact = {'reference': 'Local explicit decision', 'paths': [], 'findings': ['Spec:R1']}
         self.assertEqual(self.evaluate(self.authorization(exact))['status'], 'diagnosis')
         self.assertFalse(self.evaluate()['advance_allowed'])
-        child = {'assignment_id': '6' * 64, 'handoff': {'corrections': {'pins': self.pins}},
+        child = {'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(self.candidate['ticket_scope']),
+                 'handoff': {'corrections': {'pins': self.pins}},
                  'runtime': {'status': 'complete'}, 'submitted_result': {'status': 'stuck', 'work': ['Retained failed correction']}}
         self.store(child)
         feedback = self.evaluate()
@@ -322,7 +323,8 @@ class ReviewComponentTests(unittest.TestCase):
                    'skills': [], 'claim_id': 'fresh-correction'}
         review.prepare_corrections(self.database, 'product', 'm1', '42', request, self.github, dry_run=True)
         self.assertEqual(self.preflight.call_args.args[4]['stage'], 'corrections')
-        child = {'assignment_id': '6' * 64, 'handoff': {'corrections': {'pins': self.pins}},
+        child = {'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(self.candidate['ticket_scope']),
+                 'handoff': {'corrections': {'pins': self.pins}},
                  'runtime': {'status': 'complete'},
                  'submitted_result': {'status': 'stuck', 'work': ['Retained failed correction']}}
         self.store(child)
@@ -501,7 +503,8 @@ class ReviewComponentTests(unittest.TestCase):
                     review.candidate(self.database, 'product', 'm1', '42', row['assignment_id'])
                 self.assertEqual(refusal.exception.code, 'candidate_unverified')
         self.store(self.candidate)
-        child = {'assignment_id': '6' * 64, 'handoff': {'corrections': {'pins': self.pins}},
+        child = {'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(self.candidate['ticket_scope']),
+                 'handoff': {'corrections': {'pins': self.pins}},
                  'runtime': {'status': 'complete'}, 'submitted_result': {'status': 'done'}}
         self.store(child)
         with self.assertRaises(RepositoryError) as refusal:
