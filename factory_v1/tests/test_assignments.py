@@ -287,8 +287,11 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(self.prepare(request, dry=True)['assignment_id'], first['assignment_id'])
         self.assertEqual(first['handoff']['skill_entry_points'], ['diagnosing-bugs', 'implement'])
         # Repair owns a fresh profile but shares the same eligible ticket.
-        repaired = self.prepare(request)
-        replay = self.prepare({**request, 'skills': list(reversed(request['skills']))})
+        # Independent restart inventory is a mocked precursor here; the real
+        # registered-health/authority boundary has dedicated integration coverage.
+        with patch('factory_v1.restart.before_dispatch'):
+            repaired = self.prepare(request)
+            replay = self.prepare({**request, 'skills': list(reversed(request['skills']))})
         self.assertEqual(replay['assignment_id'], repaired['assignment_id'])
         self.assertEqual(repaired['assignment_id'], first['assignment_id'])
         self.assertEqual(replay['handoff_digest'], repaired['handoff_digest'])

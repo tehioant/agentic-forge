@@ -8,6 +8,7 @@ from factory_v1 import assignments, attention, controls, delivery, restart
 from factory_v1.repositories import RepositoryError, save_iteration
 from factory_v1.tests import test_iteration as iteration_fixtures
 from factory_v1.tests import test_restart as restart_fixtures
+from factory_v1.tests import test_restart_recovery as recovery_fixtures
 from factory_v1.tests import test_restart_effects as effect_fixtures
 from factory_v1.tests.test_delivery import DeliveryTarget, configuration
 from factory_v1.tests.test_iteration_regressions import fixture
@@ -115,13 +116,11 @@ class RestartIterationTests(unittest.TestCase):
         self.assertEqual(restart.ownership(f.db, f.item)['assignments'], [])
 
     def test_resume_preserves_delivery_owned_incident_snapshot(self):
-        f = fixture(self, restart_fixtures.RestartTests)
-        incident = {'status': 'active', 'incident_id': 'repair-incident', 'recovery_assignment': 'c' * 64, 'recovery_issue': 10}
-        f.item.update(delivery_monitor={'SIMULATED': 'registered observer'}, main_incident=incident)
-        f.save_item()
+        f = fixture(self, recovery_fixtures.RestartRecoveryTests)
+        f.registration()  # Explicit registered authority, not a partial raw incident.
+        incident = copy.deepcopy(f.item['main_incident'])
         controls.request(f.db, 'p', 'i', 'operator', 'pause', 'intentional')
-        with patch.object(restart, 'tracker', return_value={}), \
-             patch.object(delivery, 'sample', return_value={'evidence': {'status': 'healthy'}}):
+        with f.observations('healthy'):
             controls.resume(f.db, 'p', 'i', 'operator', 'explicit', f.github)
         self.assertEqual(f.stored()['main_incident'], incident)
         self.assertFalse(controls.blocked(f.db, 'p', 'i'))
