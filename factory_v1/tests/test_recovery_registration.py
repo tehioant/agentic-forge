@@ -18,6 +18,7 @@ class RecoveryRegistrationTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         self.root = Path(directory.name)
         self.db = sqlite3.connect(self.root / 'state.db')
+        (self.root / 'state.db').chmod(0o600)
         self.addCleanup(self.db.close)
         self.db.executescript('''
             CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT);
