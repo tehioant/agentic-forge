@@ -165,6 +165,14 @@ Scheduling, claims, polling, persistence, publication, merge validation, health 
 - GitHub's automatic issue-closing behavior must not make the board misleading. Reconcile premature closures and reopen work whose acceptance conditions are not delivered.
 - An iteration completes only when its required work is complete and `main` CI/CD and deployment health are verified. Product-specific deployment targets and acceptance journeys are decided in that product's grilling.
 
+### Implementation-ticket verification policy
+
+- Define each project's verification contract during grilling and retain it in its project configuration/specifications: required automated checks, whether deployment applies, and any applicable deployment target and health signals. Do not invent a deployment target or an extra acceptance campaign while closing a ticket.
+- For Agentic Forge implementation tickets, verify the required behavior with meaningful automated tests, independent Standards/Spec review, merge into `main` and required checks against the integrated code. Deterministic external-service fixtures may exercise failures, outages and races; identify them as simulated evidence.
+- A separate live deployment, deliberately induced outage and recovery journey is not a per-ticket completion gate. Neither manual user testing nor this additional live exercise is required by default. This operator clarification supersedes the live test-target exercise as a completion requirement for issue #18; it does not claim that exercise ran.
+- Keep the configured runtime delivery contract intact: missing observations remain unknown, failed delivery freezes ordinary merges, and only verified required checks and actual configured deployment health clear a real incident. Automated test evidence does not establish that a live deployment is healthy.
+- The explicitly agreed whole-factory live validation remains a separate milestone-level requirement. Changes to that scope or to another project's acceptance contract require an explicit operator decision.
+
 ### Bugs, stuck work, and recovery
 
 - The responsible ticket agents attempt fixes and iterate; they decide when they are stuck. Do not replace that judgment with an unagreed fixed retry count for engineering difficulty.
@@ -258,6 +266,7 @@ Use narrower integration seams only where necessary to verify a real trust bound
 
 - Use deterministic test doubles for repeatable controller scenarios, including crash windows and API failures, but add real-path integration tests for external state and enforcement.
 - Exercise the private disposable repository with real GitHub issue/board/PR/check/merge reads and writes, real isolated Hermes workers using approved capacity, and an actual CI/CD test target.
+- This real-path journey validates the whole factory milestone; individual implementation tickets follow the verification policy above rather than repeating a live deployment/outage/recovery exercise.
 - Read back exact external targets after writes and attach evidence to the tested scenario. Test artifacts must distinguish simulated controller cases from live integration runs.
 - Do not report isolation, merge, CI/CD, notification, or recovery as proven until the relevant real path has been exercised.
 - No existing factory implementation or beta test conventions were inspected. Prior art from that codebase is therefore not asserted or imported.
