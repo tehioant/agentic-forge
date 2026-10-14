@@ -172,6 +172,8 @@ class AdmissionBoundaryTests(unittest.TestCase):
     def test_pause_at_final_issue_list_read_prevents_publication_intent(self):
         work, batch, execution = self.ticket_work()
         work.update(tickets=batch, execution=execution, status='publication_pending')
+        self.item['repository_onboarding'] = {'api_base': 'https://api.github.com', 'metadata': {'id': 123}}
+        self.item['execution_allowed'] = False
         self.item['ticket_work'] = work
         self.item['stage'] = self.item['correlation']['stage'] = 'ticket_publication_pending'
         self.persist()

@@ -230,7 +230,7 @@ class BugTests(unittest.TestCase):
             with self.subTest(archived=archived):
                 work = self.work_record; work['status'] = 'publication_pending'
                 if archived:
-                    work.pop('issue_intent', None); self.item['bug_work_history'] = [{'issue_intent': {'title': 'unknown'}, 'publication_complete': False}]
+                    work.pop('issue_intent', None); self.item['bug_work_history'] = [{'assignment_id': 'archived-unknown', 'issue_intent': {'title': 'unknown'}, 'publication_complete': False}]
                 else: work['issue_intent'] = {'title': 'unknown'}
                 self.fixture.persist()
                 with patch.object(bugs, 'work_context', return_value=(work['inputs'], work['board'])), patch.object(bugs, 'observations', return_value=work['candidates']):

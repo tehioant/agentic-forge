@@ -87,8 +87,8 @@ def validate_discovery(value):
             'Current blockers name affected work; deferred/recovery cannot extend the ordinary milestone.', 'invalid_bug')
 
 
-def context(database, item, github, affected=(), check_board=True):
-    tickets.active(item, database)
+def context(database, item, github, affected=(), check_board=True, *, resolution=None):
+    tickets.active(item, database, resolution=resolution)
     work = item.get('ticket_work')
     require(work is not None and work.get('publication_complete'), 'Publish current-milestone tickets first.', 'tickets_required')
     tickets.skill(work['request']['skill'])
@@ -104,8 +104,8 @@ def context(database, item, github, affected=(), check_board=True):
     return inputs, board, scoped
 
 
-def work_context(database, item, work, github, check_board=True):
-    inputs, board, scoped = context(database, item, github, work['discovery']['affected'], check_board)
+def work_context(database, item, work, github, check_board=True, *, resolution=None):
+    inputs, board, scoped = context(database, item, github, work['discovery']['affected'], check_board, resolution=resolution)
     expected = work.get('scoped_inputs', {str(n): work['inputs'] for n in work['discovery']['affected']})
     require(inputs == work['inputs'] and board == work['board'] and scoped == expected,
             'Pinned bug scope changed.', 'bug_conflict')
@@ -395,11 +395,10 @@ def publish_locked(database, item, work, github):
     require(work.get('bug') and work.get('execution'), 'Actual bug synthesis must complete first.', 'synthesis_required')
     tickets.skill(work['request']['skill'])
     from .effect_resolution import bound
-    resolution = (bound(database, item, 'bug-publication', work['assignment_id'])
-                  if item.get('restart_reconciliation', {}).get('status') == 'blocked' else None)
+    resolution = bound(database, item, 'bug-publication', work['assignment_id'])
     tickets.active(item, database, resolution=resolution)
     try:
-        inputs, board = work_context(database, item, work, github)
+        inputs, board = work_context(database, item, work, github, resolution=resolution)
         require(inputs == work['inputs'] and board == work['board'], 'Pinned bug scope changed.', 'bug_conflict')
         if work.get('publication_complete'):
             issue = gh.read_issue(github, item['repository'], work['identity']['number'])
@@ -409,11 +408,11 @@ def publish_locked(database, item, work, github):
             verify_observation(item, work, observation)
             verify_affected(item, work, github, issue)
             work['observation'] = observation
-            tickets.checkpoint(database, item)
+            tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
             work['status'] = 'duplicate' if work.get('duplicate_number') is not None else 'published'
             work.pop('blocker', None)
             tickets.admitted_checkpoint(database, item, resolution=resolution)
-            return tickets.frontier(database, item, github)
+            return tickets.frontier(database, item, github, resolution=resolution)
         observed = observations(item, github, board)
         duplicate = work.get('duplicate_number')
         if duplicate is not None:
@@ -441,7 +440,7 @@ def publish_locked(database, item, work, github):
                 tickets.admitted_checkpoint(database, item, resolution=resolution)
                 created = gh.issue_identity(github.request('/repos/' + item['repository'] + '/issues', payload), item['repository'])
                 work['identity'] = {k: created[k] for k in ('number', 'id', 'node_id')}
-                tickets.checkpoint(database, item)
+                tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
                 issue = gh.read_issue(github, item['repository'], created['number'])
             else:
                 issue = matches[0]['issue']
@@ -452,7 +451,7 @@ def publish_locked(database, item, work, github):
         require(work.get('identity', identity) == identity and issue['number'] not in work['bug']['blockers'] + work['bug']['affected'] +
                 [item.get('work_item_number'), inputs['handoff']['issue']['number']], 'Bug identity/scope conflict.', 'publication_mismatch')
         work['identity'] = identity
-        tickets.checkpoint(database, item)
+        tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
         known = {o['issue']['number']: o['issue'] for o in work['candidates']}
         if duplicate is None:
             edges(database, item, work, github, issue['number'], {known[n]['id'] for n in work['bug']['blockers']}, resolution=resolution)
@@ -485,7 +484,7 @@ def publish_locked(database, item, work, github):
         verify_observation(item, work, observation)
         verify_affected(item, work, github, issue)
         work['observation'] = observation
-        tickets.checkpoint(database, item)
+        tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
         if work['bug']['scope'] == 'current' and work.get('scoped_revisions'):
             revision = work['scoped_revisions'][str(work['discovery']['affected'][0])]
             authorities = item.setdefault('requirement_authority', {})
@@ -496,11 +495,9 @@ def publish_locked(database, item, work, github):
         work.pop('blocker', None)
         transition(item, 'bug_tracked')
         tickets.admitted_checkpoint(database, item, resolution=resolution)
-        return tickets.frontier(database, item, github)
+        return tickets.frontier(database, item, github, resolution=resolution)
     except RepositoryError as error:
         if error.code in {'iteration_paused', 'invalid_control'}:
             raise
-        work.update(status='blocked', blocker={'code': error.code, 'message': str(error)})
-        transition(item, 'bug_tracking_blocked')
-        tickets.checkpoint(database, item)
-        return item
+        key = next(k for k, w in item['bug_work'].items() if w is work)
+        return tickets.publication_blocked(database, item, error, resolution=resolution, bug=key)

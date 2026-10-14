@@ -26,13 +26,20 @@ def authority(item, rows, kind, target):
         journal = row.get('publication') if row else None
         require(journal is not None and journal.get('status') in {'pending', 'published'},
                 'Exact existing candidate intent required.', 'publication_conflict')
+        assignments.require_result_active(row)
         return [row['handoff_digest'], row['revision'], row['runtime'], row.get('result_disposition'),
-                journal['approval'], journal['candidate']]
+                journal['approval'], journal['candidate'],
+                *[row.get(k) for k in ('recovery_disposition', 'restart_disposition',
+                                      'requirement_disposition', 'stuck_disposition')]]
     if kind == 'bug-publication':
-        work = next((w for w in item.get('bug_work', {}).values() if w['assignment_id'] == target), None)
-        require(work is not None and not work.get('requirement_disposition') and work.get('bug') and work.get('execution'),
+        from .bugs import assigned
+        work = assigned(item, target)
+        require(not work.get('requirement_disposition') and work.get('bug') and work.get('execution'),
                 'Exact current completed bug synthesis required.', 'synthesis_required')
-        return [work['assignment_id'], work['inputs'], work['request'], work['bug'], work['execution']]
+        from .requirements import authority as requirement_authority
+        return [work['assignment_id'], work['inputs'], work['request'], work['bug'], work['execution'],
+                work['board'], work.get('scoped_inputs'), work.get('scoped_revisions'),
+                [requirement_authority(item, n) for n in work['discovery']['affected']]]
     require(False, 'Unknown effect resolution lane.', 'invalid_restart')
 
 
@@ -44,6 +51,8 @@ def pinned_authority(database, item, kind, target):
             isinstance(onboarding.get('api_base'), str) and onboarding['api_base'],
             'Exact registered repository/capability required for effect resolution.', 'scope_mismatch')
     return assignments.digest([item['repository'], identity, onboarding['api_base'], item['approval'],
+                               *[item.get(k) for k in ('handoff', 'requirement_changes', 'main_incident',
+                                                       'main_recoveries', 'stuck_work')],
                                authority(item, assignments.rows(database), kind, target)])
 
 

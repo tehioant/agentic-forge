@@ -348,12 +348,19 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         else:
             require(publication['pr_number'] is None, 'Fixed PR disappeared.', 'publication_conflict')
         api.approve(plan, content, pr_payload)
+        def current_assignment():
+            fresh = assignments.inspect(database, project, iteration, operator, assignment_id)
+            assignments.require_result_active(fresh)
+            require(binding(fresh) == binding(assignment), 'Candidate authority changed.', 'stale_assignment')
+            return fresh
         def write(path, payload, method='POST'):
             controls.require_active(database, project, iteration, resolution=resolution)
+            current_assignment()
             return api.write(path, payload, method)
         with controls.admission(database, project, iteration, resolution=resolution):
+            current_assignment()
             assignment['publication'] = publication
-            save(database, assignment)  # Intent is durable before any object/ref/PR write.
+            save(database, assignment, publication_only=True)  # Intent is durable before any object/ref/PR write.
         if head != plan['candidate']:
             for path, data in content.items():
                 expected = object_sha('blob', data)
@@ -390,7 +397,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
             number = prs[0].get('number')
             require(type(number) is int and number > 0, 'PR number unavailable.', 'github_mismatch')
         publication['pr_number'] = number
-        save(database, assignment)
+        save(database, assignment, publication_only=True)
         pr = api.read('/pulls/' + str(number))
         verify_pr(pr, config, plan, title, body)
         associated = api.read('/issues/' + str(number))
@@ -404,8 +411,9 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == handoff['baseline'],
                 'Base moved during publication.', 'github_mismatch')
         with controls.admission(database, project, iteration, resolution=resolution):
+            current_assignment()
             publication['status'] = 'published'
-            save(database, assignment)
+            save(database, assignment, publication_only=True)
         return {k: publication[k] for k in ('status', 'candidate', 'pr_number')} | {'close_allowed': False, 'merge_allowed': False}
 
 
@@ -413,9 +421,14 @@ def pr_query(config):
     return '/pulls?state=all&head=' + urllib.parse.quote(config['repository'].split('/')[0] + ':' + config['branch'], safe='') + '&base=' + urllib.parse.quote(config['base'], safe='') + '&per_page=100'
 
 
-def save(database, assignment):
+def save(database, assignment, *, publication_only=False):
+    if publication_only:
+        fresh = next(a for a in assignments.rows(database) if a['assignment_id'] == assignment['assignment_id'])
+        fresh['publication'] = assignment['publication']
+    else:
+        fresh = assignment
     database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
-                     (json.dumps(assignment, sort_keys=True), assignment['assignment_id']))
+                     (json.dumps(fresh, sort_keys=True), assignment['assignment_id']))
     database.commit()
 
 

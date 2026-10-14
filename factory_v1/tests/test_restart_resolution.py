@@ -9,7 +9,7 @@ from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from unittest.mock import patch
 
-from factory_v1 import assignments, bugs, controls, effect_resolution, publication, repositories, restart, tickets
+from factory_v1 import assignments, bugs, controls, effect_resolution, publication, repositories, requirements, restart, tickets
 from factory_v1.__main__ import main
 from factory_v1.errors import IntakeError
 from factory_v1.repositories import RepositoryError
@@ -299,8 +299,13 @@ class CandidateResolutionTests(unittest.TestCase):
 
 class BugResolutionTests(unittest.TestCase):
     def setUp(self):
+        real_context = bugs.context
         self.f = fixture(self, bug_fixtures.BugAdmissionTests)
         f = self.f
+        self.enterContext(patch.object(bugs, 'context', real_context))
+        self.enterContext(patch.object(requirements, 'revalidate_inputs', return_value=f.inputs))
+        self.enterContext(patch.object(tickets, 'verified_board', return_value=f.board))
+        f.item['ticket_work']['inputs'] = f.inputs
         self.state = f.database.execute('PRAGMA database_list').fetchone()[2]
         f.item['repository_onboarding'].update(api_base='https://api.github.com', metadata={'id': 123})
         f.item['restart_reconciliation'] = blocked('tracker')

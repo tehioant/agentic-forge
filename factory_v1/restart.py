@@ -239,7 +239,7 @@ def tracker(database, item, api):
         from . import bugs
         for identity, work in list(observed.get('bug_work', {}).items()):
             if work.get('bug') and work.get('execution') and not work.get('requirement_disposition'):
-                observed = bugs.publish(observation, observed, {'assignment_id': identity}, api)
+                observed = bugs.publish(observation, observed, {'assignment_id': work['assignment_id']}, api)
                 require(observed['bug_work'][identity].get('publication_complete'),
                         'Bug effects remain partial; use scoped reconciliation, never replay writes.', 'publication_uncertain')
         for key in ('bug_work', 'requirement_authority'):
