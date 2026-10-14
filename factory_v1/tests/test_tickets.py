@@ -1,17 +1,19 @@
-"""CLI lifecycle + real HTTP adapter tests. All tracker/agent artifacts are labeled fixtures."""
+"""Small ticket validators and durable publication/admission components; no CLI or transport."""
+import base64
 import copy
 import hashlib
 import json
-import re
-import os
-import subprocess
-import sys
-import threading
+import sqlite3
+import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from factory_v1.tests import test_planning
+from factory_v1 import controls, repositories, tickets
+
+REAL_PINNED_INPUTS = tickets.pinned_inputs
 
 
 def conn(nodes):
@@ -22,557 +24,405 @@ def hash_json(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+class FrontierFixture:
+    """Explicit state for one direct function, not a preparatory lifecycle."""
+    def __init__(self, case, native=False):
+        directory = tempfile.TemporaryDirectory()
+        case.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.state = self.root / 'state.sqlite'
+        self.database = sqlite3.connect(self.state)
+        case.addCleanup(self.database.close)
+        self.database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+        self.database.execute('CREATE TABLE role_assignments (assignment_id TEXT, payload TEXT)')
+        self.github = Mock(base='https://api.github.com')
+        source = Path(__file__).resolve().parents[1] / 'ticket_skills/to-tickets.md'
+        descriptor = {'name': 'to-tickets', 'path': str(source), 'sha256': hashlib.sha256(source.read_bytes()).hexdigest()}
+        statuses = {'ready': 'Ready', 'active': 'Active', 'blocked': 'Blocked', 'deferred': 'Deferred', 'done': 'Done'}
+        self.board = {'project_id': 'P1', 'status': {'id': 'STATUS', 'options': {n: n for n in statuses.values()}},
+                      'scope': {'id': 'SCOPE', 'options': {'m1': 'M1', 'm2': 'M2'}}}
+        if native:
+            statuses = {'ready': 'Todo', 'active': 'In Progress', 'done': 'Done'}
+            self.board = {'project_id': 'P1', 'status': {'id': 'STATUS', 'options': {n: n for n in statuses.values()}},
+                          'milestone': {'id': 501, 'number': 1, 'title': 'm1'}}
+        self.start_request = {'skill': descriptor, 'tracker': {'project_id': 'P1', 'status_field': 'Status',
+                              'triage_label': 'agent-triage', 'statuses': statuses}}
+        url = 'https://github.com/example/product/blob/' + 'a' * 40 + '/docs/milestone.md'
+        self.inputs = {'handoff': {'issue': {'number': 7}}, 'documents': {
+            'milestone.md': {'url': url, 'sha256': hashlib.sha256(b'## User Stories\n1. Retain notes.\n').hexdigest(),
+                             'content': '## User Stories\n1. Retain notes.\n'},
+            'vision.md': {'url': url.replace('milestone', 'vision'), 'sha256': hashlib.sha256(b'Team sharing').hexdigest(),
+                          'content': 'Team sharing'}}}
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product',
+                     'status': 'active', 'stage': 'ticket_frontier_ready', 'execution_allowed': False,
+                     'correlation': {'stage': 'ticket_frontier_ready', 'worker_run_id': None},
+                     'origin': {'platform': 'discord', 'chat_id': '1'},
+                     'approval': {'operator_id': '42', 'reference': 'fixture-direction'},
+                     'repository_onboarding': {'status': 'verified', 'api_base': self.github.base, 'metadata': {'id': 123}},
+                     'handoff': self.inputs['handoff']}
+        self.work = {'assignment_id': 'ticket-fixture', 'request': self.start_request,
+                     'skill': tickets.skill(descriptor), 'inputs': self.inputs, 'input_digest': tickets.digest(self.inputs),
+                     'adaptation': tickets.ADAPTATION, 'board': self.board, 'status': 'published', 'publication_complete': True,
+                     'published': {}}
+        self.item['ticket_work'] = self.work
+        self.issues, self.members, self.deps = {}, {}, {}
+        for number, blockers in ((10, []), (11, [10]), (12, [])):
+            ticket = self.ticket('note-' + str(number), blockers=blockers)
+            self.issues[number] = self.issue(number, tickets.body(self.item, ticket, {10: 10}))
+            fields = {'STATUS': statuses['ready']}
+            if not native:
+                fields['SCOPE'] = 'M1'
+            self.members[number] = {'id': 'ITEM' + str(number), 'fields': fields}
+            self.deps[number] = blockers
+        self.work['frontier'] = {'authority': 'github', 'items': [
+            {'number': n, 'id': i['id'], 'node_id': i['node_id'], 'membership_id': self.members[n]['id'],
+             'status': 'ready', 'issue_state': 'open', 'state_reason': None, 'blockers': self.deps[n],
+             'contract_valid': True, 'held': False, 'admissible': not self.deps[n]} for n, i in self.issues.items()],
+            'eligible': [10, 12], 'foreign_active': [], 'active': []}
+        self.database.execute('INSERT INTO iterations VALUES (?, ?, ?)', ('product', 'm1', json.dumps(self.item)))
+        self.database.commit()
+        self.state.chmod(0o600)
+        stack = ExitStack()
+        case.addCleanup(stack.close)
+        self.stack = stack
+        stack.enter_context(patch.object(tickets, 'pinned_inputs', side_effect=lambda *_: copy.deepcopy(self.inputs)))
+        stack.enter_context(patch.object(tickets, 'verified_board', side_effect=lambda *_: copy.deepcopy(self.board)))
+        stack.enter_context(patch.object(tickets.gh, 'project_items', side_effect=lambda *_: self.project_items()))
+        stack.enter_context(patch.object(tickets.gh, 'read_issue', side_effect=lambda _g, _r, n: copy.deepcopy(self.issues[n])))
+        stack.enter_context(patch.object(tickets.gh, 'dependencies', side_effect=lambda _g, _r, n: [copy.deepcopy(self.issues[b]) for b in self.deps.get(n, [])]))
+        stack.enter_context(patch.object(tickets.gh, 'membership', side_effect=self.membership))
+        self.set_field = stack.enter_context(patch.object(tickets.gh, 'set_field', side_effect=self.field))
+        self.add_item = stack.enter_context(patch.object(tickets.gh, 'add_item', side_effect=self.member))
+        self.add_dependency = stack.enter_context(patch.object(tickets.gh, 'add_dependency', side_effect=self.edge))
+        stack.enter_context(patch.object(tickets.gh, 'rest_pages', side_effect=lambda *_: copy.deepcopy(list(self.issues.values()))))
+        self.github.request.side_effect = self.request
+
+    def ticket(self, key='note', blockers=None):
+        return {'key': key, 'title': 'Retain a note', 'desired_behavior': 'Persist the exact note.',
+                'references': [{'spec': self.inputs['documents']['milestone.md']['url'], 'requirement': 'US-1'}],
+                'acceptance_criteria': ['Reopening retains café.'], 'blockers': blockers or [], 'status': 'ready',
+                'iteration': 'm1', 'triage_label': 'agent-triage'}
+
+    def evidence(self, result, work=None):
+        work = work or self.work
+        sources = {work['skill']['path']: work['skill']['sha256'],
+                   **{d['url']: d['sha256'] for d in work['inputs']['documents'].values()}, **work.get('load_sources', {})}
+        return {'run_id': 'fixture-run', 'decomposition': 'One bounded observable note slice.', 'result_digest': tickets.digest(result),
+                'loads': [{'source': source, 'sha256': pin, 'tool_reference': 'fixture-read'} for source, pin in sources.items()]}
+
+    def issue(self, number, body):
+        milestone = copy.deepcopy(self.board.get('milestone'))
+        if milestone:
+            milestone['state'] = 'open'
+        return {'number': number, 'id': 1000 + number, 'node_id': 'I' + str(number), 'title': 'Retain a note', 'body': body,
+                'state': 'open', 'state_reason': None, 'labels': [{'name': 'agent-triage'}],
+                'repository_url': 'https://api.github.com/repos/example/product',
+                'html_url': 'https://github.com/example/product/issues/' + str(number), 'milestone': milestone}
+
+    def project_items(self):
+        return [{'id': m['id'], 'content': {'id': self.issues[n]['node_id'], 'number': n, 'repository': {'nameWithOwner': 'example/product'}},
+                 'fieldValues': conn([{'field': {'id': k}, 'optionId': v} for k, v in m['fields'].items()])} for n, m in self.members.items()]
+
+    def membership(self, _github, _board, _repo, issue):
+        m = self.members.get(issue['number'])
+        return None if m is None else {'id': m['id'], 'status': m['fields'].get('STATUS'), 'scope': m['fields'].get('SCOPE')}
+
+    def field(self, _github, _project, item, field, option):
+        next(m for m in self.members.values() if m['id'] == item)['fields'][field] = option
+
+    def member(self, _github, _project, node):
+        n = next(n for n, i in self.issues.items() if i['node_id'] == node)
+        self.members[n] = {'id': 'ITEM' + str(n), 'fields': {}}
+
+    def edge(self, _github, _repo, number, blocker):
+        self.deps.setdefault(number, []).append(next(n for n, i in self.issues.items() if i['id'] == blocker))
+
+    def request(self, path, body=None, method=None):
+        if method == 'PATCH':
+            n = int(path.rsplit('/', 1)[1]); self.issues[n].update(body)
+            return copy.deepcopy(self.issues[n])
+        if body is not None and path == '/repos/example/product/issues':
+            n = max(self.issues, default=9) + 1
+            self.issues[n] = self.issue(n, body['body']); self.issues[n]['title'] = body['title']
+            return copy.deepcopy(self.issues[n])
+        raise AssertionError(('unexpected external boundary', path, body, method))
+
+    def persist(self):
+        repositories.save_iteration(self.database, self.item)
+        self.database.commit()
+
+    def stored(self):
+        with sqlite3.connect(self.state) as database:
+            return json.loads(database.execute('SELECT payload FROM iterations').fetchone()[0])
+
+    def pause(self):
+        controls.request(self.database, 'product', 'm1', '42', 'pause', 'fixture-pause')
+
+    def publication(self):
+        self.work.pop('publication_complete', None)
+        self.work.update(status='publication_pending', tickets=[self.ticket()], execution=self.evidence([self.ticket()]))
+        self.issues.clear(); self.members.clear(); self.deps.clear()
+        self.persist()
+
+
 class TicketTests(unittest.TestCase):
     def setUp(self):
-        self.planning = test_planning.PlanningTests()
-        self.planning.setUp()
-        self.addCleanup(self.planning.doCleanups)
-        self.fixture = self.planning.fixture
-        completion = self.planning.completion()
-        self.planning.publication(completion)
-        self.planning.published[self.planning.issue_path]['node_id'] = 'SPEC7'
-        self.planning.published[self.planning.issue_path]['title'] = 'Pinned note milestone'
-        self.assertEqual(self.planning.command('complete-planning', completion).returncode, 0)
-        self.issues = {}
-        self.deps = {}
-        self.dependency_observations = {}
-        self.project_item_overrides = {}
-        self.members = {}
-        self.boards = [{'id': 'P1', 'title': 'Approved linked board', 'closed': False}]
-        self.fields = [
-            {'id': 'STATUS', 'name': 'Status', 'options': [{'id': n, 'name': n} for n in ['Ready', 'Active', 'Blocked', 'Deferred', 'Done']]},
-            {'id': 'SCOPE', 'name': 'Iteration', 'options': [{'id': 'M1', 'name': 'm1'}, {'id': 'M2', 'name': 'm2'}]},
-        ]
-        self.drop = None
-        self.omit_effect = False
-        self.bad_readback = None
-        self.graph_error = False
-        self.creation_event = None
-        self.release_response = None
-        parent = self.fixture.server.RequestHandlerClass
-        case = self
-        class Handler(parent):
-            def do_GET(self):
-                if self.path.startswith('/repos/example/product/issues?'):
-                    case.fixture.calls.append(('GET', self.path))
-                    self.reply(200, list(case.issues.values()))
-                    return
-                match = re.fullmatch(r'/repos/example/product/issues/(\d+)(/dependencies/blocked_by\?.*)?', self.path)
-                if match and int(match[1]) in case.issues:
-                    n = int(match[1])
-                    case.fixture.calls.append(('GET', self.path))
-                    if match[2]:
-                        self.reply(200, case.dependency_observations.get(n, [case.issues[b] for b in case.deps.get(n, [])]))
-                    else:
-                        value = copy.deepcopy(case.issues[n])
-                        if case.bad_readback == 'body': value['body'] += 'wrong'
-                        if case.bad_readback == 'identity': value['id'] += 1
-                        if case.bad_readback == 'repo': value['repository_url'] = 'https://api.github.com/repos/wrong/repo'
-                        self.reply(200, value)
-                    return
-                super().do_GET()
-
-            def do_POST(self):
-                data = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-                case.fixture.calls.append(('POST', self.path, data))
-                kind = None
-                if self.path == '/graphql':
-                    query, v = data['query'], data['variables']
-                    if case.graph_error:
-                        self.reply(200, {'errors': [{'message': 'insufficient Projects scope'}]})
-                        return
-                    if 'query LinkedProjects' in query:
-                        offset = int(v['cursor'] or 0)
-                        page = conn(case.boards[offset:offset + 100])
-                        if offset + 100 < len(case.boards):
-                            page['pageInfo'] = {'hasNextPage': True, 'endCursor': str(offset + 100)}
-                        result = {'repository': {'projectsV2': page}}
-                    elif 'query ProjectFields' in query:
-                        result = {'node': {'id': 'P1', 'fields': conn(case.fields)}}
-                    elif 'query ProjectItems' in query:
-                        nodes = []
-                        for n, member in case.members.items():
-                            issue = case.issues[n]
-                            nodes.append({'id': member['id'], 'content': {'id': issue['node_id'], 'number': n,
-                                          'repository': {'nameWithOwner': 'example/product'}},
-                                          'fieldValues': conn([{'field': {'id': k}, 'optionId': val} for k, val in member['fields'].items()])})
-                            nodes[-1].update(case.project_item_overrides.get(n, {}))
-                        result = {'node': {'id': 'P1', 'items': conn(nodes)}}
-                    elif 'mutation AddTicket' in query:
-                        kind = 'membership'
-                        n = next(n for n, i in case.issues.items() if i['node_id'] == v['issue'])
-                        if not case.omit_effect:
-                            case.members[n] = {'id': 'ITEM' + str(n), 'fields': {}}
-                        result = {'addProjectV2ItemById': {'item': {'id': 'ITEM' + str(n)}}}
-                    elif 'mutation TicketField' in query:
-                        kind = 'field'
-                        n = next(n for n, m in case.members.items() if m['id'] == v['item'])
-                        if not case.omit_effect:
-                            case.members[n]['fields'][v['field']] = v['option']
-                        result = {'updateProjectV2ItemFieldValue': {'projectV2Item': {'id': v['item']}}}
-                    else:
-                        self.reply(403, {})
-                        return
-                    response = {'data': result}
-                elif self.path == '/repos/example/product/issues':
-                    kind = 'issue'
-                    n = 10 + len(case.issues)
-                    response = {'number': n, 'id': 1000 + n, 'node_id': 'I' + str(n), 'state': 'open',
-                                'state_reason': None, 'title': data['title'], 'body': data['body'],
-                                'labels': [{'name': l} for l in data['labels']],
-                                'repository_url': 'https://api.github.com/repos/example/product',
-                                'html_url': 'https://github.com/example/product/issues/' + str(n)}
-                    if not case.omit_effect: case.issues[n] = response
-                elif '/dependencies/blocked_by' in self.path:
-                    kind = 'dependency'
-                    n = int(self.path.split('/')[5])
-                    b = next(n for n, i in case.issues.items() if i['id'] == data['issue_id'])
-                    if not case.omit_effect: case.deps.setdefault(n, []).append(b)
-                    response = case.issues[b]
-                else:
-                    self.reply(403, {})
-                    return
-                if kind == 'issue' and case.creation_event is not None:
-                    case.creation_event.set()
-                    case.release_response.wait(timeout=10)
-                    self.close_connection = True
-                    return
-                if kind is not None and case.drop == kind:
-                    case.drop = None
-                    self.close_connection = True
-                    return
-                self.reply(200, response)
-        self.fixture.server.RequestHandlerClass = Handler
-        path = Path(__file__).resolve().parents[1] / 'ticket_skills/to-tickets.md'
-        self.start_request = {'skill': {'name': 'to-tickets', 'path': str(path),
-                              'sha256': hashlib.sha256(path.read_bytes()).hexdigest()},
-                              'tracker': {'project_id': None, 'status_field': 'Status', 'scope_field': 'Iteration',
-                                          'statuses': {'ready': 'Ready', 'active': 'Active', 'blocked': 'Blocked', 'deferred': 'Deferred', 'done': 'Done'},
-                                          'triage_label': 'agent-triage'}}
-
-    def control(self, command, request=None, issue=None):
-        args = [command, '--project', 'product', '--iteration', 'm1', '--api-base', self.fixture.base]
-        if request is not None:
-            path = self.fixture.root / 'tickets.json'
-            path.write_text(json.dumps(request))
-            args += ['--request', str(path)]
-        if issue is not None: args += ['--issue', str(issue)]
-        return self.fixture.cli(*args)
+        self.fixture = FrontierFixture(self)
+        self.database, self.item, self.github = self.fixture.database, self.fixture.item, self.fixture.github
+        self.issues, self.members, self.deps = self.fixture.issues, self.fixture.members, self.fixture.deps
+        self.start_request = self.fixture.start_request
 
     def ok(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
         return json.loads(result.stdout)
 
-    def inspect(self):
-        return self.planning.inspect()
-
-    def completion(self):
-        item = self.ok(self.control('synthesize-tickets', self.start_request))
-        work = item['ticket_work']
-        url = work['inputs']['documents']['milestone.md']['url']
-        def ticket(key, title, behavior, blockers):
-            return {'key': key, 'title': title, 'desired_behavior': behavior, 'references': [{'spec': url, 'requirement': 'US-1'}],
-                    'acceptance_criteria': ['CLI retains the note after a fresh process and rejects unsafe paths.'],
-                    'blockers': blockers, 'status': 'ready', 'iteration': 'm1', 'triage_label': 'agent-triage'}
-        # Deliberately reverse dependency order; expected behavior is blockers first.
-        batch = [ticket('reopen', 'Reopen a retained note', 'A reader reopens a stored note through the French CLI.', ['create']),
-                 ticket('create', 'Retain a note', 'A reader creates a local note through the French CLI.', []),
-                 ticket('invalid', 'Refuse unsafe note paths', 'A reader receives a French error without touching other files.', [])]
-        loads = [{'source': work['skill']['path'], 'sha256': work['skill']['sha256'], 'tool_reference': 'fixture:read-skill'}]
-        loads += [{'source': d['url'], 'sha256': d['sha256'], 'tool_reference': 'fixture:read-' + n}
-                  for n, d in work['inputs']['documents'].items()]
-        return {'assignment_id': work['assignment_id'], 'input_digest': work['input_digest'], 'adaptation': work['adaptation'],
-                'tickets': batch, 'execution': {'run_id': 'fixture-agent-run', 'loads': loads,
-                'decomposition': 'Fixture agent drafts retained-note and reopen tracer bullets; reopen genuinely depends on retention, unsafe-path refusal is independent.',
-                'result_digest': hash_json(batch)}}
+    def control(self, command, request=None, issue=None):
+        """Compatibility facade for remaining fixture consumers; never a CLI."""
+        functions = {'synthesize-tickets': tickets.synthesize, 'complete-tickets': tickets.complete_synthesis,
+                     'publish-tickets': tickets.publish, 'frontier': tickets.frontier, 'reserve-ticket': tickets.reserve}
+        try:
+            args = (self.database, self.inspect(), self.github)
+            if command in {'synthesize-tickets', 'complete-tickets'}:
+                args = (self.database, self.inspect(), request, self.github)
+            elif command == 'reserve-ticket':
+                args += (issue,)
+            value = functions[command](*args)
+            return SimpleNamespace(returncode=0, stdout=json.dumps(value), stderr='')
+        except repositories.RepositoryError as error:
+            self.database.rollback()
+            return SimpleNamespace(returncode=2, stdout='', stderr=json.dumps({'error': error.code, 'message': str(error)}))
 
     def publish(self):
-        return self.ok(self.control('complete-tickets', self.completion()))
+        return self.inspect()
 
+    def inspect(self):
+        return self.fixture.stored()
 
-    def test_synthesis_publication_frontier_and_one_reservation(self):
-        item = self.publish()
-        self.assertEqual(item['ticket_work']['status'], 'published')
-        self.assertEqual([i['title'] for i in self.issues.values()], ['Retain a note', 'Reopen a retained note', 'Refuse unsafe note paths'])
-        self.assertEqual(self.deps, {11: [10]})
-        self.assertIn('#10', self.issues[11]['body'])
-        self.assertEqual(item['ticket_work']['frontier']['eligible'], [10, 12])
-        self.assertEqual(self.control('reserve-ticket', issue=11).returncode, 2)
-        reserved = self.ok(self.control('reserve-ticket', issue=10))
-        self.assertEqual(reserved['reservation']['status'], 'reserved')
-        self.assertFalse(reserved['execution_allowed'])
-        self.assertIsNone(reserved['correlation']['worker_run_id'])
-        self.assertEqual(self.control('reserve-ticket', issue=12).returncode, 2)
-        self.assertEqual(self.ok(self.control('reserve-ticket', issue=10))['reservation'], reserved['reservation'])
-        self.assertEqual(self.inspect()['reservation'], reserved['reservation'])
-        self.assertFalse(any('/issues/7' in c[1] and c[0] != 'GET' for c in self.fixture.calls))
+    def completion(self):
+        batch = [self.fixture.ticket('reopen', ['create']), self.fixture.ticket('create'), self.fixture.ticket('independent')]
+        work = self.fixture.work
+        return {'assignment_id': work['assignment_id'], 'input_digest': work['input_digest'], 'adaptation': tickets.ADAPTATION,
+                'tickets': batch, 'execution': self.fixture.evidence(batch)}
 
-    def test_repeated_completion_and_publication_do_not_reset_progress(self):
-        request = self.completion()
-        self.ok(self.control('complete-tickets', request))
-        self.ok(self.control('reserve-ticket', issue=10))
-        result = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(result['ticket_work']['frontier']['active'], [10])
-        self.ok(self.control('publish-tickets'))
-        self.assertEqual(len(self.issues), 3)
-        self.assertEqual(self.deps, {11: [10]})
+    def test_batch_orders_blockers_and_rejects_invalid_scope_and_cycles(self):
+        batch = self.completion()['tickets']
+        self.assertEqual([t['key'] for t in tickets.validate_batch(batch, self.fixture.inputs, 'm1', 'agent-triage')], ['create', 'reopen', 'independent'])
+        for defect in ('unknown', 'cycle', 'duplicate', 'future', 'deferred', 'reference', 'criteria', 'label', 'requirement'):
+            bad = copy.deepcopy(batch)
+            if defect == 'unknown': bad[0]['blockers'] = ['absent']
+            if defect == 'cycle': bad[1]['blockers'] = ['reopen']
+            if defect == 'duplicate': bad[1]['key'] = 'reopen'
+            if defect == 'future': bad[0]['iteration'] = 'm2'
+            if defect == 'deferred': bad[0]['status'] = 'deferred'
+            if defect == 'reference': bad[0]['references'][0]['spec'] = 'https://other/spec'
+            if defect == 'criteria': bad[0]['acceptance_criteria'] = []
+            if defect == 'label': bad[0]['triage_label'] = 'other'
+            if defect == 'requirement': bad[0]['references'][0]['requirement'] = 'US-99'
+            with self.subTest(defect=defect), self.assertRaises(repositories.RepositoryError):
+                tickets.validate_batch(bad, self.fixture.inputs, 'm1', 'agent-triage')
 
-    def test_authoritative_changes_block_defer_and_remove_scope(self):
-        self.publish()
-        self.members[10]['fields']['STATUS'] = 'Blocked'
-        self.members[12]['fields']['STATUS'] = 'Deferred'
-        self.assertEqual(self.ok(self.control('frontier'))['ticket_work']['frontier']['eligible'], [])
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-        self.assertEqual(self.control('reserve-ticket', issue=12).returncode, 2)
-        self.members[10]['fields']['STATUS'] = 'Done'
-        self.issues[10].update(state='closed', state_reason='completed')
-        self.assertEqual(self.ok(self.control('frontier'))['ticket_work']['frontier']['eligible'], [11])
-        self.members[11]['fields']['SCOPE'] = 'M2'
-        self.assertEqual(self.control('reserve-ticket', issue=11).returncode, 2)
-
-    def test_github_board_not_local_generated_batch_is_backlog_authority(self):
-        self.publish()
-        self.issues[20] = copy.deepcopy(self.issues[12])
-        self.issues[20].update(number=20, id=1020, node_id='I20', html_url='https://github.com/example/product/issues/20', title='Current bug')
-        self.members[20] = {'id': 'ITEM20', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
-        self.assertEqual(self.ok(self.control('frontier'))['ticket_work']['frontier']['eligible'], [10, 12, 20])
-        self.issues[20]['labels'] = []
-        self.assertEqual(self.control('reserve-ticket', issue=20).returncode, 2)
-
-    def test_missing_ambiguous_inaccessible_or_changed_board_is_durable_blocker(self):
-        request = self.completion()
-        self.boards = []
-        blocked = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(blocked['ticket_work']['status'], 'blocked')
-        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'projects_blocked')
-        self.assertTrue(blocked['ticket_work']['execution'])
-        self.assertEqual(self.issues, {})
-        self.boards = [{'id': 'P1', 'closed': False}, {'id': 'P2', 'closed': False}]
-        self.assertEqual(self.ok(self.control('publish-tickets'))['ticket_work']['status'], 'blocked')
-        self.boards.pop()
-        self.graph_error = True
-        self.assertEqual(self.ok(self.control('publish-tickets'))['ticket_work']['status'], 'blocked')
-        self.graph_error = False
-        self.assertEqual(self.ok(self.control('publish-tickets'))['ticket_work']['status'], 'published')
-        self.fields[0]['id'] = 'REPLACED'
-        self.assertEqual(self.control('frontier').returncode, 2)
-
-    def test_lost_issue_response_reconciles_without_duplicate(self):
-        request = self.completion()
-        self.drop = 'issue'
-        self.assertEqual(self.ok(self.control('complete-tickets', request))['ticket_work']['status'], 'blocked')
-        self.assertEqual(len(self.issues), 1)
-        self.assertEqual(self.ok(self.control('publish-tickets'))['ticket_work']['status'], 'published')
-        self.assertEqual(len(self.issues), 3)
-
-    def test_absent_uncertain_issue_is_not_retried(self):
-        request = self.completion()
-        self.drop, self.omit_effect = 'issue', True
-        self.ok(self.control('complete-tickets', request))
-        self.omit_effect = False
-        result = self.ok(self.control('publish-tickets'))
-        self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_uncertain')
-        self.assertEqual(self.issues, {})
-
-    def test_lost_native_dependency_membership_and_field_responses_reconcile(self):
-        request = self.completion()
-        self.drop = 'membership'
-        self.ok(self.control('complete-tickets', request))
-        self.drop = 'field'
-        self.ok(self.control('publish-tickets'))
-        self.drop = 'dependency'
-        self.ok(self.control('publish-tickets'))
-        result = self.ok(self.control('publish-tickets'))
-        self.assertEqual(result['ticket_work']['status'], 'published')
-        self.assertEqual(len(self.issues), 3)
-        self.assertEqual(len(self.members), 3)
-        self.assertEqual(self.deps, {11: [10]})
-
-    def test_reservation_lost_response_is_durable_and_reconciles(self):
-        self.publish()
-        self.drop = 'field'
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-        pending = self.inspect()['reservation']
-        self.assertEqual(pending['status'], 'pending')
-        self.assertEqual(self.control('reserve-ticket', issue=12).returncode, 2)
-        result = self.ok(self.control('reserve-ticket', issue=10))
-        self.assertEqual(result['reservation']['run_id'], pending['run_id'])
-        self.assertEqual(result['reservation']['status'], 'reserved')
-
-    def test_catalog_prebuilt_or_stale_synthesis_is_refused(self):
-        request = self.completion()
-        before = self.inspect()
-        for defect in ['catalog', 'input', 'skill', 'adaptation', 'result', 'empty', 'assignment']:
-            bad = copy.deepcopy(request)
-            if defect == 'catalog': bad['execution']['loads'] = []
-            if defect == 'input': bad['input_digest'] = '0' * 64
-            if defect == 'skill': bad['execution']['loads'][0]['sha256'] = '0' * 64
-            if defect == 'adaptation': bad['adaptation'] = 'approval-needed'
-            if defect == 'result': bad['execution']['result_digest'] = '0' * 64
-            if defect == 'empty': bad['execution']['decomposition'] = ''
-            if defect == 'assignment': bad['assignment_id'] = 'external-batch'
-            with self.subTest(defect=defect):
-                self.assertEqual(self.control('complete-tickets', bad).returncode, 2)
-                self.assertEqual(self.inspect(), before)
-        self.assertEqual(self.issues, {})
-
-    def test_bad_contract_unknown_blockers_and_cycles_are_refused(self):
-        request = self.completion()
-        for defect in ['unknown', 'cycle', 'duplicate', 'future', 'deferred', 'reference', 'criteria', 'label']:
-            bad = copy.deepcopy(request)
-            if defect == 'unknown': bad['tickets'][0]['blockers'] = ['absent']
-            if defect == 'cycle': bad['tickets'][1]['blockers'] = ['reopen']
-            if defect == 'duplicate': bad['tickets'][1]['key'] = 'reopen'
-            if defect == 'future': bad['tickets'][0]['iteration'] = 'm2'
-            if defect == 'deferred': bad['tickets'][0]['status'] = 'deferred'
-            if defect == 'reference': bad['tickets'][0]['references'][0]['spec'] = 'https://unrelated/spec'
-            if defect == 'criteria': bad['tickets'][0]['acceptance_criteria'] = []
-            if defect == 'label': bad['tickets'][0]['triage_label'] = 'unconfigured'
-            bad['execution']['result_digest'] = hash_json(bad['tickets'])
-            with self.subTest(defect=defect):
-                self.assertEqual(self.control('complete-tickets', bad).returncode, 2)
-        self.assertEqual(self.issues, {})
-
-    def test_exact_issue_and_native_relationship_readbacks(self):
-        request = self.completion()
-        self.bad_readback = 'body'
-        result = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_mismatch')
-        self.bad_readback = None
-        self.ok(self.control('publish-tickets'))
-        self.issues[10]['body'] = self.issues[10]['body'].replace('None (can start immediately).', '- #11')
-        self.deps[10] = [11]
-        self.assertEqual(self.control('frontier').returncode, 2)  # Authoritative cycle.
-        self.deps[10] = []
-        self.assertEqual(self.control('frontier').returncode, 2)  # Native/text discrepancy.
-
-    def test_concurrent_reservations_are_serialized(self):
-        self.publish()
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda n: self.control('reserve-ticket', issue=n), [10, 12]))
-        self.assertEqual(sorted(r.returncode for r in results), [0, 2])
-        self.assertEqual(len(self.ok(self.control('frontier'))['ticket_work']['frontier']['active']), 1)
-
-    def test_skill_changes_and_material_planning_revision_invalidate_stage(self):
-        request = self.completion()
-        self.ok(self.control('complete-tickets', request))
-        self.ok(self.control('reserve-ticket', issue=10))
-        self.ok(self.planning.command('plan', dict(self.planning.plan_request, expected_revision=1)))
-        self.assertNotIn('ticket_work', self.inspect())
-        self.assertEqual(self.inspect()['reservation']['status'], 'invalidated')
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-        self.assertEqual(self.control('complete-tickets', request).returncode, 2)
-
-    def test_explicit_linked_board_resolves_ambiguity_but_unlinked_is_refused(self):
-        self.start_request['tracker']['project_id'] = 'P1'
-        self.boards.append({'id': 'P2', 'closed': False})
-        self.assertEqual(self.publish()['ticket_work']['status'], 'published')
-        self.boards = [{'id': 'P2', 'closed': False}]
-        self.assertEqual(self.control('frontier').returncode, 2)
-
-    def test_missing_schema_never_omits_board_or_creates_issues(self):
-        request = self.completion()
-        self.fields[0]['options'].pop()
-        blocked = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'projects_blocked')
-        self.assertEqual(self.issues, {})
-
-    def test_changed_selected_instructions_block_completion(self):
-        selected = self.fixture.root / 'selected-to-tickets.md'
-        selected.write_bytes(Path(self.start_request['skill']['path']).read_bytes())
-        self.start_request['skill']['path'] = str(selected)
-        request = self.completion()
-        selected.write_text('Different instructions')
-        self.fixture.calls.clear()
-        self.assertEqual(self.control('complete-tickets', request).returncode, 2)
-        self.assertEqual(self.fixture.calls, [])
-        self.assertEqual(self.issues, {})
-
-    def test_unknown_requirement_is_refused(self):
-        request = self.completion()
-        request['tickets'][0]['references'][0]['requirement'] = 'US-999'
-        request['execution']['result_digest'] = hash_json(request['tickets'])
-        self.assertEqual(self.control('complete-tickets', request).returncode, 2)
-        self.assertEqual(self.issues, {})
-
-    def test_pending_publication_cannot_reserve_already_created_slice(self):
-        request = self.completion()
-        self.drop = 'dependency'
-        item = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(item['ticket_work']['status'], 'blocked')
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-        self.assertNotIn('reservation', self.inspect())
-
-    def test_external_active_scope_and_changed_reserved_blockers_refuse_admission(self):
-        self.publish()
-        self.members[12]['fields'].update(SCOPE='M2', STATUS='Active')
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-        self.members[12]['fields'].update(SCOPE='M1', STATUS='Ready')
-        self.ok(self.control('reserve-ticket', issue=10))
-        self.issues[10]['body'] = self.issues[10]['body'].replace('None (can start immediately).', '- #12')
-        self.deps[10] = [12]
-        self.assertEqual(self.control('reserve-ticket', issue=10).returncode, 2)
-
-    def test_unchanged_parent_and_exact_scope_progress_readback(self):
-        request = self.completion()
-        self.omit_effect = True
-        # Without exact issue readback nothing can advance to board/reservation.
-        item = self.ok(self.control('complete-tickets', request))
-        self.assertEqual(item['ticket_work']['status'], 'blocked')
-        self.assertEqual(self.members, {})
-        self.assertFalse(any(c[0] != 'GET' and '/issues/7' in c[1] for c in self.fixture.calls))
-
-    def test_process_death_after_issue_write_reconciles_committed_intent(self):
-        request = self.completion()
-        path = self.fixture.root / 'crash-result.json'
-        path.write_text(json.dumps(request))
-        self.creation_event, self.release_response = threading.Event(), threading.Event()
-        command = [sys.executable, '-m', 'factory_v1', '--state', str(self.fixture.state), '--operator-id', '42',
-                   'complete-tickets', '--project', 'product', '--iteration', 'm1', '--api-base', self.fixture.base,
-                   '--request', str(path)]
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-        try:
-            self.assertTrue(self.creation_event.wait(timeout=5))
-            process.kill()
-            process.communicate(timeout=5)
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.communicate(timeout=5)
-            self.release_response.set()
-            self.creation_event = None
-        self.assertEqual(len(self.issues), 1)
-        self.assertTrue(self.inspect()['ticket_work']['intents']['create']['issue'])
-        self.assertEqual(self.ok(self.control('publish-tickets'))['ticket_work']['status'], 'published')
-        self.assertEqual(len(self.issues), 3)
-
-    def test_linked_board_pagination_finds_unambiguous_selected_board(self):
-        self.boards = [{'id': 'C' + str(n), 'closed': True} for n in range(100)] + self.boards
-        self.assertEqual(self.publish()['ticket_work']['status'], 'published')
-
-    def test_malformed_execution_load_shapes_are_safe_cli_refusals(self):
-        request = self.completion()
-        before = self.inspect()
+    def test_execution_requires_complete_actual_loads_and_result(self):
+        request = self.completion(); work = self.fixture.work
+        self.assertEqual(tickets.validate_execution(work, request['execution'], request['tickets']), request['execution'])
         for field in ('source', 'sha256', 'tool_reference'):
-            for value in ([], {}, None, 42):
-                with self.subTest(field=field, value=value):
-                    bad = copy.deepcopy(request)
-                    bad['execution']['loads'][0][field] = value
-                    result = self.control('complete-tickets', bad)
-                    self.assertEqual(result.returncode, 2, result.stderr)
-                    refusal = json.loads(result.stderr)
-                    self.assertEqual(refusal['error'], 'execution_evidence_required')
-                    self.assertTrue(refusal['message'])
-                    self.assertEqual(self.inspect(), before)
-                    self.assertEqual(self.issues, {})
+            for value in ([], {}, None, 42, ''):
+                bad = copy.deepcopy(request['execution']); bad['loads'][0][field] = value
+                with self.subTest(field=field, value=value), self.assertRaises(repositories.RepositoryError) as caught:
+                    tickets.validate_execution(work, bad, request['tickets'])
+                self.assertEqual(caught.exception.code, 'execution_evidence_required')
+        for field, value in (('loads', []), ('result_digest', '0' * 64), ('decomposition', ''), ('run_id', '')):
+            with self.subTest(field=field), self.assertRaises(repositories.RepositoryError):
+                tickets.validate_execution(work, {**request['execution'], field: value}, request['tickets'])
 
-    def test_malformed_project_and_issue_shapes_are_safe_cli_refusals(self):
-        self.publish()
-        before = self.inspect()
-        malformed = [
-            {'fieldValues': conn([{'field': {'id': 'STATUS'}, 'optionId': ['Ready']}])},
-            {'fieldValues': conn([{'field': {'id': []}, 'optionId': 'Ready'}])},
-            {'fieldValues': conn([{'field': None, 'optionId': 'Ready'}])},
-            {'fieldValues': conn([None])},
-            {'content': {'id': 'I10', 'number': 10, 'repository': []}},
-            {'content': {'id': 'I10', 'number': [], 'repository': {'nameWithOwner': 'example/product'}}},
-        ]
-        for override in malformed:
-            with self.subTest(override=override):
-                self.project_item_overrides[10] = override
-                result = self.control('frontier')
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(json.loads(result.stderr)['error'], 'github_mismatch')
-                self.assertEqual(self.inspect(), before)
-        self.project_item_overrides.clear()
-        for field, value in [('state', []), ('labels', [{'name': []}]), ('state_reason', {})]:
-            original = copy.deepcopy(self.issues[10][field])
-            with self.subTest(field=field):
-                self.issues[10][field] = value
-                result = self.control('frontier')
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(json.loads(result.stderr)['error'], 'github_mismatch')
-                self.assertEqual(self.inspect(), before)
-            self.issues[10][field] = original
+    def test_stale_completion_and_changed_inputs_leave_durable_state_unchanged(self):
+        request = self.completion(); before = self.inspect()
+        for field, value in (('assignment_id', 'old'), ('input_digest', '0' * 64), ('adaptation', 'other')):
+            with self.subTest(field=field), patch.object(tickets, 'publish') as publish:
+                with self.assertRaises(repositories.RepositoryError):
+                    tickets.complete_synthesis(self.database, self.item, {**request, field: value}, self.github)
+                self.database.rollback(); self.assertEqual(self.inspect(), before); publish.assert_not_called()
+        with patch.object(tickets, 'pinned_inputs', return_value={}):
+            with self.assertRaises(repositories.RepositoryError):
+                tickets.complete_synthesis(self.database, self.item, request, self.github)
+        self.database.rollback(); self.assertEqual(self.inspect(), before)
 
-    def test_external_contract_requires_substance_and_current_references(self):
-        item = self.publish()
-        self.issues[20] = copy.deepcopy(self.issues[12])
-        self.issues[20].update(number=20, id=1020, node_id='I20', html_url='https://github.com/example/product/issues/20', title='Current bug')
-        self.members[20] = {'id': 'ITEM20', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
-        good = copy.deepcopy(self.issues[20])
-        url = item['ticket_work']['inputs']['documents']['milestone.md']['url']
-        defects = [
-            {'title': ' '},
-            {'body': good['body'].replace('A reader receives a French error without touching other files.', '')},
-            {'body': good['body'].replace('US-1', 'US-999')},
-            {'body': good['body'].replace('CLI retains the note after a fresh process and rejects unsafe paths.', '')},
-            {'body': good['body'].replace(url, 'https://unrelated/spec')},
-            {'body': good['body'].replace('ready (GitHub Projects is authoritative for current progress).', '')},
-            {'body': good['body'] + '\n## What to build\n\nConflicting behavior.\n'},
-        ]
-        for defect in defects:
+    def test_repeat_completion_retains_publication_and_external_progress(self):
+        request = self.completion(); self.fixture.work['completion_digest'] = tickets.digest(request); self.fixture.persist()
+        with patch.object(tickets, 'publish', side_effect=lambda _d, i, _g: i):
+            item = tickets.complete_synthesis(self.database, self.item, request, self.github)
+        self.assertEqual(item['ticket_work']['status'], 'published')
+        self.assertTrue(item['ticket_work']['publication_complete'])
+        self.assertEqual(self.inspect(), item)
+
+    def test_external_contract_requires_substance_current_refs_and_unambiguous_sections(self):
+        good = self.issues[10]
+        self.assertEqual(tickets.external_contract(good, self.fixture.inputs), 'ready')
+        for body in (good['body'].replace('Persist the exact note.', ''), good['body'].replace('US-1', 'US-99'),
+                     good['body'].replace('Reopening retains café.', ''), good['body'].replace('## Status', '## Missing'),
+                     good['body'] + '\n## What to build\nConflicting prose.\n'):
+            with self.subTest(body=body):
+                self.assertFalse(tickets.external_contract({**good, 'body': body}, self.fixture.inputs))
+        self.assertFalse(tickets.external_contract({**good, 'title': ' '}, self.fixture.inputs))
+
+    def test_selected_skill_bytes_are_revalidated_without_repinning(self):
+        path = self.fixture.root / 'to-tickets.md'; path.write_bytes(Path(self.start_request['skill']['path']).read_bytes())
+        descriptor = {**self.start_request['skill'], 'path': str(path)}
+        self.assertEqual(tickets.skill(descriptor)['sha256'], descriptor['sha256'])
+        path.write_text('Changed instructions')
+        with self.assertRaises(repositories.RepositoryError) as caught:
+            tickets.skill(descriptor)
+        self.assertEqual(caught.exception.code, 'skill_blocked')
+
+    def test_single_ticket_publication_retains_exact_body_and_no_dispatch(self):
+        self.fixture.publication()
+        result = tickets.publish(self.database, self.item, self.github)
+        self.assertTrue(result['ticket_work']['publication_complete'])
+        self.assertEqual(result['ticket_work']['frontier']['eligible'], [10])
+        self.assertEqual(self.issues[10]['body'], tickets.body(self.item, self.fixture.ticket(), {}))
+        self.assertEqual(self.members[10]['fields'], {'STATUS': 'Ready', 'SCOPE': 'M1'})
+        self.assertFalse(result['execution_allowed']); self.assertIsNone(result['correlation']['worker_run_id'])
+        self.assertEqual(self.inspect(), result)
+        writes = self.github.request.call_count
+        tickets.publish(self.database, result, self.github)
+        self.assertEqual(self.github.request.call_count, writes)
+
+    def test_unknown_creation_is_never_retried_and_known_marker_is_adopted(self):
+        self.fixture.publication()
+        self.fixture.work['intents'] = {'note': {'issue': {'title': 'Retain a note'}}}; self.fixture.persist()
+        blocked = tickets.publish(self.database, self.item, self.github)
+        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'publication_uncertain')
+        self.github.request.assert_not_called()
+        self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
+        recovered = tickets.publish(self.database, blocked, self.github)
+        self.assertTrue(recovered['ticket_work']['publication_complete'])
+        self.github.request.assert_not_called(); self.assertEqual(self.inspect(), recovered)
+
+    def test_lost_creation_response_preserves_intent_before_effect_and_replay(self):
+        self.fixture.publication()
+        def create(path, body, method=None):
+            self.assertIn('issue', self.inspect()['ticket_work']['intents']['note'])
+            self.fixture.request(path, body, method)
+            raise repositories.RepositoryError('github_unavailable', 'lost acknowledgement')
+        self.github.request.side_effect = create
+        blocked = tickets.publish(self.database, self.item, self.github)
+        self.assertEqual(blocked['ticket_work']['status'], 'blocked'); self.assertEqual(len(self.issues), 1)
+        self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
+        result = tickets.publish(self.database, blocked, self.github)
+        self.assertTrue(result['ticket_work']['publication_complete']); self.github.request.assert_not_called()
+
+    def test_missing_board_retains_execution_and_prevents_issue_intent(self):
+        self.fixture.publication()
+        with patch.object(tickets, 'verified_board', side_effect=repositories.RepositoryError('projects_blocked', 'board absent')):
+            blocked = tickets.publish(self.database, self.item, self.github)
+        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'projects_blocked')
+        self.assertTrue(blocked['ticket_work']['execution']); self.assertNotIn('intents', blocked['ticket_work'])
+        self.assertEqual(self.inspect(), blocked); self.github.request.assert_not_called()
+
+    def test_exact_issue_body_and_identity_readback_fail_closed(self):
+        self.fixture.publication()
+        self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
+        self.fixture.work['intents'] = {'note': {'identity': {'number': 10, 'id': 999, 'node_id': 'I10'}}}; self.fixture.persist()
+        result = tickets.publish(self.database, self.item, self.github)
+        self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_mismatch')
+        self.assertFalse(result['ticket_work'].get('publication_complete')); self.fixture.add_item.assert_not_called()
+
+    def test_one_reservation_replays_same_run_and_refuses_sibling(self):
+        result = tickets.reserve(self.database, self.item, self.github, 10)
+        self.assertEqual(result['reservation']['status'], 'reserved')
+        self.assertEqual(self.inspect(), result)
+        replay = tickets.reserve(self.database, result, self.github, 10)
+        self.assertEqual(replay['reservation'], result['reservation'])
+        with self.assertRaises(repositories.RepositoryError) as caught:
+            tickets.reserve(self.database, replay, self.github, 12)
+        self.assertEqual(caught.exception.code, 'reservation_conflict'); self.database.rollback()
+        self.assertEqual(self.inspect()['reservation'], result['reservation'])
+
+    def test_lost_reservation_status_response_reconciles_durable_run(self):
+        def write(*args):
+            self.assertEqual(self.inspect()['reservation']['status'], 'pending')
+            self.fixture.field(*args)
+            raise repositories.RepositoryError('github_unavailable', 'lost status response')
+        self.fixture.set_field.side_effect = write
+        with self.assertRaises(repositories.RepositoryError):
+            tickets.reserve(self.database, self.item, self.github, 10)
+        pending = self.inspect()['reservation']; self.database.rollback()
+        self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
+        result = tickets.reserve(self.database, self.item, self.github, 10)
+        self.assertEqual(result['reservation']['run_id'], pending['run_id'])
+        self.assertEqual(result['reservation']['status'], 'reserved'); self.fixture.set_field.assert_not_called()
+
+    def test_partial_publication_and_foreign_active_refuse_reservation(self):
+        for defect in ('partial', 'foreign'):
             with self.subTest(defect=defect):
-                self.issues[20] = {**good, **defect}
-                snapshot = self.ok(self.control('frontier'))['ticket_work']['frontier']
-                self.assertFalse(next(r for r in snapshot['items'] if r['number'] == 20)['contract_valid'])
-                self.assertEqual(snapshot['eligible'], [10, 12])
-                result = self.control('reserve-ticket', issue=20)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(json.loads(result.stderr)['error'], 'ticket_ineligible')
-                self.assertNotIn('reservation', self.inspect())
-                self.assertEqual(self.members[20]['fields']['STATUS'], 'Ready')
-                snapshot = self.ok(self.control('frontier'))['ticket_work']['frontier']
-                self.assertEqual(snapshot['eligible'], [10, 12])
-                self.assertFalse(next(r for r in snapshot['items'] if r['number'] == 20)['contract_valid'])
-        self.issues[20] = good
-        self.assertEqual(self.ok(self.control('reserve-ticket', issue=20))['reservation']['issue_number'], 20)
+                self.fixture.work['publication_complete'] = defect != 'partial'; self.fixture.persist()
+                self.members[12]['fields'].update(SCOPE='M2' if defect == 'foreign' else 'M1', STATUS='Active' if defect == 'foreign' else 'Ready')
+                with self.assertRaises(repositories.RepositoryError) as caught:
+                    tickets.reserve(self.database, self.item, self.github, 10)
+                self.assertEqual(caught.exception.code, 'publication_pending' if defect == 'partial' else 'reservation_conflict')
+                self.database.rollback(); self.assertNotIn('reservation', self.inspect()); self.fixture.set_field.assert_not_called()
 
-    def test_generated_contract_rejects_the_same_missing_substance(self):
-        request = self.completion()
-        for field, value in [('title', ' '), ('desired_behavior', ''), ('acceptance_criteria', [' ']),
-                             ('references', [{'spec': request['tickets'][0]['references'][0]['spec'], 'requirement': 'US-999'}])]:
-            with self.subTest(field=field):
-                bad = copy.deepcopy(request)
-                bad['tickets'][0][field] = value
-                bad['execution']['result_digest'] = hash_json(bad['tickets'])
-                result = self.control('complete-tickets', bad)
-                self.assertEqual(result.returncode, 2, result.stderr)
-                self.assertEqual(self.issues, {})
+    def test_real_pinned_inputs_reject_endpoint_repository_and_raw_document_drift(self):
+        handoff = {'repository': 'example/product', 'api_base': self.github.base, 'commit': 'a' * 40,
+                   'issue': {'number': 7, 'id': 700}, 'documents': {}}
+        responses = {'/repos/example/product': {'id': 123, 'full_name': 'example/product', 'name': 'product',
+                     'owner': {'login': 'example'}, 'private': True}, '/repos/example/product/git/commits/' + 'a' * 40: {'sha': 'a' * 40}}
+        for name, document in self.fixture.inputs['documents'].items():
+            raw = document['content'].encode(); path = 'docs/' + name
+            blob = hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()
+            handoff['documents'][name] = {'path': path, 'blob': blob, 'url': document['url']}
+            responses['/repos/example/product/contents/' + path + '?ref=' + 'a' * 40] = {
+                'path': path, 'type': 'file', 'encoding': 'base64', 'sha': blob, 'content': base64.b64encode(raw).decode()}
+        self.item.update(handoff=handoff, planning={'status': 'complete'})
+        self.fixture.issues[7] = {**self.fixture.issue(7, self.fixture.inputs['documents']['milestone.md']['content']), 'id': 700}
+        self.github.request.side_effect = lambda path: copy.deepcopy(responses[path])
+        read = REAL_PINNED_INPUTS(self.database, self.item, self.github); self.database.rollback()
+        self.assertEqual(read['documents']['milestone.md']['content'], self.fixture.inputs['documents']['milestone.md']['content'])
+        metadata = responses['/repos/example/product/contents/docs/milestone.md?ref=' + 'a' * 40]
+        metadata['content'] = base64.b64encode(b'changed bytes').decode()
+        with self.assertRaises(repositories.RepositoryError) as caught: REAL_PINNED_INPUTS(self.database, self.item, self.github)
+        self.assertEqual(caught.exception.code, 'publication_mismatch'); self.database.rollback()
+        responses['/repos/example/product']['id'] = 999
+        with self.assertRaises(repositories.RepositoryError) as caught: REAL_PINNED_INPUTS(self.database, self.item, self.github)
+        self.assertEqual(caught.exception.code, 'repository_mismatch'); self.database.rollback()
+        self.github.base += '/other'; self.github.request.reset_mock()
+        with self.assertRaises(repositories.RepositoryError) as caught: REAL_PINNED_INPUTS(self.database, self.item, self.github)
+        self.assertEqual(caught.exception.code, 'capability_conflict'); self.github.request.assert_not_called()
 
-    def test_native_blocker_identity_mismatch_refuses_completed_board_credit(self):
-        self.publish()
-        self.members[10]['fields']['STATUS'] = 'Done'
-        self.issues[10].update(state='closed', state_reason='completed')
-        before = self.inspect()
-        for identity in ({'id': 999999}, {'node_id': 'OTHER'}, {'id': 999999, 'node_id': 'OTHER'}):
-            with self.subTest(identity=identity):
-                self.dependency_observations[11] = [{**self.issues[10], **identity}]
-                result = self.control('reserve-ticket', issue=11)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(json.loads(result.stderr)['error'], 'github_mismatch')
-                self.assertEqual(self.inspect(), before)
-                self.assertEqual(self.members[11]['fields']['STATUS'], 'Ready')
-        self.dependency_observations.clear()
-        self.assertEqual(self.ok(self.control('reserve-ticket', issue=11))['reservation']['status'], 'reserved')
+    def test_authoritative_board_additions_and_changed_reserved_blockers_refuse(self):
+        self.issues[20] = self.fixture.issue(20, self.issues[12]['body'])
+        self.members[20] = {'id': 'ITEM20', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
+        result = tickets.frontier(self.database, self.item, self.github)
+        self.assertEqual(result['ticket_work']['frontier']['eligible'], [10, 12, 20])
+        self.issues[20]['labels'] = []
+        with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 20)
+        self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback(); self.assertNotIn('reservation', self.inspect())
+        reserved = tickets.reserve(self.database, self.item, self.github, 10)
+        self.issues[10]['body'] = self.issues[10]['body'].replace('None (can start immediately).', '- #12'); self.deps[10] = [12]
+        with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 10)
+        self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback()
+        self.assertEqual(self.inspect()['reservation'], reserved['reservation']); self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')
 
-    def test_native_blocker_identity_is_checked_even_outside_board_scope(self):
-        self.publish()
-        self.members[10]['fields'].update(STATUS='Done', SCOPE='M2')
-        self.issues[10].update(state='closed', state_reason='completed')
-        self.dependency_observations[11] = [{**self.issues[10], 'id': 999999, 'node_id': 'OTHER'}]
-        result = self.control('frontier')
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'github_mismatch')
-        self.dependency_observations.clear()
-        snapshot = self.ok(self.control('frontier'))['ticket_work']['frontier']
-        self.assertNotIn(11, snapshot['eligible'])
-        self.assertEqual(self.control('reserve-ticket', issue=11).returncode, 2)
+    def test_unknown_dependency_and_membership_intents_block_without_repeated_effect(self):
+        self.fixture.publication(); ticket = self.fixture.ticket(blockers=['blocker'])
+        self.fixture.work.update(tickets=[ticket], published={'blocker': {'number': 10, 'id': 1010, 'node_id': 'I10'}})
+        self.issues[10] = self.fixture.issue(10, 'external blocker')
+        self.issues[11] = self.fixture.issue(11, tickets.body(self.item, ticket, {'blocker': 10}))
+        for fault in ('dependency', 'membership'):
+            self.fixture.work['intents'] = {'note': {'dependencies': [1010]} if fault == 'dependency' else {'membership': True}}
+            self.deps[11] = [] if fault == 'dependency' else [10]; self.fixture.persist()
+            result = tickets.publish(self.database, self.item, self.github)
+            self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_uncertain')
+            self.assertFalse(result['ticket_work'].get('publication_complete'))
+            self.fixture.add_dependency.assert_not_called(); self.fixture.add_item.assert_not_called(); self.github.request.assert_not_called()
+            self.assertEqual(self.inspect(), result)
 
-    def test_wrong_endpoint_refused_before_external_access(self):
-        self.completion()
-        self.fixture.calls.clear()
-        result = self.fixture.cli('frontier', '--project', 'product', '--iteration', 'm1', '--api-base', self.fixture.base + '/other')
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.fixture.calls, [])
+    def test_late_pause_after_status_receipt_refuses_reserved_advancement(self):
+        def write(*args):
+            self.fixture.field(*args); self.fixture.pause()
+        self.fixture.set_field.side_effect = write
+        with self.assertRaises(repositories.RepositoryError) as caught:
+            tickets.reserve(self.database, self.item, self.github, 10)
+        self.assertEqual(caught.exception.code, 'iteration_paused'); self.database.rollback()
+        self.assertEqual(self.inspect()['reservation']['status'], 'pending')
+        self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
+        self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')

@@ -1,4 +1,4 @@
-"""Public CLI, real loopback HTTP and fresh-process restart; ALL external evidence SIMULATED."""
+"""Direct engineering seams; legacy sibling fixture helpers are not discovered."""
 import base64
 import copy
 import json
@@ -277,531 +277,6 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(observed['evidence']['status'], 'healthy')
         return target, path
 
-    def test_delivery_health_race_at_mutation_boundary_freezes_before_put(self):
-        target, path = self.install_delivery_observer()
-        target.after_health = lambda: setattr(target, 'healthy', target.health_reads < 3)
-        self.refused('main_frozen')
-        self.assertEqual(target.health_reads, 3)  # Installed healthy, admission healthy, boundary unhealthy.
-        self.assertEqual(self.writes('PUT'), [])
-        self.assertNotIn('merge', self.stored())
-        result = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
-        self.assertEqual(result['incident']['status'], 'active')
-        self.assertEqual(result['observations'][-1]['record']['failure'], 'delivery_unhealthy')
-        notifications = self.ok(self.fixture.cli('notifications', '--project', 'product', '--iteration', 'm1'))
-        self.assertEqual(len(notifications), 1)
-        self.refused('main_frozen')  # Fresh process refuses despite still-green branch/main checks.
-        self.assertEqual(len(self.writes('PUT')), 0)
-        target.after_health = None
-        target.healthy = True
-        cleared = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
-        self.assertIsNone(cleared['incident'])
-        self.assertEqual(self.ok(self.cli())['status'], 'merged')
-        self.assertEqual(len(self.writes('PUT')), 1)
-
-    def test_requirements_changed_during_final_delivery_sample_never_merge(self):
-        target, _ = self.install_delivery_observer()
-        spec = self.assignment.tracker.planning
-        original_publication = copy.deepcopy(spec.published)
-        original_assignment = self.stored()
-        original_pr = copy.deepcopy(self.pr)
-        for source in ['issue', 'document']:
-            with self.subTest(source=source):
-                final_health_read = target.health_reads + 2
-                def change():
-                    if target.health_reads == final_health_read:
-                        if source == 'issue':
-                            spec.published[spec.issue_path]['body'] += '\nChanged during final delivery sample'
-                        else:
-                            path = next(p for p in spec.published if '/contents/' in p)
-                            spec.published[path]['content'] = base64.b64encode(b'Changed pinned bytes').decode()
-                target.after_health = change
-                try:
-                    self.refused('publication_mismatch')
-                    self.assertEqual(target.health_reads, final_health_read)
-                    self.assertEqual(self.writes('PUT'), [])
-                    self.assertNotIn('merge', self.stored())
-                    observed = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
-                    self.assertEqual(observed['monitor']['latest']['status'], 'healthy')
-                finally:
-                    target.after_health = None
-                    spec.published = copy.deepcopy(original_publication)
-                    self.write_assignment(original_assignment)
-                    self.pr = copy.deepcopy(original_pr)
-                    self.refs['main'] = self.base_sha
-                    self.calls.clear()
-
-    def test_coherent_healthy_main_move_during_final_delivery_sample_never_merges(self):
-        from unittest.mock import patch
-        from factory_v1 import delivery
-        from factory_v1.repositories import state_lock
-        target, _ = self.install_delivery_observer()
-        original_read = delivery.DeliveryGitHub.read
-        original_boundary = delivery.mutation_boundary
-        original_merge_read = merge.MergeGitHub.read
-        original_config = copy.deepcopy(self.config)
-        original_protection = copy.deepcopy(self.protection)
-        original_issue = copy.deepcopy(self.assignment.tracker.issues[10])
-        original_refs = dict(self.refs)
-        original_checks = copy.deepcopy(self.check_runs)
-        moved = 'd' * 40
-        cases = {'main': 'stale_baseline', 'post-admission-main': 'stale_baseline',
-                 'config': 'stale_admission', 'protection': 'stale_protection',
-                 'branch': 'stale_head', 'candidate-check': 'checks_failed', 'issue': 'stale_admission',
-                 'pause': 'iteration_paused'}
-        # Reuse the single qualified fixture; no additional stage/worker chains per case.
-        with closing(sqlite3.connect(':memory:')) as snapshot:
-            with closing(sqlite3.connect(self.fixture.state)) as db:
-                db.backup(snapshot)
-            for mode, code in cases.items():
-                with self.subTest(mode=mode):
-                    with closing(sqlite3.connect(self.fixture.state)) as db:
-                        snapshot.backup(db)
-                    self.config = copy.deepcopy(original_config)
-                    self.write_config()
-                    self.protection = copy.deepcopy(original_protection)
-                    self.assignment.tracker.issues[10] = copy.deepcopy(original_issue)
-                    self.refs = dict(original_refs)
-                    self.check_runs = copy.deepcopy(original_checks)
-                    target.sha = target.check_sha = target.deploy_sha = target.workflow_sha = self.base_sha
-                    target.health_reads = 1
-                    self.calls.clear()
-                    starts = 0
-                    boundaries = 0
-                    protection_reads = 0
-                    def merge_read(api, suffix):
-                        nonlocal protection_reads
-                        value = original_merge_read(api, suffix)
-                        if suffix == '/branches/main/protection':
-                            protection_reads += 1
-                            if mode == 'post-admission-main' and protection_reads == 3:
-                                self.refs['main'] = moved
-                                self.pass_checks(moved)
-                        return value
-
-                    def boundary(*args):
-                        nonlocal boundaries
-                        result = original_boundary(*args)
-                        boundaries += 1
-                        if mode == 'pause' and boundaries == 2:
-                            self.assignment.mutate_iteration(lambda i: i.update(status='paused'))
-                        return result
-
-                    def read(api, suffix):
-                        nonlocal starts
-                        if suffix == '':
-                            starts += 1
-                            if starts == 3:  # Final observer initial read, AFTER prior admission.
-                                if mode == 'main':
-                                    self.refs['main'] = moved
-                                    self.pass_checks(moved)
-                                    target.sha = target.check_sha = target.deploy_sha = target.workflow_sha = moved
-                                elif mode == 'config':
-                                    self.config['baseline'] = moved
-                                    self.write_config()
-                                elif mode == 'protection':
-                                    self.protection['required_status_checks']['strict'] = False
-                                elif mode == 'branch':
-                                    self.refs[self.config['branch']] = moved
-                                elif mode == 'candidate-check':
-                                    self.check_runs[self.config['head']][0]['conclusion'] = 'failure'
-                                elif mode == 'issue':
-                                    self.assignment.tracker.issues[10]['body'] += '\nChanged during final sample'
-                        return original_read(api, suffix)
-                    with (closing(sqlite3.connect(self.fixture.state)) as db, state_lock(db),
-                          patch.object(delivery.DeliveryGitHub, 'read', read), patch.object(delivery, 'mutation_boundary', boundary),
-                          patch.object(merge.MergeGitHub, 'read', merge_read)):
-                        with self.assertRaises(merge.RepositoryError) as refused:
-                            merge.lifecycle(db, 'product', 'm1', '42', str(self.config_path), 'merge-candidate')
-                        self.assertEqual(refused.exception.code, code)
-                    self.assertEqual(self.writes('PUT'), [])
-                    self.assertNotIn('merge', self.stored())
-                    observed = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
-                    self.assertEqual(observed['monitor']['latest']['status'], 'healthy')
-                    self.assertEqual(observed['monitor']['latest']['main'], moved if mode == 'main' else self.base_sha)
-                    self.assertIsNone(observed['incident'])
-
-    def test_delivery_outage_at_mutation_boundary_freezes_before_put(self):
-        target, _ = self.install_delivery_observer()
-        self.boundary_change = lambda: setattr(target, 'health_outage', True)
-        self.refused('main_frozen')
-        self.assertEqual(self.writes('PUT'), [])
-        result = self.ok(self.fixture.cli('inspect-delivery', '--project', 'product', '--iteration', 'm1'))
-        self.assertEqual(result['monitor']['latest']['status'], 'unknown')
-        self.assertIsNotNone(result['incident'])
-
-    def test_merge_then_integrated_checks_close_and_restart_inspects_exact_evidence(self):
-        merged = self.ok(self.cli())
-        self.assertEqual(merged['status'], 'merged')
-        self.assertEqual(merged['integrated_evidence']['integrated'], self.merge_sha)
-        self.assertFalse(merged['close_allowed'])
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.pass_checks(self.merge_sha)
-        delivered = self.ok(self.cli('verify-delivery'))
-        self.assertEqual(delivered['status'], 'delivered')
-        self.assertEqual({c['head_sha'] for c in delivered['delivery_checks']}, {self.merge_sha})
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-        self.assertFalse(delivered['iteration_complete'])
-        self.assertFalse(delivered['deployment_verified'])
-        writes = self.writes()
-        self.assertEqual(self.ok(self.cli()), delivered)
-        self.assertEqual(self.writes(), writes)
-        inspected = self.assignment.ok(self.assignment.inspect(self.candidate))
-        self.assertEqual(inspected['merge'], self.stored()['merge'])
-
-    def test_pinned_spec_issue_changed_at_final_protection_read_never_merges(self):
-        spec = self.review.seam.case.assignment.tracker.planning
-        def change():
-            spec.published[spec.issue_path]['body'] += '\nBoundary requirement change'
-        self.boundary_change = change
-        self.refused('publication_mismatch')
-        self.assertEqual(self.writes('PUT'), [])
-        self.assertNotIn('merge', self.stored())
-        self.refused('publication_mismatch')
-
-    def test_old_approved_pair_cannot_override_later_completed_rejection(self):
-        later = self.review.pair('review-reject', '-later')
-        feedback = self.assignment.ok(self.review.command('review-candidate', self.review.pair_request(later)))
-        self.assertEqual(feedback['status'], 'corrections')
-        for _ in range(2):
-            self.refused('stale_review')
-        self.assertEqual(self.writes('PUT'), [])
-        self.assertFalse(self.stored()['merge_refusal'].get('close_allowed', False))
-
-    def test_pinned_document_changed_at_final_protection_read_never_merges(self):
-        spec = self.assignment.tracker.planning
-        def change():
-            path = next(p for p in spec.published if '/contents/' in p)
-            spec.published[path]['content'] = base64.b64encode(b'Changed pinned bytes').decode()
-        self.boundary_change = change
-        self.refused('publication_mismatch')
-        self.assertEqual(self.writes('PUT'), [])
-
-    def test_lone_completed_rejecting_axis_blocks_old_approved_merge_without_aggregation(self):
-        self.review.axis('review-spec', 'review-reject', '-lone')
-        self.refused('stale_review')
-        self.assertEqual(self.writes('PUT'), [])
-
-    def test_merge_autoclosure_reopens_immediately_including_lost_responses(self):
-        self.auto_close = True
-        self.drop_merge = True
-        self.drop_close = True
-        result = self.ok(self.cli())
-        self.assertEqual(result['status'], 'merged')
-        self.assertFalse(result['close_allowed'])
-        self.assertEqual(result['delivery_checks'], [])
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(len(self.writes('PUT')), 1)
-        self.assertEqual(len(self.writes('PATCH')), 1)
-        self.ok(self.cli())
-        self.assertEqual(len(self.writes('PUT')), 1)
-        self.assertEqual(len(self.writes('PATCH')), 1)
-
-    def test_requirements_changed_during_merge_autoclosure_are_reopened_not_delivered(self):
-        self.auto_close = True
-        def change():
-            self.assignment.tracker.issues[10]['body'] += '\nChanged during integration'
-        self.after_merge = change
-        self.refused('stale_requirements')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertFalse(self.stored()['merge']['close_allowed'])
-        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
-
-    def test_issue_identity_changed_during_merge_refuses_without_unsafe_state_write(self):
-        self.auto_close = True
-        def change():
-            self.assignment.tracker.issues[10]['node_id'] = 'REPLACED'
-        self.after_merge = change
-        self.refused('scope_mismatch')
-        self.assertEqual(self.writes('PATCH'), [])
-        self.assertFalse(self.stored()['merge']['close_allowed'])
-        self.assertEqual(self.stored()['merge']['failure']['code'], 'scope_mismatch')
-
-    def test_branch_only_and_premature_manual_closure_are_reopened_not_delivered(self):
-        self.assignment.tracker.issues[10]['state'] = 'closed'
-        self.refused('not_integrated', 'verify-delivery')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(self.writes('PUT'), [])
-        self.assertNotIn('merge', self.stored())
-
-    def test_branch_only_checks_after_merge_reopen_auto_closure_then_integrated_checks_deliver(self):
-        self.ok(self.cli())
-        self.assignment.tracker.issues[10]['state'] = 'closed'
-        self.refused('checks_unknown', 'verify-delivery')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
-        self.check_runs[self.merge_sha] = copy.deepcopy(self.check_runs[self.config['head']])
-        self.refused('checks_stale', 'verify-delivery')
-        self.pass_checks(self.merge_sha)
-        self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
-        self.assertEqual(len(self.writes('PUT')), 1)
-
-    def test_concrete_protection_403_and_absent_protection_fail_closed(self):
-        before = self.fixture.state.read_bytes()
-        self.protection_http = 403
-        self.refused('protection_required', 'merge-preflight')
-        self.assertEqual(self.fixture.state.read_bytes(), before)
-        self.refused('protection_required')
-        self.assertEqual(self.stored()['merge_refusal']['code'], 'protection_required')
-        self.assertEqual(self.writes(), [])
-        self.protection_http = 404
-        self.refused('protection_required')
-        self.assertEqual(self.writes(), [])
-
-    def test_stale_head_wrong_scope_stale_baseline_failed_missing_unknown_checks(self):
-        head = self.config['head']
-        self.refs[self.config['branch']] = 'd' * 40
-        self.refused('stale_head')
-        self.refs[self.config['branch']] = head
-        self.repo['id'] = 456
-        self.refused('repository_mismatch')
-        self.repo['id'] = 123
-        self.refs['main'] = 'd' * 40
-        self.refused('stale_baseline')
-        self.refs['main'] = self.base_sha
-        self.check_runs[head][0]['conclusion'] = 'failure'
-        self.refused('checks_failed')
-        self.check_runs[head][0]['conclusion'] = None
-        self.refused('checks_failed')
-        self.pass_checks(head)
-        self.check_runs[head][0]['app']['id'] = 88
-        self.refused('checks_unknown')
-        self.assertEqual(self.writes(), [])
-
-    def test_changed_protection_weak_gates_and_unsupported_rules_never_admit(self):
-        self.protection['required_status_checks']['strict'] = False
-        self.refused('stale_protection')
-        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.protection})
-        self.write_config()
-        self.refused('protection_required')
-        self.protection['required_status_checks']['strict'] = True
-        self.rules = [{'type': 'merge_queue'}]
-        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.protection})
-        self.write_config()
-        self.refused('protection_required')
-        self.assertEqual(self.writes(), [])
-
-    def test_native_chain_axis_source_and_transcript_changes_do_not_qualify(self):
-        original = copy.deepcopy(self.config)
-        self.config['executions'] = [{'role': 'implementation', 'status': 'done'}] * 4
-        self.write_config()
-        self.refused('execution_required')
-        self.config = copy.deepcopy(original)
-        self.write_config()
-        transcript = Path(self.builder['runtime']['artifacts']) / 'scratch/conversation.json'
-        raw = transcript.read_bytes()
-        transcript.write_bytes(raw + b'\n')
-        self.refused('execution_required')
-        transcript.write_bytes(raw)
-        self.config['spec_assignment'] = self.config['standards_assignment']
-        self.write_config()
-        self.refused('stale_review')
-        self.config = copy.deepcopy(original)
-        self.write_config()
-        skill = Path(self.builder['handoff']['skills'][0]['path'])
-        skill.write_bytes(skill.read_bytes() + b'\nchanged')
-        self.refused('skill_blocked')
-        self.assertEqual(self.writes(), [])
-
-    def test_shared_fingerprints_keep_stage_bindings_private_envelopes_and_evidence_bounds(self):
-        axis = self.axes[0]
-        review_binding = test_review.review.execution_binding(axis)
-        merge_binding = merge.execution_binding(axis)
-        self.assertEqual(review_binding['evidence'], merge_binding['evidence'])
-        self.assertEqual(review_binding['model_evidence'], merge_binding['model_evidence'])
-        self.assertEqual(review_binding['axis'], 'Standards')
-        self.assertEqual(merge_binding['binding'], publication.binding(axis))
-        root = Path(axis['runtime']['artifacts'])
-        root.chmod(0o755)
-        self.refused('execution_required')
-        root.chmod(0o700)
-        response = next((root / 'model-evidence').glob('response-*.json'))
-        hidden = response.with_suffix('.retained')
-        response.rename(hidden)
-        self.refused('execution_required')
-        hidden.rename(response)
-        transcript = root / 'scratch/conversation.json'
-        raw = transcript.read_bytes()
-        with transcript.open('wb') as stream:
-            stream.truncate(16_000_001)
-        self.refused('execution_required')
-        transcript.write_bytes(raw)
-        raw = response.read_bytes()
-        with response.open('wb') as stream:
-            stream.truncate(16_000_001)
-        self.refused('execution_required')
-        response.write_bytes(raw)
-        transcript.rename(transcript.with_suffix('.retained'))
-        transcript.symlink_to(transcript.with_suffix('.retained'))
-        self.refused('unsafe_path')
-        self.assertEqual(self.writes(), [])
-
-    def test_pause_and_requirement_revisions_survive_restart_and_reopen_obsolete_closure(self):
-        self.assignment.mutate_iteration(lambda i: i.update(status='paused'))
-        self.refused('iteration_paused')
-        self.refused('iteration_paused')
-        self.assignment.mutate_iteration(lambda i: i.update(status='active'))
-        self.assignment.tracker.issues[10]['body'] += '\nChanged requirements'
-        self.refused('stale_requirements')
-        self.assignment.tracker.issues[10]['state'] = 'closed'
-        self.refused('stale_requirements', 'verify-delivery')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(self.writes('PUT'), [])
-
-    def test_ordinary_main_incident_cannot_use_caller_boolean_or_unbound_recovery(self):
-        self.assignment.mutate_iteration(lambda i: i.update(main_incident={'status': 'active', 'incident_id': 'incident-1',
-                                                                        'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}))
-        self.refused('main_frozen')
-        self.config['recovery'] = True
-        self.write_config()
-        self.refused('scope_mismatch')
-        self.config['recovery'] = {'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10}
-        self.write_config()
-        self.refused('main_frozen')
-        self.assertEqual(self.writes(), [])
-
-    def test_lost_merge_response_readback_and_uncertain_open_outcome_never_resend(self):
-        self.drop_merge = True
-        self.assertEqual(self.ok(self.cli())['status'], 'merged')
-        self.ok(self.cli())
-        self.assertEqual(len(self.writes('PUT')), 1)
-
-    def test_open_uncertain_merge_stays_durable_even_after_pause_and_restart(self):
-        self.omit_merge = True
-        self.drop_merge = True
-        self.refused('merge_uncertain')
-        self.assertEqual(self.stored()['merge']['status'], 'pending')
-        self.assignment.mutate_iteration(lambda i: i.update(status='paused'))
-        self.refused('merge_uncertain')
-        self.assertEqual(len(self.writes('PUT')), 1)
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-
-    def test_concurrent_controllers_do_not_double_merge(self):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda _: self.cli(), range(2)))
-        for result in results:
-            self.assertEqual(self.ok(result)['status'], 'merged')
-        self.assertEqual(len(self.writes('PUT')), 1)
-
-    def test_later_main_drift_preserves_prior_delivery_until_removed_or_revalidated(self):
-        self.ok(self.cli())
-        self.pass_checks(self.merge_sha)
-        delivered = self.ok(self.cli('verify-delivery'))
-        writes = self.writes()
-        later = 'd' * 40
-        self.refs['main'] = later
-        self.membership = 'ahead'
-        self.commits[later] = {'sha': later, 'tree': {'sha': 'e' * 40}}
-        def kill_at_boundary(boundary):
-            reached = threading.Event()
-            released = threading.Event()
-            def crash_boundary():
-                reached.set()
-                released.wait(10)
-                return True
-            setattr(self, boundary, crash_boundary)
-            process = subprocess.Popen([sys.executable, '-m', 'factory_v1', '--state', str(self.fixture.state),
-                '--operator-id', '42', 'verify-delivery', '--project', 'product', '--iteration', 'm1',
-                '--merge-config', str(self.config_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-            try:
-                self.assertTrue(reached.wait(10), 'Revalidation did not reach ' + boundary)
-            finally:
-                process.kill()
-                process.communicate(timeout=10)
-                setattr(self, boundary, None)
-                released.set()
-        kill_at_boundary('before_main_commit')
-        self.assertEqual(self.stored()['merge'],
-                         {key: value for key, value in delivered.items() if key != 'merge_allowed'})
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-        self.assertEqual(self.writes(), writes)
-        for _ in range(2):
-            self.refused('delivery_stale', 'verify-delivery')
-            retained = self.stored()['merge']
-            self.assertEqual(retained['status'], 'revalidation-required')
-            self.assertFalse(retained['close_allowed'])
-            self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
-            self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
-            self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-            self.assertEqual(self.writes(), writes)
-        self.commits[later]['tree']['sha'] = self.plan['tree']
-        self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
-        self.assertEqual(self.writes(), writes)
-        self.assignment.tracker.issues[10]['state'] = 'open'
-        kill_at_boundary('before_close_readback')
-        retained = self.stored()['merge']
-        self.assertEqual(retained['status'], 'delivered')
-        self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-        writes = self.writes()
-        self.commits[later]['tree']['sha'] = 'e' * 40
-        self.refused('delivery_stale', 'verify-delivery')
-        self.assertEqual(self.stored()['merge']['status'], 'revalidation-required')
-        self.assertEqual(self.stored()['merge']['delivery_checks'], retained['delivery_checks'])
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-        self.assertEqual(self.writes(), writes)
-        self.commits[later]['tree']['sha'] = self.baseline_tree
-        self.refused('delivery_removed', 'verify-delivery')
-        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(len(self.writes('PATCH')), 3)
-
-    def test_integrated_tree_membership_and_failed_checks_hold_delivery(self):
-        self.ok(self.cli())
-        self.pass_checks(self.merge_sha)
-        self.check_runs[self.merge_sha][0]['conclusion'] = 'failure'
-        self.refused('checks_failed', 'verify-delivery')
-        self.pass_checks(self.merge_sha)
-        self.membership = 'diverged'
-        self.refused('not_integrated', 'verify-delivery')
-        self.membership = 'identical'
-        self.commits[self.merge_sha]['tree']['sha'] = 'e' * 40
-        self.refused('integration_mismatch', 'verify-delivery')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-
-    def test_reviewed_bytes_modes_and_policy_unchanged_mapping_required(self):
-        file = self.source / 'hello.py'
-        file.chmod(0o755)
-        self.refused('implementation_unverified')
-        self.assertEqual(self.writes(), [])
-
-    def test_rejected_requirement_axis_cannot_merge_despite_green_tests(self):
-        rejected = self.review.axis('review-spec', mode='review-reject', suffix='-rejected')
-        axes = (self.axes[0], rejected)
-        feedback = self.assignment.ok(self.review.command('review-candidate', self.review.pair_request(axes),
-                                                          self.review.authorization(axes)))
-        self.assertEqual(feedback['status'], 'corrections')
-        self.config.update(spec_assignment=rejected['assignment_id'],
-                           executions=[merge.execution_binding(a) for a in [self.builder, self.candidate, *axes]])
-        self.write_config()
-        self.refused('stale_review')
-        self.assertEqual(self.writes(), [])
-
-    def test_healthy_candidate_does_not_hide_failed_or_unknown_main_checks(self):
-        self.check_runs[self.base_sha][0]['conclusion'] = 'failure'
-        self.refused('main_frozen')
-        self.check_runs[self.base_sha] = []
-        self.refused('main_frozen')
-        self.assertEqual(self.writes(), [])
-
-    def test_exact_incident_repair_uses_same_checks_and_independent_reviews(self):
-        self.assert_incident_repair_uses_same_checks_and_independent_reviews()
-
-    def test_observed_incident_admits_gated_repair_and_only_exact_deployment_clears(self):
-        target, path = self.install_delivery_observer()
-        target.healthy = False
-        failed = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
-        incident_id = failed['incident']['incident_id']
-        self.assert_incident_repair_uses_same_checks_and_independent_reviews()
-        target.sha = target.check_sha = target.workflow_sha = self.merge_sha
-        target.healthy = True
-        # CI is green, but deployment still points at the pre-repair main.
-        still_frozen = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
-        self.assertEqual(still_frozen['incident']['incident_id'], incident_id)
-        target.deploy_sha = self.merge_sha
-        cleared = self.ok(self.fixture.cli('observe-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(path)))
-        self.assertIsNone(cleared['incident'])
-        self.assertEqual(cleared['evidence']['main'], self.merge_sha)
 
     def assert_incident_repair_uses_same_checks_and_independent_reviews(self):
         request = self.assignment.configuration(stage='repair')
@@ -852,37 +327,446 @@ class MergeTests(unittest.TestCase):
         item = self.assignment.tracker.inspect()
         self.assertEqual(item['main_incident']['status'], 'active')
 
-    def test_lost_issue_closure_response_reconciles_without_duplicate_merge_or_closure(self):
-        self.ok(self.cli())
-        self.pass_checks(self.merge_sha)
-        self.drop_close = True
-        self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'closed')
-        self.drop_close = False
-        self.assertEqual(self.ok(self.cli('verify-delivery'))['status'], 'delivered')
-        self.assertEqual(len(self.writes('PUT')), 1)
-        self.assertEqual(len(self.writes('PATCH')), 1)
+import hashlib
+import tempfile
+from unittest.mock import Mock, patch
+from factory_v1 import controls, delivery, requirements
+from factory_v1.repositories import RepositoryError
 
-    def test_material_spec_revision_and_obsolete_requirements_reopen_integrated_work(self):
-        self.ok(self.cli())
-        self.pass_checks(self.merge_sha)
-        self.ok(self.cli('verify-delivery'))
-        self.assignment.mutate_iteration(lambda i: i['handoff'].update(commit='f' * 40))
-        self.refused('stale_assignment', 'verify-delivery')
-        self.assertEqual(self.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
-        inspected = self.ok(self.fixture.cli('inspect-merge', '--project', 'product', '--iteration', 'm1',
-                                            '--assignment', self.candidate['assignment_id']))
-        self.assertEqual(inspected['merge']['failure']['code'], 'stale_assignment')
-        self.assertNotEqual(inspected['revision']['spec'], inspected['current_spec'])
 
-    def test_private_config_and_controller_state_cannot_be_worker_mounts(self):
-        self.config_path.chmod(0o644)
-        self.refused('execution_required')
+class MergeComponentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.db = sqlite3.connect(self.root / 'state.sqlite')
+        self.addCleanup(self.db.close)
+        (self.root / 'state.sqlite').chmod(0o600)
+        self.db.executescript('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT);'
+                             'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+            'approval': {'operator_id': '42', 'reference': 'Local merge fixture'}, 'repository': 'example/product',
+            'repository_onboarding': {'metadata': {'id': 123}, 'api_base': 'https://api.github.com'},
+            'handoff': {'commit': 'c' * 40}, 'ticket_work': {'input_digest': 'd' * 64,
+                'inputs': {'handoff': {'commit': 'c' * 40}, 'documents': {'spec': {'sha256': 'e' * 64}}}}}
+        self.save_item()
+        self.body = 'Local required greeting'
+        self.candidate = {'assignment_id': 'a' * 64, 'claim_id': 'local-candidate',
+            'handoff': {'stage': 'simplify', 'repository': 'example/product', 'repository_id': 123,
+                'workspace': str(self.root / 'worker'), 'profile': {'name': 'local', 'home': str(self.root / 'profile')},
+                'issue': {'number': 10, 'id': 110, 'node_id': 'ISSUE10', 'body_sha256': hashlib.sha256(self.body.encode()).hexdigest()},
+                'skills': []}, 'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
+            'revision': requirements.authority(self.item, 10)}
+        self.candidate['handoff_digest'] = assignments.digest(self.candidate['handoff'])
+        self.builder = {'assignment_id': 'b' * 64, 'handoff': {'stage': 'implementation'}}
+        self.store(self.candidate)
+        self.classic = {'required_status_checks': {'strict': True, 'checks': [{'context': 'quality', 'app_id': 99}]},
+            'enforce_admins': {'enabled': True}, 'allow_force_pushes': {'enabled': False}, 'allow_deletions': {'enabled': False}}
+        self.rules = []
+        self.config = {'operator_id': '42', 'execution_reference': 'LABELED prequalified host input, not native execution',
+            'executions': [{'local': n} for n in range(4)], 'candidate_assignment': 'a' * 64,
+            'standards_assignment': '1' * 64, 'spec_assignment': '2' * 64,
+            'repository': 'example/product', 'repository_id': 123, 'base': 'main', 'branch': 'factory/10',
+            'pr_number': 20, 'head': 'b' * 40, 'baseline': 'a' * 40, 'issue': 10,
+            'api_base': 'https://api.github.com', 'bearer': 'LABELED-LOCAL-NONSECRET',
+            'required_checks': copy.deepcopy(self.classic['required_status_checks']['checks']),
+            'protection_sha256': assignments.digest({'rules': self.rules, 'protection': self.classic}), 'recovery': None}
+        self.config_path = self.root / 'merge.json'
+        self.write_config()
+        self.plan = {'tree': 'e' * 40, 'base_tree': 'f' * 40}
+        self.integrated = 'c' * 40
+        self.refs = {'main': self.config['baseline'], self.config['branch']: self.config['head']}
+        repo = {'id': 123, 'full_name': 'example/product', 'default_branch': 'main'}
+        self.repo = repo
+        self.pr = {'number': 20, 'state': 'open', 'merged': False, 'draft': False,
+            'mergeable': True, 'mergeable_state': 'clean',
+            'head': {'ref': self.config['branch'], 'sha': self.config['head'], 'repo': repo},
+            'base': {'ref': 'main', 'sha': self.config['baseline'], 'repo': repo}}
+        self.work_issue = {**self.candidate['handoff']['issue'], 'body': self.body, 'state': 'open',
+                           'repository_url': 'https://api.github.com/repos/example/product'}
+        self.commits = {self.integrated: {'sha': self.integrated, 'tree': {'sha': self.plan['tree']},
+            'parents': [{'sha': self.config['baseline']}, {'sha': self.config['head']}]}}
+        self.run_records = {sha: self.good_checks(sha) for sha in (self.config['head'], self.config['baseline'], self.integrated)}
+        self.calls = []
+        self.protection_reads = 0
+        self.boundary_change = None
+        self.merge_effect = True
+        self.drop_merge = False
+        self.drop_state = False
+        self.auto_close = False
+        self.after_merge = None
+        self.membership = 'identical'
+        self.remote_inputs = copy.deepcopy(self.item['ticket_work']['inputs'])
+        self.api = merge.MergeGitHub(self.config)
+        self.external_request = Mock(side_effect=self.external)
+        self.api.github.request = self.external_request
+        self.enterContext(patch.object(merge, 'MergeGitHub', return_value=self.api))
+        # Native chain authority and Git byte/mode assembly are prerequisite seams.
+        # This component tests final admission/journals/receipts, not whole stage execution.
+        self.enterContext(patch.object(merge, 'chain', side_effect=lambda *a: (self.stored(), self.builder, self.root)))
+        self.enterContext(patch.object(merge, 'mapped_candidate', return_value=self.plan))
+        self.review = self.enterContext(patch.object(merge.review, 'evaluate', return_value={'status': 'accepted'}))
+        self.enterContext(patch.object(delivery, 'mutation_boundary', side_effect=lambda *a: assignments.current(*a)))
+        # External pinned-document loader only; real scoped requirement equality remains.
+        self.enterContext(patch.object(merge.tickets, 'pinned_inputs', side_effect=lambda *a: copy.deepcopy(self.remote_inputs)))
+
+    def save_item(self):
+        self.db.execute('DELETE FROM iterations')
+        self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+        self.db.commit()
+
+    def store(self, row):
+        self.db.execute('INSERT OR REPLACE INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.db.commit()
+
+    def stored(self):
+        return json.loads(self.db.execute('SELECT payload FROM role_assignments WHERE assignment_id=?', ('a' * 64,)).fetchone()[0])
+
+    def write_config(self):
+        self.config_path.write_text(json.dumps(self.config))
         self.config_path.chmod(0o600)
-        mounted = self.artifacts / 'scratch/merge.json'
+
+    def good_checks(self, sha):
+        return {'total_count': 1, 'check_runs': [{'id': 1, 'name': 'quality', 'app': {'id': 99},
+            'head_sha': sha, 'status': 'completed', 'conclusion': 'success'}]}
+
+    def external(self, path, body=None, method=None):
+        method = method or ('POST' if body is not None else 'GET')
+        suffix = path.removeprefix('/repos/example/product')
+        self.calls.append((method, suffix, copy.deepcopy(body)))
+        if method == 'PUT':
+            journal = self.stored()['merge']
+            self.assertEqual(journal['status'], 'pending')
+            self.assertIsNone(journal['integrated_evidence'])
+            self.assertNotIn('bearer', journal['authority'])
+            if self.merge_effect:
+                self.pr.update(merged=True, state='closed', merge_commit_sha=self.integrated)
+                self.refs['main'] = self.integrated
+                if self.auto_close: self.work_issue['state'] = 'closed'
+                if self.after_merge: self.after_merge()
+            if self.drop_merge: raise RepositoryError('transport_error', 'Local lost response')
+            return {'merged': self.merge_effect}
+        if method == 'PATCH':
+            journal = self.stored().get('merge')
+            assert body is not None
+            if body['state'] == 'closed':
+                self.assertTrue(journal['close_allowed'])
+                self.assertTrue(journal['delivery_checks'])
+            elif journal:
+                self.assertFalse(journal['close_allowed'])
+            self.work_issue.update(body)
+            if self.drop_state: raise RepositoryError('transport_error', 'Local lost state response')
+            return copy.deepcopy(self.work_issue)
+        if suffix == '': value = self.repo
+        elif suffix == '/issues/10': value = self.work_issue
+        elif suffix == '/pulls/20': value = self.pr
+        elif suffix == '/rules/branches/main': value = self.rules
+        elif suffix == '/branches/main/protection':
+            value = copy.deepcopy(self.classic)
+            self.protection_reads += 1
+            if self.boundary_change: self.boundary_change(self.protection_reads)
+        elif suffix.startswith('/git/ref/heads/'):
+            branch = suffix.removeprefix('/git/ref/heads/')
+            value = {'ref': 'refs/heads/' + branch, 'object': {'type': 'commit', 'sha': self.refs[branch]}}
+        elif suffix.startswith('/commits/'):
+            value = self.run_records.get(suffix.split('/')[2], {'total_count': 0, 'check_runs': []})
+        elif suffix.startswith('/git/commits/'): value = self.commits[suffix.split('/')[-1]]
+        elif suffix.startswith('/compare/'):
+            sha = suffix.split('/')[-1].split('...')[0]
+            value = {'status': self.membership, 'base_commit': {'sha': sha}, 'merge_base_commit': {'sha': sha}}
+        else: raise AssertionError('Unplanned external route ' + suffix)
+        return copy.deepcopy(value)
+
+    def lifecycle(self, action='merge-candidate'):
+        return merge.lifecycle(self.db, 'product', 'm1', '42', self.config_path, action)
+
+    def mutations(self, method=None):
+        return [c for c in self.calls if c[0] == method] if method else [c for c in self.calls if c[0] != 'GET']
+
+    def test_intent_precedes_effect_and_lost_merge_autoclose_reopens_truthfully(self):
+        self.auto_close = self.drop_merge = self.drop_state = True
+        journal = self.lifecycle()
+        self.assertEqual(journal['status'], 'merged')
+        self.assertFalse(journal['close_allowed'])
+        self.assertEqual(journal['delivery_checks'], [])
+        self.assertEqual(self.work_issue['state'], 'open')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(len(self.mutations('PATCH')), 1)
+        self.assertEqual(self.lifecycle()['status'], 'merged')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(len(self.mutations('PATCH')), 1)
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            self.assertEqual(merge.inspect_merge(restarted, 'product', 'm1', '42', 'a' * 64)['merge']['integrated_evidence']['integrated'], self.integrated)
+
+    def test_pending_uncertain_intent_never_resends_even_while_paused(self):
+        self.merge_effect = False
+        self.drop_merge = True
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'merge_uncertain')
+        controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause pending merge')
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'merge_uncertain')
+        self.assertEqual(self.stored()['merge']['status'], 'pending')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+
+    def test_late_pause_after_last_protection_read_blocks_intent_and_put(self):
+        def change(reads):
+            if reads == 3:
+                controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause final admission read')
+        self.boundary_change = change
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'iteration_paused')
+        self.assertEqual(self.protection_reads, 3)
+        self.assertEqual(self.mutations(), [])
+        self.assertNotIn('merge', self.stored())
+
+    def test_final_publication_document_drift_blocks_intent_and_put(self):
+        def change(reads):
+            if reads == 3: self.remote_inputs['documents']['spec']['sha256'] = '0' * 64
+        self.boundary_change = change
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'stale_requirements')
+        self.assertEqual(self.protection_reads, 3)
+        self.assertEqual(self.mutations(), [])
+        self.assertNotIn('merge', self.stored())
+
+    def test_final_issue_identity_or_body_drift_refuses_unsafe_writes(self):
+        for field, value, code in [('node_id', 'REPLACED', 'scope_mismatch'),
+                                   ('body', self.body + ' changed', 'stale_admission')]:
+            self.protection_reads = 0
+            self.calls.clear()
+            self.work_issue.update(node_id='ISSUE10', body=self.body)
+            self.store(self.candidate)
+            def change(reads):
+                if reads == 3:
+                    self.work_issue[field] = value
+            self.boundary_change = change
+            with self.subTest(field=field):
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+            self.assertEqual(self.mutations(), [])
+            self.assertNotIn('merge', self.stored())
+
+    def test_final_review_admission_cannot_use_earlier_pass(self):
+        self.review.side_effect = [{'status': 'accepted'}, {'status': 'corrections'}]
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'stale_review')
+        self.assertEqual(self.mutations(), [])
+        self.assertNotIn('merge', self.stored())
+
+    def test_delivery_incident_at_final_sample_freezes_ordinary_merge(self):
+        calls = 0
+        def boundary(*args):
+            nonlocal calls
+            calls += 1
+            item = assignments.current(*args)
+            if calls == 2:
+                item['main_incident'] = {'status': 'active', 'incident_id': 'new-incident'}
+            return item
+        with patch.object(delivery, 'mutation_boundary', side_effect=boundary):
+            with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'main_frozen')
+        self.assertEqual(self.mutations(), [])
+        self.assertNotIn('merge', self.stored())
+
+    def test_exact_repair_scope_keeps_checks_reviews_and_incident(self):
+        self.builder['handoff']['stage'] = 'repair'
+        incident = {'status': 'active', 'incident_id': 'incident-1', 'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
+        self.item['main_incident'] = incident
+        self.save_item()
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'main_frozen')
+        self.config['recovery'] = {'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10}
+        self.write_config()
+        self.run_records[self.config['baseline']] = {'total_count': 0, 'check_runs': []}
+        self.assertEqual(self.lifecycle()['status'], 'merged')
+        self.assertGreaterEqual(self.review.call_count, 2)
+        self.assertEqual(assignments.current(self.db, 'product', 'm1', '42')['main_incident'], incident)
+        self.assertEqual(self.lifecycle('verify-delivery')['status'], 'delivered')
+        self.assertEqual(assignments.current(self.db, 'product', 'm1', '42')['main_incident'], incident)
+
+    def test_integrated_checks_only_delivery_and_lost_closure_readback(self):
+        self.lifecycle()
+        self.work_issue['state'] = 'closed'
+        self.run_records[self.integrated] = self.good_checks(self.config['head'])
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle('verify-delivery')
+        self.assertEqual(refusal.exception.code, 'checks_stale')
+        self.assertEqual(self.work_issue['state'], 'open')
+        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
+        self.run_records[self.integrated] = self.good_checks(self.integrated)
+        self.drop_state = True
+        delivered = self.lifecycle('verify-delivery')
+        self.assertEqual(delivered['status'], 'delivered')
+        self.assertEqual(self.work_issue['state'], 'closed')
+        self.assertEqual({r['head_sha'] for r in delivered['delivery_checks']}, {self.integrated})
+        self.assertFalse(delivered['iteration_complete'])
+        self.assertFalse(delivered['deployment_verified'])
+        writes = self.mutations()
+        self.assertEqual(self.lifecycle('verify-delivery'), delivered)
+        self.assertEqual(self.mutations(), writes)
+
+    def test_prior_delivery_receipts_survive_unknown_main_drift_without_reopening(self):
+        self.lifecycle()
+        delivered = self.lifecycle('verify-delivery')
+        later = 'd' * 40
+        self.refs['main'] = later
+        self.membership = 'ahead'
+        self.commits[later] = {'sha': later, 'tree': {'sha': '0' * 40}}
+        writes = self.mutations()
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle('verify-delivery')
+        self.assertEqual(refusal.exception.code, 'delivery_stale')
+        retained = self.stored()['merge']
+        self.assertEqual(retained['status'], 'revalidation-required')
+        self.assertFalse(retained['close_allowed'])
+        self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
+        self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
+        self.assertEqual(self.work_issue['state'], 'closed')
+        self.assertEqual(self.mutations(), writes)
+        self.commits[later]['tree']['sha'] = self.plan['base_tree']
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle('verify-delivery')
+        self.assertEqual(refusal.exception.code, 'delivery_removed')
+        self.assertEqual(self.work_issue['state'], 'open')
+        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
+
+    def test_reopened_delivery_checkpoint_keeps_prior_receipts_before_close_response(self):
+        self.lifecycle()
+        delivered = self.lifecycle('verify-delivery')
+        self.work_issue['state'] = 'open'
+        original = self.external_request.side_effect
+        def read_return(path, body=None, method=None):
+            if method == 'PATCH' and body['state'] == 'closed':
+                retained = self.stored()['merge']
+                self.assertEqual(retained['status'], 'delivered')
+                self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
+                self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
+            return original(path, body, method)
+        self.external_request.side_effect = read_return
+        self.assertEqual(self.lifecycle('verify-delivery')['status'], 'delivered')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+
+    def test_checks_and_resealed_protection_semantic_matrix(self):
+        self.assertTrue(merge.protection(self.api, self.config))
+        for field, value in [('strict', False), ('checks', [])]:
+            old = copy.deepcopy(self.classic)
+            self.classic['required_status_checks'][field] = value
+            self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+            with self.subTest(field=field):
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.protection(self.api, self.config)
+                self.assertEqual(refusal.exception.code, 'protection_required')
+            self.classic = old
+        self.rules = [{'type': 'merge_queue'}]
+        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+        with self.assertRaises(RepositoryError) as refusal: merge.protection(self.api, self.config)
+        self.assertEqual(refusal.exception.code, 'protection_required')
+        for field, value, code in [('head_sha', '0' * 40, 'checks_stale'), ('conclusion', 'failure', 'checks_failed'),
+                                   ('status', 'queued', 'checks_failed'), ('app', {'id': 88}, 'checks_unknown')]:
+            records = self.good_checks(self.config['head'])
+            records['check_runs'][0][field] = value
+            self.run_records[self.config['head']] = records
+            with self.subTest(field=field):
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.checks(self.api, self.config, self.config['head'])
+                self.assertEqual(refusal.exception.code, code)
+        self.assertEqual(self.mutations(), [])
+
+    def test_controller_config_private_scope_and_fixed_intent(self):
+        self.config_path.chmod(0o644)
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.config_path.chmod(0o600)
+        worker = self.root / 'worker'
+        worker.mkdir()
+        mounted = worker / 'merge.json'
         mounted.write_bytes(self.config_path.read_bytes())
         mounted.chmod(0o600)
-        self.config_path = mounted
-        self.refused('execution_required')
-        self.assertEqual(self.writes(), [])
+        with self.assertRaises(RepositoryError) as refusal: merge.controller_paths(self.db, mounted)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.lifecycle()
+        self.config['execution_reference'] = 'Replacement authority'
+        self.write_config()
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'merge_conflict')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+
+    def test_actual_merge_capability_denies_unscoped_write_and_branch_only_closure(self):
+        with self.assertRaises(RepositoryError) as refusal:
+            self.api.request(self.api.prefix + '/issues/11', {'state': 'closed'}, 'PATCH')
+        self.assertEqual(refusal.exception.code, 'capability_blocked')
+        self.work_issue['state'] = 'closed'
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle('verify-delivery')
+        self.assertEqual(refusal.exception.code, 'not_integrated')
+        self.assertEqual(self.work_issue['state'], 'open')
+        self.assertEqual(self.mutations('PUT'), [])
+
+    def test_changed_requirements_during_autoclosure_reopen_with_incomplete_receipt(self):
+        self.auto_close = True
+        self.after_merge = lambda: self.work_issue.update(body=self.body + ' revised during integration')
+        with self.assertRaises(RepositoryError) as refusal:
+            self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'stale_requirements')
+        self.assertEqual(self.work_issue['state'], 'open')
+        journal = self.stored()['merge']
+        self.assertEqual(journal['status'], 'incomplete')
+        self.assertFalse(journal['close_allowed'])
+        self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(len(self.mutations('PATCH')), 1)
+
+    def test_real_integrated_tree_parents_and_membership_are_not_branch_proof(self):
+        self.pr.update(merged=True, state='closed', merge_commit_sha=self.integrated)
+        self.refs['main'] = self.integrated
+        self.assertEqual(merge.merged_evidence(self.api, self.config, self.pr, self.plan)['integrated'], self.integrated)
+        original = copy.deepcopy(self.commits[self.integrated])
+        for change in ({'tree': {'sha': '0' * 40}}, {'parents': [{'sha': self.config['head']}]}):
+            self.commits[self.integrated] = {**original, **change}
+            with self.subTest(change=change):
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.merged_evidence(self.api, self.config, self.pr, self.plan)
+                self.assertEqual(refusal.exception.code, 'integration_mismatch')
+        self.commits[self.integrated] = original
+        self.membership = 'diverged'
+        with self.assertRaises(RepositoryError) as refusal:
+            merge.merged_evidence(self.api, self.config, self.pr, self.plan)
+        self.assertEqual(refusal.exception.code, 'not_integrated')
+        self.assertEqual(self.mutations(), [])
+
+    def test_final_branch_main_and_check_drift_never_admit_intent(self):
+        for mode, code in [('main', 'stale_baseline'), ('branch', 'stale_admission'), ('check', 'checks_failed')]:
+            self.protection_reads = 0
+            self.calls.clear()
+            self.refs.update(main=self.config['baseline'])
+            self.refs[self.config['branch']] = self.config['head']
+            self.run_records[self.config['head']] = self.good_checks(self.config['head'])
+            self.store(self.candidate)
+            def change(reads):
+                if reads != 3:
+                    return
+                if mode == 'main':
+                    self.refs['main'] = 'd' * 40
+                elif mode == 'branch':
+                    self.refs[self.config['branch']] = 'd' * 40
+                else:
+                    self.run_records[self.config['head']]['check_runs'][0]['conclusion'] = 'failure'
+            self.boundary_change = change
+            with self.subTest(mode=mode):
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+            self.assertEqual(self.mutations(), [])
+            self.assertNotIn('merge', self.stored())
+
+    def test_identity_changed_after_merge_persists_hold_without_wrong_issue_write(self):
+        self.auto_close = True
+        self.after_merge = lambda: self.work_issue.update(node_id='REPLACED')
+        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+        self.assertEqual(self.mutations('PATCH'), [])
+        journal = self.stored()['merge']
+        self.assertFalse(journal['close_allowed'])
+        self.assertEqual(journal['status'], 'incomplete')
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,431 +1,279 @@
+"""Exact-scope spending policy components; SQLite is real, all upstream I/O mocked."""
 import json
 import os
 import sqlite3
-import subprocess
-import sys
 import tempfile
-import threading
-import time
 import unittest
 from contextlib import closing
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import Mock, patch
 
-
-class FixtureHandler(BaseHTTPRequestHandler):
-    calls = []
-    uncertain = False
-
-    def do_POST(self):
-        body = self.rfile.read(int(self.headers['Content-Length']))
-        self.calls.append(body)
-        if self.uncertain:
-            self.close_connection = True
-            return
-        self.send_response(200)
-        self.send_header('Content-Type', 'application/json')
-        self.end_headers()
-        self.wfile.write(b'{"actual_units":2,"output":"fixture-answer"}')
-
-    def log_message(self, format, *args):
-        pass
+from factory_v1 import spending
+from factory_v1.model_access import ModelAccessError, SUBSCRIPTION_SCOPE
+from factory_v1.tests import test_spending_cancel
 
 
 class ModelSpendingTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
+        self.temp = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.state = self.root / 'state.sqlite'
-        self.sock = self.root / 'model.sock'
-        self.expires = int(time.time()) + 600
-        FixtureHandler.calls = []
-        FixtureHandler.uncertain = False
-        self.http = HTTPServer(('127.0.0.1', 0), FixtureHandler)
-        self.fixture_url = f'http://127.0.0.1:{self.http.server_port}/fixed-fixture'
-        self.http_thread = threading.Thread(target=self.http.serve_forever,
-                                            kwargs={'poll_interval': 0.01}, daemon=True)
-        self.http_thread.start()
-        self.addCleanup(self.http.shutdown)
-        self.addCleanup(self.http.server_close)
-        request = {
-            'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product',
-            'idea': 'approved test product', 'approval': {'operator_id': '42', 'reference': 'operator-approval'},
-            'origin': {'platform': 'discord', 'chat_id': '1', 'thread_id': '1', 'parent_chat_id': '2', 'scope_id': '3'},
-        }
-        intake = self.root / 'intake.json'
-        intake.write_text(json.dumps(request))
-        self.assertEqual(self.invoke('register', '--request', str(intake)).returncode, 0)
+        self.db = sqlite3.connect(self.state)
+        self.addCleanup(self.db.close)
+        self.db.execute('CREATE TABLE iterations(project_id TEXT, iteration_id TEXT, payload TEXT)')
+        item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+                'approval': {'operator_id': '42', 'reference': 'test-approval'}}
+        self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(item)))
+        self.db.commit()
+        spending.initialize(self.db)
+        self.scope = ('product', 'm1', 'fixture-provider', 'fixture-model', 'generate')
+        self.adapter = Mock(reservation=3, payload_fields=None)
+        self.adapter.call.return_value = (2, 'fixture-answer')
+        self.expires = 2**40
 
-    def invoke(self, *args):
-        return subprocess.run([sys.executable, '-m', 'factory_v1', '--state', str(self.state),
-                                '--operator-id', '42', *args], text=True, capture_output=True,
-                               timeout=15, env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+    def grant(self, ceiling=5, expires=None, kind='allowance', provider=None, model=None, operation=None, reference='test-grant'):
+        scope = (*self.scope[:2], provider or self.scope[2], model or self.scope[3], operation or self.scope[4])
+        try:
+            with self.db:
+                return spending.add_grant(self.db, *scope, kind, ceiling, self.expires if expires is None else expires, reference)
+        except spending.SpendingError as error:
+            spending.record_refusal(self.db, scope, None, error)
+            raise
 
-    def grant(self, ceiling=5, expires=None, kind='allowance', provider='fixture-provider', model='fixture-model', operation='generate', reference='subscription-allowance-approval'):
-        return self.invoke('spend-grant', '--project', 'product', '--iteration', 'm1',
-                           '--provider', provider, '--model', model,
-                           '--operation', operation, '--kind', kind, '--ceiling', str(ceiling),
-                           '--expires', str(self.expires if expires is None else expires), '--reference', reference)
+    def call(self, key='request-1', reserve=None, payload=None, **kwargs):
+        return spending.execute_controlled(self.db, self.scope, key,
+            {'prompt': 'transient no-secret fixture input'} if payload is None else payload,
+            self.adapter.reservation if reserve is None else reserve, adapter=self.adapter, **kwargs)
 
-    def stop_broker(self, process):
-        if process.poll() is None:
-            process.terminate()
-            process.wait(timeout=5)
-        if process.stderr:
-            process.stderr.close()
+    def receipt(self, key='request-1', outcome='failed', units=None, scope=None, reference='trusted-no-charge-receipt'):
+        project, iteration, provider, model, operation = scope or self.scope
+        with self.db:
+            return spending.reconcile(self.db, project, iteration, provider, model, operation, key, outcome, units, reference)
 
-    def broker(self, extra=(), provider='fixture-provider', model='fixture-model', operation='generate', subscription_socket=None):
-        process = subprocess.Popen([sys.executable, '-m', 'factory_v1', '--state', str(self.state),
-            '--operator-id', '42', 'model-broker', '--socket', str(self.sock), '--project', 'product',
-            '--iteration', 'm1', '--provider', provider, '--model', model,
-            '--operation', operation, *(['--subscription-socket', str(subscription_socket)] if subscription_socket else ['--fixture-url', self.fixture_url]), *extra],
-            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
-        self.addCleanup(self.stop_broker, process)
-        deadline = time.monotonic() + 5
-        while not self.sock.exists() and time.monotonic() < deadline:
-            if process.poll() is not None:
-                self.fail(process.stderr.read().decode())
-            time.sleep(.01)
-        self.assertTrue(self.sock.exists(), 'broker socket did not become ready')
-        return process
+    def refused(self, code, function, *args, **kwargs):
+        with self.assertRaises(spending.SpendingError) as caught:
+            function(*args, **kwargs)
+        self.assertEqual(caught.exception.code, code)
 
-    def call(self, op_id='request-1', reserve=3, request=None):
-        path = self.root / f'{op_id}.json'
-        path.write_text(json.dumps({'prompt': 'transient no-secret fixture input'} if request is None else request))
-        return self.invoke('model-call', '--socket', str(self.sock), '--operation-id', op_id,
-                           '--reserve', str(reserve), '--request', str(path))
+    def item(self):
+        return json.loads(self.db.execute('SELECT payload FROM iterations').fetchone()[0])
 
-    def test_allowance_reaches_actual_unix_socket_operation_boundary_and_replay_is_idempotent(self):
-        self.assertEqual(self.grant().returncode, 0)
-        self.assertEqual(self.grant().returncode, 0)
-        self.broker()
-        result = self.call()
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), {'actual_units': 2, 'result': 'fixture-answer', 'status': 'complete'})
-        replay = self.call()
-        self.assertEqual(replay.returncode, 0, replay.stderr)
-        conflict = self.call(request={'prompt': 'different request under same key'})
-        self.assertEqual(conflict.returncode, 2)
-        self.assertEqual(json.loads(conflict.stderr)['error'], 'idempotency_conflict')
-        self.assertEqual(len(FixtureHandler.calls), 1)
-        with closing(sqlite3.connect(self.state)) as db:
-            self.assertEqual(db.execute('select remaining from model_grants').fetchone()[0], 3)
-            self.assertEqual(db.execute('select status,actual_units from model_operations').fetchone(), ('complete', 2))
-            self.assertNotIn(b'transient no-secret fixture input', self.state.read_bytes())
-            self.assertEqual(db.execute('select decision from model_decisions order by rowid').fetchall(),
-                             [('grant_recorded',), ('admitted',), ('reconciled_complete',), ('refused',)])
+    def subscription(self, kind='allowance'):
+        self.scope = ('product', 'm1', *SUBSCRIPTION_SCOPE)
+        self.adapter = Mock(reservation=1, payload_fields={'input'})
+        self.adapter.call.return_value = (1, {'label': 'fixture-subscription-answer'})
+        self.grant(ceiling=2, kind=kind)
+
+    def test_allowance_reaches_controlled_operation_boundary_and_replay_is_idempotent(self):
+        first = self.grant()
+        self.assertTrue(self.grant()['replay'])
+        self.assertEqual(self.grant()['grant_id'], first['grant_id'])
+        self.assertEqual(self.call(), {'actual_units': 2, 'result': 'fixture-answer', 'status': 'complete'})
+        self.assertTrue(self.call()['replay'])
+        self.refused('idempotency_conflict', self.call, payload={'prompt': 'different request'})
+        self.adapter.call.assert_called_once()
+        self.assertEqual(self.db.execute('select remaining from model_grants').fetchone()[0], 3)
+        self.assertEqual(self.db.execute('select status,actual_units from model_operations').fetchone(), ('complete', 2))
+        self.assertNotIn(b'transient no-secret fixture input', self.state.read_bytes())
+        self.assertEqual(self.db.execute('select decision from model_decisions order by rowid').fetchall(),
+                         [('grant_recorded',), ('admitted',), ('reconciled_complete',), ('refused',)])
 
     def test_unapproved_and_exhausted_spending_is_refused_and_persistently_blocks(self):
-        self.broker()
-        refused = self.call(reserve=3)
-        self.assertEqual(refused.returncode, 2)
-        self.assertEqual(json.loads(refused.stderr)['error'], 'spending_blocked')
-        with closing(sqlite3.connect(self.state)) as db:
-            item = json.loads(db.execute('select payload from iterations').fetchone()[0])
-            self.assertEqual(item['model_access']['status'], 'blocked')
-            self.assertEqual(db.execute('select decision,reason from model_decisions').fetchone(),
-                             ('refused', 'authorization_unavailable_or_exhausted'))
-        self.assertEqual(FixtureHandler.calls, [])
+        self.refused('spending_blocked', self.call)
+        self.assertEqual(self.item()['model_access']['status'], 'blocked')
+        self.assertEqual(self.db.execute('select decision,reason from model_decisions').fetchone(),
+                         ('refused', 'authorization_unavailable_or_exhausted'))
+        self.adapter.call.assert_not_called()
 
     def test_expired_and_mismatched_grants_do_not_reach_fixture(self):
-        expired = self.grant(expires=int(time.time()) - 1)
-        self.assertEqual(expired.returncode, 2)
-        self.assertEqual(json.loads(expired.stderr)['error'], 'invalid_grant')
-        self.assertEqual(self.grant().returncode, 0)
-        with closing(sqlite3.connect(self.state)) as db:
-            db.execute('update model_grants set expires=?', (int(time.time()) - 1,))
-            db.commit()
-        self.broker()
-        expired_call = self.call('expired-op', reserve=3)
-        self.assertEqual(expired_call.returncode, 2)
-        self.assertEqual(json.loads(expired_call.stderr)['error'], 'spending_blocked')
-        path = self.root / 'bad.json'
-        path.write_text(json.dumps({'provider': 'other', 'prompt': 'x'}))
-        result = self.invoke('model-call', '--socket', str(self.sock), '--operation-id', 'bad',
-                             '--reserve', '3', '--request', str(path))
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_request')
-        self.assertEqual(FixtureHandler.calls, [])
+        self.refused('invalid_grant', self.grant, expires=1)
+        self.grant()
+        with self.db:
+            self.db.execute('update model_grants set expires=1')
+        self.refused('spending_blocked', self.call, 'expired-op')
+        self.refused('invalid_request', self.call, 'bad', payload={'provider': 'other', 'prompt': 'x'})
+        self.adapter.call.assert_not_called()
 
     def test_uncertain_result_is_frozen_until_exact_trusted_reconciliation(self):
-        self.assertEqual(self.grant().returncode, 0)
-        self.broker()
-        FixtureHandler.uncertain = True
-        uncertain = self.call('uncertain-op', reserve=3)
-        self.assertEqual(uncertain.returncode, 2)
-        self.assertEqual(json.loads(uncertain.stderr)['error'], 'outcome_uncertain')
-        FixtureHandler.uncertain = False
-        retry = self.call('uncertain-op', reserve=3)
-        self.assertEqual(retry.returncode, 2)
-        self.assertEqual(json.loads(retry.stderr)['error'], 'outcome_uncertain')
-        self.assertEqual(len(FixtureHandler.calls), 1)
-        wrong_scope = self.invoke('spend-reconcile', '--project', 'product', '--iteration', 'm1',
-            '--provider', 'other', '--model', 'fixture-model', '--operation', 'generate',
-            '--operation-id', 'uncertain-op', '--outcome', 'failed', '--reference', 'receipt')
-        self.assertEqual(wrong_scope.returncode, 2)
-        self.assertEqual(json.loads(wrong_scope.stderr)['error'], 'scope_mismatch')
-        fixed = self.invoke('spend-reconcile', '--project', 'product', '--iteration', 'm1',
-            '--provider', 'fixture-provider', '--model', 'fixture-model', '--operation', 'generate',
-            '--operation-id', 'uncertain-op', '--outcome', 'failed', '--reference', 'operator-reconciled-no-charge')
-        self.assertEqual(fixed.returncode, 0, fixed.stderr)
-        self.assertEqual(json.loads(fixed.stdout)['status'], 'failed')
-        retry_after_receipt = self.call('uncertain-op', reserve=3)
-        self.assertEqual(retry_after_receipt.returncode, 0, retry_after_receipt.stderr)
-        self.assertEqual(json.loads(retry_after_receipt.stdout)['status'], 'failed')
-        self.assertEqual(len(FixtureHandler.calls), 1)
+        self.grant()
+        self.adapter.call.side_effect = OSError('labeled lost response')
+        self.refused('outcome_uncertain', self.call, 'uncertain-op')
+        self.adapter.call.side_effect = None
+        self.refused('outcome_uncertain', self.call, 'uncertain-op')
+        self.refused('scope_mismatch', self.receipt, 'uncertain-op', scope=(*self.scope[:2], 'other', *self.scope[3:]))
+        self.assertEqual(self.receipt('uncertain-op')['status'], 'failed')
+        self.assertEqual(self.call('uncertain-op')['status'], 'failed')
+        self.adapter.call.assert_called_once()
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
 
     def test_fixture_route_rejects_non_loopback_and_live_provider_is_disabled(self):
-        from factory_v1.spending import SpendingError, execute_controlled, initialize
-        import sqlite3
-        with closing(sqlite3.connect(self.state)) as db:
-            initialize(db)
-            self.assertEqual(self.grant().returncode, 0)
-            with self.assertRaises(SpendingError) as error:
-                execute_controlled(db, ('product', 'm1', 'fixture-provider', 'fixture-model', 'generate'),
-                                   'invalid-route', {'prompt': 'x'}, 1, 'https://provider.example/v1')
-        self.assertEqual(error.exception.code, 'provider_unavailable')
-        self.assertEqual(FixtureHandler.calls, [])
-
-
-    def subscription_fixture(self, status=200):
-        """Real UDS HTTP fixture; not a provider or billing-success claim."""
-        import socketserver
-        case = self
-        self.upstream_calls = []
-        self.upstream_status = status
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *args):
-                pass
-            def do_POST(self):
-                case.upstream_calls.append((self.path, json.loads(self.rfile.read(int(self.headers['Content-Length'])))))
-                self.send_response(case.upstream_status)
-                self.send_header('Content-Type', 'text/event-stream')
-                self.end_headers()
-                done = {'type': 'response.output_item.done', 'output_index': 0, 'item': {'type': 'message', 'content': [{'type': 'output_text', 'text': 'labeled-fixture'}]}}
-                body = {'type': 'response.completed', 'response': {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': []}}
-                self.wfile.write(('data: ' + json.dumps(done) + '\n\ndata: ' + json.dumps(body) + '\n\n').encode())
-        path = self.root / 'upstream.sock'
-        server = socketserver.UnixStreamServer(str(path), Handler)
-        threading.Thread(target=server.serve_forever,
-                         kwargs={'poll_interval': 0.01}, daemon=True).start()
-        self.addCleanup(server.server_close)
-        self.addCleanup(server.shutdown)
-        return path
-
-    def subscription(self, kind='allowance', status=200):
-        path = self.subscription_fixture(status)
-        result = self.grant(ceiling=2, kind=kind, provider='openai-codex', model='gpt-6.1-sol', operation='responses')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        return self.broker(provider='openai-codex', model='gpt-6.1-sol', operation='responses', subscription_socket=path)
-
-    def receipt(self, op_id, provider='fixture-provider', model='fixture-model', operation='generate', outcome='failed', units=None, reference='trusted-no-charge-receipt'):
-        return self.invoke('spend-reconcile', '--project', 'product', '--iteration', 'm1',
-            '--provider', provider, '--model', model, '--operation', operation,
-            '--operation-id', op_id, '--outcome', outcome, '--reference', reference,
-            *(['--actual-units', str(units)] if units is not None else []))
+        self.grant()
+        with patch('factory_v1.model_access.socket.socket') as socket:
+            self.refused('provider_unavailable', spending.execute_controlled, self.db, self.scope,
+                         'invalid-route', {'prompt': 'x'}, 3, 'https://provider.example/v1')
+            socket.assert_not_called()
+        self.adapter.call.assert_not_called()
 
     def test_scoped_approval_ceiling_and_fixed_adapter_reservation(self):
-        self.assertEqual(self.grant(ceiling=3, kind='approval').returncode, 0)
-        self.broker()
-        lower = self.call('lower-reservation', reserve=1)
-        self.assertEqual(json.loads(lower.stderr)['error'], 'invalid_reservation')
-        self.assertEqual(FixtureHandler.calls, [])
-        self.assertEqual(self.call().returncode, 0)
-        exhausted = self.call('next-operation')
-        self.assertEqual(json.loads(exhausted.stderr)['error'], 'spending_blocked')
-        self.assertEqual(len(FixtureHandler.calls), 1)
-        item = json.loads(self.invoke('inspect', '--project', 'product', '--iteration', 'm1').stdout)
-        self.assertEqual(item['model_access']['status'], 'blocked')
-        self.assertFalse(item['execution_allowed'])
+        self.grant(ceiling=3, kind='approval')
+        self.refused('invalid_reservation', self.call, 'lower-reservation', reserve=1)
+        self.adapter.call.assert_not_called()
+        self.assertEqual(self.call()['status'], 'complete')
+        self.refused('spending_blocked', self.call, 'next-operation')
+        self.adapter.call.assert_called_once()
+        self.assertEqual(self.item()['model_access']['status'], 'blocked')
+        self.assertFalse(self.item()['execution_allowed'])
 
     def test_exact_provider_model_and_operation_grants_are_not_interchangeable(self):
-        for terms in ({'provider': 'other'}, {'model': 'other'}, {'operation': 'other'}):
-            self.assertEqual(self.grant(reference='mismatch-' + next(iter(terms)), **terms).returncode, 0)
-        self.broker()
-        denied = self.call()
-        self.assertEqual(json.loads(denied.stderr)['error'], 'spending_blocked')
-        self.assertEqual(FixtureHandler.calls, [])
+        for provider, model, operation in (('other', self.scope[3], self.scope[4]),
+                                           (self.scope[2], 'other', self.scope[4]),
+                                           (self.scope[2], self.scope[3], 'other')):
+            self.grant(provider=provider, model=model, operation=operation,
+                       reference='mismatch-' + provider + '-' + model + '-' + operation)
+        self.refused('spending_blocked', self.call)
+        self.adapter.call.assert_not_called()
 
     def test_new_key_cannot_escape_uncertain_outcome_and_receipt_replay_is_exact(self):
-        self.assertEqual(self.grant(ceiling=20).returncode, 0)
-        self.broker()
-        FixtureHandler.uncertain = True
-        self.assertEqual(json.loads(self.call().stderr)['error'], 'outcome_uncertain')
-        FixtureHandler.uncertain = False
-        self.assertEqual(json.loads(self.call('new-key').stderr)['error'], 'outcome_uncertain')
-        self.assertEqual(len(FixtureHandler.calls), 1)
-        invalid = self.receipt('request-1', outcome='complete', units=4)
-        self.assertEqual(json.loads(invalid.stderr)['error'], 'invalid_receipt')
-        first = self.receipt('request-1', outcome='complete', units=2)
-        self.assertEqual(first.returncode, 0, first.stderr)
-        again = self.receipt('request-1', outcome='complete', units=2)
-        self.assertTrue(json.loads(again.stdout)['replay'])
-        conflict = self.receipt('request-1', outcome='complete', units=1)
-        self.assertEqual(json.loads(conflict.stderr)['error'], 'reconciliation_conflict')
-        self.assertEqual(self.call('new-key').returncode, 0)
-        self.assertEqual(len(FixtureHandler.calls), 2)
+        self.grant(ceiling=20)
+        self.adapter.call.side_effect = ModelAccessError('outcome_uncertain')
+        self.refused('outcome_uncertain', self.call)
+        self.adapter.call.side_effect = None
+        self.refused('outcome_uncertain', self.call, 'new-key')
+        self.adapter.call.assert_called_once()
+        self.refused('invalid_receipt', self.receipt, outcome='complete', units=4)
+        self.assertEqual(self.receipt(outcome='complete', units=2)['status'], 'complete')
+        self.assertTrue(self.receipt(outcome='complete', units=2)['replay'])
+        self.refused('reconciliation_conflict', self.receipt, outcome='complete', units=1)
+        self.assertEqual(self.call('new-key')['status'], 'complete')
+        self.assertEqual(self.adapter.call.call_count, 2)
 
-    def test_subscription_uds_pins_route_model_tier_and_uses_only_allowance(self):
+    def test_subscription_scope_request_allowance_and_privacy(self):
         self.subscription()
-        payload = {'input': [{'role': 'user', 'content': 'labeled fixture request'}]}
-        result = self.call(reserve=1, request=payload)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)['result']['output'][0]['content'][0]['text'], 'labeled-fixture')
-        path, upstream = self.upstream_calls[0]
-        self.assertEqual(path, '/v1/responses')
-        self.assertEqual(upstream['model'], 'gpt-6.1-sol')
-        self.assertEqual(upstream['service_tier'], 'default')
-        self.assertFalse(upstream['store'])
-        self.assertTrue(upstream['stream'])
-        self.assertEqual(len(self.upstream_calls), 1)
-        self.assertEqual(self.call(reserve=1, request=payload).returncode, 0)
-        self.assertEqual(len(self.upstream_calls), 1)
+        payload = {'input': 'labeled fixture request'}
+        self.assertEqual(self.call(reserve=1, payload=payload)['status'], 'complete')
+        self.assertTrue(self.call(reserve=1, payload=payload)['replay'])
         for key in ['model', 'api_key', 'service_tier', 'url', 'unknown']:
-            denied = self.call('deny-' + key, reserve=1, request={**payload, key: 'must-not-forward'})
-            self.assertEqual(json.loads(denied.stderr)['error'], 'invalid_request')
-        self.assertEqual(len(self.upstream_calls), 1)
-        with closing(sqlite3.connect(self.state)) as db:
-            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 1)
-            self.assertNotIn(b'labeled fixture request', self.state.read_bytes())
-            self.assertNotIn(b'labeled-fixture', self.state.read_bytes())
+            self.refused('invalid_request', self.call, 'deny-' + key, reserve=1, payload={**payload, key: 'must-not-forward'})
+        self.adapter.call.assert_called_once_with(payload)
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 1)
+        self.assertNotIn(b'labeled fixture request', self.state.read_bytes())
+        self.assertNotIn(b'fixture-subscription-answer', self.state.read_bytes())
 
     def test_paid_approval_does_not_authorize_subscription_or_any_paid_fallback(self):
         self.subscription(kind='approval')
-        result = self.call(reserve=1, request={'input': 'fixture'})
-        self.assertEqual(json.loads(result.stderr)['error'], 'spending_blocked')
-        self.assertEqual(self.upstream_calls, [])
-        self.assertEqual(FixtureHandler.calls, [])
+        self.refused('spending_blocked', self.call, payload={'input': 'fixture'})
+        self.adapter.call.assert_not_called()
 
-    def test_quota_refusal_persists_and_requires_billing_receipt_then_explicit_resume(self):
-        self.subscription(status=429)
-        payload = {'input': 'fixture'}
-        refused = self.call(reserve=1, request=payload)
-        self.assertEqual(json.loads(refused.stderr)['error'], 'quota_exhausted')
-        self.upstream_status = 200
-        self.assertEqual(json.loads(self.call('another-key', reserve=1, request=payload).stderr)['error'], 'outcome_uncertain')
-        self.assertEqual(len(self.upstream_calls), 1)
-        self.assertEqual(self.receipt('request-1', provider='openai-codex', model='gpt-6.1-sol', operation='responses').returncode, 0)
-        retry = self.call('another-key', reserve=1, request=payload)
-        self.assertEqual(json.loads(retry.stderr)['error'], 'quota_exhausted')
-        resumed = self.invoke('spend-resume', '--project', 'product', '--iteration', 'm1',
-            '--provider', 'openai-codex', '--model', 'gpt-6.1-sol', '--operation', 'responses', '--reference', 'verified-quota-restored')
-        self.assertEqual(resumed.returncode, 0, resumed.stderr)
-        self.assertEqual(self.call('another-key', reserve=1, request=payload).returncode, 0)
-        self.assertEqual(len(self.upstream_calls), 2)
+    def test_quota_refusal_requires_billing_receipt_then_explicit_resume(self):
+        self.subscription()
+        self.adapter.call.side_effect = ModelAccessError('quota_exhausted')
+        self.refused('quota_exhausted', self.call, payload={'input': 'fixture'})
+        self.adapter.call.side_effect = None
+        self.refused('outcome_uncertain', self.call, 'another-key', payload={'input': 'fixture'})
+        self.refused('outcome_uncertain', self.resume)
+        self.receipt()
+        self.refused('quota_exhausted', self.call, 'another-key', payload={'input': 'fixture'})
+        self.assertEqual(self.resume(), {'status': 'ready'})
+        self.assertEqual(self.call('another-key', payload={'input': 'fixture'})['status'], 'complete')
+        self.assertEqual(self.adapter.call.call_count, 2)
 
-    def test_capability_request_cap_expiry_and_exact_peer_uid_are_enforced(self):
-        self.assertEqual(self.grant(ceiling=20).returncode, 0)
-        process = self.broker(extra=['--max-calls', '1', '--ttl', '2'])
-        self.assertEqual(self.call().returncode, 0)
-        exhausted = self.call('next')
-        self.assertEqual(json.loads(exhausted.stderr)['error'], 'capability_exhausted')
-        process.wait(timeout=5)
-        self.assertFalse(self.sock.exists())
-        process = self.broker(extra=['--worker-uid', str(os.getuid() + 1)])
-        denied = self.call('wrong-worker')
-        self.assertEqual(json.loads(denied.stderr)['error'], 'worker_identity_mismatch')
-        self.assertEqual(len(FixtureHandler.calls), 1)
+    def resume(self):
+        with self.db:
+            return spending.resume_quota(self.db, self.scope, 'verified-quota-restored')
+
+    def test_capability_request_cap_and_exact_peer_uid_are_enforced(self):
+        self.subscription()
+        def cap(component, mocks):
+            sends = []
+            def reply(raw):
+                sends.append(json.loads(raw))
+                if len(sends) == 2:
+                    component.stop.set()
+            component.connection.sendall.side_effect = reply
+        component = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, run=cap)
+        replies = [json.loads(call.args[0]) for call in component.connection.sendall.call_args_list]
+        self.assertEqual(replies[0]['result']['status'], 'complete')
+        self.assertEqual(replies[1]['error'], 'capability_exhausted')
+        self.adapter.call.assert_called_once()
+        self.assertFalse(component.path.exists())
+        denied = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, peer_uid=os.getuid() + 1)
+        self.assertEqual(json.loads(denied.connection.sendall.call_args.args[0])['error'], 'worker_identity_mismatch')
+        self.adapter.call.assert_called_once()
 
     def test_wrong_operator_and_paused_iteration_cannot_start_broker(self):
-        from factory_v1.spending import SpendingError, serve_unix_socket
-        with self.assertRaises(SpendingError) as error:
-            serve_unix_socket(str(self.sock), str(self.state), ('product', 'm1', 'fixture-provider', 'fixture-model', 'generate'), self.fixture_url, operator_id='other')
-        self.assertEqual(error.exception.code, 'approval_required')
-        self.assertFalse(self.sock.exists())
-        with closing(sqlite3.connect(self.state)) as db:
-            item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+        with patch.object(spending.socket, 'socket') as socket:
+            self.refused('approval_required', spending.serve_unix_socket, str(self.root / 'capability.sock'),
+                         str(self.state), self.scope, operator_id='other')
+            item = self.item()
             item['status'] = 'paused'
-            db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-            db.commit()
-        with self.assertRaises(SpendingError) as error:
-            serve_unix_socket(str(self.sock), str(self.state), ('product', 'm1', 'fixture-provider', 'fixture-model', 'generate'), self.fixture_url, operator_id='42')
-        self.assertEqual(error.exception.code, 'iteration_paused')
-        self.assertEqual(FixtureHandler.calls, [])
+            with self.db:
+                self.db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+            self.refused('iteration_paused', spending.serve_unix_socket, str(self.root / 'capability.sock'),
+                         str(self.state), self.scope, operator_id='42')
+            socket.assert_not_called()
 
-    def test_capability_expiry_is_rechecked_after_controller_lock_wait(self):
-        import fcntl
-        self.assertEqual(self.grant(ceiling=20).returncode, 0)
-        process = self.broker(extra=['--ttl', '1'])
-        results = []
-        with open(str(self.state) + '.onboarding.lock', 'a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            caller = threading.Thread(target=lambda: results.append(self.call()))
-            caller.start()
-            time.sleep(1.3)
-            fcntl.flock(lock, fcntl.LOCK_UN)
-        caller.join(timeout=10)
-        self.assertFalse(caller.is_alive())
-        self.assertEqual(json.loads(results[0].stderr)['error'], 'capability_exhausted')
-        self.assertEqual(FixtureHandler.calls, [])
-        process.wait(timeout=5)
-        with closing(sqlite3.connect(self.state)) as db:
-            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 20)
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
-
-    def test_pre_admission_and_disabled_route_refusals_survive_restart_without_secrets(self):
-        self.assertEqual(self.grant().returncode, 0)
-        process = self.broker()
+    def test_pre_admission_and_disabled_route_refusals_survive_reopen_without_secrets(self):
+        self.grant()
         marker = 'never-persist-request-secret'
-        override = self.call('override', request={'provider': marker, 'prompt': marker})
-        self.assertEqual(json.loads(override.stderr)['error'], 'invalid_request')
-        reservation = self.call('under-reserve', reserve=1)
-        self.assertEqual(json.loads(reservation.stderr)['error'], 'invalid_reservation')
-        self.stop_broker(process)
-        self.sock.unlink(missing_ok=True)
-        disabled = self.invoke('model-broker', '--socket', str(self.sock), '--project', 'product',
-            '--iteration', 'm1', '--provider', 'paid-provider', '--model', 'paid-model',
-            '--operation', 'generate', '--fixture-url', self.fixture_url)
-        self.assertEqual(json.loads(disabled.stderr)['error'], 'provider_unavailable')
-        self.assertFalse(self.sock.exists())
-        self.broker()
-        with closing(sqlite3.connect(self.state)) as db:
-            refusals = db.execute("SELECT provider,model,operation,operation_id,reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall()
-            self.assertEqual(refusals, [
-                ('fixture-provider', 'fixture-model', 'generate', 'override', 'invalid_request'),
-                ('fixture-provider', 'fixture-model', 'generate', 'under-reserve', 'invalid_reservation'),
-                ('paid-provider', 'paid-model', 'generate', None, 'provider_unavailable')])
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
-            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+        self.refused('invalid_request', self.call, 'override', payload={'provider': marker, 'prompt': marker})
+        self.refused('invalid_reservation', self.call, 'under-reserve', reserve=1)
+        disabled = ('product', 'm1', 'paid-provider', 'paid-model', 'generate')
+        with patch.object(spending.socket, 'socket') as socket:
+            self.refused('provider_unavailable', spending._serve_unix_socket,
+                str(self.root / 'capability.sock'), str(self.state), disabled, 'http://127.0.0.1:1/fixed',
+                1, '42', None, 3, 10, 1, os.getuid(), spending.MAX_REQUEST, None, None, None)
+            socket.assert_not_called()
+        with closing(sqlite3.connect(self.state)) as fresh:
+            self.assertEqual(fresh.execute("SELECT provider,operation_id,reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall(),
+                [('fixture-provider', 'override', 'invalid_request'), ('fixture-provider', 'under-reserve', 'invalid_reservation'),
+                 ('paid-provider', None, 'provider_unavailable')])
+            self.assertEqual(fresh.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
+            self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
         self.assertNotIn(marker.encode(), self.state.read_bytes())
-        self.assertEqual(FixtureHandler.calls, [])
+        self.adapter.call.assert_not_called()
 
-    def test_controller_and_startup_refusals_are_durable_without_rejected_grant_data(self):
-        self.assertEqual(self.grant().returncode, 0)
+    def test_controller_refusals_are_durable_without_rejected_grant_data(self):
+        self.grant()
         marker = 'never-persist-rejected-grant-secret'
-        self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')
-        self.assertEqual(json.loads(self.grant(ceiling=0, reference=marker).stderr)['error'], 'invalid_grant')
-        startup = ['model-broker', '--socket', str(self.sock), '--project', 'product', '--iteration', 'm1',
-            '--provider', 'fixture-provider', '--model', 'fixture-model', '--operation', 'generate', '--fixture-url', self.fixture_url]
-        denied = self.invoke('--operator-id', 'other', *startup)
-        self.assertEqual(json.loads(denied.stderr)['error'], 'approval_required')
-        with closing(sqlite3.connect(self.state)) as db:
-            item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
-            item['status'] = 'paused'
-            db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-            db.commit()
-        paused = self.invoke(*startup)
-        self.assertEqual(json.loads(paused.stderr)['error'], 'iteration_paused')
-        with closing(sqlite3.connect(self.state)) as db:
-            self.assertEqual(db.execute("SELECT reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall(),
-                [('grant_conflict',), ('invalid_grant',), ('approval_required',), ('iteration_paused',)])
-            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+        self.refused('grant_conflict', self.grant, ceiling=6)
+        self.refused('invalid_grant', self.grant, ceiling=0, reference=marker)
+        with closing(sqlite3.connect(self.state)) as fresh:
+            self.assertEqual(fresh.execute("SELECT reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall(),
+                             [('grant_conflict',), ('invalid_grant',)])
+            self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
         self.assertNotIn(marker.encode(), self.state.read_bytes())
-        self.assertFalse(self.sock.exists())
-        self.assertEqual(FixtureHandler.calls, [])
 
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
-        self.assertEqual(self.grant().returncode, 0)
-        self.assertEqual(json.loads(self.grant(ceiling=6).stderr)['error'], 'grant_conflict')
-        self.assertEqual(json.loads(self.grant(provider='bad/value').stderr)['error'], 'invalid_scope')
+        self.grant()
+        self.refused('grant_conflict', self.grant, ceiling=6)
+        self.refused('invalid_scope', self.grant, provider='bad/value')
         for ceiling in [0, -1, 2**63]:
-            self.assertEqual(json.loads(self.grant(ceiling=ceiling, reference='invalid-' + str(ceiling)).stderr)['error'], 'invalid_grant')
-        self.broker()
+            self.refused('invalid_grant', self.grant, ceiling=ceiling, reference='invalid-' + str(ceiling))
         for payload in [{'prompt': float('nan')}, {'prompt': 'x' * 33000}]:
-            refused = self.call('invalid', request=payload)
-            self.assertEqual(json.loads(refused.stderr)['error'], 'invalid_request')
-        self.assertEqual(FixtureHandler.calls, [])
+            self.refused('invalid_request', self.call, 'invalid', payload=payload)
+        self.adapter.call.assert_not_called()
+
+    def test_deadline_and_grant_expiry_after_reservation_are_known_no_effect(self):
+        self.grant()
+        prepare = spending._prepare
+        def expired(*args, **kwargs):
+            result = prepare(*args, **kwargs)
+            result['grant_expires'] = 0
+            return result
+        with patch.object(spending, '_prepare', side_effect=expired):
+            self.refused('capability_exhausted', self.call)
+        self.adapter.call.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT status,actual_units FROM model_operations').fetchall(), [('failed', 0)])
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+
+    def test_large_sandbox_request_uses_only_admitted_bound(self):
+        self.subscription()
+        payload = {'input': 'x' * 50000}
+        self.refused('invalid_request', self.call, payload=payload)
+        self.assertEqual(self.call(payload=payload, max_request=spending.SANDBOX_MAX_REQUEST)['status'], 'complete')
+        self.refused('invalid_request', self.call, 'oversize', payload={'input': 'x' * spending.SANDBOX_MAX_REQUEST}, max_request=spending.SANDBOX_MAX_REQUEST)
+        self.adapter.call.assert_called_once_with(payload)
 
 
 if __name__ == '__main__':

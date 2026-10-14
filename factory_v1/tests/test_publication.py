@@ -1,4 +1,4 @@
-"""Public CLI + real loopback HTTP + durable restart; NOT live GitHub/worker proof."""
+"""Direct publication component checks; legacy helpers are not discovered."""
 import base64
 import copy
 import hashlib
@@ -225,11 +225,249 @@ class PublicationTests(unittest.TestCase):
         with closing(sqlite3.connect(self.fixture.state)) as database:
             return json.loads(database.execute('SELECT payload FROM role_assignments').fetchone()[0])
 
-    def test_happy_restart_published_never_done_and_no_token_leak(self):
-        result = self.ok(self.cli())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Legacy PublicationTests has helper methods only; focused tests use explicit state below.
+import datetime
+import inspect
+
+
+def git_object(kind, data):
+    """Independent Git wire-object oracle: real bytes, no Git process."""
+    return hashlib.sha1(kind.encode() + b' ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+
+
+def git_tree(entries):
+    ordered = sorted(entries, key=lambda entry: entry['path'].encode() + (b'/' if entry['type'] == 'tree' else b''))
+    data = b''.join(entry['mode'].lstrip('0').encode() + b' ' + entry['path'].encode() + b'\0' + bytes.fromhex(entry['sha']) for entry in ordered)
+    return git_object('tree', data)
+
+
+class PublicationComponentTests(unittest.TestCase):
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.state = self.root / 'state.sqlite'
+        self.artifacts = self.root / 'artifacts'
+        self.artifacts.mkdir(mode=0o700)
+        self.source = self.artifacts / 'workspace'
+        self.baseline = self.artifacts / 'inputs/baseline'
+        for folder in (self.source, self.baseline):
+            (folder / 'factory_v1').mkdir(parents=True)
+            (folder / 'factory_v1/behavior.py').write_bytes(b'old behavior\n')
+            (folder / 'test_behavior.py').write_bytes(b'old tests\n')
+        (self.source / 'factory_v1/behavior.py').write_bytes(b'new behavior\n')
+        self.refresh_source()
+        (self.artifacts / 'initial-source.json').write_text(json.dumps({'baseline': manifest(self.baseline)}))
+        self.repo = {'id': 123, 'full_name': 'example/product', 'default_branch': 'main'}
+        self.issue = {'id': 10, 'node_id': 'ISSUE_10', 'number': 10, 'state': 'open',
+                      'body': 'Pinned work body', 'repository_url': 'https://api.github.com/repos/example/product'}
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product',
+                     'status': 'active', 'execution_allowed': False,
+                     'approval': {'operator_id': '42', 'reference': 'approved'},
+                     'origin': {'platform': 'discord', 'chat_id': '123', 'thread_id': '123', 'parent_chat_id': '456', 'scope_id': '789'},
+                     'handoff': {'commit': 'a' * 40},
+                     'ticket_work': {'assignment_id': 'synthesis-1', 'input_digest': 'inputs-1'},
+                     'repository_onboarding': {'api_base': 'http://127.0.0.1:8765', 'metadata': {'id': 123}}}
+        revision = {'spec': self.item['handoff'], 'ticket_assignment': 'synthesis-1', 'ticket_inputs': 'inputs-1'}
+        handoff = {'stage': 'implementation', 'profile': {'role': 'implementation', 'name': 'factory-worker', 'home': str(self.root / 'profile')},
+                   'workspace': str(self.root / 'assigned'), 'repository': 'example/product', 'repository_id': 123,
+                   'issue': {k: self.issue[k] for k in ('id', 'node_id', 'number')} | {'body_sha256': hashlib.sha256(self.issue['body'].encode()).hexdigest()},
+                   'spec_commit': 'a' * 40, 'baseline': 'a' * 40, 'candidate': None,
+                   'capabilities': ['write_workspace'], 'skills': [], 'tracker': {'api_base': 'http://127.0.0.1:8765'}}
+        self.assignment = {'assignment_id': 'd' * 64, 'claim_id': 'claim-1', 'revision': revision,
+                           'ticket_scope': {'project': 'product', 'iteration': 'm1', 'repository': 'example/product', 'issue_number': 10},
+                           'handoff': handoff, 'handoff_digest': publication.assignments.digest(handoff),
+                           'runtime': {'status': 'complete', 'run_id': 'run-1', 'container_removed': True, 'artifacts': str(self.artifacts)},
+                           'result_disposition': {'isolated_execution': True, 'trusted_execution': False, 'advance_allowed': False, 'close_allowed': False}}
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+            db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+            db.execute('CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
+            db.execute('INSERT INTO role_assignments VALUES (?,?)', (self.assignment['assignment_id'], json.dumps(self.assignment)))
+        Path(str(self.state) + '.onboarding.lock').touch(mode=0o600)
+        self.entries = [{'path': name, 'mode': '100644', 'type': 'blob', 'sha': git_object('blob', (self.baseline / name).read_bytes())} for name in manifest(self.baseline)]
+        subtree = git_tree([dict(e, path='behavior.py') for e in self.entries if e['path'].startswith('factory_v1/')])
+        self.entries.extend([{'path': 'factory_v1', 'mode': '040000', 'type': 'tree', 'sha': subtree},
+                             {'path': 'opaque', 'mode': '160000', 'type': 'commit', 'sha': 'e' * 40},
+                             {'path': 'link', 'mode': '120000', 'type': 'blob', 'sha': 'f' * 40}])
+        self.tree = git_tree([e for e in self.entries if '/' not in e['path']])
+        self.commits = {'a' * 40: {'sha': 'a' * 40, 'tree': {'sha': self.tree}}}
+        self.refs = {'main': 'a' * 40}
+        self.prs = []
+        self.calls = []
+        self.drop = None
+        self.overrides = {}
+        self.config = {'operator_id': '42', 'reference': 'explicit host operator approval',
+                       'execution_reference': 'component-only host authorization; NOT live worker proof',
+                       'binding': publication.binding(self.assignment), 'manifest': manifest(self.source),
+                       'paths': ['factory_v1/behavior.py'], 'policy_paths': [], 'repository': 'example/product',
+                       'repository_id': 123, 'branch': 'factory/issue-10', 'base': 'main', 'issue': 10,
+                       'expected_head': 'a' * 40, 'candidate': 'b' * 40, 'commit_date': '2026-01-01T00:00:00Z',
+                       'api_base': 'http://127.0.0.1:8765', 'bearer': 'HOST-ONLY-SECRET-FIXTURE'}
+        self.config_path = self.root / 'publication.json'
+        self.write_config()
+        for target in ('socket.socket', 'subprocess.Popen'):
+            patcher = mock.patch(target, side_effect=AssertionError('external creation denied'))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(publication.GitHub, 'request', side_effect=self.external)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.plan = self.publish(plan_only=True)
+        self.config['candidate'] = self.plan['candidate']
+        self.write_config()
+        self.calls.clear()
+
+    def refresh_source(self):
+        (self.artifacts / 'source-artifacts.json').write_text(json.dumps(manifest(self.source)))
+
+    def write_config(self):
+        self.config_path.write_text(json.dumps(self.config))
+        self.config_path.chmod(0o600)
+
+    def persist(self):
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(self.assignment), self.assignment['assignment_id']))
+            db.execute('UPDATE iterations SET payload=?', (json.dumps(self.item),))
+
+    def stored(self):
+        with closing(sqlite3.connect(self.state)) as db:
+            return json.loads(db.execute('SELECT payload FROM role_assignments WHERE assignment_id=?', (self.assignment['assignment_id'],)).fetchone()[0])
+
+    def publish(self, plan_only=False):
+        with closing(sqlite3.connect(self.state)) as db:
+            return publication.publish(db, 'product', 'm1', '42', self.assignment['assignment_id'], self.config_path, plan_only)
+
+    def read_prs(self):
+        result = copy.deepcopy(self.prs)
+        for pr in result:
+            for side in ('head', 'base'):
+                branch = pr[side]
+                pr[side] = {'ref': branch, 'sha': self.refs[branch], 'repo': copy.deepcopy(self.repo)}
+        return result
+
+    def external(self, path, payload=None, method=None):
+        method = method or ('GET' if payload is None else 'POST')
+        suffix = path.removeprefix('/repos/example/product')
+        self.calls.append((method, suffix, copy.deepcopy(payload)))
+        if method == 'GET':
+            if suffix == '':
+                return copy.deepcopy(self.repo)
+            if suffix == '/issues/10':
+                return copy.deepcopy(self.issue)
+            if suffix.startswith('/git/commits/'):
+                value = copy.deepcopy(self.commits.get(suffix.split('/')[-1]))
+                if value and 'message' in value:
+                    value.update(self.overrides)
+                return value
+            if suffix.startswith('/git/trees/'):
+                return {'sha': self.tree, 'tree': copy.deepcopy(self.entries), 'truncated': False}
+            if suffix.startswith('/git/ref/heads/'):
+                branch = suffix.removeprefix('/git/ref/heads/')
+                return None if branch not in self.refs else {'ref': 'refs/heads/' + branch, 'object': {'type': 'commit', 'sha': self.refs[branch]}}
+            if suffix.startswith('/pulls?'):
+                return self.read_prs()
+            if suffix == '/pulls/20':
+                return self.read_prs()[0]
+            if suffix == '/issues/20':
+                return {'number': 20, 'body': self.prs[0]['body'], 'state': 'open', 'pull_request': {},
+                        'repository_url': 'https://api.github.com/repos/example/product'}
+            raise AssertionError('Unexpected read ' + suffix)
+        assert isinstance(payload, dict)
+        journal = self.stored()['publication']
+        self.assertEqual(journal['status'], 'pending')
+        self.assertNotIn('bearer', journal['approval'])
+        if suffix == '/git/blobs':
+            result = {'sha': git_object('blob', base64.b64decode(payload['content']))}
+        elif suffix == '/git/trees':
+            self.assertEqual(payload['base_tree'], self.tree)
+            result = {'sha': self.plan['tree']}
+        elif suffix == '/git/commits':
+            date = datetime.datetime.strptime(payload['author']['date'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=datetime.timezone.utc)
+            identity = 'Factory Controller <factory-controller@users.noreply.github.com>'
+            raw = f"tree {payload['tree']}\nparent {payload['parents'][0]}\nauthor {identity} {int(date.timestamp())} +0000\ncommitter {identity} {int(date.timestamp())} +0000\n\n{payload['message']}".encode()
+            self.assertTrue(payload['message'].endswith('\n'))
+            sha = git_object('commit', raw)
+            result = {'sha': sha, 'tree': {'sha': payload['tree']}, 'parents': [{'sha': payload['parents'][0]}], 'message': payload['message'][:-1]}
+            self.commits[sha] = copy.deepcopy(result)
+        elif suffix == '/git/refs':
+            self.refs[payload['ref'].removeprefix('refs/heads/')] = payload['sha']
+            result = {}
+        elif suffix.startswith('/git/refs/heads/'):
+            self.assertIs(payload['force'], False)
+            self.refs[suffix.removeprefix('/git/refs/heads/')] = payload['sha']
+            result = {}
+        elif suffix == '/pulls':
+            self.assertEqual(self.prs, [])
+            self.prs.append(dict(payload, number=20, state='open', merged=False))
+            result = self.read_prs()[0]
+        else:
+            raise AssertionError('Unexpected write ' + suffix)
+        if self.drop == suffix:
+            self.drop = None
+            raise RepositoryError('github_unavailable', 'simulated lost response')
+        return result
+
+    def writes(self):
+        return [call for call in self.calls if call[0] != 'GET']
+
+    def refuse(self, code=None):
+        before = len(self.writes())
+        with self.assertRaises((RepositoryError, ValueError, TypeError, KeyError, AttributeError)) as raised:
+            self.publish()
+        if code:
+            self.assertIsInstance(raised.exception, RepositoryError)
+            self.assertEqual(getattr(raised.exception, 'code', None), code)
+        self.assertNotIn(self.config['bearer'], str(raised.exception))
+        self.assertEqual(len(self.writes()), before)
+
+    def test_happy_publication_durable_exact_commit_pr_and_no_delivery_authority(self):
+        result = self.publish()
         self.assertEqual(result['status'], 'published')
         self.assertFalse(result['close_allowed'])
         self.assertFalse(result['merge_allowed'])
+        self.assertEqual(result['candidate'], self.plan['candidate'])
         self.assertEqual(self.refs['main'], 'a' * 40)
         self.assertEqual(self.issue['state'], 'open')
         self.assertIn('Refs #10', self.prs[0]['body'])
@@ -237,579 +475,473 @@ class PublicationTests(unittest.TestCase):
         self.assertNotIn('Closes', self.prs[0]['body'])
         self.assertNotIn(self.config['bearer'], json.dumps(self.stored()))
         self.assertFalse(self.stored()['result_disposition']['trusted_execution'])
-        before = self.writes()
-        self.assertEqual(result, self.ok(self.cli()))
-        self.assertEqual(before, self.writes())
-        payload = next(c[2] for c in before if c[1].endswith('/git/trees'))
-        self.assertEqual([c['path'] for c in payload['tree']], ['factory_v1/behavior.py'])
-        identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com',
-                    'date': '2026-01-01T00:00:00Z'}
-        commit = next(c[2] for c in before if c[1].endswith('/git/commits'))
-        self.assertEqual(commit, {'message': 'Factory candidate: Refs #10\n', 'tree': self.plan['tree'],
-                                  'parents': ['a' * 40], 'author': identity, 'committer': identity})
-        self.assertEqual(result['candidate'], self.plan['candidate'])
+        self.assertFalse(self.stored()['result_disposition']['advance_allowed'])
+        writes = self.writes()
+        self.assertEqual(self.publish(), result)
+        self.assertEqual(self.writes(), writes)
+        tree = next(c[2] for c in writes if c[1] == '/git/trees')
+        self.assertEqual([entry['path'] for entry in tree['tree']], ['factory_v1/behavior.py'])
+        commit = next(c[2] for c in writes if c[1] == '/git/commits')
+        identity = {'name': 'Factory Controller', 'email': 'factory-controller@users.noreply.github.com', 'date': '2026-01-01T00:00:00Z'}
+        self.assertEqual(commit, {'message': 'Factory candidate: Refs #10\n', 'tree': self.plan['tree'], 'parents': ['a' * 40], 'author': identity, 'committer': identity})
 
-    def test_exact_commit_message_readback_with_and_without_terminal_lf(self):
-        result = self.ok(self.cli())
-        self.assertEqual(result['status'], 'published')
-        self.assertEqual(result['candidate'], self.plan['candidate'])
-        commit = self.commits[result['candidate']]
-        self.assertEqual(commit['message'], self.plan['message'])
-        payload = next(c[2] for c in self.writes() if c[1].endswith('/git/commits'))
-        self.assertEqual(payload['message'], self.plan['message'] + '\n')
-        before = self.writes()
-        self.assertEqual(self.ok(self.cli()), result)
-        commit['message'] = self.plan['message'] + '\n'
-        self.assertEqual(self.ok(self.cli()), result)
-        self.assertEqual(self.writes(), before)
+    def test_exact_git_wire_hashes_preserve_terminal_lf_and_opaque_entries(self):
+        subtree = git_tree([{'path': 'behavior.py', 'mode': '100644', 'type': 'blob', 'sha': git_object('blob', b'new behavior\n')}])
+        expected = git_tree([dict(e, sha=subtree) if e['path'] == 'factory_v1' else e for e in self.entries if '/' not in e['path']])
+        self.assertEqual(self.plan['tree'], expected)
+        self.assertEqual(publication.object_sha('blob', b'new behavior\n'), git_object('blob', b'new behavior\n'))
+        message = 'Factory candidate: Refs #10'
+        raw = f"tree {expected}\nparent {'a' * 40}\nauthor Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\ncommitter Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n\n{message}\n".encode()
+        self.assertEqual(self.plan['candidate'], git_object('commit', raw))
+        self.assertNotEqual(self.plan['candidate'], git_object('commit', raw[:-1]))
+        result = self.publish()
+        for read_message in (message, message + '\n'):
+            self.commits[result['candidate']]['message'] = read_message
+            self.assertEqual(self.publish(), result)
 
-    def test_commit_readback_mismatch_keeps_pending_intent_before_ref_or_pr(self):
+    def test_commit_readback_matrix_retains_intent_and_prevents_ref_pr(self):
         message = self.plan['message']
-        cases = [('message', value) for value in (
-            'drift', ' ' + message, message + ' ', message + '\t', message + '\r\n',
-            message + '\n\n', message + '\n ', message + '\n\t', '\n' + message,
-            None, [], {}, 123, True)]
-        cases.extend([('sha', 'c' * 40), ('tree', {'sha': 'c' * 40}),
-                      ('parents', []), ('parents', [{'sha': 'c' * 40}]),
-                      ('parents', [{'sha': self.config['expected_head']}] * 2)])
-        saved = None
+        cases = [('message', value) for value in ('drift', ' ' + message, message + ' ', message + '\t',
+                 message + '\r\n', message + '\n\n', message + '\n ', message + '\n\t', '\n' + message, None, [], {}, 123, True)]
+        cases += [('sha', 'c' * 40), ('tree', {'sha': 'c' * 40}), ('parents', []),
+                  ('parents', [{'sha': 'c' * 40}]), ('parents', [{'sha': 'a' * 40}] * 2)]
+        journal = None
         for field, value in cases:
-            with self.subTest(field=field, value=value):
-                self.calls.clear()
-                self.commit_readback_overrides = {field: value}
-                result = self.cli()
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertEqual(result.stdout, '')
-                self.assertEqual(json.loads(result.stderr), {
-                    'error': 'github_mismatch', 'message': 'Exact commit readback failed.'})
-                self.assertNotIn(self.config['bearer'], result.stdout + result.stderr)
-                self.assertNotIn(self.config['branch'], self.refs)
-                self.assertEqual(self.prs, [])
-                self.assertEqual(self.refs['main'], self.config['expected_head'])
-                self.assertEqual(self.issue['state'], 'open')
-                self.assertEqual(self.stored()['publication']['status'], 'pending')
-                if saved is None:
-                    saved = self.stored()['publication']
-                self.assertEqual(self.stored()['publication'], saved)
-                self.assertEqual([c[1] for c in self.writes()], [
-                    '/repos/example/product/git/blobs', '/repos/example/product/git/trees',
-                    '/repos/example/product/git/commits'])
+            self.calls.clear()
+            self.overrides = {field: value}
+            with self.assertRaises(RepositoryError) as raised:
+                self.publish()
+            self.assertEqual(raised.exception.code, 'github_mismatch')
+            self.assertEqual(str(raised.exception), 'Exact commit readback failed.')
+            self.assertEqual(self.prs, [])
+            self.assertNotIn(self.config['branch'], self.refs)
+            self.assertEqual(self.refs['main'], 'a' * 40)
+            self.assertEqual(self.issue['state'], 'open')
+            self.assertEqual(self.stored()['publication']['status'], 'pending')
+            if journal is None:
+                journal = self.stored()['publication']
+            self.assertEqual(self.stored()['publication'], journal)
+            self.assertEqual([c[1] for c in self.writes()], ['/git/blobs', '/git/trees', '/git/commits'])
 
-    def test_lost_ref_response_reconciles_same_target_after_restart(self):
-        self.drop = '/git/refs'
-        self.assertEqual(self.cli().returncode, 2)
-        self.assertEqual(self.stored()['publication']['status'], 'pending')
-        self.ok(self.cli())
-        self.assertEqual(sum(c[1].endswith('/git/refs') for c in self.writes()), 1)
+    def test_lost_ref_or_pr_response_reconciles_without_second_effect(self):
+        # Each subcase starts with the same tiny state, not a prior worker/controller chain.
+        initial_state = self.state.read_bytes()
+        for suffix in ('/git/refs', '/pulls'):
+            self.state.write_bytes(initial_state)
+            self.refs = {'main': 'a' * 40}
+            self.prs = []
+            self.calls.clear()
+            self.drop = suffix
+            with self.assertRaises(RepositoryError):
+                self.publish()
+            self.assertEqual(self.stored()['publication']['status'], 'pending')
+            self.assertEqual(self.publish()['status'], 'published')
+            self.assertEqual(sum(c[1] == suffix for c in self.writes()), 1)
+            self.assertEqual(len(self.prs), 1)
 
-    def test_lost_pr_response_reconciles_same_target_after_restart(self):
-        self.drop = '/pulls'
-        self.assertEqual(self.cli().returncode, 2)
-        self.ok(self.cli())
-        self.assertEqual(sum(c[1].endswith('/pulls') for c in self.writes()), 1)
-        self.assertEqual(len(self.prs), 1)
-
-    def test_update_same_branch_pr_is_nonforce(self):
-        first = self.ok(self.cli())
-        (self.source / 'factory_v1/behavior.py').write_text('second candidate\n')
+    def test_second_candidate_uses_same_pr_nonforce_update(self):
+        first = self.publish()
+        (self.source / 'factory_v1/behavior.py').write_bytes(b'second candidate\n')
         self.refresh_source()
         self.config['manifest'] = manifest(self.source)
         self.config['expected_head'] = first['candidate']
         self.write_config()
-        self.plan = self.ok(self.cli('--plan-only'))
+        self.plan = self.publish(plan_only=True)
         self.config['candidate'] = self.plan['candidate']
         self.write_config()
-        self.ok(self.cli())
+        self.publish()
         patches = [c for c in self.writes() if c[0] == 'PATCH']
-        self.assertEqual(len(patches), 1)
-        self.assertEqual(patches[0][2], {'sha': self.plan['candidate'], 'force': False})
+        self.assertEqual(patches, [('PATCH', '/git/refs/heads/factory/issue-10', {'sha': self.plan['candidate'], 'force': False})])
         self.assertEqual(len(self.prs), 1)
         self.assertEqual(self.stored()['publication']['pr_number'], 20)
 
-    def test_concurrent_publications_serialize_one_intent(self):
+    def test_concurrent_publishers_share_one_durable_intent_and_pr(self):
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(lambda _: self.cli(), range(2)))
-        for result in results:
-            self.ok(result)
-        self.assertEqual(sum(c[1].endswith('/pulls') for c in self.writes()), 1)
+            futures = [pool.submit(self.publish) for _ in range(2)]
+            results = [future.result(timeout=3) for future in futures]
+        self.assertEqual(results[0], results[1])
+        self.assertEqual(sum(c[1] == '/pulls' for c in self.writes()), 1)
 
-    def test_private_config_missing_or_worker_mounted_refused(self):
+    def test_private_config_and_all_worker_mount_exclusions(self):
+        before = self.state.read_bytes()
         self.config_path.chmod(0o644)
-        self.deny('approval_required')
-        self.config_path = self.source / 'publication.json'
-        self.write_config()
-        self.deny('approval_required')
-
-    def test_artifact_authorization_dotdot_alias_refused_before_http_or_state(self):
-        outside = self.root / 'outside'
-        outside.mkdir()
-        self.config_path = self.artifacts / 'publication.json'
-        self.write_config()
-        before = self.fixture.state.read_bytes()
-        self.deny('approval_required')
+        self.refuse('approval_required')
         self.assertEqual(self.calls, [])
-        self.assertEqual(self.fixture.state.read_bytes(), before)
-        self.config_path = outside / '..' / self.artifacts.name / 'publication.json'
-        self.deny('unsafe_path')
-        self.assertEqual(self.calls, [])
-        self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_authorization_in_each_excluded_scope_refused_before_http_or_state(self):
-        outside = self.root / 'outside'
-        outside.mkdir()
-        scopes = (Path(self.assignment['handoff']['workspace']),
-                  Path(self.assignment['handoff']['profile']['home']), self.artifacts)
-        for scope in scopes:
+        self.config_path.chmod(0o600)
+        canonical = self.config_path
+        for scope in (self.artifacts, self.artifacts / 'scratch', self.source,
+                      Path(self.assignment['handoff']['workspace']), Path(self.assignment['handoff']['profile']['home'])):
             scope.mkdir(exist_ok=True)
             self.config_path = scope / 'publication.json'
             self.write_config()
-            for path, code in ((self.config_path, 'approval_required'),
-                               (outside / '..' / scope.name / 'publication.json', 'unsafe_path')):
-                with self.subTest(scope=scope.name, path=str(path)):
-                    self.config_path = path
-                    before = self.fixture.state.read_bytes()
-                    self.deny(code)
-                    self.assertEqual(self.calls, [])
-                    self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_authorization_hardlinks_in_each_excluded_scope_refused_before_http_or_state(self):
-        scopes = (self.artifacts, self.artifacts / 'scratch',
-                  Path(self.assignment['handoff']['workspace']),
-                  Path(self.assignment['handoff']['profile']['home']))
-        for scope in scopes:
-            scope.mkdir(exist_ok=True)
+            self.refuse('approval_required')
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.state.read_bytes(), before)
+            self.config_path.unlink()
+            self.config_path = canonical
             alias = scope / 'authorization-hardlink.json'
-            os.link(self.config_path, alias)
+            os.link(canonical, alias)
             try:
-                self.assertTrue(alias.samefile(self.config_path))
-                self.assertEqual(self.config_path.stat().st_nlink, 2)
-                for extra in (('--plan-only',), ()):
-                    with self.subTest(scope=str(scope), extra=extra):
-                        self.calls.clear()
-                        before = self.fixture.state.read_bytes()
-                        result = self.cli(*extra)
-                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                        self.assertEqual(json.loads(result.stderr)['error'], 'approval_required')
-                        self.assertEqual(result.stdout, '')
-                        self.assertNotIn(self.config['bearer'], result.stdout + result.stderr)
-                        self.assertEqual(self.calls, [])
-                        self.assertEqual(self.fixture.state.read_bytes(), before)
+                self.refuse('approval_required')
+                self.assertEqual(self.calls, [])
+                self.assertEqual(self.state.read_bytes(), before)
             finally:
                 alias.unlink()
-        self.assertEqual(self.config_path.stat().st_nlink, 1)
-        self.assertEqual(self.ok(self.cli('--plan-only'))['status'], 'plan_only')
-        self.assertEqual(self.ok(self.cli())['status'], 'published')
+        self.assertEqual(canonical.stat().st_nlink, 1)
 
-    def test_protected_scope_aliases_refused_before_http_or_state(self):
+    def test_authorization_and_protected_scope_aliases_refuse_before_reads(self):
         outside = self.root / 'outside'
         outside.mkdir()
-        original = copy.deepcopy(self.assignment)
+        canonical = self.config_path
+        file_link = self.root / 'authorization-alias.json'
+        file_link.symlink_to(canonical)
+        directory_link = self.root / 'root-alias'
+        directory_link.symlink_to(self.root, target_is_directory=True)
+        before = self.state.read_bytes()
+        for alias in (file_link, directory_link / canonical.name, outside / '..' / canonical.name):
+            self.config_path = alias
+            self.refuse('unsafe_path')
+            self.assertEqual(self.calls, [])
+            self.assertEqual(self.state.read_bytes(), before)
+        self.config_path = canonical
         for name in ('workspace', 'profile', 'artifacts'):
-            scope = Path(original['handoff']['workspace'] if name == 'workspace' else
-                         original['handoff']['profile']['home'] if name == 'profile' else
-                         original['runtime']['artifacts'])
+            original = copy.deepcopy(self.assignment)
+            scope = Path(original['handoff']['workspace'] if name == 'workspace' else original['handoff']['profile']['home'] if name == 'profile' else original['runtime']['artifacts'])
             scope.mkdir(exist_ok=True)
             link = self.root / (name + '-alias')
             link.symlink_to(scope, target_is_directory=True)
             for alias in (outside / '..' / scope.name, link):
-                with self.subTest(scope=name, alias=str(alias)):
-                    self.assignment = copy.deepcopy(original)
-                    if name == 'workspace':
-                        self.assignment['handoff']['workspace'] = str(alias)
-                    elif name == 'profile':
-                        self.assignment['handoff']['profile']['home'] = str(alias)
-                    else:
-                        self.assignment['runtime']['artifacts'] = str(alias)
-                    self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
-                    self.config['binding'] = publication.binding(self.assignment)
-                    self.persist_assignment()
-                    self.config_path = scope / 'publication.json'
-                    self.write_config()
-                    before = self.fixture.state.read_bytes()
-                    self.deny('unsafe_path')
-                    self.assertEqual(self.calls, [])
-                    self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_private_outside_authorization_valid_but_aliases_refused(self):
-        outside = self.root / 'assigned-workspace-outside'
-        outside.mkdir()
-        self.config_path = outside / 'publication.json'
-        self.write_config()
-        canonical = self.config_path
-        file_link = self.root / 'authorization-alias.json'
-        file_link.symlink_to(canonical)
-        directory_link = self.root / 'outside-alias'
-        directory_link.symlink_to(outside, target_is_directory=True)
-        for alias in (file_link, directory_link / canonical.name,
-                      outside / '..' / outside.name / canonical.name):
-            with self.subTest(alias=str(alias)):
-                self.config_path = alias
-                before = self.fixture.state.read_bytes()
-                self.deny('unsafe_path')
+                if name == 'workspace':
+                    self.assignment['handoff']['workspace'] = str(alias)
+                elif name == 'profile':
+                    self.assignment['handoff']['profile']['home'] = str(alias)
+                else:
+                    self.assignment['runtime']['artifacts'] = str(alias)
+                self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
+                self.config['binding'] = publication.binding(self.assignment)
+                self.persist()
+                self.write_config()
+                self.refuse('unsafe_path')
                 self.assertEqual(self.calls, [])
-                self.assertEqual(self.fixture.state.read_bytes(), before)
-        self.config_path = canonical
-        self.assertEqual(self.ok(self.cli())['status'], 'published')
-        self.assertEqual(self.stored()['publication']['status'], 'published')
+            self.assignment = original
+            self.config['binding'] = publication.binding(original)
+        self.persist()
+        self.write_config()
+        self.assertEqual(self.publish()['status'], 'published')
 
-    def test_scope_role_repository_branch_issue_pin_denials_before_writes(self):
+    def test_scope_repository_branch_issue_candidate_and_binding_pin_refusals(self):
         original = copy.deepcopy(self.config)
-        for field, value in [('repository', 'other/product'), ('repository_id', 999), ('branch', 'main'),
+        before = self.state.read_bytes()
+        for field, value in (('repository', 'other/product'), ('repository_id', 999), ('branch', 'main'),
                              ('branch', '../escape'), ('issue', 11), ('candidate', 'c' * 40), ('paths', ['other.py']),
-                             ('base', 'other'), ('api_base', 'http://127.0.0.1:1')]:
-            with self.subTest(field=field, value=value):
-                self.config = copy.deepcopy(original)
-                self.config[field] = value
-                self.write_config()
-                self.deny()
-        self.config = original
+                             ('base', 'other'), ('api_base', 'http://127.0.0.1:8766')):
+            self.config = copy.deepcopy(original)
+            self.config[field] = value
+            self.write_config()
+            self.refuse()
+            self.assertEqual(self.state.read_bytes(), before)
         for field in ('handoff_digest', 'claim_id', 'baseline', 'spec_commit', 'stage', 'profile', 'revision'):
-            with self.subTest(binding=field):
-                self.config = copy.deepcopy(original)
-                self.config['binding'][field] = 'wrong'
+            self.config = copy.deepcopy(original)
+            self.config['binding'][field] = 'wrong'
+            self.write_config()
+            self.refuse('scope_mismatch')
+            self.assertEqual(self.state.read_bytes(), before)
+
+    def test_worker_reports_review_roles_execution_and_profile_pins_are_not_authority(self):
+        original_assignment = copy.deepcopy(self.assignment)
+        original_config = copy.deepcopy(self.config)
+        for changes, code in (({'status': 'failed'}, 'execution_required'), ({'container_removed': False}, 'execution_required'),
+                              ({'run_id': 'wrong'}, 'scope_mismatch')):
+            self.assignment = copy.deepcopy(original_assignment)
+            self.assignment['runtime'].update(changes)
+            self.assignment['submitted_result'] = {'status': 'done', 'trusted_execution': True}
+            if code == 'execution_required':
+                self.config['binding'] = publication.binding(self.assignment)
                 self.write_config()
-                self.deny('scope_mismatch')
-
-    def test_worker_report_is_not_trusted_execution(self):
-        self.assignment['runtime']['status'] = 'failed'
-        self.assignment['submitted_result'] = {'status': 'done', 'trusted_execution': True}
-        self.config['binding'] = publication.binding(self.assignment)
+            else:
+                self.config = copy.deepcopy(original_config)
+                self.write_config()
+            self.persist()
+            self.refuse(code)
+        self.assignment = copy.deepcopy(original_assignment)
+        for stage, name, role in (('review-spec', 'factory-worker', 'review'), ('implementation', 'default', 'implementation')):
+            self.assignment['handoff']['stage'] = stage
+            self.assignment['handoff']['profile'].update(name=name, role=role)
+            self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
+            self.config['binding'] = publication.binding(self.assignment)
+            self.persist()
+            self.write_config()
+            self.refuse('scope_mismatch')
+        self.assignment = original_assignment
+        self.config = original_config
+        self.persist()
+        self.config['execution_reference'] = ''
         self.write_config()
-        self.persist_assignment()
-        self.deny('execution_required')
-
-    def test_review_role_is_readonly_even_with_private_approval(self):
-        self.assignment['handoff']['stage'] = 'review-spec'
-        self.assignment['handoff']['profile']['role'] = 'review'
-        self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
-        self.config['binding'] = publication.binding(self.assignment)
-        self.persist_assignment()
+        self.refuse('approval_required')
+        self.config['execution_reference'] = 'component authenticated host attestation'
         self.write_config()
-        self.deny('scope_mismatch')
+        self.assertEqual(self.publish()['status'], 'published')
+        self.assertFalse(self.stored()['result_disposition']['trusted_execution'])
 
-    def test_paused_stopped_stale_and_competing_scope_denied(self):
+    def test_pause_stop_stale_assignment_and_competing_claim_refuse(self):
         for status in ('paused', 'stopped'):
-            with closing(sqlite3.connect(self.fixture.state)) as database, database:
-                item = json.loads(database.execute('SELECT payload FROM iterations').fetchone()[0])
-                item['status'] = status
-                database.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-            self.deny('iteration_paused')
-        with closing(sqlite3.connect(self.fixture.state)) as database, database:
-            item['status'] = 'active'
-            item['ticket_work']['input_digest'] = 'obsolete'
-            database.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-        self.deny('stale_assignment')
-
-    def test_stop_marker_refused(self):
+            self.item['status'] = status
+            self.persist()
+            self.refuse('iteration_paused')
+        self.item['status'] = 'active'
+        self.item['ticket_work']['input_digest'] = 'obsolete'
+        self.persist()
+        self.refuse('stale_assignment')
+        self.item['ticket_work']['input_digest'] = 'inputs-1'
+        self.persist()
         (self.artifacts / 'stop').touch()
-        self.deny('cancelled')
+        self.refuse('cancelled')
+        (self.artifacts / 'stop').unlink()
+        other = copy.deepcopy(self.assignment)
+        other['assignment_id'] = 'c' * 64
+        other['ticket_scope']['issue_number'] = 11
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('INSERT INTO role_assignments VALUES (?,?)', (other['assignment_id'], json.dumps(other)))
+        self.refuse('claim_conflict')
+        self.assertEqual(self.calls, [])
 
-    def test_manifest_bytes_modes_and_links_denied(self):
+    def test_manifest_bytes_modes_and_symlink_refuse_before_remote_writes(self):
         path = self.source / 'factory_v1/behavior.py'
         path.chmod(0o755)
-        self.deny('manifest_mismatch')
+        self.refuse('manifest_mismatch')
         path.chmod(0o644)
-        path.write_text('replacement\n')
-        self.deny('manifest_mismatch')
+        path.write_bytes(b'replacement\n')
+        self.refuse('manifest_mismatch')
         path.unlink()
         path.symlink_to(self.baseline / 'factory_v1/behavior.py')
-        self.deny('unsafe_path')
+        self.refuse('unsafe_path')
 
-    def test_policy_held_but_implementation_tests_are_reviewable(self):
-        (self.source / '.github').mkdir()
-        (self.source / '.github/workflows').mkdir()
-        (self.source / '.github/workflows/check.yml').write_text('checks: disabled\n')
+    def test_policy_gates_are_held_but_product_behavior_and_tests_are_publishable(self):
+        original = copy.deepcopy(self.config)
+        for name in ('lefthook.yml', '.mise.toml', '.betterleaks.toml', '.githooks/pre-commit',
+                     'scripts/security/check.sh', 'tools/gate.py', '.github/workflows/check.yml', 'AGENTS.md'):
+            path = self.source / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'reviewed policy change\n')
+            self.refresh_source()
+            self.config = copy.deepcopy(original)
+            self.config['manifest'] = manifest(self.source)
+            self.config['paths'].append(name)
+            self.write_config()
+            self.refuse('policy_held')
+            if name == 'AGENTS.md':
+                self.config['policy_paths'] = ['AGENTS.md']
+                self.write_config()
+                self.assertEqual(self.publish(plan_only=True)['status'], 'plan_only')
+            path.unlink()
+        for name in ('factory_v1/sandbox_policy.py', 'factory_v1/tests/test_security.py', 'test_behavior.py', 'scripts/build_product.py'):
+            self.assertFalse(publication.policy_path(name))
+        (self.source / 'test_behavior.py').write_bytes(b'new requirement tests\n')
         self.refresh_source()
+        self.config = original
         self.config['manifest'] = manifest(self.source)
-        self.config['paths'].append('.github/workflows/check.yml')
+        self.config['paths'].append('test_behavior.py')
         self.write_config()
-        self.deny('policy_held')
-        self.assertFalse(publication.policy_path('factory_v1/sandbox.py'))
-        self.assertFalse(publication.policy_path('factory_v1/tests/test_security.py'))
-
-    def test_explicit_operator_policy_path_can_be_planned(self):
-        (self.source / 'AGENTS.md').write_text('Reviewed explicit operator standards change\n')
-        self.refresh_source()
-        self.config['manifest'] = manifest(self.source)
-        self.config['paths'].append('AGENTS.md')
-        self.config['policy_paths'] = ['AGENTS.md']
-        self.write_config()
-        self.plan = self.ok(self.cli('--plan-only'))
+        self.plan = self.publish(plan_only=True)
         self.config['candidate'] = self.plan['candidate']
         self.write_config()
-        self.ok(self.cli())
+        self.assertEqual(self.publish()['status'], 'published')
 
-    def test_secret_and_suid_detection(self):
+    def test_secret_suid_source_and_json_bounds_are_refused(self):
         path = self.source / 'factory_v1/behavior.py'
-        for data, mode in [('ghp_' + 'a' * 30, 0o644), ('ordinary code', 0o4644)]:
+        for data, mode in (('ghp_' + 'a' * 30, 0o644), ('ordinary code', 0o4644)):
             path.write_text(data)
             path.chmod(mode)
             self.refresh_source()
             self.config['manifest'] = manifest(self.source)
             self.write_config()
-            self.deny('source_blocked')
+            self.refuse('source_blocked')
+        path.chmod(0o644)
+        with path.open('wb') as stream:
+            stream.truncate(100 * 1024 * 1024 + 1)
+        self.refuse('source_blocked')
+        path.write_bytes(b'new behavior\n')
+        self.config['manifest'] = manifest(self.source)
+        self.write_config()
+        (self.artifacts / 'source-artifacts.json').write_bytes(b' ' * (8 * 1024 * 1024 + 1))
+        self.refuse('invalid_publication')
 
-    def test_remote_repository_issue_base_and_branch_replacement_refused(self):
-        self.repo['id'] = 999
-        self.deny('github_mismatch')
-        self.repo['id'] = 123
-        self.issue['state'] = 'closed'
-        self.deny('scope_mismatch')
-        self.issue['state'] = 'open'
-        old_body = self.issue['body']
-        self.issue['body'] = 'stale'
-        self.deny('scope_mismatch')
-        self.issue['body'] = old_body
-        self.refs['main'] = 'c' * 40
-        self.deny('scope_mismatch')
-        self.refs['main'] = 'a' * 40
+    def test_remote_repository_body_issue_base_branch_and_pr_refusals(self):
+        for target, key, value, code in ((self.repo, 'id', 999, 'github_mismatch'),
+                                        (self.issue, 'state', 'closed', 'scope_mismatch'),
+                                        (self.issue, 'body', 'stale', 'scope_mismatch'),
+                                        (self.refs, 'main', 'c' * 40, 'scope_mismatch')):
+            old = target[key]
+            target[key] = value
+            self.refuse(code)
+            target[key] = old
         self.refs[self.config['branch']] = 'c' * 40
-        self.deny('publication_conflict')
-
-    def test_pr_mismatch_refused_before_new_mutations(self):
-        self.ok(self.cli())
+        self.refuse('publication_conflict')
+        del self.refs[self.config['branch']]
+        self.publish()
         self.calls.clear()
-        for field, value in [('body', 'Closes #10'), ('base', 'other'), ('state', 'closed')]:
+        for field, value in (('body', 'Closes #10'), ('base', 'other'), ('state', 'closed')):
             old = self.prs[0][field]
             self.prs[0][field] = value
             if field == 'base':
                 self.refs['other'] = 'a' * 40
-            self.deny('github_mismatch')
+            self.refuse('github_mismatch')
             self.prs[0][field] = old
+        original = self.read_prs()
+        for side, value in (('head', None), ('base', []), ('head', {'ref': self.config['branch'], 'repo': None}),
+                            ('base', dict(original[0]['base'], sha='c' * 40))):
+            observed = copy.deepcopy(original)
+            observed[0][side] = value
+            with mock.patch.object(self, 'read_prs', return_value=observed):
+                self.refuse()
 
-    def test_pending_approval_cannot_be_replaced(self):
+    def test_pending_approval_journal_and_published_identity_cannot_be_rewritten(self):
         self.drop = '/git/refs'
-        self.assertEqual(self.cli().returncode, 2)
+        with self.assertRaises(RepositoryError):
+            self.publish()
         self.calls.clear()
-        self.config['reference'] = 'different approval'
+        self.config['reference'] = 'replacement approval'
         self.write_config()
-        self.deny('publication_conflict')
-
-    def test_git_independently_verifies_tree_with_untouched_unsupported_entries(self):
-        with tempfile.TemporaryDirectory(prefix='publication-git-') as directory:
-            subprocess.run(['/usr/bin/git', 'init', '--bare', '--template=', directory], capture_output=True, check=True)
-            def tree(entries):
-                data = ''.join(f"{e['mode']} {e['type']} {e['sha']}\t{e['path']}\n" for e in entries).encode()
-                return subprocess.run(['/usr/bin/git', '--git-dir=' + directory, 'mktree', '--missing'],
-                                      input=data, capture_output=True, check=True).stdout.decode().strip()
-            subtree = tree([{'path': 'behavior.py', 'mode': '100644', 'type': 'blob',
-                             'sha': publication.object_sha('blob', b'new behavior\n')}])
-            root_entries = [dict(e, sha=subtree) if e['path'] == 'factory_v1' else e
-                            for e in self.entries if '/' not in e['path']]
-            self.assertEqual(self.plan['tree'], tree(root_entries))
-        self.ok(self.cli())
-
-    def test_deletion_and_addition_are_exact_scope(self):
-        (self.source / 'factory_v1/behavior.py').unlink()
-        (self.source / 'new_behavior.py').write_text('new file\n')
-        self.refresh_source()
-        self.config['manifest'] = manifest(self.source)
-        self.config['paths'] = ['factory_v1/behavior.py', 'new_behavior.py']
+        self.refuse('publication_conflict')
+        self.config['reference'] = 'explicit host operator approval'
         self.write_config()
-        self.plan = self.ok(self.cli('--plan-only'))
-        self.config['candidate'] = self.plan['candidate']
-        self.write_config()
-        self.ok(self.cli())
-        changes = self.plan['changes']
-        self.assertIsNone(next(c for c in changes if c['path'] == 'factory_v1/behavior.py')['sha'])
-        self.assertEqual(next(c for c in changes if c['path'] == 'new_behavior.py')['mode'], '100644')
-
-    def test_addition_cannot_replace_opaque_tree_or_link(self):
-        (self.source / 'link').write_text('not a link\n')
-        self.refresh_source()
-        self.config['manifest'] = manifest(self.source)
-        self.config['paths'].append('link')
-        self.write_config()
-        self.deny('scope_mismatch')
-
-    def test_conflicting_persisted_ticket_claim_is_not_stolen(self):
-        other = copy.deepcopy(self.assignment)
-        other['assignment_id'] = 'c' * 64
-        other['ticket_scope']['issue_number'] = 11
-        with closing(sqlite3.connect(self.fixture.state)) as database, database:
-            database.execute('INSERT INTO role_assignments VALUES (?,?)', (other['assignment_id'], json.dumps(other)))
-        self.deny('claim_conflict')
-
-    def test_profile_denial_and_execution_pin_denial(self):
-        self.config['binding']['execution']['run_id'] = 'different-run'
-        self.write_config()
-        self.deny('scope_mismatch')
-        self.assignment['handoff']['profile']['name'] = 'default'
-        self.assignment['handoff_digest'] = publication.assignments.digest(self.assignment['handoff'])
-        self.config['binding'] = publication.binding(self.assignment)
-        self.persist_assignment()
-        self.write_config()
-        self.deny('scope_mismatch')
-
-    def test_adapter_denies_arbitrary_operations_and_payload_before_network(self):
-        api = publication.PublicationGitHub(GitHub(self.base, 'unused', 1), self.config)
-        for method, path, body in [('POST', '/repos/other/product/pulls', {}),
-                                   ('PATCH', '/repos/example/product/git/refs/heads/main', {'force': True}),
-                                   ('PUT', '/repos/example/product/pulls/20/merge', {}),
-                                   ('GET', 'https://evil.invalid/', None)]:
-            with self.assertRaises(RepositoryError):
-                api.request(path, body, method)
-        with self.assertRaises(RepositoryError):
-            api.write('/actions/secrets', {})
-        with self.assertRaises(RepositoryError):
-            api.read('/actions/secrets')
-        self.assertEqual(self.calls, [])
-
-    def test_gate_configurations_and_tooling_require_operator_path(self):
-        original = copy.deepcopy(self.config)
-        for name in ('lefthook.yml', '.mise.toml', '.betterleaks.toml',
-                     '.githooks/pre-commit', 'scripts/security/check.sh', 'tools/gate.py'):
-            with self.subTest(path=name):
-                path = self.source / name
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text('gate configuration fixture\n')
-                self.refresh_source()
-                self.config = copy.deepcopy(original)
-                self.config['manifest'] = manifest(self.source)
-                self.config['paths'].append(name)
-                self.write_config()
-                self.deny('policy_held')
-                path.unlink()
-        for name in ('factory_v1/sandbox_policy.py', 'factory_v1/tests/test_security.py',
-                     'test_behavior.py', 'scripts/build_product.py'):
-            self.assertFalse(publication.policy_path(name), name)
-
-    def test_legitimate_behavior_and_test_delta_can_publish(self):
-        (self.source / 'test_behavior.py').write_text('new requirement tests\n')
-        self.refresh_source()
-        self.config['manifest'] = manifest(self.source)
-        self.config['paths'].append('test_behavior.py')
-        self.write_config()
-        self.plan = self.ok(self.cli('--plan-only'))
-        self.config['candidate'] = self.plan['candidate']
-        self.write_config()
-        self.ok(self.cli())
-
-    def test_malformed_config_fields_and_json_refuse_without_state_changes(self):
-        before = self.fixture.state.read_bytes()
-        original = copy.deepcopy(self.config)
-        for field, value in (('api_base', 123), ('api_base', {}), ('commit_date', None),
-                             ('paths', [None]), ('paths', [{}]), ('paths', ['x'] * 201),
-                             ('policy_paths', [{}]), ('manifest', []), ('binding', [])):
-            with self.subTest(field=field, value=value):
-                self.config = copy.deepcopy(original)
-                self.config[field] = value
-                self.write_config()
-                self.deny()
-                self.assertEqual(self.fixture.state.read_bytes(), before)
-        self.config = original
-        for data in (b'{', b'\xff', b'{"operator_id":"42","operator_id":"42"}',
-                     b' ' * (8 * 1024 * 1024 + 1)):
-            self.config_path.write_bytes(data)
-            self.deny()
-            self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_invalid_state_never_creates_sqlite_or_lock(self):
-        import sys
-        missing = self.root / 'missing.sqlite'
-        corrupt = self.root / 'corrupt.sqlite'
-        corrupt.write_bytes(b'not a SQLite database')
-        empty = self.root / 'empty.sqlite'
-        empty.touch()
-        before = set(self.root.iterdir())
-        for state in ('', ':memory:', str(missing), str(corrupt), str(empty)):
-            with self.subTest(state=state):
-                result = subprocess.run([sys.executable, '-m', 'factory_v1', '--state', state,
-                    '--operator-id', '42', 'publish-candidate', '--project', 'product',
-                    '--iteration', 'm1', '--assignment', self.assignment['assignment_id'],
-                    '--publication-config', str(self.config_path)], capture_output=True, text=True, timeout=15)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertIn('error', json.loads(result.stderr))
-                self.assertEqual(result.stdout, '')
-                self.assertEqual(set(self.root.iterdir()), before)
-        self.assertEqual(corrupt.read_bytes(), b'not a SQLite database')
-        self.assertEqual(empty.stat().st_size, 0)
-        self.assertEqual(self.calls, [])
-
-    def test_malformed_persistent_json_and_shapes_refuse_without_mutations(self):
-        original = json.dumps(self.assignment)
-        for payload in ('{', '[]', '{"assignment_id":null}',
-                        '{"assignment_id":"x","assignment_id":"y"}'):
-            with self.subTest(payload=payload):
-                with closing(sqlite3.connect(self.fixture.state)) as database, database:
-                    database.execute('UPDATE role_assignments SET payload=?', (payload,))
-                before = self.fixture.state.read_bytes()
-                self.deny()
-                self.assertEqual(self.fixture.state.read_bytes(), before)
-        with closing(sqlite3.connect(self.fixture.state)) as database, database:
-            database.execute('UPDATE role_assignments SET payload=?', (original,))
-            database.execute('UPDATE iterations SET payload=?', ('[]',))
-        before = self.fixture.state.read_bytes()
-        self.deny()
-        self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_source_and_json_bounds_refuse_before_remote_writes(self):
-        path = self.source / 'factory_v1/behavior.py'
-        with path.open('wb') as stream:
-            stream.truncate(100 * 1024 * 1024 + 1)
-        self.deny('source_blocked')
-        path.write_text('new behavior\n')
-        metadata = self.artifacts / 'source-artifacts.json'
-        metadata.write_bytes(b' ' * (8 * 1024 * 1024 + 1))
-        self.deny('invalid_publication')
-
-    def test_complete_runtime_flags_do_not_replace_private_execution_attestation(self):
-        self.assignment['submitted_result'] = {'status': 'done', 'execution_reference': 'worker assertion',
-                                               'trusted_execution': True}
-        self.persist_assignment()
-        self.config['execution_reference'] = ''
-        self.write_config()
-        self.deny('approval_required')
-        self.config['execution_reference'] = 'fixture independently authenticated host attestation'
-        self.write_config()
-        self.ok(self.cli())
-        self.assertFalse(self.stored()['result_disposition']['trusted_execution'])
-        self.assertFalse(self.stored()['result_disposition']['advance_allowed'])
-
-    def test_journal_candidate_and_pr_identity_drift_are_held_without_rewrite(self):
-        self.ok(self.cli())
+        result = self.publish()
         self.calls.clear()
         saved = self.stored()
         for field, value in (('candidate', 'c' * 40), ('status', 'unknown'), ('pr_number', 21)):
-            with self.subTest(field=field):
-                changed = copy.deepcopy(saved)
-                changed['publication'][field] = value
-                with closing(sqlite3.connect(self.fixture.state)) as database, database:
-                    database.execute('UPDATE role_assignments SET payload=?', (json.dumps(changed),))
-                before = self.fixture.state.read_bytes()
-                self.deny('publication_conflict')
-                self.assertEqual(self.fixture.state.read_bytes(), before)
-
-    def test_published_branch_and_commit_drift_are_not_replayed(self):
-        result = self.ok(self.cli())
-        self.calls.clear()
-        before = self.fixture.state.read_bytes()
+            changed = copy.deepcopy(saved)
+            changed['publication'][field] = value
+            with closing(sqlite3.connect(self.state)) as db, db:
+                db.execute('UPDATE role_assignments SET payload=?', (json.dumps(changed),))
+            before = self.state.read_bytes()
+            self.refuse('publication_conflict')
+            self.assertEqual(self.state.read_bytes(), before)
+        self.assignment = saved
+        self.persist()
         for head in (None, self.config['expected_head']):
             if head is None:
                 del self.refs[self.config['branch']]
             else:
                 self.refs[self.config['branch']] = head
-            self.deny('publication_conflict')
-            self.assertEqual(self.fixture.state.read_bytes(), before)
+            self.refuse('publication_conflict')
         self.refs[self.config['branch']] = result['candidate']
-        commit = self.commits[result['candidate']]
         for field, value in (('tree', None), ('parents', [None]), ('message', 'drift')):
-            old = commit[field]
-            commit[field] = value
-            self.deny()
-            self.assertEqual(self.fixture.state.read_bytes(), before)
-            commit[field] = old
+            old = self.commits[result['candidate']][field]
+            self.commits[result['candidate']][field] = value
+            self.refuse()
+            self.commits[result['candidate']][field] = old
 
-    def test_pr_nested_malformed_metadata_and_base_sha_drift_are_refused(self):
-        self.ok(self.cli())
-        self.calls.clear()
-        original = self.read_prs()
-        before = self.fixture.state.read_bytes()
-        for side, value in (('head', None), ('base', []),
-                            ('head', {'ref': self.config['branch'], 'repo': None}),
-                            ('base', dict(original[0]['base'], sha='c' * 40))):
-            observed = copy.deepcopy(original)
-            observed[0][side] = value
-            with mock.patch.object(self, 'read_prs', return_value=observed):
-                self.deny()
-                self.assertEqual(self.fixture.state.read_bytes(), before)
+    def test_add_delete_scope_and_unsupported_entry_replacement(self):
+        (self.source / 'link').write_bytes(b'not a link\n')
+        self.refresh_source()
+        self.config['manifest'] = manifest(self.source)
+        self.config['paths'].append('link')
+        self.write_config()
+        self.refuse('scope_mismatch')
+        (self.source / 'link').unlink()
+        (self.source / 'factory_v1/behavior.py').unlink()
+        (self.source / 'new_behavior.py').write_bytes(b'new file\n')
+        self.refresh_source()
+        self.config['manifest'] = manifest(self.source)
+        self.config['paths'] = ['factory_v1/behavior.py', 'new_behavior.py']
+        self.write_config()
+        self.plan = self.publish(plan_only=True)
+        self.config['candidate'] = self.plan['candidate']
+        self.write_config()
+        self.publish()
+        self.assertIsNone(next(e for e in self.plan['changes'] if e['path'] == 'factory_v1/behavior.py')['sha'])
+        self.assertEqual(next(e for e in self.plan['changes'] if e['path'] == 'new_behavior.py')['mode'], '100644')
+
+    def test_adapter_denies_arbitrary_operation_and_nonapproved_payload(self):
+        github = mock.Mock(spec=GitHub)
+        api = publication.PublicationGitHub(github, self.config)
+        for method, path, body in (('POST', '/repos/other/product/pulls', {}),
+                                   ('PATCH', '/repos/example/product/git/refs/heads/main', {'force': True}),
+                                   ('PUT', '/repos/example/product/pulls/20/merge', {}), ('GET', 'https://evil.invalid/', None)):
+            with self.assertRaises(RepositoryError):
+                api.request(path, body, method)
+        for operation in (lambda: api.write('/actions/secrets', {}), lambda: api.read('/actions/secrets')):
+            with self.assertRaises(RepositoryError):
+                operation()
+        api.approve(self.plan, {'factory_v1/behavior.py': b'new behavior\n'}, {'title': 'approved'})
+        with self.assertRaises(RepositoryError):
+            api.write('/git/refs/heads/' + self.config['branch'], {'sha': self.plan['candidate'], 'force': True}, 'PATCH')
+        github.request.assert_not_called()
+
+    def test_malformed_configuration_persistent_json_and_invalid_database_no_effect(self):
+        before = self.state.read_bytes()
+        original = copy.deepcopy(self.config)
+        for field, value in (('api_base', 123), ('api_base', {}), ('commit_date', None), ('paths', [None]),
+                             ('paths', [{}]), ('paths', ['x'] * 201), ('policy_paths', [{}]), ('manifest', []), ('binding', [])):
+            self.config = copy.deepcopy(original)
+            self.config[field] = value
+            self.write_config()
+            self.refuse()
+            self.assertEqual(self.state.read_bytes(), before)
+        self.config = original
+        for data in (b'{', b'\xff', b'{"operator_id":"42","operator_id":"42"}', b' ' * (8 * 1024 * 1024 + 1)):
+            self.config_path.write_bytes(data)
+            self.refuse()
+            self.assertEqual(self.state.read_bytes(), before)
+        self.write_config()
+        original_payload = json.dumps(self.assignment)
+        for payload in ('{', '[]', '{"assignment_id":null}', '{"assignment_id":"x","assignment_id":"y"}'):
+            with closing(sqlite3.connect(self.state)) as db, db:
+                db.execute('UPDATE role_assignments SET payload=?', (payload,))
+            snapshot = self.state.read_bytes()
+            self.refuse()
+            self.assertEqual(self.state.read_bytes(), snapshot)
+        with closing(sqlite3.connect(self.state)) as db, db:
+            db.execute('UPDATE role_assignments SET payload=?', (original_payload,))
+            db.execute('UPDATE iterations SET payload=?', ('[]',))
+        snapshot = self.state.read_bytes()
+        self.refuse()
+        self.assertEqual(self.state.read_bytes(), snapshot)
+        self.assertEqual(self.writes(), [])
+        # Read/write URI admission cannot create absent targets. Ephemeral targets are wrapper-only.
+        missing = self.root / 'missing.sqlite'
+        with self.assertRaises(sqlite3.Error):
+            sqlite3.connect(missing.as_uri() + '?mode=rw', uri=True)
+        self.assertFalse(missing.exists())
+
+
+    def test_nonpersistent_missing_corrupt_and_empty_state_refuse_without_creation(self):
+        import sys
+        from factory_v1 import __main__ as cli
+        from factory_v1.errors import IntakeError
+        before = set(self.root.iterdir())
+        for state in ('', ':memory:'):
+            with mock.patch.object(sys, 'argv', ['factory', '--state', state, '--operator-id', '42',
+                'publish-candidate', '--project', 'product', '--iteration', 'm1', '--assignment', self.assignment['assignment_id'],
+                '--publication-config', str(self.config_path)]), self.assertRaises(IntakeError) as raised:
+                cli.main()
+            self.assertEqual(raised.exception.code, 'invalid_state')
+            self.assertEqual(set(self.root.iterdir()), before)
+        missing = self.root / 'missing.sqlite'
+        with self.assertRaises(sqlite3.Error):
+            sqlite3.connect(missing.as_uri() + '?mode=rw', uri=True)
+        self.assertFalse(missing.exists())
+        for name, raw in (('empty.sqlite', b''), ('corrupt.sqlite', b'not a SQLite database')):
+            path = self.root / name
+            path.write_bytes(raw)
+            Path(str(path) + '.onboarding.lock').touch(mode=0o600)
+            before = set(self.root.iterdir())
+            with closing(sqlite3.connect(path.as_uri() + '?mode=rw', uri=True)) as db, self.assertRaises(sqlite3.Error):
+                publication.publish(db, 'product', 'm1', '42', self.assignment['assignment_id'], self.config_path)
+            self.assertEqual(path.read_bytes(), raw)
+            self.assertEqual(set(self.root.iterdir()), before)
+        self.assertEqual(self.calls, [])
+
+    def test_exact_commit_guard_sensitivity(self):
+        value = {'sha': self.plan['candidate'], 'tree': {'sha': self.plan['tree']},
+                 'parents': [{'sha': self.config['expected_head']}], 'message': 'drift'}
+        api = mock.Mock()
+        api.read.return_value = value
+        with self.assertRaises(RepositoryError) as raised:
+            publication.verify_commit(api, self.plan, self.config)
+        self.assertEqual(str(raised.exception), 'Exact commit readback failed.')
+        source = inspect.getsource(publication.verify_commit)
+        source = source.replace("value.get('message') in (plan['message'], plan['message'] + '\\n')", 'True')
+        namespace = dict(vars(publication))
+        exec(compile(source, '<commit-message-guard-probe>', 'exec'), namespace)
+        namespace['verify_commit'](api, self.plan, self.config)

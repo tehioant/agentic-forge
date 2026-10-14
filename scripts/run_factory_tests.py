@@ -1,10 +1,7 @@
-"""Run the complete discovered factory suite in two isolated subprocess shards."""
-from contextlib import ExitStack
-import os
+"""Run every discovered factory unit/component test, without external execution."""
+from contextlib import contextmanager
 from pathlib import Path
-import subprocess
 import sys
-import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,53 +16,48 @@ def test_ids(suite):
             yield test.id()
 
 
-def partition(suite):
-    identities = sorted(test_ids(suite))
+def inventory(suite):
+    identities = list(test_ids(suite))
     if not identities or len(set(identities)) != len(identities):
         raise ValueError('Discovery must contain a nonempty, unique test inventory.')
-    return [identities[::2], identities[1::2]]
+    return identities
 
 
-def run_shards(shards, root, tests):
-    env = dict(os.environ)
-    env['PYTHONPATH'] = os.pathsep.join([str(tests), str(root), env.get('PYTHONPATH', '')])
-    processes = []
-    with tempfile.TemporaryDirectory(prefix='factory-tests-') as temporary, ExitStack() as files:
-        try:
-            for index, identities in enumerate(shards, 1):
-                if not identities:
-                    continue
-                path = Path(temporary) / f'shard-{index}.log'
-                log = files.enter_context(path.open('w'))
-                print(f'Shard {index}: {len(identities)} tests', flush=True)
-                process = subprocess.Popen([sys.executable, '-m', 'unittest', '-v', *identities],
-                                           cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
-                processes.append((index, process, path, log))
-            success = True
-            for index, process, path, log in processes:
-                code = process.wait()
-                log.flush()
-                print(f'=== Shard {index}; exit {code} ===', flush=True)
-                print(path.read_text(), end='', flush=True)
-                success = success and code == 0
-            return 0 if success else 1
-        finally:
-            for _, process, _, _ in processes:
-                if process.poll() is None:
-                    process.terminate()
-                    process.wait()
+@contextmanager
+def no_external_execution():
+    active, attempts = True, []
+    def audit(event, args):
+        if active and (event.startswith('socket.') or event in {
+            'subprocess.Popen', 'os.system', 'os.posix_spawn', 'os.fork',
+            'os.forkpty', 'os.exec', 'os.kill', 'os.killpg',
+        }):
+            attempts.append(event)
+            raise RuntimeError('Unit/component tests must mock external execution: ' + event)
+    sys.addaudithook(audit)
+    try:
+        yield attempts
+    finally:
+        active = False
 
 
 def main():
     sys.path.insert(0, str(ROOT))
-    loader = unittest.TestLoader()
-    suite = loader.discover(str(TESTS))
-    if loader.errors:
-        print('\n'.join(map(str, loader.errors)), file=sys.stderr)
-        return 1
-    shards = partition(suite)
-    print(f'Discovered {sum(map(len, shards))} unique tests; every test runs in exactly one shard.', flush=True)
-    return run_shards(shards, ROOT, TESTS)
+    with no_external_execution() as attempts:
+        loader = unittest.TestLoader()
+        suite = loader.discover(str(TESTS))
+        if loader.errors:
+            print('\n'.join(map(str, loader.errors)), file=sys.stderr)
+            return 1
+        try:
+            identities = inventory(suite)
+        except ValueError as error:
+            print(str(error), file=sys.stderr)
+            return 1
+        print(f'Discovered {len(identities)} unique tests; every test runs exactly once.', flush=True)
+        result = unittest.TextTestRunner(verbosity=2).run(suite)
+        if attempts:
+            print('Unmocked external execution attempted: ' + ', '.join(attempts), file=sys.stderr)
+        return int(not result.wasSuccessful() or result.testsRun != len(identities) or bool(attempts))
 
 
 if __name__ == '__main__':

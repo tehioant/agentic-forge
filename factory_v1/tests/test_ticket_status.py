@@ -1,36 +1,33 @@
-"""MOCK ONLY: Status admission regressions through the public CLI/HTTP harness."""
+"""Status contract/frontier admission with mocked tracker I/O, without lifecycle setup."""
 import copy
-import json
-import unittest
 
-from factory_v1.tests import test_ticket_native_scope
+from factory_v1 import repositories
+from factory_v1.tests import test_lean_tickets
 
 
-class TicketStatusTests(unittest.TestCase):
-    setUp = test_ticket_native_scope.NativeScopeTests.setUp
-
+class TicketStatusTests(test_lean_tickets.LeanControllerCase):
     def assert_status_refused(self, status, heading='## Status'):
-        self.case.publish()
         ready = 'ready (GitHub Projects is authoritative for current progress).'
-        self.case.issues[12]['body'] = self.case.issues[12]['body'].replace(
-            '## Status\n\n' + ready, heading + '\n\n' + status)
-        members = copy.deepcopy(self.case.members)
-        reservation = self.case.inspect().get('reservation')
-        result = self.case.control('reserve-ticket', issue=12)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'ticket_ineligible')
-        self.assertEqual(self.case.inspect().get('reservation'), reservation)
-        self.assertEqual(self.case.members, members)
-        snapshot = self.case.ok(self.case.control('frontier'))['ticket_work']['frontier']
+        self.issues[12]['body'] = self.canonical_body.replace('## Status\n\n' + ready, heading + '\n\n' + status)
+        self.assertNotEqual(self.issues[12]['body'], self.canonical_body)
+        members = copy.deepcopy(self.members)
+        snapshot = self.frontier()
+        before = self.stored()
+        with self.assertRaises(repositories.RepositoryError) as error:
+            self.reserve(12)
+        self.assertEqual(error.exception.code, 'ticket_ineligible')
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.members, members)
+        self.assert_no_external_writes()
         self.assertEqual(snapshot['eligible'], [10])
         row = next(r for r in snapshot['items'] if r['number'] == 12)
         self.assertFalse(row['admissible'])
         self.assertTrue(row['held'] or not row['contract_valid'])
-        reserved = self.case.ok(self.case.control('reserve-ticket', issue=10))
+        reserved = self.reserve(10)
         self.assertEqual(reserved['reservation']['issue_number'], 10)
         self.assertEqual(reserved['reservation']['status'], 'reserved')
-        self.assertEqual(self.case.members[12], members[12])
-        self.assertEqual(self.case.members[10]['fields']['STATUS'], 'In Progress')
+        self.assertEqual(self.members[12], members[12])
+        self.assertEqual(self.members[10]['fieldValues']['nodes'][0]['optionId'], 'Active')
         self.assertFalse(reserved['execution_allowed'])
 
     def test_deferred_under_trailing_space_status_heading_is_refused(self):
@@ -52,14 +49,13 @@ class TicketStatusTests(unittest.TestCase):
         self.assert_status_refused('ready\n\n## Status \n\ndeferred')
 
     def test_canonical_generated_ready_annotation_remains_admissible(self):
-        item = self.case.publish()
-        self.assertIn('## Status\n\nready (GitHub Projects is authoritative for current progress).',
-                      self.case.issues[12]['body'])
-        self.assertEqual(item['ticket_work']['frontier']['eligible'], [10, 12])
-        self.assertTrue(all(r['contract_valid'] and not r['held']
-                            for r in item['ticket_work']['frontier']['items']))
-        reserved = self.case.ok(self.case.control('reserve-ticket', issue=12))
+        self.issues[12]['body'] = self.canonical_body
+        self.assertIn('## Status\n\nready (GitHub Projects is authoritative for current progress).', self.issues[12]['body'])
+        snapshot = self.frontier()
+        self.assertEqual(snapshot['eligible'], [10, 12])
+        self.assertTrue(all(r['contract_valid'] and not r['held'] for r in snapshot['items']))
+        reserved = self.reserve(12)
         self.assertEqual(reserved['reservation']['status'], 'reserved')
-        self.assertEqual(self.case.members[12]['fields']['STATUS'], 'In Progress')
-        self.assertEqual(self.case.issues[12]['milestone']['id'], 501)
+        self.assertEqual(self.members[12]['fieldValues']['nodes'][0]['optionId'], 'Active')
+        self.assertEqual(self.issues[12]['body'], self.canonical_body)
         self.assertFalse(reserved['execution_allowed'])
