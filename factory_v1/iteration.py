@@ -23,9 +23,10 @@ def required_items(item, observed, github):
     rows = {r['number']: r for r in observed['items']}
     pinned = {r['number'] for r in item['ticket_work']['published'].values()}
     require(pinned and pinned <= rows.keys(), 'Required published work left the milestone.', 'iteration_incomplete')
-    required, deferred = [], []
+    required, deferred, issues = [], [], {}
     for number, row in sorted(rows.items()):
         issue = tickets.gh.read_issue(github, item['repository'], number)
+        issues[number] = copy.deepcopy(issue)
         parts = tickets.sections(issue['body']) or {}
         if number not in pinned and parts.get('Bug scope') == 'deferred' and row['status'] == 'deferred' and row['contract_valid']:
             deferred.append(number)
@@ -38,7 +39,7 @@ def required_items(item, observed, github):
         required.append(row)
     require(not (requirements.held_numbers(item) | diagnosis.held_numbers(item) | bugs.held_numbers(item)),
             'Unresolved requirement, diagnosis or bug-discovery holds remain.', 'iteration_incomplete')
-    return required, deferred
+    return required, deferred, issues
 
 
 def delivered_item(database, item, row, config_path, operator, github, main):
@@ -110,7 +111,7 @@ def complete(database, project, iteration, operator, request, github):
     delivery.validate_persisted(database, item, saved)
     require(saved['latest']['status'] == 'healthy', 'Unknown delivery is not completion.', 'iteration_incomplete')
     observed = frontier(database, item, github)
-    required, deferred = required_items(item, observed, github)
+    required, deferred, scoped_issues = required_items(item, observed, github)
     configs = {merge.load_config(p, operator)['issue']: p for p in request['merge_configs']}
     require(len(configs) == len(request['merge_configs']) and set(configs) == {r['number'] for r in required},
             'Cover every required item exactly; caller cannot select a subset.', 'iteration_incomplete')
@@ -128,9 +129,12 @@ def complete(database, project, iteration, operator, request, github):
                 w['identity']['number'] in configs) for w in bug_records),
             'Blocking/recovery bugs must have verified delivery.', 'iteration_incomplete')
     require(delivery.observe(saved['config']) == health and
-            [delivered_item(database, item, row, configs[row['number']], operator, github, health['main']) for row in required] == delivered and
-            frontier(database, item, github) == observed,
+            [delivered_item(database, item, row, configs[row['number']], operator, github, health['main']) for row in required] == delivered,
             'Milestone or delivery changed during verification.', 'completion_race')
+    final_frontier = frontier(database, item, github)
+    require(final_frontier == observed and
+            required_items(item, final_frontier, github) == (required, deferred, scoped_issues),
+            'Milestone scope or issue changed during verification.', 'completion_race')
     report = {'project_id': project, 'iteration_id': iteration, 'repository': item['repository'],
               'spec': item['handoff'], 'delivered': delivered, 'delivery': health,
               'verification': 'live' if github.base == 'https://api.github.com' and saved['config']['api_base'] == github.base else 'simulation',
