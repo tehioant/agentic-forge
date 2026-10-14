@@ -17,6 +17,12 @@ def active(item):
     return item.get('main_recoveries', {}).get(incident['incident_id']) if incident else None
 
 
+def pending_registration(item):
+    """Registration authority must be cleared in its owning iteration, never dropped."""
+    return bool((item.get('main_incident') or {}).get('recovery_issue') is not None or
+                any(record['status'] != 'cleared' for record in item.get('main_recoveries', {}).values()))
+
+
 def recovery_number(item):
     record = active(item)
     return record['config']['issue']['number'] if record else None

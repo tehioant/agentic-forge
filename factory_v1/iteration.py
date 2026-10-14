@@ -5,7 +5,7 @@ import json
 import sqlite3
 from contextlib import closing
 
-from . import assignments, attention, bugs, controls, delivery, diagnosis, merge, requirements, tickets
+from . import assignments, attention, bugs, controls, delivery, diagnosis, merge, recovery, requirements, tickets
 from .planning import require, text, transition
 from .repositories import save_iteration
 
@@ -110,8 +110,8 @@ def complete(database, project, iteration, operator, request, github):
             all(text(p) for p in request['merge_configs']) and len(set(request['merge_configs'])) == len(request['merge_configs']),
             'Provide one private merge configuration per required milestone issue.', 'invalid_completion')
     saved = delivery.monitor_state(item, operator)
-    require(saved is not None and item.get('main_incident') is None,
-            'Configured healthy delivery and no unresolved incident required.', 'iteration_incomplete')
+    require(saved is not None and item.get('main_incident') is None and not recovery.pending_registration(item),
+            'Configured healthy delivery and no unresolved incident/recovery required.', 'iteration_incomplete')
     assert saved is not None
     delivery.validate_persisted(database, item, saved)
     require(saved['latest']['status'] == 'healthy', 'Unknown delivery is not completion.', 'iteration_incomplete')

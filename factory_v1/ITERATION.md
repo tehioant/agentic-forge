@@ -100,7 +100,12 @@ previous completed report/spec pointers. It starts only `planning_pending`, with
 no new handoff, tickets, reservation, model operation or worker. Deferred bugs remain
 in the preceding report for discussion, not auto-promoted into executable work.
 Ordinary `plan`, `complete-planning` on the old iteration, or a fresh `register` for
-the waiting product cannot bypass this boundary. Terminal verified old engineering
+the waiting product cannot bypass this boundary. A transient, unregistered main
+incident and its monitor carry forward without clearing the freeze. A registered
+recovery must instead finish its exact owning-iteration clearance before the next
+interview: copying only its incident pointer would strand the host authority,
+assignments and affected-ticket receipts. Pending registration also refuses
+completion even if its incident pointer is missing. Terminal verified old engineering
 claims are released; their full assignment/evidence rows remain inspectable.
 
 ### Selected installed sources and execution contract

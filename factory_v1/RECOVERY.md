@@ -164,6 +164,12 @@ by exact issue/body/membership readback. An unknown no-effect outcome stays held
 rather than blindly repeating the write. Changed identity/body cannot redirect the
 operation. No ticket creation, duplicate issue, new board or inferred edge is used.
 
+Once registered, recovery authority stays in its exact project/iteration. Milestone
+completion and next-interview monitor inheritance refuse pending registration;
+operator input cannot copy only the incident pointer and strand its repair records.
+A later predecessor-addressed poll routes to the current same-product iteration,
+where a registered recovery still requires explicit verified clearance.
+
 Only actual configured health and required check/workflow/deployment evidence on
 the **exact repair merge** allow clearance; health is sampled again after affected
 tracker readbacks. The clearance record retains merge/check/evidence/frontier and

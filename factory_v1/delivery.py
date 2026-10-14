@@ -425,6 +425,9 @@ def sample(database, project, iteration, operator, config=None):
 
 def inherit_monitor(database, previous, successor, operator):
     """Transfer exact delivery evidence without clearing freezes or duplicating attention."""
+    from . import recovery
+    require(not recovery.pending_registration(previous),
+            'Clear registered recovery in its owning iteration before continuation.', 'recovery_held')
     saved = monitor_state(previous, operator)
     require(saved is not None or previous.get('main_incident') is None,
             'An incident requires its configured monitor.', 'invalid_delivery')
