@@ -100,7 +100,11 @@ The private JSON has **exactly** these fields (no optional omission):
   "protection": classic_protection_response})`, installed from independently resolved
   actual readbacks. Changing policy invalidates admission, never silently repins it.
 - `recovery`: `null` ordinarily, or exactly `{"incident_id": "<ID>",
-  "implementation_assignment": "<64-hex repair ID>", "issue": <work-item number>}`.
+  "implementation_assignment": "<64-hex root repair ID>", "issue": <work-item number>,
+  "removed_assignments": ["<independently resolved delivered assignment ID>"]}`.
+  The removal list may be empty. See [registration and clearance](RECOVERY.md).
+  Corrective recovery additionally supplies `root_execution`, independently
+  resolving original repair/diagnosis execution as well as the current four stages.
 
 Do not print config contents or auth headers. Use exclusive owner-only file creation
 in the private controller directory. Bindings are installed by deployment authority,
@@ -133,9 +137,11 @@ scoped trusted path remains a prerequisite, not permission for this CLI to mutat
 
 Ordinary candidates also require passing required checks on baseline main. Failed
 or unknown main checks refuse ordinary admission. A durable iteration `main_incident`
-freezes ordinary merges. Its exact trusted shape is `status=active`, `incident_id`,
-`recovery_assignment`, `recovery_issue`; only the config-bound **repair-stage** builder
-for that same incident/work item can use the exception. A caller boolean or ordinary
+freezes ordinary merges. The host-owned recovery registration must bind its exact
+`incident_id`, `recovery_assignment` and `recovery_issue`; only that **repair-stage**
+root or its controller-correlated corrective descendants can use the exception.
+The exact final simplified byte/mode diff must stay inside registered incident
+paths, including after the last remote admission reads. A caller boolean or ordinary
 implementation using repair-looking prose does not qualify. Repair still needs the
 same simplification, both independent review axes, protection and candidate/integrated
 checks. This operation neither clears the incident nor declares deployment healthy.

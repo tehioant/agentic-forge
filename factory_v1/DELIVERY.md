@@ -166,14 +166,15 @@ Existing candidate, review, requirements, protection and quality/security gates
 remain unchanged. Remote state can change after the final read; GitHub's own merge
 gates remain authoritative and the watcher detects subsequent delivery failure.
 
-Recovery requires the existing exact incident ID, repair implementation assignment
-and issue binding and the *same* ordinary engineering gates. The observer preserves
-that binding but does not grant it or dispatch repair work. A future trusted repair
-controller must bind `recovery_assignment`/`recovery_issue` in **both** the iteration
-active incident and `delivery_incidents` row atomically under this lock. Fixture
-repair tests explicitly label that host authorization as simulated. Only freshly
-verified current-main CI/CD, newest exact deployment success and actual configured
-health clear the incident; repair merge/issue closure/workflow success alone cannot.
+Recovery uses [the host-owned recovery lifecycle](RECOVERY.md), the exact incident,
+repair assignment and issue, and the *same* ordinary engineering gates. Registration
+binds both incident pointers atomically. Once registered, healthy polling updates
+evidence but cannot clear the freeze. `verify-recovery` requires the repair merge,
+integrated checks, exact removed-behavior reopening/status/dependency readbacks and
+actual configured current-main deployment health before atomic clearance. The
+observer alone neither grants repair authority nor dispatches a worker. Unregistered
+transient incidents retain healthy-sample clearance. Deterministic fixtures are
+simulated evidence, not native execution or actual deployment proof.
 
 For compatibility, an iteration **without an installed delivery monitor** retains
 #17's existing CI-only merge boundary; it never gains a verified deployment claim.

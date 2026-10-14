@@ -265,6 +265,23 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(row['handoff']['credentials'], [])
         self.assertFalse(row['handoff']['inherited_memory'])
         request = self.configuration('repair')
+        # Labeled registered-scope input; this test qualifies claims/order, not host registration.
+        from factory_v1 import recovery
+        config = {'operator_id': '42', 'reference': 'LABELED registered authority fixture',
+                  'incident_id': 'local-incident', 'issue': request['issue'], 'paths': ['app.py'],
+                  'removable_assignments': [], 'evidence_id': 'e' * 64}
+        record = {'config': config, 'evidence': {'main': request['baseline']}, 'assignment': None,
+                  'status': 'registered', 'parked': [row['assignment_id']], 'removable': {}}
+        self.item.update(main_recoveries={'local-incident': record}, delivery_monitor={'config': {}},
+            main_incident={'incident_id': 'local-incident', 'status': 'active', 'monitor_sha256': assignments.digest({}),
+                'first_evidence': 'e' * 64, 'latest_evidence': 'e' * 64,
+                'recovery_assignment': assignments.digest(config), 'recovery_issue': 10})
+        self.save_item()
+        with self.db:
+            self.db.execute('CREATE TABLE delivery_incidents (project TEXT, iteration TEXT, id TEXT, payload TEXT)')
+            self.db.execute('INSERT INTO delivery_incidents VALUES (?,?,?,?)',
+                ('product', 'm1', 'local-incident', json.dumps(self.item['main_incident'])))
+        request['preceding'] = recovery.preceding(record)
         first = self.prepare(request, dry=True)
         request['skills'].reverse()
         self.assertEqual(self.prepare(request, dry=True)['assignment_id'], first['assignment_id'])

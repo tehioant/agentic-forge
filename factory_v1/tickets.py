@@ -436,7 +436,10 @@ def frontier(database, item, github):
     rows = {}
     native_blockers = {}
     foreign_active = []
+    from .recovery import recovery_number
+    recovery_issue = recovery_number(item)
     for member in gh.project_items(github, board['project_id']):
+        issue = None
         content = member.get('content')
         if not isinstance(content, dict) or content.get('repository', {}).get('nameWithOwner') != item['repository']:
             continue
@@ -446,12 +449,22 @@ def frontier(database, item, github):
             current_scope = gh.issue_scope(issue, board) == board['milestone']['id']
         else:
             current_scope = fields.get(board['scope']['id']) == board['scope']['options'][item['iteration_id']]
-        if not current_scope:
+        if not current_scope and content.get('number') != recovery_issue:
             if status_options.get(fields.get(board['status']['id'])) == 'active':
                 foreign_active.append(content.get('number'))
             continue
         if 'milestone' not in board:
             issue = gh.read_issue(github, item['repository'], content.get('number'))
+        assert issue is not None
+        if issue['number'] == recovery_issue:
+            from .recovery import active as active_recovery
+            recovery_record = active_recovery(item)
+            assert recovery_record is not None
+            from .recovery import observed_issue_pin
+            pin = observed_issue_pin(item, recovery_record)
+            require(all(issue[k] == pin[k] for k in ('number', 'id', 'node_id')) and
+                    hashlib.sha256(issue['body'].encode()).hexdigest() == pin['body_sha256'],
+                    'Registered incident issue changed.', 'scope_mismatch')
         for pinned in work.get('published', {}).values():
             if pinned['number'] == issue['number']:
                 require(all(issue[k] == pinned[k] for k in ('number', 'id', 'node_id')),
@@ -466,7 +479,7 @@ def frontier(database, item, github):
         scoped_inputs = requirement_inputs(item, issue['number'])
         if scoped_inputs != work['inputs']:
             revalidate_inputs(database, item, github, issue['number'])
-        contract = external_contract(issue, scoped_inputs)
+        contract = external_contract(issue, scoped_inputs, ('vision.md', 'milestone.md')) if issue['number'] == recovery_issue else external_contract(issue, scoped_inputs)
         parts = sections(issue['body']) or {}
         triaged = any(isinstance(l, dict) and l.get('name') == work['request']['tracker']['triage_label'] for l in issue['labels'])
         deps = gh.dependencies(github, item['repository'], issue['number'])
@@ -483,7 +496,7 @@ def frontier(database, item, github):
                                 'state_reason': issue.get('state_reason'), 'blockers': blockers,
                                 'contract_valid': bool(contract and triaged),
                                 'held': contract in {'blocked', 'deferred'} or
-                                    parts.get('Bug scope') not in {None, 'current'}}
+                                    (parts.get('Bug scope') not in {None, 'current'} and issue['number'] != recovery_issue)}
     for dependencies in native_blockers.values():
         for dependency in dependencies:
             row = rows.get(dependency['number'])
@@ -516,11 +529,14 @@ def frontier(database, item, github):
     from .diagnosis import held_numbers
     from .requirements import held_numbers as requirement_holds
     from .bugs import held_numbers as bug_holds
-    holds = held_numbers(item) | requirement_holds(item) | bug_holds(item)
+    from .recovery import held_numbers as recovery_holds
+    holds = held_numbers(item) | requirement_holds(item) | bug_holds(item) | recovery_holds(item)
     for row in rows.values():
         row['held'] = row['held'] or row['number'] in holds
         row['admissible'] = bool(row['contract_valid'] and not row['held'] and row['issue_state'] == 'open' and
                                  row['status'] in {'ready', 'active'} and all(completed(b) for b in row['blockers']))
+        if item.get('main_incident') and row['number'] != recovery_issue:
+            row['admissible'] = False
     eligible = [n for n, r in rows.items() if r['admissible'] and r['status'] == 'ready']
     work['frontier'] = {'authority': 'github', 'items': list(rows.values()), 'eligible': sorted(eligible),
                         'foreign_active': foreign_active,
@@ -535,6 +551,8 @@ def reserve(database, item, github, number):
     row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
                            (item['project_id'], item['iteration_id'])).fetchone()
     item = json.loads(row[0])
+    from .recovery import admission
+    admission(item, 'reservation', number)
     scope = {'project': item['project_id'], 'iteration': item['iteration_id'],
              'repository': item['repository'], 'issue_number': number,
              'repository_id': item.get('repository_onboarding', {}).get('metadata', {}).get('id')}
