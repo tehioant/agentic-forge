@@ -13,6 +13,10 @@ Instructions for any AI agent (Warp/Oz, Claude, or equivalent) working in this r
 - Commit as often as possible — step by step, small task to small task, one commit per task
 - Always ask clarifying questions before proceeding on ambiguous requests. Auto-approve mode does not waive this — always ask.
 
+## Verification Policy
+
+- For ticket completion and test planning, follow the implementation-ticket verification policy in `docs/specs/fresh-agentic-factory.md`. Use meaningful automated tests, independent review and integrated CI; configure deployment requirements in the project specs rather than adding a live deployment/outage/recovery exercise to each ticket.
+
 ## Plan Mode
 
 - Make the plan extremely concise. Sacrifice grammar for the sake of concision.
