@@ -122,6 +122,7 @@ class CleanupErrorTests(unittest.TestCase):
         docker.image.return_value = 'fixture'
         docker.remove.side_effect = FileNotFoundError('injected Docker disappearance during cleanup')
         with ExitStack() as stack:
+            stack.enter_context(patch('factory_v1.restart.before_dispatch'))
             stack.enter_context(patch('factory_v1.sandbox.load_config', return_value=config))
             stack.enter_context(patch('factory_v1.sandbox.Docker', return_value=docker))
             stack.enter_context(patch('factory_v1.model_access.transport'))

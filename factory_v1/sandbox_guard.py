@@ -13,9 +13,17 @@ def process_identity(pid):
     try:
         # Field 22 is starttime; account for parentheses/spaces in comm.
         fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
-        return None if fields[0] == 'Z' else fields[19]
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        return None if fields[0] == 'Z' or not boot else boot + ':' + fields[19]
     except (OSError, IndexError):
         return None
+
+
+def same_process(observed, expected):
+    """Conservatively retain legacy start-only owners; never use this to signal."""
+    return observed is not None and (observed == expected or
+            (isinstance(expected, str) and expected.isdecimal() and ':' in observed and
+             observed.rsplit(':', 1)[1] == expected))
 
 
 def main():
@@ -32,7 +40,7 @@ def main():
         if (root / 'stop').exists():
             reason = 'cancelled'
             break
-        if process_identity(record['controller_pid']) != record['controller_start']:
+        if not same_process(process_identity(record['controller_pid']), record['controller_start']):
             reason = 'controller_lost'
             break
         if time.monotonic() >= deadline:

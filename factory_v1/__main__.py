@@ -122,6 +122,18 @@ def main():
         control.add_argument('--iteration', required=True)
         if name != 'inspect-control':
             control.add_argument('--reference', required=True)
+        if name == 'resume':
+            control.add_argument('--api-base', required=True)
+            control.add_argument('--bearer', default='credential-blind-controller')
+            control.add_argument('--timeout', type=float, default=10)
+    restart = commands.add_parser('reconcile-restart', help='Exact read-only-effect reconciliation; never resumes pause or sends notifications.')
+    for option in ('project', 'iteration', 'api-base'):
+        restart.add_argument('--' + option, required=True)
+    restart.add_argument('--bearer', default='credential-blind-controller')
+    restart.add_argument('--timeout', type=float, default=10)
+    restart.add_argument('--recover-assignment')
+    restart.add_argument('--run')
+    restart.add_argument('--reference')
     onboarding = commands.add_parser('onboard')
     onboarding.add_argument('--project', required=True)
     onboarding.add_argument('--iteration', required=True)
@@ -336,6 +348,24 @@ def main():
             raise IntakeError('invalid_recovery', 'Malformed recovery evidence; freeze remains in force.') from error
         print(json.dumps(result, sort_keys=True))
         return
+    if args.command == 'reconcile-restart':
+        from .restart import reconcile
+        from .repositories import GitHub, RepositoryError, state_lock
+        try:
+            recovery = (args.recover_assignment, args.run, args.reference)
+            if any(value is not None for value in recovery) and not all(value is not None for value in recovery):
+                raise IntakeError('invalid_restart', 'Recovery needs exact assignment, run and explicit operator reference together.')
+            uri = Path(args.state).resolve().as_uri() + '?mode=rw'
+            with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database):
+                result = reconcile(database, args.project, args.iteration, args.operator_id,
+                                   GitHub(args.api_base, args.bearer, args.timeout),
+                                   recover=recovery if recovery[0] is not None else None)
+            print(json.dumps(result, sort_keys=True))
+        except RepositoryError as error:
+            raise IntakeError(error.code, str(error)) from error
+        except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
+            raise IntakeError('invalid_restart', 'Malformed restart state; no dispatch permitted.') from error
+        return
     if args.command in {'observe-delivery', 'watch-delivery', 'inspect-delivery'}:
         from . import delivery
         from .repositories import RepositoryError, state_lock
@@ -374,7 +404,9 @@ def main():
                 if args.command == 'inspect-control':
                     result = controls.inspect(database, args.project, args.iteration, args.operator_id)
                 elif args.command == 'resume':
-                    result = controls.resume(database, args.project, args.iteration, args.operator_id, args.reference)
+                    from .repositories import GitHub
+                    result = controls.resume(database, args.project, args.iteration, args.operator_id, args.reference,
+                                             GitHub(args.api_base, args.bearer, args.timeout))
                 else:
                     result = controls.request(database, args.project, args.iteration, args.operator_id, args.command, args.reference)
         except RepositoryError as error:

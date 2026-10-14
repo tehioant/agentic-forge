@@ -40,6 +40,11 @@ class AdmissionBoundaryTests(unittest.TestCase):
     def pause(self):
         return controls.request(self.database, 'product', 'm1', '42', 'pause', 'test-pause')
 
+    def resume(self):
+        # Planning admission is isolated from the restart readback component.
+        with patch('factory_v1.restart.reconcile', return_value={'status': 'ready'}):
+            return controls.resume(self.database, 'product', 'm1', '42', 'explicit-test-resume', self.github)
+
     def assert_refused(self, operation, before):
         with self.assertRaises(repositories.RepositoryError) as caught:
             operation()
@@ -54,7 +59,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
         with patch.object(planning, 'resolve', return_value={}) as load:
             self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
             load.assert_not_called()
-            controls.resume(self.database, 'product', 'm1', '42', 'explicit-test-resume')
+            self.resume()
             result = planning.plan(self.database, self.item, self.request)
         self.assertEqual(result['stage'], 'planning_pending')
         self.assertEqual(self.stored(), result)
@@ -74,7 +79,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
         self.item['requirement_authority'] = {'10': {'revision': 'held'}}
         self.persist()
         self.pause()
-        controls.resume(self.database, 'product', 'm1', '42', 'explicit-test-resume')
+        self.resume()
         with patch.object(planning, 'resolve', return_value={}):
             with self.assertRaises(repositories.RepositoryError) as caught:
                 planning.plan(self.database, self.item, self.request)

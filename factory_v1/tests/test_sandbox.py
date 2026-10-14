@@ -190,6 +190,8 @@ class LauncherFixture:
 
     def launch(self, *, setup=None):
         with ExitStack() as mocks:
+            # Separate restart reads from this legacy launcher component.
+            mocks.enter_context(patch('factory_v1.restart.before_dispatch'))
             mocks.enter_context(patch.object(sandbox, 'Docker', return_value=self.docker))
             mocks.enter_context(patch('factory_v1.model_access.transport'))
             mocks.enter_context(patch.object(assignments, 'inspect', side_effect=self.inspect))

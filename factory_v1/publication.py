@@ -51,6 +51,12 @@ def policy_path(path):
                  for part in parts[1:])))
 
 
+def valid_ref(value):
+    return (isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,150}', value) is not None and
+            all(p not in {'', '.', '..'} and not p.endswith(('.', '.lock')) for p in value.split('/')) and
+            '..' not in value and '@{' not in value)
+
+
 def load_config(path, operator):
     try:
         path = physical(path)
@@ -72,9 +78,7 @@ def load_config(path, operator):
                 'Exact publication identity and deterministic commit pins required.', 'invalid_publication')
         datetime.datetime.strptime(config['commit_date'], '%Y-%m-%dT%H:%M:%SZ')
         for key in ('branch', 'base'):
-            require(isinstance(config[key], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,150}', config[key]) and
-                    all(p not in {'', '.', '..'} and not p.endswith(('.', '.lock')) for p in config[key].split('/')) and
-                    '..' not in config[key] and '@{' not in config[key], 'Unsafe fixed ref.', 'scope_mismatch')
+            require(valid_ref(config[key]), 'Unsafe fixed ref.', 'scope_mismatch')
         require(config['branch'] not in {'main', 'master', config['base']}, 'No main/base writes.', 'scope_mismatch')
         require(isinstance(config['paths'], list) and 0 < len(config['paths']) <= 200 and
                 all(isinstance(p, str) for p in config['paths']) and

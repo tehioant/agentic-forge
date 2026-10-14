@@ -154,9 +154,11 @@ def ticket_claims(database, scope):
     from .diagnosis import released_claim
     from .requirements import released_claim as revised_claim
     from .recovery import released_claim as recovery_claim
+    from .restart import released_claim as recovered_claim
     existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
                 not released_claim(database, old) and not revised_claim(database, old) and
-                not completed_iteration_claim(database, old) and not recovery_claim(database, old)]
+                not completed_iteration_claim(database, old) and not recovery_claim(database, old) and
+                not recovered_claim(old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
                 'One active ticket across the factory; stale claims are never automatically stolen.', 'claim_conflict')
@@ -168,11 +170,20 @@ def claims(database, request, scope, assignment_id):
     if request['stage'] != 'diagnosis':
         ticket_claims(database, scope)
     from .requirements import released_claim as revised_claim
+    from .restart import released_claim as recovered_claim
     for old in existing:
+        if recovered_claim(old):
+            require(old['assignment_id'] == assignment_id or old['claim_id'] != request['claim_id'],
+                    'Infrastructure recovery requires a fresh claim identity.', 'claim_conflict')
+            continue
         if revised_claim(database, old) or completed_iteration_claim(database, old):
             continue
         if old['assignment_id'] == assignment_id:
             continue
+        require(not (request['stage'] in {'implementation', 'corrections', 'simplify', 'repair'} and
+                     old['handoff']['stage'] in {'implementation', 'corrections', 'simplify', 'repair'} and
+                     old.get('runtime', {}).get('status') in {'preparing', 'running', 'unconfirmed', 'stopped', 'failed'}),
+                'Existing modifying attempt needs exact cleanup and explicit recovery, not a concurrent writer.', 'claim_conflict')
         require(old['claim_id'] != request['claim_id'], 'Claim identity already binds a different assignment.', 'claim_conflict')
         old_profile = old['handoff']['profile']
         profile = request['profile']
@@ -199,6 +210,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
     # two entry points; caller descriptor order cannot change a claim identity.
     request = {**request, 'skills': [{k: v for k, v in s.items() if k != 'instructions'} for s in selected]}
     item = current(database, project, iteration, operator)
+    if not dry_run:
+        from .restart import before_dispatch
+        before_dispatch(database, project, iteration, operator, github)
+        item = current(database, project, iteration, operator)
     from . import recovery
     recovery.admission(item, request['stage'], request['issue']['number'])
     recovery_contract = recovery.handoff(database, item, request) if request['stage'] == 'repair' else None
@@ -385,6 +400,7 @@ def inspect(database, project, iteration, operator, assignment_id):
 
 def require_result_active(assignment):
     require(not assignment.get('recovery_disposition'), 'Ordinary work parked for main recovery.', 'main_frozen')
+    require(not assignment.get('restart_disposition'), 'Recovered attempt is historical; prepare a fresh scoped claim.', 'stale_assignment')
     require(not assignment.get('requirement_disposition'), 'Obsolete work cannot admit results or merge.', 'requirements_held')
     require(not assignment.get('stuck_disposition'), 'Held or superseded work requires fresh scoped implementation.', 'stuck_held')
     runtime = assignment.get('runtime')
