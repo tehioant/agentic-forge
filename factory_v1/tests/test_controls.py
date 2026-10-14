@@ -169,23 +169,25 @@ class ControlTests(ControlFixture):
 
     def test_pause_and_stop_do_not_wait_for_sqlite_writer_or_controller_lock(self):
         for action, state in (('pause', 'requested'), ('emergency-stop', 'acknowledged')):
-            with self.subTest(action=action), closing(sqlite3.connect(self.state)) as writer, state_lock(writer):
-                writer.execute('BEGIN IMMEDIATE')
-                writer.execute('UPDATE iterations SET payload=payload')
-                entered = threading.Event()
-                def request():
-                    with closing(sqlite3.connect(self.state, timeout=.1)) as independent:
-                        entered.set()
-                        return self.pause(action, independent)
-                with ThreadPoolExecutor(max_workers=1) as pool:
-                    pending = pool.submit(request)
-                    self.assertTrue(entered.wait(1))
-                    response = pending.result(timeout=1)
-                self.assertEqual(response['state'], state)
-                self.assertFalse(response['dispatch_allowed'])
-                self.refused('control_busy', self.resume)
-                self.refused('iteration_paused', controls.require_active, writer, 'product', 'm1')
-                writer.rollback()
+            with self.subTest(action=action), ThreadPoolExecutor(max_workers=1) as pool:
+                with closing(sqlite3.connect(self.state)) as writer, state_lock(writer):
+                    writer.execute('BEGIN IMMEDIATE')
+                    writer.execute('UPDATE iterations SET payload=payload')
+                    entered = threading.Event()
+                    def request():
+                        with closing(sqlite3.connect(self.state, timeout=.1)) as independent:
+                            entered.set()
+                            return self.pause(action, independent)
+                    try:
+                        pending = pool.submit(request)
+                        self.assertTrue(entered.wait(1))
+                        response = pending.result(timeout=1)
+                        self.assertEqual(response['state'], state)
+                        self.assertFalse(response['dispatch_allowed'])
+                        self.refused('control_busy', self.resume)
+                        self.refused('iteration_paused', controls.require_active, writer, 'product', 'm1')
+                    finally:
+                        writer.rollback()
             self.assertEqual(self.inspect()['state'], 'completed')
             self.assertTrue(self.resume()['dispatch_allowed'])
 

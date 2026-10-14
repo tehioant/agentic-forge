@@ -26,10 +26,19 @@ Legacy `test_controls.cli/value/wait` helpers remain compatible for untouched ca
 
 Focused set: `test_admission_boundaries`, `test_broker_controls`, `test_controls`, `test_bug_admission`, `test_revision_integration`, `test_lean_tickets`, `test_role_skills`, `test_sandbox_cleanup`.
 
-The implementation check completed **82 unique tests, exit 0, 4.142 seconds**, with content/mode fingerprints unchanged. The in-process test wrapper rejects unmocked socket creation/connections, subprocess launches, shell execution and process signaling. Test-local mocks replace intentional external seams. This is not the full suite.
+The initial implementation check, before review corrections, completed **82 unique tests, exit 0, 4.142 seconds**, with content/mode fingerprints unchanged. This is historical evidence for the initial refactor, not a final-head pass. The in-process test wrapper rejects unmocked socket creation/connections, subprocess launches, shell execution and process signaling. Test-local mocks replace intentional external seams. This is not the full suite.
 
 Interpreter-only guard-removal probes separately confirmed that targeted late-admission/byte/span/replay assertions fail when the relevant guard is bypassed. No production file was modified for those probes. Sensitivity evidence is distinct from passing acceptance checks.
 
 An early controls-fixture check deadlocked by injecting pause while its admission lane was already held; the injection was corrected to the released boundary. Other early fixture errors were corrected without changing production. No incomplete run is counted as a pass.
+
+## Review corrections
+
+The independent Standards and Spec reviews of `8243912bdb0e280df714c5a870bdc58b6fada8a2` identified two blockers, preserved in their original reports:
+
+- **ST-1:** The lock-contention test could join a regressed worker before releasing its controller lock. Executor shutdown now encloses the writer/lock scope, and writer rollback is guaranteed by `finally`. All assertion ASTs and wait limits are unchanged. A controlled timeout probe, without launching a blocked thread, failed before correction with both locks held at shutdown and passed afterward with both released. The 17 controls tests passed in 0.894 seconds.
+- **SPEC-1:** Database-failure cancellation alone did not prove the canceller responds to a readable durable hold. Two new broker tests inject real pause/emergency-stop sidecar requests during the admitted adapter call and run the captured real canceller. They assert the blocked boolean was read before cancellation, helper join and capability retirement, pending billing and retained allowance debit, and same/new-operation refusal without another outbound call. The three broker tests passed in 0.213 seconds. An interpreter-only mutant that ignores the true boolean produced exactly the two expected cancellation-assertion failures while database-error coverage passed. Controlled scheduling ends the mutant after one read, without waiting for TTL or launching a thread.
+
+No production modules or CI settings changed during correction. Retained probes live outside the repository at `/home/ops/.hermes/fresh-forge-evidence/issue21/test-refactor-review/`. Final candidate-bound continuation reviews and focused verification are reported with delivery rather than transferring these earlier working-tree runs to a later commit.
 
 The original CI run `38550256750` remains cancelled at its 15-minute limit: one 269-test shard passed, the other did not report completion, and compile was skipped. This refactoring is not evidence that CI passed. No new remote run, publication, merge or native/model execution has been performed. Fresh simplification/review and final exact-candidate focused verification are recorded separately in the delivery response.
