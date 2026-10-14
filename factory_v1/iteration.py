@@ -218,6 +218,7 @@ def next_iteration(database, project, iteration, operator, request):
         'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
         'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
         'Publish new updated-spec pointers, never overwrite the preceding milestone.')
+    delivery.inherit_monitor(database, item, result, operator)
     database.execute('INSERT INTO iterations VALUES (?, ?, ?)', (project, result['iteration_id'], json.dumps(result)))
     item['next_iteration'] = {'iteration_id': result['iteration_id'], 'request': request}
     save_iteration(database, item)
