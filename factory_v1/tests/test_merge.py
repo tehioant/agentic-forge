@@ -582,7 +582,8 @@ class MergeComponentTests(unittest.TestCase):
         record = {'config': {'operator_id': '42', 'reference': 'LABELED registered authority fixture',
                     'incident_id': 'incident-1', 'issue': self.candidate['handoff']['issue'],
                     'evidence_id': 'e' * 64, 'paths': ['app.py'], 'removable_assignments': []},
-                  'evidence': {'main': self.config['baseline']}, 'assignment': self.builder['assignment_id']}
+                  'evidence': {'main': self.config['baseline']}, 'assignment': self.builder['assignment_id'],
+                  'status': 'repair', 'parked': [], 'removed': {}, 'removable': {}, 'clearance': None}
         self.item['main_recoveries'] = {'incident-1': record}
         self.save_item()
         scope = recovery.contract(record)
