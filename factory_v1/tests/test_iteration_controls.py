@@ -5,10 +5,10 @@ import json
 import sqlite3
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from unittest.mock import Mock, patch
 
-from factory_v1 import controls, iteration, planning, skills, tickets
+from factory_v1 import controls, iteration, planning, restart, skills, tickets
 from factory_v1.__main__ import main
 from factory_v1.repositories import RepositoryError, state_lock
 from factory_v1.tests import test_iteration as fixtures
@@ -109,9 +109,13 @@ class IterationControlTests(unittest.TestCase):
         f = fixture(self, fixtures.ContinuationComponents)
         before = json.loads(f.db.execute('SELECT payload FROM iterations').fetchone()[0])
         interrupt(f)
-        controls.resume(f.db, 'product', 'm1', '42', 'explicit-later-resume')
+        with patch.object(restart, 'tracker', return_value={}):
+            controls.resume(f.db, 'product', 'm1', '42', 'explicit-later-resume', Mock(base='http://127.0.0.1:9876'))
         stored = json.loads(f.db.execute('SELECT payload FROM iterations').fetchone()[0])
-        self.assertEqual(stored, before)
+        report = stored['restart_reconciliation']
+        self.assertEqual(report['status'], 'ready')
+        self.assertEqual(report['blockers'], [])
+        self.assertEqual(stored, dict(before, restart_reconciliation=report))
         self.assertFalse(controls.blocked(f.db, 'product', 'm1'))
         with state_lock(f.db):
             started = f.start()
@@ -128,7 +132,7 @@ class IterationControlTests(unittest.TestCase):
         before = copy.deepcopy(item)
         def read(*args):
             state = f.db.execute('PRAGMA database_list').fetchone()[2]
-            with sqlite3.connect(state) as other:
+            with closing(sqlite3.connect(state)) as other:
                 controls.request(other, 'product', 'm2', '42', 'pause', 'last-publication-read')
             return {'commit': 'e' * 40, 'issue': {'number': 8, 'id': 80}}
         with patch.object(planning, 'read_publication', side_effect=read), state_lock(f.db):

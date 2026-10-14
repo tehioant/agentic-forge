@@ -200,8 +200,9 @@ def integration(assignment, api):
     old = journal.get('integrated_evidence')
     require(old is None or old['integrated'] == evidence['integrated'], 'Integration identity changed.', 'integration_mismatch')
     # Retain a proven effect even when checks are unknown. This is NOT delivery approval.
-    journal.update(integrated_evidence=evidence, close_allowed=False)
+    journal['integrated_evidence'] = evidence
     if journal['status'] not in {'delivered', 'revalidation-required'}:
+        journal['close_allowed'] = False
         journal['status'] = 'merged'
     gate = merge.protection(api, config)
     branch_checks = merge.checks(api, config, config['head'])
@@ -269,7 +270,7 @@ def ownership(database, item):
     from .requirements import released_claim as revised
     from .diagnosis import released_claim as directed
     active = [a for a in assignments.rows(database) if not revised(database, a) and not directed(database, a) and
-              not released_claim(a)]
+              not released_claim(a) and not assignments.completed_iteration_claim(database, a)]
     profiles, homes, ticket_scopes = set(), set(), set()
     for a in active:
         p = a['handoff']['profile']
