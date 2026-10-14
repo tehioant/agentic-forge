@@ -13,6 +13,7 @@ class EffectResolution:
     kind: str
     target: str
     authority: str
+    resolving: bool
 
 
 def authority(item, rows, kind, target):
@@ -58,17 +59,21 @@ def pinned_authority(database, item, kind, target):
 
 def bound(database, item, kind, target):
     return EffectResolution(item['project_id'], item['iteration_id'], item['approval']['operator_id'], kind, target,
-                            pinned_authority(database, item, kind, target))
+                            pinned_authority(database, item, kind, target),
+                            item.get('restart_reconciliation', {}).get('status') == 'blocked')
 
 
 def permitted(database, project, iteration, resolution):
-    require(type(resolution) is EffectResolution, 'Explicit exact effect authority required.', 'invalid_restart')
+    require(type(resolution) is EffectResolution and type(resolution.resolving) is bool,
+            'Explicit exact effect authority required.', 'invalid_restart')
     require((resolution.project, resolution.iteration) == (project, iteration),
             'Effect resolution scope changed.', 'scope_mismatch')
     item = assignments.current(database, project, iteration, resolution.operator, require_active=False)
     require(item['status'] == 'active', 'Paused/out-of-iteration effects remain held.', 'iteration_paused')
     require(resolution.authority == pinned_authority(database, item, resolution.kind, resolution.target),
             'Persisted effect authority changed.', 'stale_admission')
+    if not resolution.resolving:
+        return set()
     if resolution.kind == 'ticket-publication':
         return {('tracker', 'publication_uncertain')}
     if resolution.kind == 'candidate-publication':
