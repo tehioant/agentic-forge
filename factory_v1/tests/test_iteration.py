@@ -30,7 +30,7 @@ def work_row(number=1):
 
 
 def context():
-    return {'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product', 'idea': 'notes',
+    item = {'project_id': 'product', 'iteration_id': 'm1', 'repository': 'example/product', 'idea': 'notes',
             'approval': {'operator_id': '42', 'reference': 'approved-intake'}, 'origin': copy.deepcopy(ORIGIN),
             'status': 'active', 'stage': 'delivery', 'execution_allowed': False,
             'correlation': {'project_id': 'product', 'iteration_id': 'm1', 'stage': 'delivery',
@@ -39,6 +39,8 @@ def context():
             'handoff': {'repository': 'example/product', 'commit': SHA, 'issue': {'number': 7, 'id': 70}, 'documents': {}},
             'ticket_work': {'publication_complete': True, 'published': {'T1': {'number': 1}},
                             'inputs': {'documents': {'milestone.md': {'url': 'https://example.test/spec', 'sha256': 'b' * 64}}}}}
+    item['ticket_work']['inputs']['handoff'] = copy.deepcopy(item['handoff'])
+    return item
 
 
 class IterationComponents(unittest.TestCase):

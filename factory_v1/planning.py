@@ -224,8 +224,8 @@ def complete(database, item, request, github):
             type(number) is int and number > 0, 'Use an exact immutable full commit SHA and positive issue number.')
     require(number != item.get('work_item_number'), 'Do not repurpose the unchanged parent work/spec issue.')
     if planning.get('continuation'):
-        previous = planning['continuation']['previous_spec']
-        require(number != previous['issue']['number'] and commit != previous['commit'],
+        previous = planning['continuation']['previous_specs'].values()
+        require(all(number != spec['issue']['number'] and commit != spec['commit'] for spec in previous),
                 'Publish new next-iteration specification pointers, preserving the delivered milestone.', 'planning_conflict')
     digest = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
     require(planning.get('completion_digest', digest) == digest,

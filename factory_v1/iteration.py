@@ -167,6 +167,29 @@ def complete(database, project, iteration, operator, request, github):
     return completion
 
 
+def continuation_inputs(item):
+    """Pin the current scoped authorities, not the milestone's superseded handoff."""
+    delivered = item['completion']['report'].get('delivered', [])
+    numbers = {r['number'] for r in item['ticket_work']['published'].values()}
+    numbers.update(int(n) for n in item.get('requirement_authority', {}))
+    numbers.update(r['issue']['number'] for r in delivered)
+    require(all(r['requirements'] == requirements.authority(item, r['issue']['number']) for r in delivered),
+            'Delivered scoped requirement authority changed.', 'stale_requirements')
+    specs, loads = {}, {}
+    for number in sorted(numbers):
+        authority = requirements.authority(item, number)
+        inputs = requirements.inputs(item, number)
+        require(inputs.get('handoff') == authority['spec'] and inputs.get('documents'),
+                'Current scoped specification inputs required.', 'stale_requirements')
+        specs[str(number)] = copy.deepcopy(authority['spec'])
+        for document in inputs['documents'].values():
+            require(loads.get(document['url'], document['sha256']) == document['sha256'],
+                    'Conflicting scoped document pins.', 'stale_requirements')
+            loads[document['url']] = document['sha256']
+    require(specs, 'Previous scoped specifications required.', 'stale_requirements')
+    return {'previous_spec': next(iter(specs.values())), 'previous_specs': specs, 'input_loads': loads}
+
+
 def next_iteration(database, project, iteration, operator, request):
     """Authenticated later operator input is the only continuation admission."""
     from . import planning
@@ -209,11 +232,10 @@ def next_iteration(database, project, iteration, operator, request):
                   correlation={**item['correlation'], 'iteration_id': request['iteration_id'],
                                'worker_run_id': None, 'work_item': None, 'evidence_id': assignments.digest(request)})
     planning.assign(result, {'origin': item['origin'], 'expected_revision': 0, 'skills': request['skills']}, skills)
-    result['planning']['continuation'] = {'previous_spec': item['handoff'], 'input': request,
+    result['planning']['continuation'] = {**continuation_inputs(item), 'input': request,
                                        'adaptation': planning.NEXT_ADAPTATION,
-                                       'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []},
-                                       'input_loads': {d['url']: d['sha256'] for d in item['ticket_work']['inputs']['documents'].values()}}
-    result['planning']['instructions'] += ('\nContinue this SAME product from continuation.previous_spec and the explicit input. '
+                                       'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}}
+    result['planning']['instructions'] += ('\nContinue this SAME product from ALL continuation.previous_specs and the explicit input. '
         'Preserve any explicit round-completion gate; no synthesis before actual answers. '
         'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
         'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
