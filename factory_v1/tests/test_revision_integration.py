@@ -50,9 +50,10 @@ class RevisionIntegrationTests(unittest.TestCase):
         self.tracker = self.case.tracker
         self.fixture = self.case.fixture
 
-    def interrupt_response(self, operation, predicate, action='pause'):
+    def interrupt_response(self, operation, predicate, action='pause', malformed_control=False):
         entered, release = threading.Event(), threading.Event()
         parent = self.fixture.server.RequestHandlerClass
+        saved_control = None
 
         class Handler(parent):
             def reply(handler, status, response):
@@ -68,12 +69,25 @@ class RevisionIntegrationTests(unittest.TestCase):
             try:
                 self.assertTrue(entered.wait(5), 'Revision did not reach selected boundary')
                 value(self, cli(self.fixture.state, action))
+                if malformed_control:
+                    paths = list(self.fixture.state.with_name(self.fixture.state.name + '.controls').glob('*.json'))
+                    self.assertEqual(len(paths), 1, 'Exactly this fixture scope must own the injected control')
+                    path = paths[0]
+                    saved_control = path, path.read_bytes()
+                    record = json.loads(saved_control[1])
+                    record.pop('request_id')
+                    path.write_text(json.dumps(record))
                 start = len(self.fixture.calls)
             finally:
                 release.set()
-            result = pending.result(timeout=15)
+            try:
+                result = pending.result(timeout=15)
+            finally:
+                if saved_control is not None:
+                    path, raw = saved_control
+                    path.write_bytes(raw)
         self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], 'iteration_paused')
+        self.assertEqual(json.loads(result.stderr)['error'], 'invalid_control' if malformed_control else 'iteration_paused')
         self.assertFalse(any(c[0] == 'PATCH' or c[0] == 'POST' and
                              (c[1] != '/graphql' or c[2]['query'].startswith('mutation '))
                              for c in self.fixture.calls[start:]))
@@ -224,6 +238,64 @@ class RevisionIntegrationTests(unittest.TestCase):
         self.assertEqual(uncertain.returncode, 2, uncertain.stdout + uncertain.stderr)
         self.assertEqual(json.loads(uncertain.stderr)['error'], 'execution_uncertain')
         self.assertFalse(marker.exists(), 'Receipt retention must not create an automatic capability retry')
+
+    def test_malformed_control_before_revision_blob_write_has_zero_mutations(self):
+        self.case.synthesize()
+        after = self.interrupt_response(
+            lambda: self.case.control('publish-requirement-change', {'change_id': 'durable-notes'}),
+            lambda path, response: path == '/repos/example/product/git/commits/' + 'a' * 40,
+            malformed_control=True)
+        record = after['requirement_changes']['durable-notes']
+        self.assertEqual(record['status'], 'publication-pending')
+        self.assertNotIn('publication', record)
+        self.assertNotIn('tree', record.get('publication', {}))
+        self.assertNotIn('commit_intent', record.get('publication', {}))
+        self.assertEqual(self.case.git_blobs, {})
+        self.assertEqual(requirements.held_numbers(after), {10, 11})
+        value(self, cli(self.fixture.state, 'resume'))
+        self.assertEqual(self.case.ok(self.case.control('publish-requirement-change', {'change_id': 'durable-notes'}))
+                         ['requirement_changes']['durable-notes']['status'], 'published')
+
+    def test_malformed_control_before_held_status_restoration_preserves_blocks(self):
+        published = self.case.publish()
+        reads = 0
+        def restoration_member(path, response):
+            nonlocal reads
+            if path == '/graphql' and 'items' in response.get('data', {}).get('node', {}):
+                reads += 1
+                return reads == 3  # Two publication checks, then the first restoration member.
+            return False
+        after = self.interrupt_response(lambda: self.case.resume(published), restoration_member, malformed_control=True)
+        self.assertEqual(after['requirement_changes']['durable-notes']['status'], 'resume-pending')
+        self.assertEqual(requirements.held_numbers(after), {10, 11})
+        self.assertEqual(self.tracker.members[10]['fields']['STATUS'], 'Blocked')
+        self.assertEqual(self.tracker.members[11]['fields']['STATUS'], 'Blocked')
+        value(self, cli(self.fixture.state, 'resume'))
+        self.assertEqual(self.case.ok(self.case.resume(published))['requirement_changes']['durable-notes']['status'], 'resumed')
+
+    def test_malformed_control_before_synthesis_attempt_never_invokes_adapter(self):
+        self.case.resolve()
+        marker = self.case.root / 'SIMULATED-malformed-control-invocation'
+        source = self.case.helper.read_text()
+        needle = 'payload = json.load(sys.stdin)\n'
+        self.assertIn(needle, source)
+        self.case.helper.write_text(source.replace(needle,
+            needle + 'Path(' + repr(str(marker)) + ').write_text("SIMULATED invocation")\n', 1))
+        config = json.loads(self.case.config.read_text())
+        config['sha256'] = hashlib.sha256(self.case.helper.read_bytes()).hexdigest()
+        self.case.config.write_text(json.dumps(config))
+        after = self.interrupt_response(
+            lambda: self.case.control('resynthesize-requirements', {'change_id': 'durable-notes',
+                'skills': self.tracker.planning.skills}, self.case.config),
+            lambda path, response: path == '/repos/example/product/issues/7', malformed_control=True)
+        record = after['requirement_changes']['durable-notes']
+        self.assertEqual(record['status'], 'resolved')
+        self.assertNotIn('attempts', record)
+        self.assertNotIn('executions', record)
+        self.assertFalse(marker.exists())
+        value(self, cli(self.fixture.state, 'resume'))
+        self.assertEqual(self.case.synthesize()['requirement_changes']['durable-notes']['status'], 'synthesized')
+        self.assertTrue(marker.exists(), 'The deterministic probe must observe an actual admitted fixture invocation')
 
     def test_stop_after_final_ready_write_cannot_release_requirement_hold(self):
         published = self.case.publish()
