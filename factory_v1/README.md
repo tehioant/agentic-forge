@@ -72,6 +72,16 @@ external outcomes, never rollback or delivery. Back up `<state>.controls/` with
 SQLite and retained artifacts. See [control semantics, commands and acceptance
 limitations](CONTROLS.md). General restart reconciliation remains a later slice.
 
+## Gated main recovery (#20)
+
+`register-recovery`, `prepare-recovery`, `inspect-recovery` and `verify-recovery`
+connect the watcher to a fresh incident-only repair role and the existing
+simplification, independent review, merge and stuck-debug paths. Ordinary work
+remains held; health polling cannot clear a registered repair before verified
+merge/check/deployment and removed-behavior reopening proof. Host-owned exact-path
+authority and independently resolved removal evidence are required, not worker
+assertions. See [configuration, public lifecycle and limitations](RECOVERY.md).
+
 ## Stuck-work diagnosis and operator direction (#16)
 
 `declare-stuck` retains the responsible worker's attempted fixes and exact failure
@@ -967,9 +977,10 @@ body/refs/triage/identity, native blockers, scope and linked board status. Curre
 bugs enter the existing milestone and add native **and textual** blocking edges
 on named affected issues; only their Blocked-by section is patched. Deferred bugs
 remain unscoped for next grilling. Recovery is unscoped with immediate-recovery
-priority. Neither can be reserved through the ordinary frontier, even if someone
-places it in the current milestone. No detection, merge freeze, repair dispatch,
-recovery reservation or worker containment is established by this tracking slice.
+priority. Deferred bugs cannot be reserved through the ordinary frontier, even if
+someone places them in the current milestone. Recovery admission additionally
+requires the exact host-owned [incident registration](RECOVERY.md); tracking alone
+does not grant repair execution, reservation or merge authority.
 
 Repeat discovery IDs cannot change content. New IDs with normalized equal symptoms,
 expected/actual behavior and scope reuse the assignment. Reworded duplicates use
