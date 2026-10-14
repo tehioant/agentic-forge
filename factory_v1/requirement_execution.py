@@ -77,6 +77,8 @@ def run_stage(database, item, record, stage, config, work):
     record.setdefault('attempts', {})[stage] = {'input_digest': tickets.digest(work), 'capability': config}
     requirements.checkpoint(database, item)
     produced = invoke(config, work)
+    record.setdefault('execution_receipts', {})[stage] = produced
+    requirements.checkpoint(database, item, receipt=True)
     evidence = tickets.validate_execution(work, produced['execution'], produced['result'])
     record.setdefault('executions', {})[stage] = {'result': produced['result'], 'evidence': evidence,
         'source': work['skill'], 'dependencies': work['skill']['dependencies'],

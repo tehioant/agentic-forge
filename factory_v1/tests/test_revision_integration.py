@@ -1,6 +1,8 @@
 """#21/#23 integration at public revision boundaries; SIMULATED local capabilities only."""
 import copy
+import hashlib
 import json
+import sys
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -157,6 +159,71 @@ class RevisionIntegrationTests(unittest.TestCase):
         published = self.case.ok(self.case.control('publish-requirement-change', {'change_id': 'durable-notes'}))
         self.assertEqual(published['requirement_changes']['durable-notes']['status'], 'published')
         self.assertEqual(sum(c[:2] == ('PATCH', '/repos/example/product/issues/10') for c in self.fixture.calls), 1)
+
+    def test_pause_during_resolution_final_membership_read_cannot_resolve_hold(self):
+        held = self.case.record()
+        reads = 0
+        def final_membership(path, response):
+            nonlocal reads
+            if path == '/graphql' and 'items' in response.get('data', {}).get('node', {}):
+                reads += 1
+                return reads == 4
+            return False
+        after = self.interrupt_response(
+            lambda: self.case.control('resolve-requirement-change', {'change_id': 'durable-notes',
+                'direction': self.case.direction, 'old_revision': held['requirement_changes']['durable-notes']['old_revision']}),
+            final_membership)
+        self.assertEqual(after['requirement_changes']['durable-notes']['status'], 'held')
+        self.assertNotIn('resolution', after['requirement_changes']['durable-notes'])
+        self.assertEqual(requirements.held_numbers(after), {10, 11})
+        value(self, cli(self.fixture.state, 'resume'))
+        self.assertEqual(self.case.resolve()['requirement_changes']['durable-notes']['status'], 'resolved')
+
+    def test_pause_after_synthesis_input_read_prevents_capability_attempt(self):
+        self.case.resolve()
+        after = self.interrupt_response(
+            lambda: self.case.control('resynthesize-requirements', {'change_id': 'durable-notes',
+                'skills': self.tracker.planning.skills}, self.case.config),
+            lambda path, response: path == '/repos/example/product/issues/7')
+        record = after['requirement_changes']['durable-notes']
+        self.assertEqual(record['status'], 'resolved')
+        self.assertNotIn('attempts', record)
+        self.assertNotIn('executions', record)
+        value(self, cli(self.fixture.state, 'resume'))
+        self.assertEqual(self.case.synthesize()['requirement_changes']['durable-notes']['status'], 'synthesized')
+
+    def test_pause_at_synthesis_return_retains_untrusted_receipt_not_admitted_result(self):
+        self.case.resolve()
+        marker = self.case.root / 'SIMULATED-return-count'
+        injected = ('if payload["stage"] == "to-spec":\n'
+            '    import subprocess\n'
+            '    Path(' + repr(str(marker)) + ').write_text("one SIMULATED invocation")\n'
+            '    subprocess.run(' + repr([sys.executable, '-m', 'factory_v1', '--state',
+                str(self.fixture.state), '--operator-id', '42', 'pause', '--project', 'product', '--iteration', 'm1',
+                '--reference', 'SIMULATED pause before returning synthesis output']) + ', check=True, stdout=subprocess.DEVNULL)\n')
+        source = self.case.helper.read_text()
+        needle = "json.dump({'result':"
+        self.assertIn(needle, source, 'The deterministic helper must reach the injected return boundary')
+        self.case.helper.write_text(source.replace(needle, injected + needle, 1))
+        config = json.loads(self.case.config.read_text())
+        config['sha256'] = hashlib.sha256(self.case.helper.read_bytes()).hexdigest()
+        self.case.config.write_text(json.dumps(config))
+        request = {'change_id': 'durable-notes', 'skills': self.tracker.planning.skills}
+        refused = self.case.control('resynthesize-requirements', request, self.case.config)
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertEqual(json.loads(refused.stderr)['error'], 'iteration_paused')
+        record = self.tracker.inspect()['requirement_changes']['durable-notes']
+        self.assertEqual(record['status'], 'resolved')
+        self.assertEqual(set(record['attempts']), {'to-spec'})
+        self.assertNotIn('executions', record)
+        self.assertIn('SIMULATED revision direction', record['execution_receipts']['to-spec']['result']['provenance.md'])
+        self.assertEqual(record['execution_receipts']['to-spec']['execution']['run_id'], 'SIMULATED-to-spec')
+        value(self, cli(self.fixture.state, 'resume'))
+        marker.unlink()
+        uncertain = self.case.control('resynthesize-requirements', request, self.case.config)
+        self.assertEqual(uncertain.returncode, 2, uncertain.stdout + uncertain.stderr)
+        self.assertEqual(json.loads(uncertain.stderr)['error'], 'execution_uncertain')
+        self.assertFalse(marker.exists(), 'Receipt retention must not create an automatic capability retry')
 
     def test_stop_after_final_ready_write_cannot_release_requirement_hold(self):
         published = self.case.publish()
