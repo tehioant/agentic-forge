@@ -216,13 +216,8 @@ def complete(database, item, request, github):
         return item
     require(not pending, 'Missing answers cannot be replaced by an agent sufficiency assertion.')
     docs = request['documents']
-    validate_documents(docs)
-    milestone = docs['milestone.md']
     commit = request['commit']
     number = request['issue_number']
-    require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit) is not None and
-            type(number) is int and number > 0, 'Use an exact immutable full commit SHA and positive issue number.')
-    require(number != item.get('work_item_number'), 'Do not repurpose the unchanged parent work/spec issue.')
     if planning.get('continuation'):
         previous = planning['continuation']['previous_specs'].values()
         require(all(number != spec['issue']['number'] and commit != spec['commit'] for spec in previous),
@@ -230,6 +225,27 @@ def complete(database, item, request, github):
     digest = hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False, allow_nan=False).encode()).hexdigest()
     require(planning.get('completion_digest', digest) == digest,
             'Completed publication cannot be silently replaced; reassign explicitly.', 'planning_conflict')
+    handoff = read_publication(database, item, planning['docs_path'], docs, commit, number, github)
+    previous = item.get('handoff')
+    require(previous is None or previous['issue']['id'] == handoff['issue']['id'],
+            'Specification issue identity changed.', 'publication_mismatch')
+    planning['status'] = 'complete'
+    planning['pending_questions'] = []
+    planning['judgment'] = {key: request[key] for key in ('sufficient', 'rationale', 'reference')}
+    planning['completion_digest'] = digest
+    item['handoff'] = handoff
+    transition(item, 'planning_complete')
+    checkpoint(database, item)
+    return item
+
+
+def read_publication(database, item, docs_path, docs, commit, number, github):
+    """Verify immutable publication only; interview and revision execution have separate admission."""
+    validate_documents(docs)
+    milestone = docs['milestone.md']
+    require(isinstance(commit, str) and re.fullmatch(r'[0-9a-f]{40}', commit) is not None and
+            type(number) is int and number > 0, 'Use an exact immutable full commit SHA and positive issue number.')
+    require(number != item.get('work_item_number'), 'Do not repurpose the unchanged parent work/spec issue.')
     reconcile(database, item, github)  # Endpoint and immutable repository ID continuity.
     prefix = '/repos/' + item['repository']
     observation = github.request(prefix + '/git/commits/' + commit)
@@ -237,7 +253,7 @@ def complete(database, item, request, github):
             'Read back the exact publication commit.', 'publication_mismatch')
     references = {}
     for name, content in docs.items():
-        path = planning['docs_path'] + '/' + name
+        path = docs_path + '/' + name
         metadata = github.request(prefix + '/contents/' + path + '?ref=' + commit)
         require(isinstance(metadata, dict) and metadata.get('type') == 'file' and
                 metadata.get('path') == path and metadata.get('encoding') == 'base64' and
@@ -260,16 +276,6 @@ def complete(database, item, request, github):
             isinstance(issue.get('labels'), list) and
             any(isinstance(label, dict) and label.get('name') == 'ready-for-agent' for label in issue['labels']),
             'Exact open specification issue identity, label and immutable milestone body must read back.', 'publication_mismatch')
-    previous = item.get('handoff')
-    require(previous is None or previous['issue']['id'] == issue['id'],
-            'Specification issue identity changed.', 'publication_mismatch')
-    planning['status'] = 'complete'
-    planning['pending_questions'] = []
-    planning['judgment'] = {key: request[key] for key in ('sufficient', 'rationale', 'reference')}
-    planning['completion_digest'] = digest
-    item['handoff'] = {'repository': item['repository'], 'commit': commit,
-                       'issue': {'number': number, 'id': issue['id'], 'url': url},
-                       'documents': references, 'api_base': github.base}
-    transition(item, 'planning_complete')
-    checkpoint(database, item)
-    return item
+    return {'repository': item['repository'], 'commit': commit,
+            'issue': {'number': number, 'id': issue['id'], 'url': url},
+            'documents': references, 'api_base': github.base}

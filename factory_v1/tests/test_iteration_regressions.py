@@ -1,10 +1,12 @@
 """Issue 24 correction regressions: SQLite components, mocked external reads only."""
+import base64
 import copy
+import hashlib
 import json
 import unittest
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, attention, delivery, diagnosis, iteration, planning, requirements, tickets
+from factory_v1 import assignments, attention, delivery, diagnosis, iteration, planning, requirement_publication, requirements, tickets
 from factory_v1.repositories import RepositoryError, save_iteration
 from factory_v1.tests import test_iteration as fixtures
 
@@ -116,3 +118,57 @@ class ScopedInputRegressions(unittest.TestCase):
                 report['delivered'][0]['requirements'] = dict(revision, ticket_inputs='0' * 64)
                 with self.assertRaisesRegex(RepositoryError, 'authority changed'):
                     iteration.continuation_inputs(f.item)
+
+
+class RevisionPublicationRegressions(unittest.TestCase):
+    def test_scoped_revision_readback_does_not_repeat_the_completed_interview(self):
+        f = fixture(self, fixtures.ContinuationComponents)
+        item = f.start()
+        item['handoff'] = copy.deepcopy(f.item['handoff'])
+        item['planning']['status'] = 'complete'
+        docs = {name: '# Agreed revised prose' for name in ('milestone.md', 'vision.md', 'provenance.md')}
+        docs['milestone.md'] = '\n'.join('## ' + s + '\nAgreed prose.\n' for s in planning.SECTIONS)
+        record = {'status': 'synthesized', 'request': {'change_id': 'revision1'}, 'documents': docs, 'tickets': [],
+                  'resolution': {'content': 'New agreed scope', 'reference': 'operator-direction'},
+                  'synthesis_request': {'skills': f.request['skills']}, 'affected': []}
+        item['requirement_changes'] = {'revision1': record}
+        save_iteration(f.db, item)
+        f.db.commit()
+        corrupt = {'value': False}
+        def read(path):
+            if '/git/commits/' in path:
+                return {'sha': 'e' * 40}
+            if '/contents/' in path:
+                name = path.split('/')[-1].split('?')[0]
+                raw = (docs[name] + ('drift' if corrupt['value'] else '')).encode()
+                return {'type': 'file', 'path': 'docs/revision1/' + name, 'encoding': 'base64',
+                        'content': base64.b64encode(raw).decode(),
+                        'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()}
+            return {'number': 9, 'id': 90, 'html_url': 'https://github.com/example/product/issues/9',
+                    'repository_url': 'https://api.github.com/repos/example/product', 'state': 'open',
+                    'body': docs['milestone.md'], 'labels': [{'name': 'ready-for-agent'}]}
+        github = Mock(base='http://127.0.0.1:9876')
+        github.request.side_effect = read
+        with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
+             patch.object(requirement_publication, 'version_documents', return_value={'path': 'docs/revision1', 'commit': 'e' * 40}), \
+             patch.object(requirement_publication, 'spec_issue', return_value=9), \
+             patch.object(tickets, 'pinned_inputs', side_effect=lambda db, shadow, api: {'handoff': shadow['handoff'], 'documents': {}}), \
+             patch.object(requirement_publication, 'verify_publication'), patch.object(requirements, 'sync_blocks'), \
+             patch.object(planning, 'resolve', return_value={}), patch.object(planning, 'reconcile'):
+            result = requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
+            revised = result['requirement_changes']['revision1']
+            self.assertEqual(revised['status'], 'published')
+            self.assertEqual(revised['new_revision']['spec']['commit'], 'e' * 40)
+            self.assertEqual(revised['new_revision']['spec']['issue']['number'], 9)
+            self.assertEqual(result['planning'], item['planning'])
+            self.assertEqual(result['handoff'], item['handoff'])
+            revised['status'] = 'synthesized'
+            save_iteration(f.db, result)
+            f.db.commit()
+            corrupt['value'] = True
+            with self.assertRaisesRegex(RepositoryError, 'Published docs differ'):
+                requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
+        # Versioned readback is not a substitute for actual selected resynthesis.
+        with patch('factory_v1.skills.resolve', return_value={}):
+            with self.assertRaisesRegex(RepositoryError, 'Actual selected synthesis required'):
+                requirement_publication.verify_synthesis(item, record)

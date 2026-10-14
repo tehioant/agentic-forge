@@ -188,18 +188,9 @@ def publish(database, project, iteration, operator, request, github):
     with closing(sqlite3.connect(':memory:')) as observation:
         database.backup(observation)
         shadow = copy.deepcopy(item)
-        shadow.pop('handoff', None)
-        shadow['planning'] = {**shadow['planning'], 'assignment_id': record['request']['change_id'],
-            'docs_path': journal['path'], 'status': 'pending'}
-        shadow['planning'].pop('completion_digest', None)
-        shadow['planning']['request']['skills'] = record['synthesis_request']['skills']
-        from .repositories import save_iteration
-        save_iteration(observation, shadow)
-        observation.commit()
-        completed = planning.complete(observation, shadow, {'assignment_id': record['request']['change_id'], 'origin': item['origin'],
-            'sufficient': True, 'rationale': record['resolution']['content'], 'reference': record['resolution']['reference'],
-            'pending_questions': [], 'documents': record['documents'], 'commit': journal['commit'], 'issue_number': number}, github)
-        record['new_inputs'] = tickets.pinned_inputs(observation, completed, github)
+        shadow['handoff'] = planning.read_publication(observation, shadow, journal['path'], record['documents'],
+                                                     journal['commit'], number, github)
+        record['new_inputs'] = tickets.pinned_inputs(observation, shadow, github)
     record['new_revision'] = {'spec': record['new_inputs']['handoff'], 'ticket_assignment': request['change_id'],
                               'ticket_inputs': tickets.digest([record['new_inputs'], record['tickets'], record['resolution']])}
     requirements.checkpoint(database, item)
