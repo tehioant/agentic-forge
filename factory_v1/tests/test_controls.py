@@ -1,28 +1,26 @@
-"""Public interruption races. All tracker/model/Docker metadata is LABELED simulated.
+"""Small interruption components; external tracker/worker/model effects are mocked.
 
-Process-tree fixtures execute real Linux processes; they do not prove container or
-native inference isolation. No completion rows are injected by these tests.
+Durable records are direct test inputs, never native execution/acceptance evidence.
+The legacy cli/value/wait helpers remain available to untouched journey tests.
 """
+import copy
+import hashlib
 import json
 import os
-import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from factory_v1 import controls, merge
+from factory_v1 import assignments, controls, delivery, merge, spending, tickets
 from factory_v1.repositories import RepositoryError, state_lock
-from factory_v1.sandbox_guard import process_identity
-from factory_v1.sandbox_policy import Docker
-from factory_v1.tests import test_assignments, test_merge, test_sandbox, test_spending_cancel
-from factory_v1.tests.test_model_access_cancel import StalledHTTPFixture, STALLS
 
 
 def cli(state, action, operator='42', project='product', iteration='m1'):
@@ -47,432 +45,520 @@ def wait(case, condition, message, seconds=5):
     case.fail(message)
 
 
-class ControlTests(unittest.TestCase):
-    def setUp(self):
-        self.assignment = test_assignments.AssignmentTests()
-        self.assignment.setUp()
-        self.addCleanup(self.assignment.doCleanups)
-        self.state = self.assignment.fixture.state
+def artifact(name, content):
+    return {'name': name, 'content': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}
 
-    def test_public_pause_pins_evidence_and_budget_until_explicit_resume(self):
-        assignment = self.assignment.ok(self.assignment.command())
+
+class ControlFixture(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix='controls-unit-')
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.state = self.root / 'state.sqlite'
+        self.db = sqlite3.connect(self.state)
+        self.addCleanup(self.db.close)
+        self.db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
+        self.db.execute('CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
+        self.item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active',
+                     'execution_allowed': False,
+                     'approval': {'operator_id': '42', 'reference': 'LABELED approval'},
+                     'repository': 'example/product',
+                     'repository_onboarding': {'status': 'verified', 'metadata': {'id': 123},
+                                               'api_base': 'https://api.github.com'},
+                     'handoff': {'commit': 'a' * 40},
+                     'ticket_work': {'assignment_id': 'tickets', 'input_digest': 'd' * 64,
+                                     'inputs': {'documents': {}}},
+                     'budget': {'attempts': 3, 'deadline': 12345}}
+        self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+        spending.initialize(self.db)
+        self.scope = ('product', 'm1', 'openai-codex', 'gpt-6.1-sol', 'responses')
+        with self.db:
+            spending.add_grant(self.db, *self.scope, 'allowance', 10, 2**40, 'LABELED existing allowance', now=100)
+        # Rewritten tests must never silently fall back to real external execution.
+        for target in ('subprocess.run', 'subprocess.Popen', 'socket.socket', 'os.pidfd_open',
+                       'factory_v1.spending.transport', 'factory_v1.repositories.GitHub.request'):
+            patcher = patch(target, side_effect=AssertionError('Unexpected external boundary: ' + target))
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def pause(self, action='pause', database=None):
+        return controls.request(database or self.db, 'product', 'm1', '42', action, 'LABELED interruption')
+
+    def inspect(self):
+        return controls.inspect(self.db, 'product', 'm1', '42')
+
+    def resume(self):
+        return controls.resume(self.db, 'product', 'm1', '42', 'LABELED explicit resume')
+
+    def refused(self, code, function, *args, error_class: type[RepositoryError] | type[spending.SpendingError] = RepositoryError, **kwargs):
+        with self.assertRaises(error_class) as caught:
+            function(*args, **kwargs)
+        self.assertEqual(caught.exception.code, code)
+
+    def store_assignment(self, assignment):
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO role_assignments VALUES (?,?)',
+                            (assignment['assignment_id'], json.dumps(assignment)))
+
+    def stored_assignment(self, assignment_id):
+        return json.loads(self.db.execute('SELECT payload FROM role_assignments WHERE assignment_id=?',
+                                          (assignment_id,)).fetchone()[0])
+
+
+class ControlTests(ControlFixture):
+    def test_pause_checkpoint_restart_and_explicit_resume_preserve_progress_and_budget(self):
+        retained = {'assignment_id': 'retained', 'ticket_scope': {'project': 'product', 'iteration': 'm1'},
+                    'handoff': {'input': 'immutable'}, 'publication': {'status': 'published'}}
+        self.store_assignment(retained)
         before = self.state.read_bytes()
-        paused = value(self, cli(self.state, 'pause'))
+        paused = self.pause()
         self.assertEqual(paused['state'], 'completed')
         self.assertFalse(paused['dispatch_allowed'])
-        self.assertEqual(paused['checkpoint']['assignments'][0]['handoff'], assignment['handoff'])
-        self.assertEqual(self.state.read_bytes(), before, 'Control request must not overwrite product progress or budgets')
-        self.assignment.refused(self.assignment.command(), 'iteration_paused')
-        self.assignment.refused(self.assignment.tracker.control('reserve-ticket', issue=10), 'iteration_paused')
-        restarted = value(self, cli(self.state, 'inspect-control'))
-        self.assertEqual(restarted['request_id'], paused['request_id'])
-        self.assertEqual(restarted['checkpoint']['assignments'][0]['assignment_id'], assignment['assignment_id'])
-        self.assertEqual(self.assignment.tracker.inspect()['status'], 'paused')
-        resumed = value(self, cli(self.state, 'resume'))
-        self.assertTrue(resumed['dispatch_allowed'])
-        self.assertEqual(self.assignment.ok(self.assignment.command())['assignment_id'], assignment['assignment_id'])
-        self.assignment.assert_no_external_writes()
-
-    def test_operator_scope_private_state_corruption_and_symlinks_fail_closed(self):
-        before = self.state.read_bytes()
-        for action in ('pause', 'emergency-stop', 'resume', 'inspect-control'):
-            self.assignment.refused(cli(self.state, action, operator='99'), 'approval_required')
-            self.assignment.refused(cli(self.state, action, project='other'), 'not_found')
+        self.assertEqual(paused['checkpoint']['assignments'], [retained])
         self.assertEqual(self.state.read_bytes(), before)
-        paused = value(self, cli(self.state, 'pause'))
-        with closing(sqlite3.connect(self.state)) as db:
-            root, record = controls.paths(db, 'product', 'm1')
+        self.refused('iteration_paused', assignments.current, self.db, 'product', 'm1', '42')
+        self.refused('iteration_paused', tickets.active, self.item, self.db)
+        with closing(sqlite3.connect(self.state)) as fresh:
+            self.assertEqual(controls.inspect(fresh, 'product', 'm1', '42')['request_id'], paused['request_id'])
+        resumed = self.resume()
+        self.assertTrue(resumed['dispatch_allowed'])
+        self.assertEqual(resumed['history'][-1]['request_id'], paused['request_id'])
+        self.assertEqual(assignments.current(self.db, 'product', 'm1', '42'), self.item)
+        self.assertEqual(assignments.rows(self.db), [retained])
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 10)
+        self.refused('control_conflict', self.resume)
+
+    def test_operator_scope_and_private_controls_fail_closed(self):
+        for function, args in ((controls.request, ('pause', 'reference')), (controls.resume, ('reference',)),
+                               (controls.inspect, ())):
+            self.refused('approval_required', function, self.db, 'product', 'm1', '99', *args)
+            self.refused('not_found', function, self.db, 'other', 'm1', '42', *args)
+        paused = self.pause()
+        root, record = controls.paths(self.db, 'product', 'm1')
         assert root is not None and record is not None
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
         self.assertEqual(record.stat().st_mode & 0o777, 0o600)
         raw = record.read_bytes()
-        for content in ('{malformed', '{}'):
-            record.write_text(content)
-            self.assignment.refused(cli(self.state, 'resume'), 'invalid_control')
-            self.assignment.refused(self.assignment.fixture.cli('inspect', '--project', 'product', '--iteration', 'm1'), 'invalid_control')
-            self.assignment.refused(self.assignment.command(), 'invalid_control')
-            self.assignment.refused(self.assignment.fixture.cli('model-broker', '--project', 'product', '--iteration', 'm1',
-                '--provider', 'openai-codex', '--model', 'gpt-6.1-sol', '--operation', 'responses',
-                '--socket', str(self.assignment.root / 'blocked.sock'), '--subscription-socket', str(self.assignment.root / 'absent.sock')),
-                'invalid_control')
-        for changed in (dict(paused, operator_id='99'), dict(paused, action='resume', state='requested'),
-                        dict(paused, checkpoint={})):
-            record.write_text(json.dumps(changed))
-            self.assignment.refused(self.assignment.command(), 'invalid_control')
+        malformed = ['{malformed', '{}', '{"action":"pause","action":"resume"}']
+        malformed += [json.dumps(dict(paused, **change)) for change in (
+            {'operator_id': '99'}, {'project': 'other'}, {'action': 'resume', 'state': 'requested'},
+            {'checkpoint': {}}, {'request_id': '../unsafe'}, {'history': None}, {'cleanup': []})]
+        for content in malformed:
+            with self.subTest(content=content):
+                record.write_text(content)
+                self.refused('invalid_control', self.resume)
+                self.refused('invalid_control', self.inspect)
+                self.refused('invalid_control', assignments.current, self.db, 'product', 'm1', '42')
+                self.refused('invalid_control', spending.admission_preview, self.db, self.scope,
+                             error_class=spending.SpendingError)
         record.write_bytes(raw)
+        for mode in (0o644, 0o666):
+            record.chmod(mode)
+            self.refused('invalid_control', controls.require_active, self.db, 'product', 'm1')
+        record.chmod(0o600)
         record.unlink()
         record.symlink_to(root / 'absent')
-        self.assignment.refused(self.assignment.command(), 'invalid_control')
+        self.refused('invalid_control', controls.require_active, self.db, 'product', 'm1')
         record.unlink()
         record.write_bytes(raw)
         record.chmod(0o600)
-        self.assertEqual(value(self, cli(self.state, 'inspect-control'))['request_id'], paused['request_id'])
+        root.chmod(0o755)
+        self.refused('invalid_control', controls.require_active, self.db, 'product', 'm1')
+        root.chmod(0o700)
+        self.assertEqual(self.inspect()['request_id'], paused['request_id'])
 
-    def test_pause_does_not_wait_for_long_sqlite_transaction_or_queued_admission(self):
-        with ThreadPoolExecutor(max_workers=1) as pool, closing(sqlite3.connect(self.state)) as db:
-            with state_lock(db):
-                db.execute('BEGIN IMMEDIATE')
-                db.execute('UPDATE iterations SET payload=payload')
-                queued = pool.submit(self.assignment.command)
-                started = time.monotonic()
-                paused = value(self, cli(self.state, 'pause'))
-                self.assertLess(time.monotonic() - started, 2)
-                self.assertEqual(paused['state'], 'requested')
-                self.assertFalse(paused['dispatch_allowed'])
-                self.assignment.refused(cli(self.state, 'resume'), 'control_busy')
-                db.rollback()
-            self.assignment.refused(queued.result(timeout=10), 'iteration_paused')
-        self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
-        self.assignment.assert_no_external_writes()
+    def test_pause_and_stop_do_not_wait_for_sqlite_writer_or_controller_lock(self):
+        for action, state in (('pause', 'requested'), ('emergency-stop', 'acknowledged')):
+            with self.subTest(action=action), closing(sqlite3.connect(self.state)) as writer, state_lock(writer):
+                writer.execute('BEGIN IMMEDIATE')
+                writer.execute('UPDATE iterations SET payload=payload')
+                entered = threading.Event()
+                def request():
+                    with closing(sqlite3.connect(self.state, timeout=.1)) as independent:
+                        entered.set()
+                        return self.pause(action, independent)
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    pending = pool.submit(request)
+                    self.assertTrue(entered.wait(1))
+                    response = pending.result(timeout=1)
+                self.assertEqual(response['state'], state)
+                self.assertFalse(response['dispatch_allowed'])
+                self.refused('control_busy', self.resume)
+                self.refused('iteration_paused', controls.require_active, writer, 'product', 'm1')
+                writer.rollback()
+            self.assertEqual(self.inspect()['state'], 'completed')
+            self.assertTrue(self.resume()['dispatch_allowed'])
 
-    def test_pause_racing_final_assignment_claim_prevents_new_row(self):
-        entered, release = threading.Event(), threading.Event()
-        parent = self.assignment.fixture.server.RequestHandlerClass
-        class Handler(parent):
-            def do_GET(handler):
-                if handler.path == '/repos/example/product/issues/10':
-                    entered.set()
-                    release.wait(5)
-                super().do_GET()
-        self.assignment.fixture.server.RequestHandlerClass = Handler
-        self.addCleanup(release.set)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self.assignment.command)
-            self.assertTrue(entered.wait(3))
-            paused = value(self, cli(self.state, 'pause'))
+    def test_stop_cannot_be_downgraded_or_autoresumed(self):
+        first = self.pause()
+        self.assertEqual(self.pause()['request_id'], first['request_id'])
+        stopped = self.pause('emergency-stop')
+        repeated = self.pause()
+        self.assertEqual(repeated['action'], 'emergency-stop')
+        self.assertEqual(repeated['request_id'], stopped['request_id'])
+        self.assertEqual(self.inspect()['action'], 'emergency-stop')
+        self.refused('iteration_paused', controls.require_active, self.db, 'product', 'm1')
+        self.assertTrue(self.resume()['dispatch_allowed'])
+
+    def test_broker_ownership_survives_pause_until_capability_teardown(self):
+        socket_path = str(self.root / 'unused-capability.sock')
+        with patch('factory_v1.sandbox_guard.process_identity', return_value='LABELED owner'), \
+                controls.broker_lease(self.db, 'product', 'm1', socket_path):
+            paused = self.pause()
             self.assertEqual(paused['state'], 'requested')
-            release.set()
-            self.assignment.refused(pending.result(), 'iteration_paused')
-        with closing(sqlite3.connect(self.state)) as db:
-            self.assertEqual(self.assignment_rows(db), [])
-        self.assignment.assert_no_external_writes()
+            self.assertEqual(paused['checkpoint']['brokers'][0]['socket'], socket_path)
+            self.refused('control_busy', self.resume)
+            self.refused('iteration_paused', controls.require_active, self.db, 'product', 'm1')
+            self.assertFalse(Path(socket_path).exists(), 'Ownership record does not create a real socket')
+        self.assertEqual(self.inspect()['checkpoint']['brokers'], [])
+        self.assertTrue(self.resume()['dispatch_allowed'])
 
-    @staticmethod
-    def assignment_rows(db):
-        from factory_v1.assignments import rows
-        return rows(db)
+    def test_other_scope_is_independent_and_resume_cannot_steal_active_iteration(self):
+        other = dict(self.item, project_id='other', iteration_id='other-m1')
+        with self.db:
+            self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('other', 'other-m1', json.dumps(other)))
+        controls.request(self.db, 'other', 'other-m1', '42', 'pause', 'LABELED other scope')
+        self.assertEqual(assignments.current(self.db, 'product', 'm1', '42'), self.item)
+        self.refused('control_conflict', controls.resume, self.db, 'other', 'other-m1', '42', 'explicit resume')
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 10)
 
-    def test_pause_racing_final_result_admission_does_not_accept_stage_evidence(self):
-        prepared = self.assignment.ok(self.assignment.command())
-        request = self.assignment.result(prepared)  # Existing explicitly untrusted structured fixture, not native evidence.
-        entered, release = threading.Event(), threading.Event()
-        parent = self.assignment.fixture.server.RequestHandlerClass
-        class Handler(parent):
-            def do_GET(handler):
-                if handler.path == '/repos/example/product/issues/10':
-                    entered.set()
-                    release.wait(5)
-                super().do_GET()
-        self.assignment.fixture.server.RequestHandlerClass = Handler
-        self.addCleanup(release.set)
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self.assignment.command, 'assignment-result', request, prepared['assignment_id'])
-            self.assertTrue(entered.wait(3))
-            value(self, cli(self.state, 'pause'))
-            release.set()
-            self.assignment.refused(pending.result(), 'iteration_paused')
-        self.assertNotIn('submitted_result', self.assignment.ok(self.assignment.inspect(prepared)))
-        self.assignment.assert_no_external_writes()
+    def test_pending_model_receipt_is_retained_while_new_admission_and_resume_are_refused(self):
+        # Only an already-admitted local reservation; no adapter/model call.
+        with self.db:
+            spending._prepare(self.db, self.scope, 'pending-op', b'{}', 1, 100, allowance_only=True)
+        paused = self.pause('emergency-stop')
+        self.assertEqual(paused['checkpoint']['pending_model_operations'], [['pending-op', 'pending', 1, None]])
+        self.refused('control_busy', self.resume)
+        self.refused('iteration_paused', spending.admission_preview, self.db, self.scope,
+                     error_class=spending.SpendingError)
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 9)
+        with self.db:
+            receipt = spending.reconcile(self.db, *self.scope, 'pending-op', 'complete', 1, 'LABELED trusted billing receipt')
+        self.assertEqual(receipt['status'], 'complete')
+        self.assertFalse(self.inspect()['dispatch_allowed'])
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 9)
+        self.assertTrue(self.resume()['dispatch_allowed'])
 
-    def test_other_project_control_does_not_pause_this_project_or_reset_budget(self):
-        item = self.assignment.tracker.inspect()
-        request = {key: item[key] for key in ('repository', 'idea', 'approval', 'origin')}
-        request.update(project_id='other', iteration_id='other-m1')
-        request_path = self.assignment.root / 'other-intake.json'
-        request_path.write_text(json.dumps(request))
-        value(self, self.assignment.fixture.cli('register', '--request', str(request_path)))
-        paused = value(self, cli(self.state, 'pause', project='other', iteration='other-m1'))
-        self.assertFalse(paused['dispatch_allowed'])
-        self.assertEqual(self.assignment.tracker.inspect()['status'], 'active')
-        prepared = self.assignment.ok(self.assignment.command())
-        self.assertEqual(prepared['ticket_scope']['project'], 'product')
-        self.assignment.refused(cli(self.state, 'resume', project='other', iteration='other-m1'), 'control_conflict')
-        self.assignment.assert_no_external_writes()
-
-    def test_concurrent_pause_stop_cannot_downgrade_stop_or_autoresume(self):
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            responses = list(pool.map(lambda action: cli(self.state, action), ['pause', 'emergency-stop', 'pause']))
-        for result in responses:
-            value(self, result)
-        inspected = value(self, cli(self.state, 'inspect-control'))
-        self.assertEqual(inspected['action'], 'emergency-stop')
-        self.assertEqual(inspected['state'], 'completed')
-        self.assertFalse(inspected['dispatch_allowed'])
-        self.assignment.refused(self.assignment.command(), 'iteration_paused')
+    def test_resume_requires_reconciled_publication_and_merge_intents(self):
+        self.pause()
+        for kind in ('publication', 'merge'):
+            with self.subTest(kind=kind):
+                record = {'assignment_id': 'pending', 'ticket_scope': {'project': 'product', 'iteration': 'm1'},
+                          kind: {'status': 'pending'}}
+                self.store_assignment(record)
+                self.refused('control_busy', self.resume)
+                record[kind]['status'] = 'published' if kind == 'publication' else 'merged'
+                self.store_assignment(record)
+        self.assertTrue(self.resume()['dispatch_allowed'])
 
 
-class ActiveControlTests(unittest.TestCase):
+class AdmissionControlTests(ControlFixture):
     def setUp(self):
-        self.sandbox = test_sandbox.SandboxTests()
-        self.sandbox.setUp()
-        self.addCleanup(self.sandbox.doCleanups)
-        self.assignment = self.sandbox.assignment
-        self.state = self.assignment.fixture.state
+        super().setUp()
+        pin = '136a8987143241a0229952a56d9c41042646073769fcad466d808bd5e40bb4f0'
+        self.request = {'stage': 'implementation', 'repository': 'example/product', 'repository_id': 123,
+                        'workspace': str(self.root / 'workspace'), 'spec_commit': 'a' * 40,
+                        'baseline': 'a' * 40, 'candidate': None, 'claim_id': 'controls-claim',
+                        'issue': {'number': 10, 'id': 1010, 'node_id': 'ISSUE10',
+                                  'body_sha256': hashlib.sha256(b'LABELED issue').hexdigest()},
+                        'profile': {'name': 'controls-worker', 'home': str(self.root / 'profile'),
+                                    'role': 'implementation', 'provider': 'openai-codex',
+                                    'model': 'gpt-6.1-sol', 'operation': 'responses', 'reasoning': 'high'},
+                        'standards': [artifact('AGENTS.md', 'LABELED standards')], 'preceding': [],
+                        'skills': [{'name': 'implement', 'source': '/home/ops/.hermes/skills/implement/SKILL.md',
+                                    'path': str(Path(__file__).parent / 'role_skill_snapshots/implement/SKILL.md'),
+                                    'sha256': pin, 'dependencies': []}],
+                        'capabilities': ['read_workspace', 'scratch', 'model', 'write_workspace'],
+                        'result_contract': assignments.CONTRACT}
+        self.github = Mock(base='https://api.github.com')
+        observed = copy.deepcopy(self.item)
+        observed['ticket_work'].update(publication_complete=True, board={'id': 'BOARD'},
+            frontier={'foreign_active': [], 'active': [], 'items': [dict(self.request['issue'], admissible=True)]})
+        patcher = patch.object(tickets, 'frontier', return_value=observed)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.issue = {'body': 'LABELED issue', 'html_url': 'https://github.com/example/product/issues/10'}
 
-    def test_emergency_stop_retains_logs_before_removal_with_guard_suspended(self):
-        import signal
-        self.sandbox.mode('process-tree')
-        prepared = self.assignment.ok(self.assignment.command())
-        controller = self.sandbox.started(prepared)
-        self.addCleanup(controller.communicate, timeout=10)
-        runtime = self.sandbox.wait_running(prepared)['runtime']
-        root = Path(runtime['artifacts'])
-        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
-        wait(self, lambda: (Docker().inspect(runtime['container']) or {}).get('State', {}).get('Running') is True,
-             'Docker fixture start did not complete')
-        tree = json.loads((root / 'scratch/process-tree.json').read_text())
-        identities = {pid: process_identity(pid) for pid in tree.values()}
-        guard = json.loads((root / 'guard-process.json').read_text())
-        os.kill(guard['pid'], signal.SIGSTOP)
-        def release_guard():
-            if process_identity(guard['pid']) == guard['start']:
-                os.kill(guard['pid'], signal.SIGCONT)
-        self.addCleanup(release_guard)
-        try:
-            wait(self, lambda: Path(f"/proc/{guard['pid']}/stat").read_text().rsplit(')', 1)[1].split()[0] == 'T',
-                 'Guard did not suspend')
-            with closing(sqlite3.connect(self.state)) as db, state_lock(db):
-                available = subprocess.run([str(self.sandbox.bin / 'docker'), 'logs', runtime['container']],
-                                           capture_output=True, timeout=3)
-                self.assertEqual(available.returncode, 0, available.stderr)
-                stopped = value(self, cli(self.state, 'emergency-stop'))
-                self.assertTrue(stopped['cleanup'][prepared['assignment_id']]['container_removed'])
-                wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()),
-                     'Worker survived stop')
-                self.assertTrue((root / 'container.log').exists(), 'Available diagnostics lost before capture')
-                self.assertEqual((root / 'container.log').read_bytes(), available.stdout)
-                calls = [json.loads(line) for line in (self.sandbox.bin / 'docker-calls.jsonl').read_text().splitlines()]
-                kill = next(i for i, call in enumerate(calls) if call[0] == 'kill')
-                log = next(i for i, call in enumerate(calls) if i > kill and call[0] == 'logs')
-                removal = next(i for i, call in enumerate(calls) if call[0] == 'rm')
-                self.assertLess(kill, log)
-                self.assertLess(log, removal)
-                release_guard()
-            output, error = controller.communicate(timeout=10)
-            self.assertEqual(controller.returncode, 0, error)
-            self.assertEqual(json.loads(output)['runtime']['status'], 'stopped')
-            self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
-        finally:
-            release_guard()
+    def prepare(self, dry_run=False):
+        return assignments.prepare(self.db, 'product', 'm1', '42', self.request, self.github, dry_run=dry_run)
 
-    def test_log_timeout_cannot_delay_execution_halt_or_skip_removal(self):
-        self.sandbox.mode('process-tree')
-        prepared = self.assignment.ok(self.assignment.command())
-        controller = self.sandbox.started(prepared)
-        self.addCleanup(controller.communicate, timeout=10)
-        runtime = self.sandbox.wait_running(prepared)['runtime']
-        root = Path(runtime['artifacts'])
-        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
-        wait(self, lambda: (Docker().inspect(runtime['container']) or {}).get('State', {}).get('Running') is True,
-             'Docker fixture start did not complete')
-        tree = json.loads((root / 'scratch/process-tree.json').read_text())
-        identities = {pid: process_identity(pid) for pid in tree.values()}
-        original = Docker.call
-        captured = []
-        import signal
-        guard = json.loads((root / 'guard-process.json').read_text())
-        os.kill(guard['pid'], signal.SIGSTOP)
-        def release_guard():
-            if process_identity(guard['pid']) == guard['start']:
-                os.kill(guard['pid'], signal.SIGCONT)
-        self.addCleanup(release_guard)
-        def fail_logs(docker, *args, **kwargs):
-            if args[0] == 'logs':
-                captured.append(True)
-                wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()),
-                     'Optional logs ran before execution halt')
-                self.assertTrue((self.sandbox.bin / 'container.json').exists())
-                raise RepositoryError('container_unavailable', 'LABELED log timeout')
-            return original(docker, *args, **kwargs)
-        wait(self, lambda: Path(f"/proc/{guard['pid']}/stat").read_text().rsplit(')', 1)[1].split()[0] == 'T',
-             'Guard did not suspend')
-        with closing(sqlite3.connect(self.state)) as db, state_lock(db), patch.object(Docker, 'call', fail_logs):
-            stopped = controls.request(db, 'product', 'm1', '42', 'emergency-stop', 'LABELED log timeout')
-        self.assertEqual(captured, [True])
-        self.assertTrue(stopped['cleanup'][prepared['assignment_id']]['container_removed'])
-        self.assertFalse((self.sandbox.bin / 'container.json').exists())
-        self.assertEqual(json.loads((root / 'container-log-error.json').read_text())['error'], 'log_unavailable')
-        release_guard()
-        controller.communicate(timeout=10)
-        self.assertEqual(controller.returncode, 0)
+    def result(self, prepared):
+        h = prepared['handoff']
+        expected = {s['source']: s['sha256'] for s in h['skills']} | h['input_loads']
+        return {'assignment_id': prepared['assignment_id'], 'handoff_digest': prepared['handoff_digest'],
+                'claim_id': prepared['claim_id'], 'run_id': 'controls-run', 'status': 'done',
+                'loads': [{'source': source, 'sha256': pin, 'tool_reference': 'LABELED read'} for source, pin in expected.items()],
+                'work': ['LABELED untrusted component input'],
+                'artifacts': [artifact('stage-evidence', 'LABELED no native execution')],
+                'tests': [{'command': 'LABELED command', 'result': 'LABELED input, not executed evidence'}]}
 
-    def test_signal_failure_does_not_skip_actual_worker_removal(self):
-        self.sandbox.mode('process-tree')
-        prepared = self.assignment.ok(self.assignment.command())
-        controller = self.sandbox.started(prepared)
-        runtime = self.sandbox.wait_running(prepared)['runtime']
-        root = Path(runtime['artifacts'])
-        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Real process fixture not ready')
-        tree = json.loads((root / 'scratch/process-tree.json').read_text())
-        identities = {pid: process_identity(pid) for pid in tree.values()}
-        with closing(sqlite3.connect(self.state)) as db, patch.object(os, 'pidfd_open', side_effect=OSError):
-            result = controls.request(db, 'product', 'm1', '42', 'emergency-stop', 'LABELED signal failure fixture')
-        cleanup = result['cleanup'][prepared['assignment_id']]
-        self.assertTrue(cleanup['container_removed'])
-        self.assertEqual(cleanup['controller_signal_error'], 'stop_unconfirmed')
-        wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()), 'Worker survived failed signal')
-        controller.communicate(timeout=10)
-        self.assertEqual(controller.returncode, 0)
-        self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
-
-    def test_real_worker_child_and_guard_stop_despite_long_shared_lock(self):
-        self.sandbox.mode('process-tree')
-        prepared = self.assignment.ok(self.assignment.command())
-        controller = self.sandbox.started(prepared)
-        runtime = self.sandbox.wait_running(prepared)['runtime']
-        root = Path(runtime['artifacts'])
-        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Real process-tree fixture never started')
-        tree = json.loads((root / 'scratch/process-tree.json').read_text())
-        identities = {pid: process_identity(pid) for pid in tree.values()}
-        self.assertTrue(all(identities.values()))
-        guard = json.loads((root / 'guard-process.json').read_text())
-        with closing(sqlite3.connect(self.state)) as db, state_lock(db):
-            started = time.monotonic()
-            response = value(self, cli(self.state, 'emergency-stop'))
-            self.assertLess(time.monotonic() - started, 3)
-            self.assertEqual(response['state'], 'acknowledged')
-            self.assertTrue(response['cleanup'][prepared['assignment_id']]['container_removed'])
-            wait(self, lambda: all(process_identity(pid) != start for pid, start in identities.items()),
-                 'Worker or child actually continued after emergency stop')
-            wait(self, lambda: process_identity(guard['pid']) != guard['start'], 'Independent guard remained live')
-            self.assertFalse((self.sandbox.bin / 'container.json').exists())
-            self.assignment.refused(cli(self.state, 'resume'), 'control_busy')
-        output, error = controller.communicate(timeout=10)
-        self.assertEqual(controller.returncode, 0, error)
-        stopped = json.loads(output)
-        self.assertEqual(stopped['runtime']['status'], 'stopped')
-        readback = value(self, cli(self.state, 'inspect-control'))
-        self.assertEqual(readback['state'], 'completed')
-        retained = readback['checkpoint']['assignments'][0]
-        self.assertEqual(retained['runtime']['run_id'], runtime['run_id'])
-        self.assertIn(readback['requested_checkpoint']['assignments'][0]['runtime']['status'], ('preparing', 'running'))
-        self.assertEqual(retained['runtime']['status'], 'stopped')
-        self.assertNotIn('submitted_result', retained)
-        self.assertTrue((root / 'initial-source.json').is_file())
-        self.assertTrue((root / 'inputs/handoff.json').is_file())
-        self.assertTrue((root / 'scratch/process-tree.json').is_file())
-        self.assertIn('retained real process fixture candidate', (root / 'workspace/hello.py').read_text())
-        self.assertEqual(self.sandbox.model_calls, [])
-        self.assignment.assert_no_external_writes()
-        evidence = os.environ.get('FORGE_CONTROL_EVIDENCE')
-        if evidence:
-            destination = Path(evidence) / 'real-process-tree'
-            destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-            shutil.copytree(root, destination / 'artifacts', dirs_exist_ok=True)
-            with closing(sqlite3.connect(self.state)) as original, closing(sqlite3.connect(destination / 'state.sqlite')) as backup:
-                original.backup(backup)
-            (destination / 'state.sqlite').chmod(0o600)
-            shutil.copytree(Path(str(self.state) + '.controls'), destination / 'state.sqlite.controls', dirs_exist_ok=True)
-            (destination / 'public-stop.json').write_text(json.dumps(response, indent=2))
-            (destination / 'fresh-readback.json').write_text(json.dumps(readback, indent=2))
-            (destination / 'process-liveness.json').write_text(json.dumps({
-                'label': 'Real Linux process-group fixture, not Docker/native worker isolation',
-                'before': identities, 'after': {pid: process_identity(pid) for pid in identities},
-                'controller_exit': controller.returncode, 'guard_after': process_identity(guard['pid'])}, indent=2))
-
-    def test_public_pause_during_assignment_retains_artifacts_and_cannot_launch_again(self):
-        self.sandbox.mode('process-tree')
-        prepared = self.assignment.ok(self.assignment.command())
-        controller = self.sandbox.started(prepared)
-        runtime = self.sandbox.wait_running(prepared)['runtime']
-        root = Path(runtime['artifacts'])
-        wait(self, lambda: (root / 'scratch/process-tree.json').exists(), 'Process fixture not ready')
-        requested = value(self, cli(self.state, 'pause'))
-        self.assertFalse(requested['dispatch_allowed'])
-        output, error = controller.communicate(timeout=10)
-        self.assertEqual(controller.returncode, 0, error)
-        result = json.loads(output)
-        self.assertEqual(result['runtime']['status'], 'stopped')
-        self.assertIn(result['runtime']['error'], ('iteration_paused', 'cancelled'))
-        self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
-        self.assertTrue((root / 'scratch/process-tree.json').is_file())
-        self.assignment.refused(self.sandbox.launch(prepared), 'iteration_paused')
-        self.assertTrue(value(self, cli(self.state, 'resume'))['dispatch_allowed'])
-        self.assignment.refused(self.sandbox.launch(prepared), 'run_conflict')
-
-
-class ModelControlTests(unittest.TestCase):
-    def test_public_stop_cancels_inflight_socket_and_joins_real_helper_preserving_uncertainty(self):
-        seam = test_spending_cancel.SpendingCancellationTests()
-        seam.setUp()
-        self.addCleanup(seam.doCleanups)
-        fixture = StalledHTTPFixture(seam.upstream, STALLS['body_close'])
-        self.addCleanup(fixture.close)
-        seam.start_broker(fixture)
-        seam.client()
-        self.assertTrue(fixture.entered.wait(2))
-        helpers = [t for t in threading.enumerate() if t.name == 'model-broker-canceller']
-        self.assertEqual(len(helpers), 1)
-        stopped = value(self, cli(seam.state, 'emergency-stop'))
-        self.assertFalse(stopped['dispatch_allowed'])
-        self.assertIn(stopped['state'], ('acknowledged', 'completed'))
-        assert seam.broker is not None
-        seam.broker.join(2)
-        self.assertFalse(seam.broker.is_alive(), seam.errors)
-        self.assertFalse(helpers[0].is_alive())
-        self.assertFalse(seam.path.exists())
-        self.assertTrue(fixture.disconnected.wait(1))
-        self.assertEqual(len(fixture.calls), 1)
-        self.assignment_refusal(cli(seam.state, 'resume'), 'control_busy')
-        fresh = value(self, cli(seam.state, 'inspect-control'))
-        self.assertEqual(fresh['checkpoint']['pending_model_operations'][0][1], 'pending')
-        with closing(sqlite3.connect(seam.state)) as db:
-            self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 1)
-
-    def assignment_refusal(self, result, code):
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertEqual(json.loads(result.stderr)['error'], code)
-
-
-class MergeControlTests(unittest.TestCase):
-    def setUp(self):
-        self.seam = test_merge.MergeTests()
-        self.seam.setUp()
-        self.addCleanup(self.seam.doCleanups)
-        self.state = self.seam.fixture.state
-
-    def test_public_pause_concurrent_with_merge_last_metadata_read_has_zero_writes(self):
-        response = []
-        self.seam.boundary_change = lambda: response.append(value(self, cli(self.state, 'pause')))
-        self.seam.refused('iteration_paused')
-        self.assertEqual(response[0]['state'], 'requested')
-        self.assertEqual(self.seam.writes(), [])
-        self.assertIsNone(self.seam.stored().get('merge'))
-        self.assertEqual(value(self, cli(self.state, 'inspect-control'))['state'], 'completed')
-        self.assertIn('publication', value(self, cli(self.state, 'inspect-control'))['checkpoint']['assignments'][1])
-
-    def test_pause_after_final_requirement_read_is_caught_by_target_boundary_guard(self):
-        original = merge.require_publication
-        calls = []
+    def test_pause_on_last_issue_read_prevents_final_assignment_claim(self):
+        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
+            self.assertFalse(self.prepare(dry_run=True)['claim_persisted'])
         def final_read(*args):
-            original(*args)
-            calls.append(True)
-            if len(calls) == 2:
-                self.assertEqual(value(self, cli(self.state, 'pause'))['state'], 'requested')
-        with closing(sqlite3.connect(self.state)) as db, state_lock(db), patch.object(merge, 'require_publication', final_read):
-            with self.assertRaises(RepositoryError) as caught:
-                merge.lifecycle(db, 'product', 'm1', '42', self.seam.config_path, 'merge-candidate')
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.assertEqual(len(calls), 2)
-        self.assertEqual(self.seam.writes(), [])
+            self.pause()
+            return self.issue
+        with patch.object(tickets.gh, 'read_issue', side_effect=final_read) as read:
+            self.refused('iteration_paused', self.prepare)
+        read.assert_called_once()
+        self.assertEqual(assignments.rows(self.db), [])
+        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 10)
+        self.assertTrue(self.resume()['dispatch_allowed'])
+        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
+            self.assertTrue(self.prepare()['claim_persisted'])
 
-    def test_stop_during_inflight_merge_reconciles_actual_effect_without_closure_or_replay(self):
-        response = []
-        self.seam.after_merge = lambda: response.append(value(self, cli(self.state, 'emergency-stop')))
-        journal = self.seam.ok(self.seam.cli())
-        self.assertEqual(response[0]['state'], 'acknowledged')
+    def test_pause_on_result_revalidation_prevents_accepting_stage_evidence(self):
+        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
+            prepared = self.prepare()
+        result = self.result(prepared)
+        def final_read(*args):
+            self.pause()
+            return self.issue
+        with patch.object(tickets.gh, 'read_issue', side_effect=final_read) as read:
+            self.refused('iteration_paused', assignments.store_result, self.db, 'product', 'm1', '42',
+                         prepared['assignment_id'], result, self.github)
+        read.assert_called_once()
+        self.assertNotIn('submitted_result', self.stored_assignment(prepared['assignment_id']))
+        self.assertTrue(self.resume()['dispatch_allowed'])
+        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
+            stored = assignments.store_result(self.db, 'product', 'm1', '42', prepared['assignment_id'], result, self.github)
+        self.assertEqual(stored['submitted_result'], result)
+        self.assertFalse(stored['result_disposition']['trusted_execution'])
+        self.assertFalse(stored['result_disposition']['advance_allowed'])
+
+
+class CleanupControlTests(ControlFixture):
+    def setUp(self):
+        super().setUp()
+        self.assignment = {'assignment_id': 'attempt', 'ticket_scope': {'project': 'product', 'iteration': 'm1'},
+                           'runtime': {'run_id': 'controls-run', 'status': 'running', 'container': 'LABELED-container',
+                                       'artifacts': str(self.root), 'controller_pid': 123,
+                                       'controller_start': 'LABELED-start', 'container_removed': False}}
+        self.store_assignment(self.assignment)
+        patcher = patch('factory_v1.sandbox_guard.process_identity', return_value=None)
+        self.identity = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_stop_halts_before_logs_and_removal_retains_artifacts(self):
+        docker = Mock()
+        docker.inspect.return_value = {'State': {'Running': False}}
+        docker.call.return_value = b'LABELED retained logs'
+        (self.root / 'candidate.txt').write_text('retained candidate')
+        with patch('factory_v1.sandbox_policy.Docker', return_value=docker):
+            response = self.pause('emergency-stop')
+        self.assertEqual([c[0] for c in docker.method_calls], ['call', 'inspect', 'call', 'remove'])
+        self.assertEqual(docker.call.call_args_list[0].args[0], 'kill')
+        self.assertEqual(docker.call.call_args_list[1].args[0], 'logs')
+        self.assertTrue(response['cleanup']['attempt']['container_removed'])
+        self.assertEqual((self.root / 'container.log').read_bytes(), b'LABELED retained logs')
+        self.assertEqual((self.root / 'candidate.txt').read_text(), 'retained candidate')
+        self.assertTrue((self.root / 'stop').exists())
+        self.assertEqual(response['state'], 'acknowledged')
+        self.refused('control_busy', self.resume)
+
+    def test_cleanup_failures_never_skip_removal_and_uncertainty_blocks_resume(self):
+        for defect in ('kill', 'inspect', 'still-running', 'logs', 'artifact', 'signal', 'remove'):
+            with self.subTest(defect=defect), ExitStack() as stack:
+                docker = Mock()
+                docker.inspect.return_value = {'State': {'Running': defect == 'still-running'}}
+                docker.call.return_value = b'LABELED logs'
+                if defect == 'kill':
+                    docker.call.side_effect = RepositoryError('container_unavailable', 'LABELED kill error')
+                elif defect == 'inspect':
+                    docker.inspect.side_effect = OSError('LABELED inspect error')
+                elif defect == 'logs':
+                    def fail_logs(command, *args, **kwargs):
+                        if command == 'logs':
+                            raise RepositoryError('container_unavailable', 'LABELED log timeout')
+                    docker.call.side_effect = fail_logs
+                elif defect == 'artifact':
+                    stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('LABELED diagnostics error')))
+                elif defect == 'signal':
+                    self.identity.return_value = 'LABELED-start'
+                    stack.enter_context(patch.object(os, 'pidfd_open', side_effect=OSError('LABELED signal error')))
+                elif defect == 'remove':
+                    docker.remove.side_effect = RepositoryError('stop_unconfirmed', 'LABELED removal uncertain')
+                stack.enter_context(patch('factory_v1.sandbox_policy.Docker', return_value=docker))
+                response = self.pause('emergency-stop')
+                outcome = response['cleanup']['attempt']
+                docker.remove.assert_called_once_with('LABELED-container')
+                self.assertEqual(outcome['container_removed'], defect != 'remove')
+                self.assertEqual(outcome['error'], 'stop_unconfirmed' if defect in {'kill', 'inspect', 'still-running', 'remove'} else None)
+                if defect in {'kill', 'inspect', 'still-running'}:
+                    self.assertNotIn('logs', [c.args[0] for c in docker.call.call_args_list])
+                if defect == 'signal':
+                    self.assertEqual(outcome['controller_signal_error'], 'stop_unconfirmed')
+                self.refused('control_busy', self.resume)
+                self.assertNotIn('submitted_result', self.stored_assignment('attempt'))
+                self.identity.return_value = None
+
+    def test_unconfirmed_runtime_requires_explicit_cleanup_readback_before_resume(self):
+        self.assignment['runtime'].update(status='unconfirmed', error='stop_unconfirmed')
+        self.store_assignment(self.assignment)
+        self.pause()
+        self.refused('control_busy', self.resume)
+        self.assignment['runtime'].update(status='stopped', container_removed=True)
+        self.store_assignment(self.assignment)
+        self.refused('control_busy', self.resume)
+        self.assignment['runtime']['error'] = 'iteration_paused'
+        self.store_assignment(self.assignment)
+        self.assertEqual(self.inspect()['state'], 'completed')
+        self.assertTrue(self.resume()['dispatch_allowed'])
+
+
+class MergeControlTests(ControlFixture):
+    def setUp(self):
+        super().setUp()
+        self.assignment = {'assignment_id': 'c' * 64, 'revision': {'spec': self.item['handoff']},
+                           'ticket_scope': {'project': 'product', 'iteration': 'm1'},
+                           'handoff': {'repository': 'example/product', 'repository_id': 123,
+                                       'issue': {'number': 10, 'id': 1010, 'node_id': 'ISSUE10',
+                                                 'body_sha256': hashlib.sha256(b'LABELED issue').hexdigest()},
+                                       'workspace': str(self.root / 'workspace'),
+                                       'profile': {'home': str(self.root / 'profile')}}}
+        self.store_assignment(self.assignment)
+        self.protection = {'required_status_checks': {'strict': True, 'checks': [{'context': 'unit', 'app_id': 1}]},
+                           'enforce_admins': {'enabled': True}, 'allow_force_pushes': {'enabled': False},
+                           'allow_deletions': {'enabled': False}}
+        self.config = {'operator_id': '42', 'execution_reference': 'LABELED mocked prerequisite chain',
+                       'executions': [{}, {}, {}, {}], 'candidate_assignment': 'c' * 64,
+                       'standards_assignment': 'd' * 64, 'spec_assignment': 'e' * 64,
+                       'repository': 'example/product', 'repository_id': 123, 'base': 'main', 'branch': 'candidate',
+                       'pr_number': 7, 'head': 'b' * 40, 'baseline': 'a' * 40, 'issue': 10,
+                       'api_base': 'https://api.github.com', 'bearer': 'LABELED inert token',
+                       'required_checks': [{'context': 'unit', 'app_id': 1}],
+                       'protection_sha256': assignments.digest({'rules': [], 'protection': self.protection}), 'recovery': None}
+        self.config_path = self.root / 'merge.json'
+        self.config_path.write_text(json.dumps(self.config))
+        self.config_path.chmod(0o600)
+        self.state.chmod(0o600)
+        self.pr = {'number': 7, 'head': {'ref': 'candidate', 'sha': 'b' * 40,
+                                      'repo': {'id': 123, 'full_name': 'example/product'}},
+                   'base': {'ref': 'main', 'sha': 'a' * 40, 'repo': {'id': 123, 'full_name': 'example/product'}},
+                   'state': 'open', 'merged': False, 'draft': False, 'mergeable': True, 'mergeable_state': 'clean'}
+        self.api = Mock(prefix='/repos/example/product')
+        self.api.github.base = 'https://api.github.com'
+        self.api.read.side_effect = self.read_metadata
+        self.api.request.side_effect = self.merge_effect
+        self.boundary = None
+        self.after_merge = None
+        # Antecedent engineering/requirement/delivery evidence is outside this
+        # controls test. Keep real target/check/protection and final controls guards.
+        for target, result in ((merge, ('MergeGitHub', self.api)),
+                               (merge, ('chain', (self.assignment, {}, self.root))),
+                               (merge, ('mapped_candidate', {'tree': 'f' * 40, 'base_tree': '0' * 40})),
+                               (merge.review, ('evaluate', {'status': 'accepted'})),
+                               (assignments, ('ticket_claims', [])),
+                               (delivery, ('mutation_boundary', self.item))):
+            patcher = patch.object(target, result[0], return_value=result[1])
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(merge, 'require_publication', side_effect=self.requirement_read)
+        self.publication_reads = patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def requirement_read(self, *args):
+        if self.publication_reads.call_count == 2 and self.boundary:
+            self.boundary()
+
+    def read_metadata(self, suffix):
+        if suffix == '':
+            return {'id': 123, 'full_name': 'example/product', 'default_branch': 'main'}
+        if suffix == '/pulls/7':
+            return copy.deepcopy(self.pr)
+        if suffix == '/issues/10':
+            return {'id': 1010, 'node_id': 'ISSUE10', 'number': 10, 'state': 'open',
+                    'body': 'LABELED issue', 'repository_url': 'https://api.github.com/repos/example/product'}
+        if suffix == '/rules/branches/main':
+            return []
+        if suffix == '/branches/main/protection':
+            return self.protection
+        if suffix.startswith('/commits/'):
+            sha = suffix.split('/')[2]
+            return {'total_count': 1, 'check_runs': [{'id': 1, 'name': 'unit', 'app': {'id': 1},
+                                                   'head_sha': sha, 'status': 'completed', 'conclusion': 'success'}]}
+        if suffix.startswith('/git/ref/heads/'):
+            branch = suffix.rsplit('/', 1)[1]
+            sha = ('9' * 40 if self.pr['merged'] else 'a' * 40) if branch == 'main' else 'b' * 40
+            return {'ref': 'refs/heads/' + branch, 'object': {'type': 'commit', 'sha': sha}}
+        if suffix == '/git/commits/' + '9' * 40:
+            return {'sha': '9' * 40, 'tree': {'sha': 'f' * 40}, 'parents': [{'sha': 'a' * 40}, {'sha': 'b' * 40}]}
+        if suffix.startswith('/compare/'):
+            return {'status': 'identical', 'base_commit': {'sha': '9' * 40}, 'merge_base_commit': {'sha': '9' * 40}}
+        raise AssertionError('Unexpected metadata request: ' + suffix)
+
+    def merge_effect(self, path, body, method):
+        self.assertEqual((path, body, method), ('/repos/example/product/pulls/7/merge',
+                                               {'sha': 'b' * 40, 'merge_method': 'merge'}, 'PUT'))
+        self.pr.update(merged=True, state='closed', merge_commit_sha='9' * 40)
+        if self.after_merge:
+            self.after_merge()
+        return {'merged': True}
+
+    def lifecycle(self, action='merge-candidate'):
+        return merge.lifecycle(self.db, 'product', 'm1', '42', self.config_path, action)
+
+    def test_pause_after_last_requirement_read_prevents_intent_and_merge_write(self):
+        self.boundary = self.pause
+        self.refused('iteration_paused', self.lifecycle)
+        self.assertEqual(self.publication_reads.call_count, 2)
+        self.api.request.assert_not_called()
+        stored = self.stored_assignment(self.assignment['assignment_id'])
+        self.assertNotIn('merge', stored)
+        self.assertEqual(stored['merge_refusal']['code'], 'iteration_paused')
+        self.assertTrue(self.resume()['dispatch_allowed'])
+        self.boundary = None
+        self.publication_reads.reset_mock()
+        self.assertEqual(self.lifecycle()['status'], 'merged')
+        self.api.request.assert_called_once()
+
+    def test_pause_after_intent_commit_prevents_final_put_without_erasing_intent(self):
+        original = controls.admission
+        @contextmanager
+        def after_admission(*args, **kwargs):
+            with original(*args, **kwargs):
+                yield
+            # Commit has completed and the real interruption lane is released.
+            journal = self.stored_assignment(self.assignment['assignment_id']).get('merge')
+            if journal and journal['status'] == 'pending' and journal['failure'] is None:
+                self.pause()
+        with patch.object(controls, 'admission', after_admission):
+            self.refused('iteration_paused', self.lifecycle)
+        self.api.request.assert_not_called()
+        stored = self.stored_assignment(self.assignment['assignment_id'])['merge']
+        self.assertEqual(stored['status'], 'pending')
+        self.assertEqual(stored['failure']['code'], 'iteration_paused')
+        self.assertIsNone(stored['integrated_evidence'])
+        self.refused('control_busy', self.resume)
+
+    def test_pause_during_last_issue_read_prevents_merge_mutation(self):
+        original = merge.issue
+        interrupted = []
+        def final_issue(*args):
+            observed = original(*args)
+            if self.publication_reads.call_count == 2 and not interrupted:
+                interrupted.append(self.pause())
+            return observed
+        with patch.object(merge, 'issue', side_effect=final_issue):
+            self.refused('iteration_paused', self.lifecycle)
+        self.assertEqual(len(interrupted), 1)
+        self.assertFalse(interrupted[0]['dispatch_allowed'])
+        self.api.request.assert_not_called()
+        self.assertNotIn('merge', self.stored_assignment(self.assignment['assignment_id']))
+
+    def test_stop_during_admitted_merge_retains_receipt_without_closure_or_replay(self):
+        self.after_merge = lambda: self.pause('emergency-stop')
+        journal = self.lifecycle()
         self.assertEqual(journal['status'], 'merged')
-        self.assertEqual(journal['integrated_evidence']['integrated'], self.seam.merge_sha)
-        self.assertEqual(self.seam.assignment.tracker.issues[10]['state'], 'open')
-        self.assertEqual(len(self.seam.writes('PUT')), 1)
-        self.seam.pass_checks(self.seam.merge_sha)
-        self.seam.refused('iteration_paused', 'verify-delivery')
-        self.assertEqual(len(self.seam.writes('PUT')), 1)
-        self.assertEqual(self.seam.writes('PATCH'), [])
-        checkpoint = value(self, cli(self.state, 'inspect-control'))
-        self.assertEqual(checkpoint['state'], 'completed')
-        self.assertFalse(checkpoint['external_effects_undone'])
-        self.assertEqual(self.seam.stored()['merge']['integrated_evidence']['integrated'], self.seam.merge_sha)
+        self.assertEqual(journal['integrated_evidence']['integrated'], '9' * 40)
+        self.assertFalse(journal['close_allowed'])
+        self.assertFalse(self.inspect()['external_effects_undone'])
+        self.assertEqual(self.stored_assignment(self.assignment['assignment_id'])['merge']['integrated_evidence'],
+                         journal['integrated_evidence'])
+        self.refused('iteration_paused', self.lifecycle, 'verify-delivery')
+        self.api.request.assert_called_once()
+        self.api.issue_state.assert_not_called()
+        self.assertFalse(self.inspect()['dispatch_allowed'])
 
 
 if __name__ == '__main__':

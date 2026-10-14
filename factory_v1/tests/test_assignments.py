@@ -286,21 +286,6 @@ class AssignmentTests(unittest.TestCase):
         self.refused(self.command(request=request), 'skill_blocked')
         self.assertEqual(self.fixture.calls, [])
 
-    def test_review_dependency_omission_refuses_before_tracker_or_claim(self):
-        before = self.fixture.state.read_bytes()
-        for stage in ('review-standards', 'review-spec'):
-            for defect in ('missing-reference', 'missing-edge', 'reference-pin'):
-                with self.subTest(stage=stage, defect=defect):
-                    request = self.configuration(stage=stage)
-                    if defect == 'missing-reference':
-                        request['skills'].pop()
-                    elif defect == 'missing-edge':
-                        request['skills'][0]['dependencies'] = []
-                    else:
-                        request['skills'][1]['sha256'] = '0' * 64
-                    self.refused(self.command(request=request), 'skill_blocked')
-                    self.assertEqual(self.fixture.state.read_bytes(), before)
-                    self.assertEqual(self.fixture.calls, [])
 
     def test_scope_repository_id_issue_identity_body_and_spec_refusals(self):
         for field, value in [('repository', 'other/product'), ('repository_id', 124), ('spec_commit', 'c' * 40)]:

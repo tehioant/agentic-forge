@@ -97,6 +97,48 @@ class ReviewedImplementTests(unittest.TestCase):
                 self.assertEqual([s['name'] for s in role_skills.snapshots(stage, descriptors)],
                                  ['code-review', STRUCTURED_TEXT])
 
+    def test_review_dependency_omission_refuses_before_tracker_or_claim(self):
+        import sqlite3
+        from unittest.mock import Mock, patch
+        from factory_v1 import assignments
+        from factory_v1.model_access import SUBSCRIPTION_SCOPE
+        for stage in ('review-standards', 'review-spec'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                descriptors = self.review_descriptors(directory)
+                def artifact(name, content):
+                    return {'name': name, 'content': content, 'sha256': hashlib.sha256(content.encode()).hexdigest()}
+                request = {'stage': stage, 'repository': 'example/product', 'repository_id': 123,
+                           'workspace': directory + '/workspace',
+                           'issue': {'number': 10, 'id': 1010, 'node_id': 'I10', 'body_sha256': 'a' * 64},
+                           'spec_commit': 'a' * 40, 'baseline': 'a' * 40, 'candidate': 'b' * 40,
+                           'standards': [artifact('AGENTS.md', 'Meaningful deterministic tests.')],
+                           'preceding': [artifact('candidate', 'b' * 40), artifact('simplification-evidence', 'Test evidence.')],
+                           'profile': {'name': 'test-' + stage, 'home': directory + '/profile', 'role': 'review',
+                                       'provider': SUBSCRIPTION_SCOPE[0], 'model': SUBSCRIPTION_SCOPE[1],
+                                       'operation': SUBSCRIPTION_SCOPE[2], 'reasoning': 'high'},
+                           'skills': descriptors, 'capabilities': ['read_workspace', 'scratch', 'model'],
+                           'result_contract': assignments.CONTRACT, 'claim_id': 'test-review-claim'}
+                self.assertEqual([s['name'] for s in assignments.validate(request)], ['code-review', STRUCTURED_TEXT])
+                database, github = sqlite3.connect(':memory:'), Mock()
+                try:
+                    for defect in ('missing-reference', 'missing-edge', 'reference-pin'):
+                        changed = copy.deepcopy(request)
+                        if defect == 'missing-reference':
+                            changed['skills'].pop()
+                        elif defect == 'missing-edge':
+                            changed['skills'][0]['dependencies'] = []
+                        else:
+                            changed['skills'][1]['sha256'] = '0' * 64
+                        with self.subTest(defect=defect), patch.object(assignments, 'current') as current:
+                            with self.assertRaises(RepositoryError) as refused:
+                                assignments.prepare(database, 'product', 'm1', '42', changed, github)
+                            self.assertEqual(refused.exception.code, 'skill_blocked')
+                            current.assert_not_called()
+                            github.request.assert_not_called()
+                            self.assertEqual(database.execute('SELECT name FROM sqlite_master').fetchall(), [])
+                finally:
+                    database.close()
+
     def test_updated_adaptations_defer_final_suite_and_release_review_to_explicit_stages(self):
         for stage in ('implementation', 'corrections', 'repair'):
             with self.subTest(stage=stage):

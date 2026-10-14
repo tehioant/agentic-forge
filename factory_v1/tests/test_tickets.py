@@ -189,54 +189,6 @@ class TicketTests(unittest.TestCase):
     def publish(self):
         return self.ok(self.control('complete-tickets', self.completion()))
 
-    def pause_during_read(self, command, request, path):
-        from factory_v1.tests.test_controls import cli
-        entered, release = threading.Event(), threading.Event()
-        parent = self.fixture.server.RequestHandlerClass
-        class Handler(parent):
-            def do_GET(handler):
-                if handler.path == path:
-                    entered.set()
-                    release.wait(5)
-                super().do_GET()
-        self.fixture.server.RequestHandlerClass = Handler
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            pending = pool.submit(self.control, command, request)
-            try:
-                self.assertTrue(entered.wait(3))
-                paused = self.ok(cli(self.fixture.state, 'pause'))
-                self.assertEqual(paused['state'], 'requested', 'Pause must not wait for external reads')
-            finally:
-                release.set()
-            result = pending.result(timeout=10)
-        self.assertEqual(result.returncode, 2, result.stdout)
-        self.assertEqual(json.loads(result.stderr)['error'], 'iteration_paused')
-        return paused
-
-    def test_pause_during_pinned_read_prevents_synthesis_claim(self):
-        before = self.inspect()
-        self.pause_during_read('synthesize-tickets', self.start_request, '/repos/example/product/issues/7')
-        item = self.inspect()
-        self.assertNotIn('ticket_work', item)
-        self.assertEqual(item['stage'], before['stage'])
-        self.assertEqual(self.issues, {})
-
-    def test_pause_during_pinned_read_prevents_synthesis_result_admission(self):
-        request = self.completion()
-        before = self.inspect()
-        self.pause_during_read('complete-tickets', request, '/repos/example/product/issues/7')
-        self.assertEqual(self.inspect()['ticket_work'], before['ticket_work'])
-        self.assertEqual(self.inspect()['stage'], before['stage'])
-        self.assertEqual(self.issues, {})
-
-    def test_pause_at_final_issue_list_read_prevents_publication_intent(self):
-        request = self.completion()
-        self.pause_during_read('complete-tickets', request, '/repos/example/product/issues?state=all&per_page=100&page=1')
-        work = self.inspect()['ticket_work']
-        self.assertEqual(work['status'], 'publication_pending')
-        self.assertNotIn('intents', work)
-        self.assertNotIn('blocker', work)
-        self.assertEqual(self.issues, {})
 
     def test_synthesis_publication_frontier_and_one_reservation(self):
         item = self.publish()
