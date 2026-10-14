@@ -174,6 +174,71 @@ reservation remains retained in recovery history; ordinary work must reconcile
 and reserve through the normal current-frontier path rather than restoring a stale
 reservation automatically.
 
+## Explicit continuation after reconciliation or revision
+
+`register-recovery` remains immutable/idempotent; changing its file is not a
+repinning mechanism. Use `inspect-recovery` for the current assignment, complete
+runtime receipt and `runtime_sha256` (canonical controller digest). Inspection is
+read-only and remains available after pause or requirement invalidation.
+
+A stopped/failed infrastructure attempt cannot relaunch its old assignment.
+First stop/reconcile through the ordinary public lifecycle and verify worker AND
+controller absence. A private host-owned 0600 authorization outside all worker
+mounts may then request `continue-recovery`. Supply every original registration
+field unchanged except a new explicit `reference`, plus:
+
+```json
+{
+  "continuation": {
+    "kind": "infrastructure",
+    "assignment_id": "<current registered root>",
+    "runtime_sha256": "<exact inspect-recovery runtime digest>",
+    "change_id": null
+  }
+}
+```
+
+```sh
+python -m factory_v1 --state /controller/state.sqlite --operator-id 42 \
+  continue-recovery --project product --iteration m1 \
+  --recovery-config /controller/continuation.json --api-base https://api.github.com
+```
+
+This is an explicit authorization, not automatic retry. It requires a recoverable
+terminal failed/stopped runtime, positively verified absence, no responsible
+submitted result or engineering/revision hold, and unchanged incident paths,
+removal authority, evidence and issue requirements. Unknown/quota/exhausted model
+admission stays refused; continuation does not reconcile model usage or restore
+quota. No deadline, attempt counter, grant or execution record is reset. At most
+100 continuations are retained per incident; all original scope/runtime/revision
+receipts and failed execution remain historical evidence, never fresh completion.
+
+For a genuine applied **revise** decision, first complete the existing scoped
+`record-requirement-change` (with `stuck_assignment`), resolution, actual selected
+spec/ticket resynthesis, versioned publication/readback and explicit resumption.
+Then use the same command with `kind=revision`, its exact `change_id`, and the
+new published issue body pin. The issue identity, original incident/path/removal
+scope and evidence must stay unchanged. The command revalidates the full actual
+correlated operator response, original independent diagnosis execution and current
+versioned synthesis/publication; a `released` flag or partial response is not
+sufficient. Pending publication can expose its exact controlled new issue bytes
+to frontier observation without replacing recovery authority or releasing any
+independent hold. Unapproved edits still fail closed.
+
+Continuation atomically parks old related roles, archives the prior authority and
+runtime, and restores a registration sentinel while the main freeze stays active.
+Prepare a **new claim and dedicated profile** via `prepare-recovery`; old claims,
+assignments, reviews and candidate evidence cannot be repurposed. The fresh
+handoff includes retained continuation history and current scoped requirement
+inputs. Diagnosis, implementation, simplification, both review axes and ordinary
+merge/delivery/health gates must still be satisfied. Replaying the exact latest
+continuation returns its receipt without retiring a subsequent attempt.
+
+Reopening re-reads exact issue/membership/scope after the issue PATCH and again
+at the status mutation boundary. An independent Blocked/deferred value wins over
+ready; replaced membership or scope refuses the status write. Admitted external
+effects still retain truthful issue/status/dependency receipts during a pause.
+
 ## Stuckness
 
 A repair's genuine `status=stuck`/`stuck-declaration` uses existing `declare-stuck`,
@@ -190,7 +255,7 @@ all these states, including healthy polling while direction is pending.
 Focused deterministic commands (no services, containers, workers or model calls):
 
 ```sh
-mise exec -- python -m unittest factory_v1.tests.test_recovery factory_v1.tests.test_recovery_components factory_v1.tests.test_recovery_interruption -v
+mise exec -- python -m unittest factory_v1.tests.test_recovery factory_v1.tests.test_recovery_components factory_v1.tests.test_recovery_interruption factory_v1.tests.test_recovery_continuation -v
 mise exec -- python -m compileall -q factory_v1
 ```
 

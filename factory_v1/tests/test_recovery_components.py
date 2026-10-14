@@ -237,7 +237,8 @@ class RecoveryComponents(RecoveryComponentFixture):
                 recovery.handoff(self.db, item, request)
             self.assertIsNotNone(self.sample(True)['incident'])
         item['stuck_work']['stuck']['status'] = 'released'
-        self.assertEqual(recovery.handoff(self.db, item, request), assignment['handoff']['recovery'])
+        with self.assertRaises(RepositoryError):
+            recovery.handoff(self.db, item, request)  # A partial stored flag is not a real applied response.
 
     def test_report_requires_loop_rationale_exact_commands_and_authorized_removals(self):
         assignment, report, result, artifacts = self.completed_report()

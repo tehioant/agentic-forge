@@ -460,7 +460,8 @@ def frontier(database, item, github):
             from .recovery import active as active_recovery
             recovery_record = active_recovery(item)
             assert recovery_record is not None
-            pin = recovery_record['config']['issue']
+            from .recovery import observed_issue_pin
+            pin = observed_issue_pin(item, recovery_record)
             require(all(issue[k] == pin[k] for k in ('number', 'id', 'node_id')) and
                     hashlib.sha256(issue['body'].encode()).hexdigest() == pin['body_sha256'],
                     'Registered incident issue changed.', 'scope_mismatch')

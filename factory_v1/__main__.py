@@ -274,7 +274,7 @@ def main():
             control.add_argument('--api-base', required=True)
             control.add_argument('--bearer', default='credential-blind-controller')
             control.add_argument('--timeout', type=float, default=10)
-    for name in ('register-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'):
+    for name in ('register-recovery', 'continue-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'):
         control = commands.add_parser(name, help='Host-owned incident recovery through unchanged worker/review/delivery gates.')
         for option in ('project', 'iteration'):
             control.add_argument('--' + option, required=True)
@@ -282,8 +282,8 @@ def main():
             control.add_argument('--api-base', required=True)
             control.add_argument('--bearer', default='credential-blind-controller')
             control.add_argument('--timeout', type=float, default=10)
-        if name in {'register-recovery', 'verify-recovery'}:
-            control.add_argument('--recovery-config' if name == 'register-recovery' else '--merge-config', required=True)
+        if name in {'register-recovery', 'continue-recovery', 'verify-recovery'}:
+            control.add_argument('--merge-config' if name == 'verify-recovery' else '--recovery-config', required=True)
         if name == 'prepare-recovery':
             control.add_argument('--request', required=True)
             control.add_argument('--dry-run', action='store_true')
@@ -309,7 +309,7 @@ def main():
             raise IntakeError('invalid_completion', 'Malformed or unavailable iteration input/evidence; no completion or continuation admitted.') from error
         print(json.dumps(result, sort_keys=True))
         return
-    if args.command in {'register-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'}:
+    if args.command in {'register-recovery', 'continue-recovery', 'prepare-recovery', 'verify-recovery', 'inspect-recovery'}:
         from . import recovery, assignments
         from .repositories import GitHub, RepositoryError, state_lock
         try:
@@ -317,12 +317,13 @@ def main():
             uri = Path(args.state).resolve().as_uri() + ('?mode=ro' if read_only else '?mode=rw')
             with closing(sqlite3.connect(uri, uri=True)) as database, state_lock(database):
                 if args.command == 'inspect-recovery':
-                    item = assignments.current(database, args.project, args.iteration, args.operator_id, require_active=False)
-                    result = {'incident': item.get('main_incident'), 'recoveries': item.get('main_recoveries', {})}
+                    result = recovery.inspect(database, args.project, args.iteration, args.operator_id)
                 else:
                     github = GitHub(args.api_base, args.bearer, args.timeout)
                     if args.command == 'register-recovery':
                         result = recovery.register(database, args.project, args.iteration, args.operator_id, args.recovery_config, github)
+                    elif args.command == 'continue-recovery':
+                        result = recovery.continue_recovery(database, args.project, args.iteration, args.operator_id, args.recovery_config, github)
                     elif args.command == 'verify-recovery':
                         result = recovery.verify(database, args.project, args.iteration, args.operator_id, args.merge_config, github)
                     else:
