@@ -89,7 +89,7 @@ class ReportPolicyTests(unittest.TestCase):
     def test_claim_retirement_requires_durable_verified_hold_and_no_live_worker(self):
         scope = {'project': 'p', 'iteration': 'i'}
         assignment = {'assignment_id': 'a', 'ticket_scope': scope, 'stuck_disposition': 'held',
-                      'runtime': {'status': 'complete'}}
+                      'runtime': {'status': 'complete', 'container_removed': True}}
         record = {'blocks_verified': True, 'retired_assignments': ['a']}
         with closing(sqlite3.connect(':memory:')) as database:
             database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
@@ -101,6 +101,8 @@ class ReportPolicyTests(unittest.TestCase):
             self.assertTrue(diagnosis.released_claim(database, {k: v for k, v in assignment.items() if k != 'runtime'}))
             for status in ('preparing', 'running', 'unconfirmed'):
                 self.assertFalse(diagnosis.released_claim(database, {**assignment, 'runtime': {'status': status}}))
+            for removed in (False, None):
+                self.assertFalse(diagnosis.released_claim(database, {**assignment, 'runtime': {'status': 'complete', 'container_removed': removed}}))
             stored({**record, 'blocks_verified': False})
             self.assertFalse(diagnosis.released_claim(database, assignment))
             stored({**record, 'retired_assignments': []})

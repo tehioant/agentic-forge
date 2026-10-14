@@ -95,8 +95,9 @@ def complete(database, project, iteration, operator, request, github):
     item = delivery.context(database, project, iteration, operator)
     require(item['status'] in {'active', 'waiting-for-operator'} and not item.get('next_iteration'),
             'Paused or continued iteration cannot complete.', 'iteration_paused')
-    require(all(requirements.released_claim(database, a) or diagnosis.released_claim(database, a) or
-                (a.get('runtime', {}).get('status') in {'complete', 'failed', 'stopped'} and
+    require(all((a.get('runtime') is None and
+                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a))) or
+                ((a.get('runtime') or {}).get('status') in {'complete', 'failed', 'stopped'} and
                  a['runtime'].get('container_removed') is True) for a in assignments.rows(database)
                 if a['ticket_scope']['project'] == project and a['ticket_scope']['iteration'] == iteration),
             'Workers must be reconciled and absent before completion.', 'iteration_incomplete')

@@ -19,6 +19,45 @@ def fixture(owner, cls):
 
 
 class CompletionRegressions(unittest.TestCase):
+    def retired(self, kind, runtime):
+        f = fixture(self, fixtures.IterationComponents)
+        assignment = {'assignment_id': 'retired', 'ticket_scope': {'project': 'product', 'iteration': 'm1'}}
+        if kind == 'diagnosis':
+            f.item['stuck_work'] = {'old': {'status': 'released', 'affected': [1], 'blocks_verified': True,
+                                          'retired_assignments': ['retired']}}
+            assignment['stuck_disposition'] = 'superseded'
+        else:
+            f.item['requirement_changes'] = {'old': {'kind': 'material', 'status': 'resumed', 'affected': [1], 'blocks_verified': True}}
+            assignment['requirement_disposition'] = {'change_id': 'old'}
+        if runtime is not None:
+            assignment['runtime'] = runtime
+        f.store()
+        return f, assignment
+
+    def test_retired_runtime_requires_verified_container_absence(self):
+        for kind in ('diagnosis', 'requirements'):
+            for status in ('stopped', 'failed', 'complete'):
+                for removed in (False, None):
+                    with self.subTest(kind=kind, status=status, removed=removed):
+                        f, assignment = self.retired(kind, {'status': status, 'container_removed': removed})
+                        release = diagnosis.released_claim if kind == 'diagnosis' else requirements.released_claim
+                        self.assertFalse(release(f.db, assignment))
+                        with patch.object(assignments, 'rows', return_value=[assignment]):
+                            with self.assertRaises(RepositoryError):
+                                f.complete()
+                        self.assertNotIn('completion', f.stored())
+                        self.assertEqual(attention.records(f.db, 'product', 'm1', f.item), [])
+
+    def test_retired_unlaunched_and_verified_terminal_workers_remain_admissible(self):
+        for kind in ('diagnosis', 'requirements'):
+            for runtime in (None, {'status': 'stopped', 'container_removed': True}):
+                with self.subTest(kind=kind, runtime=runtime):
+                    f, assignment = self.retired(kind, runtime)
+                    release = diagnosis.released_claim if kind == 'diagnosis' else requirements.released_claim
+                    self.assertTrue(release(f.db, assignment))
+                    with patch.object(assignments, 'rows', return_value=[assignment]):
+                        self.assertEqual(f.complete()['report']['delivered'], [f.delivered])
+
     def test_scope_and_raw_issue_drift_refuse_without_report_or_attention(self):
         for body in ('## Bug scope\ncurrent\n', '## Bug scope\nrecovery\n', '## Bug scope\ndeferred\n## Detail\nChanged\n'):
             with self.subTest(body=body):

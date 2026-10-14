@@ -33,7 +33,8 @@ def released_claim(database, assignment):
                            (scope['project'], scope['iteration'])).fetchone()
     item = json.loads(row[0]) if row else {}
     return (assignment.get('stuck_disposition') in {'held', 'superseded'} and
-            (not assignment.get('runtime') or assignment['runtime']['status'] in TERMINAL) and
+            (assignment.get('runtime') is None or
+             assignment['runtime'].get('status') in TERMINAL and assignment['runtime'].get('container_removed') is True) and
             assignment['assignment_id'] in {identity for record in item.get('stuck_work', {}).values()
                 if record.get('blocks_verified') for identity in record['retired_assignments']})
 
