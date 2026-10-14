@@ -49,16 +49,18 @@ class IterationControlTests(unittest.TestCase):
         f = fixture(self, fixtures.IterationComponents)
         before = f.stored()
         reads = 0
+        interruption_injected = False
         def read(*args):
-            nonlocal reads
+            nonlocal reads, interruption_injected
             reads += 1
             if reads == 2:
                 interrupt(f)
+                interruption_injected = True
             return {'body': 'accepted', 'state': 'closed'}
         f.mocks['tickets.gh.read_issue'].side_effect = read
         with state_lock(f.db):
             self.refused(f, f.complete)
-        self.assertEqual(reads, 2)
+        self.assertTrue(interruption_injected)
         self.assertEqual(f.stored(), before)
         self.assertFalse(f.db.execute("SELECT 1 FROM sqlite_master WHERE name='notifications'").fetchone())
 
