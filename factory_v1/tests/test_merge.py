@@ -571,13 +571,44 @@ class MergeComponentTests(unittest.TestCase):
         self.assertNotIn('merge', self.stored())
 
     def test_exact_repair_scope_keeps_checks_reviews_and_incident(self):
+        from factory_v1 import recovery, simplification
         self.builder['handoff']['stage'] = 'repair'
         incident = {'status': 'active', 'incident_id': 'incident-1', 'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
         self.item['main_incident'] = incident
         self.save_item()
         with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
         self.assertEqual(refusal.exception.code, 'main_frozen')
-        self.config['recovery'] = {'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10}
+        # Labeled prequalified host registration/native-chain input; no repair worker is run.
+        record = {'config': {'operator_id': '42', 'reference': 'LABELED registered authority fixture',
+                    'incident_id': 'incident-1', 'issue': self.candidate['handoff']['issue'],
+                    'evidence_id': 'e' * 64, 'paths': ['app.py'], 'removable_assignments': []},
+                  'evidence': {'main': self.config['baseline']}, 'assignment': self.builder['assignment_id']}
+        self.item['main_recoveries'] = {'incident-1': record}
+        self.save_item()
+        scope = recovery.contract(record)
+        self.builder['handoff'].update(recovery=scope, adaptation='LABELED repair adaptation')
+        self.builder['runtime'] = {'artifacts': str(self.root)}
+        (self.root / 'workspace').mkdir()
+        (self.root / 'inputs/baseline').mkdir(parents=True)
+        (self.root / 'scratch').mkdir()
+        (self.root / 'workspace/app.py').write_text('fixed')
+        (self.root / 'inputs/baseline/app.py').write_text('broken')
+        command, output = 'SIMULATED diagnostic', 'SIMULATED red output, not native execution'
+        tests = [{'command': command, 'result': output}]
+        (self.root / 'scratch/conversation.json').write_text(json.dumps({'messages': [
+            {'role': 'assistant', 'tool_calls': [{'id': 'local', 'function': {'name': 'terminal', 'arguments': json.dumps({'command': command})}}]},
+            {'role': 'tool', 'tool_call_id': 'local', 'content': output}]}))
+        diagnosis = {'contract': 'factory-stuck-diagnosis-v1', 'pins': scope, 'adaptation': self.builder['handoff']['adaptation'],
+            'feedback_loop': {'command': command, 'result': output, 'symptom': 'local regression'}, 'commands': tests,
+            'hypotheses': [{'hypothesis': 'literal', 'prediction': 'fix restores behavior', 'evidence': output}],
+            'attempted_repairs': ['bounded fix'], 'findings': ['literal differs'], 'cause_or_uncertainty': 'literal',
+            'directions': [{'id': 'forward', 'direction': 'fix', 'tradeoff': 'retains behavior'}], 'recommendation': 'forward', 'blockers': []}
+        report = {'contract': recovery.CONTRACT, 'scope': scope, 'mode': 'roll-forward', 'rationale': 'bounded fix',
+                  'diagnosis': diagnosis, 'removed_assignments': [], 'regression': 'focused regression', 'cleanup': 'no probes'}
+        self.builder['submitted_result'] = {'status': 'done', 'tests': tests,
+            'artifacts': [simplification.artifact('recovery-report', json.dumps(report))]}
+        self.config['recovery'] = {'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'],
+                                   'issue': 10, 'removed_assignments': []}
         self.write_config()
         self.run_records[self.config['baseline']] = {'total_count': 0, 'check_runs': []}
         self.assertEqual(self.lifecycle()['status'], 'merged')
@@ -949,7 +980,8 @@ class MergeComponentTests(unittest.TestCase):
                     self.item['main_incident'] = {'status': 'active', 'incident_id': 'incident-1',
                         'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
                     self.config['recovery'] = True if mode == 'boolean-recovery' else {
-                        'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10}
+                        'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10,
+                        'removed_assignments': []}
                 self.save_item()
                 self.write_config()
                 with self.assertRaises(RepositoryError) as refusal:

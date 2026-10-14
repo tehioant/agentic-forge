@@ -3,7 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from . import assignments, delivery, simplification, tickets
+from . import assignments, controls, delivery, simplification, tickets
 from .planning import require, text
 from .repositories import RepositoryError, save_iteration
 from .sandbox_source import manifest, relative
@@ -112,7 +112,7 @@ def register(database, project, iteration, operator, config_path, github):
     item.setdefault('main_recoveries', {})[incident['incident_id']] = record
     # A registration sentinel keeps health polling frozen even before assignment preparation.
     incident.update(recovery_assignment=assignments.digest(config), recovery_issue=config['issue']['number'])
-    with database:
+    with controls.admission(database, project, iteration), database:
         for prior in related:
             prior['recovery_disposition'] = incident['incident_id']
             database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
@@ -259,20 +259,25 @@ def merge_boundary(database, item, config, builder, candidate_root):
 
 
 def reopen_removed(database, item, record, report, github):
+    project, iteration = item['project_id'], item['iteration_id']
     board = item['ticket_work']['board']
     statuses = item['ticket_work']['request']['tracker']['statuses']
     for identity in report['removed_assignments']:
+        controls.require_active(database, project, iteration)
         pin = record['removable'][identity]['issue']
         issue = exact_issue(github, item['repository'], pin)
         member = tickets.gh.membership(github, board, item['repository'], issue)
         require(member is not None, 'Affected ticket board membership missing.', 'recovery_held')
         assert member is not None
-        receipt = record['removed'].setdefault(identity, {'issue': pin, 'open_intent': False, 'status_intent': False})
-        checkpoint(database, item)
-        if issue['state'] != 'open':
-            require(not receipt['open_intent'], 'Unknown reopening outcome; reconcile exact issue, never repeat blindly.', 'delivery_uncertain')
-            receipt['open_intent'] = True
+        with controls.admission(database, project, iteration):
+            receipt = record['removed'].setdefault(identity, {'issue': pin, 'open_intent': False, 'status_intent': False})
             checkpoint(database, item)
+        if issue['state'] != 'open':
+            with controls.admission(database, project, iteration):
+                require(not receipt['open_intent'], 'Unknown reopening outcome; reconcile exact issue, never repeat blindly.', 'delivery_uncertain')
+                receipt['open_intent'] = True
+                checkpoint(database, item)
+            controls.require_active(database, project, iteration)
             try:
                 github.request('/repos/' + item['repository'] + '/issues/' + str(pin['number']),
                                {'state': 'open', 'state_reason': 'reopened'}, 'PATCH')
@@ -280,12 +285,17 @@ def reopen_removed(database, item, record, report, github):
                 pass
         issue = exact_issue(github, item['repository'], pin)
         require(issue['state'] == 'open', 'Removed behavior ticket must read back open.', 'delivery_uncertain')
+        # An admitted write may finish after pause; retain its truthful receipt before any next intent.
+        receipt['issue_readback'] = issue
+        checkpoint(database, item)
         protected = {board['status']['options'][name] for role, name in statuses.items() if role in {'blocked', 'deferred'}}
         option = member['status'] if member['status'] in protected else board['status']['options'][statuses['ready']]
         if member['status'] != option:
-            require(not receipt['status_intent'], 'Unknown status outcome; reconcile before any retry.', 'delivery_uncertain')
-            receipt['status_intent'] = True
-            checkpoint(database, item)
+            with controls.admission(database, project, iteration):
+                require(not receipt['status_intent'], 'Unknown status outcome; reconcile before any retry.', 'delivery_uncertain')
+                receipt['status_intent'] = True
+                checkpoint(database, item)
+            controls.require_active(database, project, iteration)
             try:
                 tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
             except RepositoryError:
@@ -300,6 +310,7 @@ def reopen_removed(database, item, record, report, github):
         with database:
             database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(prior), identity))
             checkpoint(database, item)
+        controls.require_active(database, project, iteration)
 
 
 def verify(database, project, iteration, operator, config_path, github):
@@ -307,7 +318,7 @@ def verify(database, project, iteration, operator, config_path, github):
     config = merge.load_config(config_path, operator)
     merge.controller_paths(database, config_path)
     require(github.base == config['api_base'], 'Wrong configured tracker route.', 'scope_mismatch')
-    existing = assignments.current(database, project, iteration, operator, require_active=False)
+    existing = assignments.current(database, project, iteration, operator)
     recovery = config['recovery']
     require(recovery is not None, 'Recovery merge authority required.', 'recovery_held')
     previous = existing.get('main_recoveries', {}).get(recovery['incident_id'])
@@ -349,11 +360,11 @@ def verify(database, project, iteration, operator, config_path, github):
     record = active(item)
     assert record is not None
     evidence = final_sample['evidence']
-    record.update(status='cleared', clearance={'merge': journal['integrated_evidence'], 'checks': journal['delivery_checks'],
-                                              'evidence_id': assignments.digest(evidence), 'frontier': observed['ticket_work']['frontier']})
-    incident = item['main_incident']
-    incident.update(status='cleared', clearance_evidence=assignments.digest(evidence))
-    with database:
+    with controls.admission(database, project, iteration), database:
+        record.update(status='cleared', clearance={'merge': journal['integrated_evidence'], 'checks': journal['delivery_checks'],
+                                                  'evidence_id': assignments.digest(evidence), 'frontier': observed['ticket_work']['frontier']})
+        incident = item['main_incident']
+        incident.update(status='cleared', clearance_evidence=assignments.digest(evidence))
         for assignment in assignments.rows(database):
             if assignment.get('recovery_disposition') == incident['incident_id']:
                 assignment.pop('recovery_disposition')

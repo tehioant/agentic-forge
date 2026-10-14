@@ -15,7 +15,7 @@ from factory_v1.repositories import RepositoryError, save_iteration
 from factory_v1.tests.test_recovery import RecoveryFixture
 
 
-class RecoveryComponents(RecoveryFixture):
+class RecoveryComponentFixture(RecoveryFixture):
     def setUp(self):
         super().setUp()
         self.temp = tempfile.TemporaryDirectory()
@@ -53,6 +53,10 @@ class RecoveryComponents(RecoveryFixture):
         self.read_patch = patch.object(tickets.gh, 'read_issue', side_effect=lambda g, r, n: copy.deepcopy(self.issue))
         self.reader = self.read_patch.start()
         self.addCleanup(self.read_patch.stop)
+        for target in ('subprocess.run', 'subprocess.Popen', 'socket.socket'):
+            blocker = patch(target, side_effect=AssertionError('Unexpected external boundary: ' + target))
+            blocker.start()
+            self.addCleanup(blocker.stop)
 
     def register(self):
         return recovery.register(self.db, 'p', 'i', '42', self.config_file, self.github)
@@ -156,6 +160,9 @@ class RecoveryComponents(RecoveryFixture):
         stack.enter_context(patch.object(tickets.gh, 'dependencies', return_value=[]))
         return field, member
 
+
+
+class RecoveryComponents(RecoveryComponentFixture):
     def test_private_registration_is_durable_idempotent_and_pins_real_observation(self):
         record = self.register()
         self.assertEqual(record, self.register())

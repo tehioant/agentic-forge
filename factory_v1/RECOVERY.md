@@ -56,8 +56,16 @@ changed requirements or moved main require reconciliation, never silent repinnin
 
 ## Public lifecycle
 
-All commands use the existing persistent state and shared lock. Illustrative paths
-below refer to controller-owned inputs, not credentials or files supplied by a worker.
+All commands use the existing persistent state and shared lock. New registration,
+repair claims/results, reopening/status intents and final clearance also serialize
+their short save-and-commit boundaries through the interruption lane. Pause or
+emergency stop admits none of them until explicit resume; `inspect-recovery`
+remains readable. The public controls do not wait for the long recovery controller
+lock. No interruption lane is held across tracker or health I/O. Receipts/readbacks
+of an already admitted effect are retained truthfully while paused, without
+admitting the next status write or clearing the incident. See [controls](CONTROLS.md).
+Illustrative paths below refer to controller-owned inputs, not credentials or files
+supplied by a worker.
 
 ```sh
 python -m factory_v1 --state /controller/state.sqlite --operator-id 42 \
@@ -182,7 +190,7 @@ all these states, including healthy polling while direction is pending.
 Focused deterministic commands (no services, containers, workers or model calls):
 
 ```sh
-mise exec -- python -m unittest factory_v1.tests.test_recovery factory_v1.tests.test_recovery_components -v
+mise exec -- python -m unittest factory_v1.tests.test_recovery factory_v1.tests.test_recovery_components factory_v1.tests.test_recovery_interruption -v
 mise exec -- python -m compileall -q factory_v1
 ```
 
