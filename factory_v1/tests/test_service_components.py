@@ -45,7 +45,7 @@ class DispatchComponentTests(unittest.TestCase):
     def test_paused_scope_never_reaches_dispatch_or_precursor_reads(self):
         with service.connect(self.service) as db:
             controls.request(db, 'p', 'i', 'operator', 'pause', 'pause:1')
-        with patch.object(restart, 'before_dispatch') as preflight, patch.object(dispatch.sandbox, 'launch') as launch:
+        with patch.object(restart, 'before_dispatch') as preflight, patch.object(dispatch, 'run_assignment') as launch:
             with self.assertRaises(RepositoryError) as error:
                 dispatch.tick(self.service, Mock())
         self.assertEqual(error.exception.code, 'iteration_paused')
@@ -56,14 +56,14 @@ class DispatchComponentTests(unittest.TestCase):
         def pause(db, *args, **kwargs):
             controls.request(db, 'p', 'i', 'operator', 'pause', 'late-pause:1')
         with patch.object(restart, 'before_dispatch', side_effect=pause), \
-             patch.object(dispatch.sandbox, 'launch') as launch, patch.object(dispatch, 'installed') as installed:
+             patch.object(dispatch, 'run_assignment') as launch, patch.object(dispatch, 'installed') as installed:
             with self.assertRaises(RepositoryError) as error:
                 dispatch.tick(self.service, Mock())
         self.assertEqual(error.exception.code, 'iteration_paused')
         launch.assert_not_called()
         installed.assert_not_called()
 
-    def test_prepared_assignment_calls_existing_launcher_with_shutdown_event(self):
+    def test_prepared_assignment_calls_owned_launcher_with_shutdown_event(self):
         launcher = self.root / 'launcher.json'
         service.atomic(launcher, {})
         self.config['launchers']['implementation'] = str(launcher)
@@ -72,17 +72,16 @@ class DispatchComponentTests(unittest.TestCase):
         github = Mock()
         with patch.object(restart, 'before_dispatch') as before, \
              patch.object(dispatch.assignments, 'inspect', return_value=self.seed), \
-             patch.object(dispatch, 'installed'), patch.object(dispatch.sandbox, 'launch') as launch:
+             patch.object(dispatch, 'installed'), patch.object(dispatch, 'run_assignment') as launch:
             result = dispatch.tick(self.service, github, stop_event=event)
         self.assertEqual(result['stage'], 'launch')
         self.assertEqual(result['blockers'], ['attempt_requires_reconciliation'])
         before.assert_called_once()
-        launch.assert_called_once_with(self.service['state'], 'p', 'i', 'operator', self.seed['assignment_id'],
-                                       str(launcher), github, stop_event=event)
+        launch.assert_called_once_with(self.service, self.seed['assignment_id'], str(launcher), stop_event=event)
 
     def test_missing_launcher_refuses_instead_of_guessing_capacity(self):
         with patch.object(restart, 'before_dispatch'), patch.object(dispatch.assignments, 'inspect', return_value=self.seed), \
-             patch.object(dispatch, 'installed'), patch.object(dispatch.sandbox, 'launch') as launch:
+             patch.object(dispatch, 'installed'), patch.object(dispatch, 'run_assignment') as launch:
             result = dispatch.tick(self.service, Mock())
         self.assertEqual(result['blockers'], ['implementation_launcher_unavailable'])
         launch.assert_not_called()
@@ -93,7 +92,7 @@ class DispatchComponentTests(unittest.TestCase):
         self.persist()
         with patch.object(restart, 'before_dispatch'), patch.object(dispatch, 'installed'), \
              patch.object(dispatch.simplification, 'prepare', side_effect=RepositoryError('implementation_unverified', 'missing checks')) as prepare, \
-             patch.object(dispatch.sandbox, 'launch') as launch:
+             patch.object(dispatch, 'run_assignment') as launch:
             with self.assertRaises(RepositoryError) as error:
                 dispatch.tick(self.service, Mock())
         self.assertEqual(error.exception.code, 'implementation_unverified')
@@ -139,7 +138,7 @@ class DispatchComponentTests(unittest.TestCase):
             db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
             db.commit()
         with patch.object(restart, 'before_dispatch', side_effect=change), \
-             patch.object(dispatch.sandbox, 'launch') as launch:
+             patch.object(dispatch, 'run_assignment') as launch:
             result = dispatch.tick(self.service, Mock())
         self.assertEqual(result['blockers'], ['stage_changed_during_reconciliation'])
         launch.assert_not_called()
@@ -151,3 +150,77 @@ class DispatchComponentTests(unittest.TestCase):
             result = dispatch.tick(self.service, Mock(), stop_event=event)
         self.assertEqual(result['blockers'], ['service_stopping'])
         read.assert_not_called()
+
+    def test_pause_at_owned_child_admission_prevents_popen(self):
+        launcher = self.root / 'launcher.json'
+        service.atomic(launcher, {})
+        self.config['launchers']['implementation'] = str(launcher)
+        self.persist()
+        original = dispatch.run_assignment
+        def pause_then_launch(*args, **kwargs):
+            with service.connect(self.service) as db:
+                controls.request(db, 'p', 'i', 'operator', 'pause', 'before-popen:1')
+            return original(*args, **kwargs)
+        with patch.object(restart, 'before_dispatch'), patch.object(dispatch, 'installed'), \
+             patch.object(dispatch.assignments, 'inspect', return_value=self.seed), \
+             patch.object(dispatch, 'run_assignment', side_effect=pause_then_launch), \
+             patch.object(dispatch.subprocess, 'Popen') as popen:
+            with self.assertRaises(RepositoryError) as error:
+                dispatch.tick(self.service, Mock())
+        self.assertEqual(error.exception.code, 'iteration_paused')
+        popen.assert_not_called()
+        with service.connect(self.service) as db:
+            self.assertTrue(controls.blocked(db, 'p', 'i'))
+            row = json.loads(db.execute('SELECT payload FROM role_assignments').fetchone()[0])
+        self.assertNotIn('runtime', row)
+
+    def test_unjoinable_child_persists_pause_and_prevents_next_tick(self):
+        process = Mock(pid=12345)
+        process.wait.side_effect = dispatch.subprocess.TimeoutExpired('child', .1)
+        event = threading.Event()
+        def popen(*args, **kwargs):
+            event.set()
+            return process
+        with patch.object(dispatch.subprocess, 'Popen', side_effect=popen), \
+             patch.object(dispatch.os, 'killpg') as kill:
+            with self.assertRaises(RepositoryError) as error:
+                dispatch.run_assignment(self.service, self.seed['assignment_id'], '/fixture/launcher', stop_event=event)
+        self.assertEqual(error.exception.code, 'execution_uncertain')
+        self.assertEqual([c.args for c in kill.call_args_list],
+                         [(12345, dispatch.signal.SIGTERM), (12345, dispatch.signal.SIGKILL)])
+        with service.connect(self.service) as db:
+            self.assertTrue(controls.blocked(db, 'p', 'i'))
+            row = json.loads(db.execute('SELECT payload FROM role_assignments').fetchone()[0])
+        self.assertNotIn('runtime', row)
+        with patch.object(dispatch, 'run_assignment') as launch:
+            with self.assertRaises(RepositoryError) as refusal:
+                dispatch.tick(self.service, Mock())
+        self.assertEqual(refusal.exception.code, 'iteration_paused')
+        launch.assert_not_called()
+
+    def test_child_exit_and_claims_need_fresh_durable_complete_and_removal(self):
+        launcher = self.root / 'launcher.json'
+        service.atomic(launcher, {})
+        self.config['launchers']['implementation'] = str(launcher)
+        for runtime in (None, {'status': 'complete', 'container_removed': False},
+                        {'status': 'complete'}, {'status': 'failed', 'container_removed': True},
+                        {'status': 'complete', 'container_removed': True}):
+            with self.subTest(runtime=runtime):
+                self.persist()
+                def read(db, *args):
+                    return json.loads(db.execute('SELECT payload FROM role_assignments').fetchone()[0])
+                def child(*args, **kwargs):
+                    updated = deepcopy(self.seed)
+                    updated['submitted_result'] = {'status': 'done'}
+                    if runtime is not None:
+                        updated['runtime'] = runtime
+                    with service.connect(self.service) as db, db:
+                        db.execute('UPDATE role_assignments SET payload=?', (json.dumps(updated),))
+                    return {'status': 'complete', 'container_removed': True}
+                with patch.object(restart, 'before_dispatch'), patch.object(dispatch, 'installed'), \
+                     patch.object(dispatch.assignments, 'inspect', side_effect=read), \
+                     patch.object(dispatch, 'run_assignment', side_effect=child):
+                    result = dispatch.tick(self.service, Mock())
+                admitted = runtime == {'status': 'complete', 'container_removed': True}
+                self.assertEqual(result['status'], 'progress' if admitted else 'blocked')
+                self.assertEqual(result['blockers'], [] if admitted else ['attempt_requires_reconciliation'])

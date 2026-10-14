@@ -5,11 +5,16 @@ One configured ticket is driven from the authoritative frontier; a missing host
 capability is a hold, never a fabricated executor or permission to fall back.
 """
 from pathlib import Path
+import os
+import signal
+import subprocess
+import sys
+import time
 
 from . import assignments, controls, merge, publication, requirement_execution, review
-from . import role_skills, sandbox, simplification, tickets
+from . import role_skills, simplification, tickets
 from .planning import checkpoint, require, text
-from .repositories import state_lock
+from .repositories import RepositoryError, state_lock
 
 FIELDS = {'operator_id', 'project', 'iteration', 'reference', 'implementation', 'roles', 'launchers',
           'tickets', 'synthesis_config', 'review_config', 'publication_config', 'merge_config'}
@@ -142,6 +147,71 @@ def synthesize(database, item, config, github, *, stop_event=None):
          'execution': produced['execution'], 'tickets': produced['result']}, github)
 
 
+def _stop_child(process):
+    for signum, timeout in ((signal.SIGTERM, 35), (signal.SIGKILL, 5)):
+        try:
+            os.killpg(process.pid, signum)
+        except OSError:
+            pass  # Still escalate and reap; a signal is not join proof.
+        try:
+            process.wait(timeout=timeout)
+            return
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    raise RepositoryError('execution_uncertain', 'Owned launcher could not be joined; reconcile before further dispatch.')
+
+
+def run_assignment(service, assignment_id, launcher, *, stop_event=None):
+    from .service import connect, scope
+    try:
+        _launch_child(service, assignment_id, launcher, stop_event=stop_event)
+    except (RepositoryError, OSError, subprocess.SubprocessError):
+        # Even pre-runtime/unknown child failures cannot become automatic retries.
+        with connect(service) as database:
+            controls.request(database, *scope(service), 'pause', 'service-launch-reconciliation:' + assignment_id)
+        raise
+
+
+def _launch_child(service, assignment_id, launcher, *, stop_event=None):
+    """Own a bounded public CLI child; its exit is never completion evidence."""
+    from .service import connect, scope
+    argv = [sys.executable, '-m', 'factory_v1', '--state', service['state'],
+            '--operator-id', service['operator_id'], 'launch-assignment',
+            '--project', service['project'], '--iteration', service['iteration'],
+            '--assignment', assignment_id, '--launcher-config', launcher,
+            '--api-base', service['api_base']]
+    # Same host Docker routing allowlist as Docker, plus a scoped temp root.
+    env = {key: os.environ[key] for key in
+           ('PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR', 'TMPDIR') if key in os.environ}
+    with connect(service) as database, controls.admission(database, *scope(service)[:2]):
+        require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+        try:
+            process = subprocess.Popen(argv, cwd=Path(__file__).parent.parent, env=env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+        except OSError as error:
+            raise RepositoryError('execution_uncertain', 'Launcher startup failed; inspect before retry.') from error
+    joined = False
+    # Public launcher permits at most 3600 worker seconds; allow bounded setup/cleanup.
+    deadline = time.monotonic() + 3900
+    try:
+        while True:
+            with connect(service) as database:
+                controls.require_active(database, *scope(service)[:2])
+            require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+            require(time.monotonic() < deadline, 'Owned launcher exceeded its bound.', 'execution_uncertain')
+            try:
+                code = process.wait(timeout=.1)
+                joined = True
+                break
+            except subprocess.TimeoutExpired:
+                continue
+        require(code == 0, 'Launcher failed; reconcile the durable attempt.', 'execution_uncertain')
+    finally:
+        if not joined:
+            _stop_child(process)
+
+
 def tick(service, github, *, stop_event=None):
     from .service import connect, scope
     if stop_event is not None and stop_event.is_set():
@@ -238,7 +308,7 @@ def tick(service, github, *, stop_event=None):
         # owns signal cancellation, verified checks and mandatory cleanup.
         if stop_event is not None and stop_event.is_set():
             return blocked('service_stopping')
-        sandbox.launch(service['state'], *scope(service), *launch, github, stop_event=stop_event)
+        run_assignment(service, *launch, stop_event=stop_event)
         with connect(service) as database, state_lock(database):
             observed = assignments.inspect(database, *scope(service), launch[0])
             runtime = observed.get('runtime', {})

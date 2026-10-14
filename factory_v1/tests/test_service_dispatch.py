@@ -3,8 +3,6 @@ from copy import deepcopy
 import unittest
 from unittest.mock import Mock, patch
 
-from pathlib import Path
-import tempfile
 import threading
 import signal
 import subprocess
@@ -77,14 +75,29 @@ class DispatchBoundaryTests(unittest.TestCase):
         self.assertEqual(result['blockers'], ['review_execution-unverified'])
         evaluate.assert_called_once()
 
-    def test_signal_cancellation_marks_both_attempt_and_supervisor_shutdown(self):
-        local, supervisor = threading.Event(), threading.Event()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            dispatch.sandbox.cancel_attempt(local, root, supervisor)
-            self.assertTrue((root / 'stop').is_file())
-        self.assertTrue(local.is_set())
-        self.assertTrue(supervisor.is_set())
+    def test_public_launcher_uses_an_owned_child_not_the_service_pid(self):
+        process = Mock()
+        process.wait.return_value = 0
+        config = {'state': '/private/controller.sqlite', 'operator_id': 'operator', 'project': 'p', 'iteration': 'i',
+                  'api_base': 'https://api.github.com'}
+        from contextlib import nullcontext
+        with patch('factory_v1.service.connect', return_value=nullcontext(Mock())), \
+             patch.object(dispatch.controls, 'admission', return_value=nullcontext()), \
+             patch.object(dispatch.subprocess, 'Popen', return_value=process) as launch, \
+             patch.object(dispatch.controls, 'require_active'), \
+             patch.dict(dispatch.os.environ, {'HERMES_HOME': '/secret', 'GH_TOKEN': 'secret',
+                 'HTTPS_PROXY': 'secret', 'PYTHONPATH': '/unrelated', 'DOCKER_HOST': 'unix:///approved'}, clear=True):
+            dispatch.run_assignment(config, 'a' * 64, '/private/launcher.json')
+        argv = launch.call_args.args[0]
+        self.assertEqual(argv[1:3], ['-m', 'factory_v1'])
+        self.assertIn('launch-assignment', argv)
+        self.assertIn('/private/launcher.json', argv)
+        self.assertEqual(launch.call_args.kwargs['env'], {'DOCKER_HOST': 'unix:///approved'})
+        self.assertTrue(launch.call_args.kwargs['start_new_session'])
+        self.assertEqual(argv[3:], ['--state', config['state'], '--operator-id', 'operator',
+            'launch-assignment', '--project', 'p', '--iteration', 'i', '--assignment', 'a' * 64,
+            '--launcher-config', '/private/launcher.json', '--api-base', config['api_base']])
+        process.wait.assert_called_once()
 
     def test_host_synthesis_cancellation_joins_owned_process_group(self):
         process = Mock(pid=12345)
@@ -111,3 +124,89 @@ class DispatchBoundaryTests(unittest.TestCase):
                   'argv': ['/bin/true']}
         with self.assertRaises(RepositoryError):
             dispatch.validate(config, {'operator_id': 'operator', 'project': 'p', 'iteration': 'i'})
+
+class OwnedLauncherTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import nullcontext
+        self.service = {'state': '/private/state.sqlite', 'operator_id': 'operator',
+                        'project': 'p', 'iteration': 'i', 'api_base': 'https://api.github.com'}
+        self.event = threading.Event()
+        self.process = Mock(pid=12345)
+        self.process.wait.return_value = 0
+        self.launch = self.enterContext(patch.object(dispatch.subprocess, 'Popen', return_value=self.process))
+        self.kill = self.enterContext(patch.object(dispatch.os, 'killpg'))
+        self.enterContext(patch('factory_v1.service.connect', side_effect=lambda _: nullcontext(Mock())))
+        self.enterContext(patch.object(dispatch.controls, 'admission', side_effect=lambda *a: nullcontext()))
+        self.active = self.enterContext(patch.object(dispatch.controls, 'require_active'))
+        self.hold = self.enterContext(patch.object(dispatch.controls, 'request'))
+
+    def run_child(self):
+        dispatch.run_assignment(self.service, 'a' * 64, '/private/launcher.json', stop_event=self.event)
+
+    def test_shutdown_before_spawn_refuses_without_child(self):
+        self.event.set()
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'service_stopping')
+        self.launch.assert_not_called()
+        self.kill.assert_not_called()
+
+    def test_shutdown_joins_child_after_term(self):
+        def waiting(**kwargs):
+            self.event.set()
+            raise subprocess.TimeoutExpired('child', .1)
+        def wait(**kwargs):
+            if not self.event.is_set():
+                return waiting(**kwargs)
+            return 0
+        self.process.wait.side_effect = wait
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'service_stopping')
+        self.kill.assert_called_once_with(12345, signal.SIGTERM)
+        self.assertEqual(self.process.wait.call_args.kwargs, {'timeout': 35})
+
+    def test_term_timeout_escalates_to_kill_and_join(self):
+        self.active.side_effect = RepositoryError('iteration_paused', 'paused')
+        self.process.wait.side_effect = [subprocess.TimeoutExpired('child', 70), 0]
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'iteration_paused')
+        self.assertEqual([c.args for c in self.kill.call_args_list],
+                         [(12345, signal.SIGTERM), (12345, signal.SIGKILL)])
+        self.assertEqual(self.process.wait.call_args.kwargs, {'timeout': 5})
+
+    def test_unjoinable_child_overrides_pause_with_uncertainty(self):
+        self.active.side_effect = RepositoryError('iteration_paused', 'paused')
+        self.process.wait.side_effect = subprocess.TimeoutExpired('child', 70)
+        self.kill.side_effect = OSError('signal unavailable')
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'execution_uncertain')
+        self.hold.assert_called_once()
+        self.assertEqual(self.hold.call_args.args[4], 'pause')
+        self.assertEqual([c.args for c in self.kill.call_args_list],
+                         [(12345, signal.SIGTERM), (12345, signal.SIGKILL)])
+        self.assertEqual(self.process.wait.call_args.kwargs, {'timeout': 5})
+
+    def test_overall_deadline_terminates_and_joins(self):
+        with patch.object(dispatch.time, 'monotonic', side_effect=[0, 3901]):
+            with self.assertRaises(RepositoryError) as error:
+                self.run_child()
+        self.assertEqual(error.exception.code, 'execution_uncertain')
+        self.kill.assert_called_once_with(12345, signal.SIGTERM)
+        self.process.wait.assert_called_once_with(timeout=35)
+
+    def test_nonzero_child_exit_is_not_success(self):
+        self.process.wait.return_value = 1
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'execution_uncertain')
+        self.kill.assert_not_called()
+
+    def test_spawn_failure_is_structured_and_never_signals(self):
+        self.launch.side_effect = OSError('unavailable')
+        with self.assertRaises(RepositoryError) as error:
+            self.run_child()
+        self.assertEqual(error.exception.code, 'execution_uncertain')
+        self.kill.assert_not_called()
