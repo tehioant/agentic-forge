@@ -347,7 +347,8 @@ def resume(database, project, iteration, operator, reference):
                             for other in iterations),
                     'Another iteration is active; resume cannot steal its scope.', 'control_conflict')
             with database:
-                item['status'] = 'active'
+                if item['status'] != 'waiting-for-operator':
+                    item['status'] = 'active'
                 from .repositories import save_iteration
                 save_iteration(database, item)
             record = {**old, 'request_id': uuid.uuid4().hex, 'reference': reference, 'action': 'resume', 'state': 'completed',

@@ -42,7 +42,11 @@ route only for reads; normal publication/merge/closure commands remain separate.
   iteration under `BEGIN IMMEDIATE` before admitting completion. The caller holds
   the shared controller lock throughout. A new local pause/hold cannot be replaced
   by the earlier snapshot. Report, exact-origin attention intent, archived reservation
-  and `waiting-for-operator` state commit atomically.
+  and `waiting-for-operator` state commit atomically. Completion and next-interview
+  admission use the short [interruption lane](CONTROLS.md) through their local
+  save/commit, never across external reads. Pause/stop sidecars are checked against
+  the real persistent state even when tracker observations use a disposable copy.
+  Explicit resume preserves an already-completed wait; it does not restart work.
 
 Inspect the normal `inspect` output's `completion.report`: issue/PR URLs, candidate
 and integrated commits/tree/parents, per-item requirements/reviews/checks, current

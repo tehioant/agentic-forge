@@ -5,16 +5,19 @@ import json
 import sqlite3
 from contextlib import closing
 
-from . import assignments, attention, bugs, delivery, diagnosis, merge, requirements, tickets
+from . import assignments, attention, bugs, controls, delivery, diagnosis, merge, requirements, tickets
 from .planning import require, text, transition
 from .repositories import save_iteration
 
 
 def frontier(database, item, github):
-    """Observe the real tracker without checkpointing an old iteration over a hold."""
+    """Observe tracker read-only, checking controls against the real durable state."""
+    controls.require_active(database, item['project_id'], item['iteration_id'])
     with closing(sqlite3.connect(':memory:')) as observation:
         database.backup(observation)
-        return tickets.frontier(observation, item, assignments.ReadOnlyGitHub(github))['ticket_work']['frontier']
+        result = tickets.frontier(observation, item, assignments.ReadOnlyGitHub(github))['ticket_work']['frontier']
+    controls.require_active(database, item['project_id'], item['iteration_id'])
+    return result
 
 
 def required_items(item, observed, github):
@@ -93,6 +96,7 @@ def pending_decisions(database, item):
 def complete(database, project, iteration, operator, request, github):
     """Caller holds state_lock; all external reads precede atomic report + outbox + wait."""
     item = delivery.context(database, project, iteration, operator)
+    controls.require_active(database, project, iteration)
     require(item['status'] in {'active', 'waiting-for-operator'} and not item.get('next_iteration'),
             'Paused or continued iteration cannot complete.', 'iteration_paused')
     require(all((a.get('runtime') is None and
@@ -145,26 +149,27 @@ def complete(database, project, iteration, operator, request, github):
     completion = {'report_id': identity, 'event_id': 'completion-' + identity, 'report': report}
     require(item.get('completion', completion) == completion,
             'Completed report is immutable; changed delivery requires investigation.', 'completion_conflict')
-    database.execute('BEGIN IMMEDIATE')
-    latest = delivery.context(database, project, iteration, operator)
-    require(latest == item, 'Iteration changed across external verification; no report admitted.', 'completion_race')
-    if 'completion' not in item:
-        item['completion'] = completion
-        if item.get('reservation'):
-            item.setdefault('reservation_history', []).append(item.pop('reservation'))
-        item['status'] = 'waiting-for-operator'
-        transition(item, 'waiting-for-operator')
-        database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
-        lines = [f"Iteration {iteration} delivered for {item['repository']} ({report['verification']}). Report {identity}."]
-        lines += [f"#{r['issue']['number']} {r['issue']['url']} PR {r['pr']['url']} commit {r['integration']['integrated']}" for r in delivered]
-        lines += [f"Deployment {health['deployment']['id']} at {health['main']}: healthy. Deferred issues: {deferred}. Pending decisions: {decisions}.",
-                  f"Retained bug discoveries: {len(bug_records)}. Inspect the durable completion report for scope/evidence.", report['invitation']]
-        message = '\n'.join(lines)
-        attention.enqueue(database, item, {'event_id': completion['event_id'], 'kind': 'completion',
-            'message': message, 'issue_number': item['handoff']['issue']['number'],
-            'run_id': completion['event_id'], 'evidence_ids': [identity]})
-        save_iteration(database, item)
-    database.commit()
+    with controls.admission(database, project, iteration):
+        database.execute('BEGIN IMMEDIATE')
+        latest = delivery.context(database, project, iteration, operator)
+        require(latest == item, 'Iteration changed across external verification; no report admitted.', 'completion_race')
+        if 'completion' not in item:
+            item['completion'] = completion
+            if item.get('reservation'):
+                item.setdefault('reservation_history', []).append(item.pop('reservation'))
+            item['status'] = 'waiting-for-operator'
+            transition(item, 'waiting-for-operator')
+            database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
+            lines = [f"Iteration {iteration} delivered for {item['repository']} ({report['verification']}). Report {identity}."]
+            lines += [f"#{r['issue']['number']} {r['issue']['url']} PR {r['pr']['url']} commit {r['integration']['integrated']}" for r in delivered]
+            lines += [f"Deployment {health['deployment']['id']} at {health['main']}: healthy. Deferred issues: {deferred}. Pending decisions: {decisions}.",
+                      f"Retained bug discoveries: {len(bug_records)}. Inspect the durable completion report for scope/evidence.", report['invitation']]
+            message = '\n'.join(lines)
+            attention.enqueue(database, item, {'event_id': completion['event_id'], 'kind': 'completion',
+                'message': message, 'issue_number': item['handoff']['issue']['number'],
+                'run_id': completion['event_id'], 'evidence_ids': [identity]})
+            save_iteration(database, item)
+        database.commit()
     return completion
 
 
@@ -197,6 +202,7 @@ def next_iteration(database, project, iteration, operator, request):
     from .skills import resolve_installed
     database.execute('BEGIN IMMEDIATE')
     item = delivery.context(database, project, iteration, operator)
+    controls.require_active(database, project, iteration)
     fields = {'iteration_id', 'event_id', 'operator_id', 'origin', 'reference', 'message_id', 'input', 'skills'}
     require(isinstance(request, dict) and set(request) == fields and request['operator_id'] == operator and
             request['origin'] == item['origin'] and text(request['reference']) and text(request['input']) and
@@ -241,9 +247,10 @@ def next_iteration(database, project, iteration, operator, request):
         'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
         'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
         'Publish new updated-spec pointers, never overwrite the preceding milestone.')
-    delivery.inherit_monitor(database, item, result, operator)
-    database.execute('INSERT INTO iterations VALUES (?, ?, ?)', (project, result['iteration_id'], json.dumps(result)))
-    item['next_iteration'] = {'iteration_id': result['iteration_id'], 'request': request}
-    save_iteration(database, item)
-    database.commit()
+    with controls.admission(database, project, iteration):
+        delivery.inherit_monitor(database, item, result, operator)
+        database.execute('INSERT INTO iterations VALUES (?, ?, ?)', (project, result['iteration_id'], json.dumps(result)))
+        item['next_iteration'] = {'iteration_id': result['iteration_id'], 'request': request}
+        save_iteration(database, item)
+        database.commit()
     return result

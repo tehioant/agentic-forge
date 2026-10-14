@@ -212,7 +212,7 @@ class RevisionIntegrationTests(unittest.TestCase):
         with patch.object(publication, 'reconcile'), \
              patch.object(publication, 'version_documents', side_effect=lambda db, item, record, gh: record['publication']), \
              patch.object(publication, 'spec_issue', return_value=4), \
-             patch.object(planning, 'complete', side_effect=lambda db, item, request, gh: item):
+             patch.object(planning, 'read_publication', return_value=self.new_inputs['handoff']):
             return publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
 
     def prepare_resume(self):
