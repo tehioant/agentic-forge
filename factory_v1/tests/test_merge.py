@@ -767,6 +767,744 @@ class MergeComponentTests(unittest.TestCase):
         self.assertFalse(journal['close_allowed'])
         self.assertEqual(journal['status'], 'incomplete')
 
+    def test_concrete_protection_http_failures_keep_preflight_immutable_and_refusal_durable(self):
+        original = self.external_request.side_effect
+        for status in (403, 404):
+            with self.subTest(http_status=status):
+                self.store(self.candidate)
+                self.calls.clear()
+                def inaccessible(path, body=None, method=None):
+                    if path.endswith('/branches/main/protection'):
+                        self.calls.append(('GET', '/branches/main/protection', None))
+                        if status == 403:
+                            raise RepositoryError('github_blocked', 'LOCAL simulated HTTP 403', status)
+                        # GitHub.request translates GET HTTP 404 to an absent value.
+                        return None
+                    return original(path, body, method)
+                self.external_request.side_effect = inaccessible
+                before = list(self.db.iterdump())
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle('merge-preflight')
+                self.assertEqual(refusal.exception.code, 'protection_required')
+                self.assertEqual(list(self.db.iterdump()), before)
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, 'protection_required')
+                self.assertEqual(self.stored()['merge_refusal']['code'], 'protection_required')
+                self.assertNotIn('merge', self.stored())
+                self.assertEqual(self.mutations(), [])
+                self.assertEqual(self.work_issue['state'], 'open')
+        self.external_request.side_effect = original
+
+    def test_green_candidate_cannot_hide_failed_or_unknown_baseline_checks(self):
+        for mode in ('failed', 'missing', 'unknown'):
+            with self.subTest(main_checks=mode):
+                self.store(self.candidate)
+                self.refs['main'] = self.config['baseline']
+                self.pr.update(state='open', merged=False)
+                self.calls.clear()
+                records = self.good_checks(self.config['baseline'])
+                if mode == 'missing':
+                    records = {'total_count': 0, 'check_runs': []}
+                else:
+                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
+                self.run_records[self.config['baseline']] = records
+                # The real baseline predicate, not a supplied main_incident, refuses.
+                self.assertTrue(merge.checks(self.api, self.config, self.config['head']))
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, 'main_frozen')
+                self.assertIn(('GET', '/commits/' + self.config['baseline'] +
+                               '/check-runs?per_page=100&filter=latest', None), self.calls)
+                self.assertEqual(self.stored()['merge_refusal']['code'], 'main_frozen')
+                self.assertNotIn('merge', self.stored())
+                self.assertEqual(self.mutations(), [])
+                self.assertNotIn('main_incident', assignments.current(self.db, 'product', 'm1', '42'))
+
+    def test_concurrent_locked_controllers_share_one_merge_intent_and_put(self):
+        import fcntl
+        from factory_v1.repositories import state_lock
+        state = self.root / 'state.sqlite'
+        started = threading.Barrier(2, timeout=3)
+        local = threading.local()
+        def stored():
+            db = getattr(local, 'database', self.db)
+            return json.loads(db.execute('SELECT payload FROM role_assignments WHERE assignment_id=?',
+                                        (self.candidate['assignment_id'],)).fetchone()[0])
+        def controller():
+            with closing(sqlite3.connect(state, timeout=3)) as db:
+                local.database = db
+                started.wait()  # Never wait/join while holding the shared controller lock.
+                with state_lock(db):
+                    # A missing shared lock must fail deterministically, not by race luck.
+                    with open(str(state) + '.onboarding.lock', 'a') as contender:
+                        with self.assertRaises(BlockingIOError):
+                            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return merge.lifecycle(db, 'product', 'm1', '42', self.config_path, 'merge-candidate')
+        with patch.object(self, 'stored', side_effect=stored):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                futures = [pool.submit(controller) for _ in range(2)]
+                results = [future.result(timeout=5) for future in futures]
+        self.assertEqual([r['status'] for r in results], ['merged', 'merged'])
+        self.assertEqual(results[0]['integrated_evidence'], results[1]['integrated_evidence'])
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(self.mutations('PATCH'), [])
+        with closing(sqlite3.connect(state)) as restarted:
+            journal = merge.inspect_merge(restarted, 'product', 'm1', '42', self.candidate['assignment_id'])['merge']
+        self.assertEqual(journal['status'], 'merged')
+        self.assertEqual(journal['integrated_evidence'], results[0]['integrated_evidence'])
+
+    def test_material_spec_or_obsolete_assignment_reopens_retaining_integrated_receipts(self):
+        authority = {k: v for k, v in self.config.items() if k != 'bearer'}
+        evidence = {'candidate': self.config['head'], 'integrated': self.integrated,
+                    'tree': self.plan['tree'], 'main': self.integrated, 'membership': 'identical',
+                    'parents': [self.config['baseline'], self.config['head']]}
+        prior = {'status': 'delivered', 'authority': authority, 'integrated_evidence': evidence,
+                 'branch_checks': merge.checks(self.api, self.config, self.config['head']),
+                 'protection': merge.protection(self.api, self.config),
+                 'delivery_checks': merge.checks(self.api, self.config, self.integrated),
+                 'failure': None, 'close_allowed': True, 'iteration_complete': False, 'deployment_verified': False}
+        original_item = copy.deepcopy(self.item)
+        self.pr.update(merged=True, state='closed', merge_commit_sha=self.integrated)
+        self.refs['main'] = self.integrated
+        # Only unrelated execution prerequisites are admitted; revision inspection is real.
+        def revision_checked_chain(db, project, iteration, operator, config, path):
+            return assignments.inspect(db, project, iteration, operator, config['candidate_assignment']), self.builder, self.root
+        with patch.object(merge, 'chain', side_effect=revision_checked_chain):
+            for mode, code in (('material-spec', 'stale_assignment'), ('obsolete', 'requirements_held')):
+                with self.subTest(requirements=mode):
+                    self.item = copy.deepcopy(original_item)
+                    candidate = copy.deepcopy(self.candidate)
+                    candidate['merge'] = copy.deepcopy(prior)
+                    if mode == 'material-spec':
+                        self.item['handoff']['commit'] = 'f' * 40
+                    else:
+                        candidate['requirement_disposition'] = {'change_id': 'material-revision', 'status': 'obsolete'}
+                    self.save_item()
+                    self.store(candidate)
+                    self.work_issue['state'] = 'closed'
+                    self.calls.clear()
+                    with self.assertRaises(RepositoryError) as refusal:
+                        self.lifecycle('verify-delivery')
+                    self.assertEqual(refusal.exception.code, code)
+                    retained = self.stored()['merge']
+                    self.assertEqual(retained['status'], 'incomplete')
+                    self.assertFalse(retained['close_allowed'])
+                    self.assertEqual(retained['failure']['code'], code)
+                    self.assertEqual(retained['integrated_evidence'], prior['integrated_evidence'])
+                    self.assertEqual(retained['delivery_checks'], prior['delivery_checks'])
+                    self.assertEqual(self.work_issue['state'], 'open')
+                    self.assertEqual(self.mutations('PUT'), [])
+                    self.assertEqual(len(self.mutations('PATCH')), 1)
+                    with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+                        inspected = merge.inspect_merge(restarted, 'product', 'm1', '42', self.candidate['assignment_id'])
+                    self.assertEqual(inspected['merge'], retained)
+                    if mode == 'material-spec':
+                        self.assertNotEqual(inspected['revision']['spec'], inspected['current_spec'])
+                    else:
+                        self.assertEqual(inspected['requirement_disposition'], candidate['requirement_disposition'])
+
+    def test_missing_or_failed_integrated_checks_reopen_without_another_merge(self):
+        self.lifecycle()
+        for mode, code in (('missing', 'checks_unknown'), ('failed', 'checks_failed'), ('unknown', 'checks_failed')):
+            with self.subTest(integrated_checks=mode):
+                records = self.good_checks(self.integrated)
+                if mode == 'missing':
+                    records = {'total_count': 0, 'check_runs': []}
+                else:
+                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
+                self.run_records[self.integrated] = records
+                self.work_issue['state'] = 'closed'
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle('verify-delivery')
+                self.assertEqual(refusal.exception.code, code)
+                self.assertEqual(self.work_issue['state'], 'open')
+                journal = self.stored()['merge']
+                self.assertEqual(journal['status'], 'incomplete')
+                self.assertEqual(journal['failure']['code'], code)
+                self.assertFalse(journal['close_allowed'])
+                self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
+                self.assertEqual(journal['delivery_checks'], [])
+                self.assertEqual(len(self.mutations('PUT')), 1)
+
+    def test_wrong_repo_missing_branch_checks_and_unbound_recovery_refuse_without_intent(self):
+        config = copy.deepcopy(self.config)
+        for mode, code in (('repository', 'scope_mismatch'), ('missing-check', 'checks_unknown'),
+                           ('unknown-check', 'checks_failed'), ('boolean-recovery', 'scope_mismatch'),
+                           ('ordinary-recovery', 'main_frozen')):
+            with self.subTest(mode=mode):
+                self.config = copy.deepcopy(config)
+                self.repo['id'] = 123
+                self.item.pop('main_incident', None)
+                self.run_records[self.config['head']] = self.good_checks(self.config['head'])
+                self.store(self.candidate)
+                self.calls.clear()
+                if mode == 'repository':
+                    self.repo['id'] = 456
+                elif mode == 'missing-check':
+                    self.run_records[self.config['head']] = {'total_count': 0, 'check_runs': []}
+                elif mode == 'unknown-check':
+                    self.run_records[self.config['head']]['check_runs'][0]['conclusion'] = None
+                else:
+                    self.item['main_incident'] = {'status': 'active', 'incident_id': 'incident-1',
+                        'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
+                    self.config['recovery'] = True if mode == 'boolean-recovery' else {
+                        'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10}
+                self.save_item()
+                self.write_config()
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+                self.assertEqual(self.mutations(), [])
+                self.assertNotIn('merge', self.stored())
+
+    def test_changed_or_resealed_weak_protection_and_malformed_check_counts_refuse(self):
+        original = copy.deepcopy(self.classic)
+        cases = [('strict', False), ('enforce_admins', False), ('allow_force_pushes', True), ('allow_deletions', True)]
+        for field, value in cases:
+            with self.subTest(protection=field):
+                self.classic = copy.deepcopy(original)
+                self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': original})
+                if field == 'strict':
+                    self.classic['required_status_checks']['strict'] = value
+                else:
+                    self.classic[field]['enabled'] = value
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.protection(self.api, self.config)
+                self.assertEqual(refusal.exception.code, 'stale_protection')
+                self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.protection(self.api, self.config)
+                self.assertEqual(refusal.exception.code, 'protection_required')
+        for count in (True, 0, 2, 100):
+            with self.subTest(total_count=count):
+                self.run_records[self.config['head']] = {**self.good_checks(self.config['head']), 'total_count': count}
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.checks(self.api, self.config, self.config['head'])
+                self.assertEqual(refusal.exception.code, 'checks_unknown')
+        self.assertEqual(self.mutations(), [])
+
+    def test_late_config_or_protection_drift_blocks_durable_intent(self):
+        for mode, code in (('config', 'stale_admission'), ('protection', 'stale_protection')):
+            with self.subTest(mode=mode):
+                self.store(self.candidate)
+                self.calls.clear()
+                self.protection_reads = 0
+                self.classic['required_status_checks']['strict'] = True
+                self.config['execution_reference'] = 'LOCAL unchanged authority'
+                self.write_config()
+                def change(reads):
+                    if reads != 2:
+                        return
+                    if mode == 'config':
+                        self.config['execution_reference'] = 'LOCAL replaced authority'
+                        self.write_config()
+                    else:
+                        self.classic['required_status_checks']['strict'] = False
+                self.boundary_change = change
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+                self.assertNotIn('merge', self.stored())
+                self.assertEqual(self.mutations(), [])
+
+    def test_paused_pending_intent_remains_uncertain_on_fresh_connection(self):
+        self.merge_effect = False
+        self.drop_merge = True
+        with self.assertRaises(RepositoryError) as refusal:
+            self.lifecycle()
+        self.assertEqual(refusal.exception.code, 'merge_uncertain')
+        controls.request(self.db, 'product', 'm1', '42', 'pause', 'retain uncertain intent on restart')
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            with self.assertRaises(RepositoryError) as refusal:
+                merge.lifecycle(restarted, 'product', 'm1', '42', self.config_path, 'merge-candidate')
+            self.assertEqual(refusal.exception.code, 'merge_uncertain')
+            inspected = merge.inspect_merge(restarted, 'product', 'm1', '42', self.candidate['assignment_id'])
+        self.assertEqual(inspected['merge']['status'], 'pending')
+        self.assertFalse(inspected['merge']['close_allowed'])
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(self.work_issue['state'], 'open')
+
+
+class ChainAdmissionTests(unittest.TestCase):
+    """Retained local declarations, NOT native/model execution or worker acceptance."""
+
+    def setUp(self):
+        from factory_v1.tests.test_assignments import PINS, SOURCE_ROOT
+        directory = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.db = sqlite3.connect(self.root / 'state.sqlite')
+        self.addCleanup(self.db.close)
+        (self.root / 'state.sqlite').chmod(0o600)
+        self.db.executescript('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT);'
+                             'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
+        item = {'status': 'active', 'execution_allowed': False,
+            'approval': {'operator_id': '42', 'reference': 'Local declared chain prerequisite'},
+            'handoff': {'commit': 'c' * 40}, 'ticket_work': {'input_digest': 'd' * 64,
+                'inputs': {'handoff': {'commit': 'c' * 40}, 'documents': {'spec': {'sha256': 'e' * 64}}}}}
+        self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(item)))
+        self.db.commit()
+        self.selected = {}
+        for name in ('implement', 'simplify-code', 'code-review', 'code-review/references/structured-text-contracts.md'):
+            suffix = name if name.endswith('.md') else name + '/SKILL.md'
+            path = self.root / 'selected' / suffix
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes((SOURCE_ROOT / suffix).read_bytes())
+            source = '/home/ops/.hermes/skills/' + ('software-development/' if name == 'simplify-code' else '') + suffix
+            self.selected[name] = {'name': name, 'source': source, 'path': str(path), 'sha256': PINS[name],
+                'dependencies': ['code-review/references/structured-text-contracts.md'] if name == 'code-review' else [],
+                'instructions': path.read_text()}
+        self.rows = []
+        for index, stage in enumerate(('implementation', 'simplify', 'review-standards', 'review-spec'), 1):
+            root = self.root / stage
+            root.mkdir(mode=0o700)
+            for folder in ('scratch', 'inputs/baseline', 'workspace', 'model-evidence'):
+                (root / folder).mkdir(parents=True)
+            (root / 'inputs/baseline/hello.py').write_text('print("baseline")\n')
+            (root / 'workspace/hello.py').write_text('print("candidate")\n')
+            source, baseline = manifest(root / 'workspace'), manifest(root / 'inputs/baseline')
+            run = 'declared-local-run-' + str(index)
+            receipt = {'run_id': run, 'candidate': source,
+                'provenance': 'controller_admitted_read_only_sandbox_checks',
+                'fixture_label': 'LOCAL declaration, no checks process or native worker ran',
+                'records': [{'command': 'python -m unittest local_greeting', 'exit_code': 0,
+                    'stdout': 'LOCAL declared passing prerequisite', 'stderr': '', 'output_truncated': False}]}
+            (root / 'controller-checks.json').write_text(json.dumps(receipt))
+            (root / 'initial-source.json').write_text(json.dumps({'workspace': source, 'baseline': baseline}))
+            for relative in ('scratch/result.json', 'scratch/loads.json', 'scratch/events.jsonl',
+                             'scratch/conversation.json', 'scratch/probes.json', 'inputs/worker.py',
+                             'inputs/sandbox_relay.py', 'inputs/assignment.json', 'inputs/handoff.json',
+                             'container-inspection.json', 'launch-command.json', 'source-artifacts.json',
+                             'model-evidence/response-local.json'):
+                (root / relative).write_text('LOCAL retained declaration, NOT execution: ' + relative + '\n')
+            names = ['implement'] if stage == 'implementation' else ['simplify-code'] if stage == 'simplify' else [
+                'code-review', 'code-review/references/structured-text-contracts.md']
+            h = {'stage': stage, 'profile': {'name': stage + '-local', 'home': str(self.root / ('profile-' + stage)),
+                    'role': assignments.ROLES[stage], 'provider': assignments.SUBSCRIPTION_SCOPE[0],
+                    'model': assignments.SUBSCRIPTION_SCOPE[1], 'operation': assignments.SUBSCRIPTION_SCOPE[2], 'reasoning': 'low'},
+                'repository': 'example/product', 'repository_id': 123, 'workspace': str(root / 'workspace'),
+                'issue': {'number': 10, 'id': 110, 'node_id': 'ISSUE10', 'body_sha256': 'f' * 64},
+                'spec_commit': 'c' * 40, 'baseline': 'a' * 40, 'candidate': 'b' * 40,
+                'standards': [merge.simplification.artifact('AGENTS.md', 'Local fixture standards')],
+                'preceding': [], 'skills': [copy.deepcopy(self.selected[name]) for name in names],
+                'capabilities': ['read_workspace', 'scratch', 'model'] + (['write_workspace'] if index <= 2 else []),
+                'result_contract': assignments.CONTRACT, 'claim_id': 'declared-claim-' + str(index),
+                'adaptation': merge.role_skills.ADAPTATIONS[stage], 'input_loads': {'fixture:requirements': 'e' * 64}}
+            row = {'assignment_id': str(index) * 64, 'claim_id': h['claim_id'], 'handoff': h,
+                'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
+                'revision': requirements.authority(item, 10),
+                'runtime': {'status': 'complete', 'container_removed': True, 'artifacts': str(root), 'run_id': run,
+                    'candidate_sha256': assignments.digest(source), 'baseline_sha256': assignments.digest(baseline),
+                    'checks_sha256': hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest()},
+                'result_disposition': {'checks_verified': True}}
+            row['submitted_result'] = {'assignment_id': row['assignment_id'], 'claim_id': row['claim_id'],
+                'run_id': run, 'status': 'done', 'work': [{'reference': 'LOCAL declared stage work, NOT native execution'}],
+                'loads': [{'source': key, 'sha256': value, 'tool_reference': 'LOCAL declared load'}
+                    for key, value in ({s['source']: s['sha256'] for s in h['skills']} | h['input_loads']).items()],
+                'artifacts': [], 'tests': []}
+            self.rows.append(row)
+        self.builder, self.candidate, *self.axes = self.rows
+        simplification = merge.simplification
+        root = Path(self.builder['runtime']['artifacts'])
+        self.seal(self.builder)
+        preceding = simplification.preceding(self.builder, root, manifest(root / 'workspace'),
+            manifest(root / 'inputs/baseline'), json.loads((root / 'controller-checks.json').read_text()))
+        h = self.candidate['handoff']
+        h['preceding'] = preceding
+        digest = self.candidate['runtime']['candidate_sha256']
+        report = {'contract': simplification.CONTRACT, 'adaptation': h['adaptation'],
+            'input_candidate_sha256': digest, 'candidate_sha256': digest, 'outcome': 'no-op',
+            'behavior_preservation': 'preserved', 'angles': {a: 'LOCAL declared assessment' for a in simplification.ANGLES}, 'findings': []}
+        h['simplification'] = {'implementation_assignment': self.builder['assignment_id'],
+            'input_candidate_sha256': digest, 'verification_commands': ['python -m unittest local_greeting'],
+            'scope': ['hello.py'], 'result_fields': list(report)}
+        self.candidate['submitted_result']['artifacts'] = [simplification.artifact('simplification-result', json.dumps(report))]
+        self.seal(self.candidate)
+        self.candidate['simplification_result'] = simplification.validate_result(self.candidate, self.candidate['submitted_result'])
+        root = Path(self.candidate['runtime']['artifacts'])
+        self.pins = merge.review.pins(self.candidate, manifest(root / 'workspace'), manifest(root / 'inputs/baseline'))
+        for axis in self.axes:
+            h = axis['handoff']
+            h['preceding'] = merge.review.preceding(self.candidate, root, manifest(root / 'workspace'),
+                manifest(root / 'inputs/baseline'), json.loads((root / 'controller-checks.json').read_text()))
+            report = {'contract': merge.review.CONTRACT, 'axis': merge.review.AXES[h['stage']],
+                'adaptation': h['adaptation'], 'pins': copy.deepcopy(self.pins), 'verdict': 'pass', 'findings': [],
+                'test_assessment': 'LOCAL declared assessment, NOT native reviewer work', 'stuckness': None}
+            h['review'] = {'pins': copy.deepcopy(self.pins), 'axis': report['axis'], 'policy_paths': [],
+                'verification_commands': ['python -m unittest local_greeting'], 'result_fields': list(report),
+                'verdicts': ['pass', 'reject', 'stuck']}
+            axis['submitted_result']['artifacts'] = [simplification.artifact('review-result', json.dumps(report))]
+            self.seal(axis)
+            axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+        saved = {'operator_id': '42', 'execution_reference': 'LOCAL declared approved prerequisites, NOT attestation',
+            'axes': [merge.review.execution_binding(a) for a in self.axes], 'policy_decision': None}
+        for axis in self.axes:
+            axis['review_authorization'] = copy.deepcopy(saved)
+        for row in self.rows:
+            self.store(row)
+        self.config = {'candidate_assignment': self.candidate['assignment_id'],
+            'standards_assignment': self.axes[0]['assignment_id'], 'spec_assignment': self.axes[1]['assignment_id'],
+            'repository': 'example/product', 'repository_id': 123, 'issue': 10, 'baseline': 'a' * 40,
+            'executions': [merge.execution_binding(a) for a in self.rows]}
+        self.config_path = self.root / 'controller-merge.json'
+        self.config_path.write_text(json.dumps(self.config))
+        self.config_path.chmod(0o600)
+        # Adverse-candidate holds have their own component tests. Do not let that
+        # earlier scan mask the immutable chain-pins comparison being tested here.
+        self.enterContext(patch.object(merge.review, 'adverse_reviews', return_value=[]))
+
+    def seal(self, row):
+        row['handoff_digest'] = assignments.digest(row['handoff'])
+        row['submitted_result']['handoff_digest'] = row['handoff_digest']
+
+    def store(self, row):
+        self.db.execute('INSERT OR REPLACE INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.db.commit()
+
+    def admit(self):
+        return merge.chain(self.db, 'product', 'm1', '42', self.config, self.config_path)
+
+    def reseal_axis_authority(self, axes):
+        """Isolate semantic axis guards, not the frozen-authorization regressions."""
+        saved = copy.deepcopy(self.axes[0]['review_authorization'])
+        saved['axes'] = [merge.review.execution_binding(a) for a in axes]
+        for axis in axes:
+            axis['review_authorization'] = copy.deepcopy(saved)
+            self.store(axis)
+        self.config['executions'] = [merge.execution_binding(a) for a in [self.builder, self.candidate, *axes]]
+
+    def assert_refused(self, code):
+        before = list(self.db.iterdump())
+        with self.assertRaises(RepositoryError) as refusal:
+            self.admit()
+        self.assertEqual(refusal.exception.code, code)
+        self.assertEqual(list(self.db.iterdump()), before)
+
+    def test_valid_chain_reaches_both_actual_approved_binding_comparisons(self):
+        with patch.object(merge, 'require', wraps=merge.require) as guards:
+            prior, builder, root = self.admit()
+        self.assertEqual(prior, self.candidate)
+        self.assertEqual(builder, self.builder)
+        self.assertEqual(root, Path(self.candidate['runtime']['artifacts']))
+        messages = {call.args[1]: call.args[0] for call in guards.call_args_list}
+        self.assertIs(messages['Independent review execution authorization missing or stale.'], True)
+        self.assertIs(messages['Host-resolved implement, simplify-code and both native review executions required.'], True)
+
+    def test_forged_execution_declarations_never_qualify(self):
+        self.config['executions'] = [{'role': 'implementation', 'status': 'done'}] * 4
+        self.assert_refused('execution_required')
+
+    def test_each_host_execution_binding_field_is_frozen(self):
+        approved = copy.deepcopy(self.config['executions'])
+        for index, execution in enumerate(approved):
+            for field in execution:
+                with self.subTest(stage=self.rows[index]['handoff']['stage'], field=field):
+                    self.config['executions'] = copy.deepcopy(approved)
+                    self.config['executions'][index][field] = {'forged': 'LOCAL changed approved field'}
+                    self.assert_refused('execution_required')
+        self.config['executions'] = approved
+
+    def test_each_assignment_candidate_check_and_scope_binding_is_frozen(self):
+        approved = copy.deepcopy(self.config['executions'])
+        for index, execution in enumerate(approved):
+            for field in execution['binding']:
+                with self.subTest(stage=self.rows[index]['handoff']['stage'], field=field):
+                    self.config['executions'] = copy.deepcopy(approved)
+                    self.config['executions'][index]['binding'][field] = 'LOCAL forged binding'
+                    self.assert_refused('execution_required')
+            for field in ('run_id', 'candidate_sha256', 'baseline_sha256', 'checks_sha256'):
+                with self.subTest(stage=self.rows[index]['handoff']['stage'], runtime=field):
+                    self.config['executions'] = copy.deepcopy(approved)
+                    self.config['executions'][index]['binding']['execution'][field] = 'LOCAL forged runtime pin'
+                    self.assert_refused('execution_required')
+        self.config['executions'] = approved
+
+    def test_both_review_authorizations_freeze_source_response_loads_and_work(self):
+        approved = copy.deepcopy(self.axes[0]['review_authorization'])
+        for index, binding in enumerate(approved['axes']):
+            for field in binding:
+                with self.subTest(axis=index, field=field):
+                    forged = copy.deepcopy(approved)
+                    forged['axes'][index][field] = {'forged': 'LOCAL changed approved reviewer field'}
+                    for axis in self.axes:
+                        axis['review_authorization'] = forged
+                        self.store(axis)
+                    self.assert_refused('execution_required')
+        for axis in self.axes:
+            axis['review_authorization'] = copy.deepcopy(approved)
+            self.store(axis)
+
+    def test_changed_reviewer_load_references_and_work_cannot_reuse_approval(self):
+        for original in self.axes:
+            for field in ('loads', 'work'):
+                with self.subTest(axis=original['handoff']['stage'], field=field):
+                    axis = copy.deepcopy(original)
+                    if field == 'loads':
+                        axis['submitted_result']['loads'][0]['tool_reference'] = 'LOCAL changed load reference'
+                    else:
+                        axis['submitted_result']['work'] = [{'reference': 'LOCAL changed work'}]
+                    self.store(axis)
+                    approved = copy.deepcopy(self.config['executions'])
+                    rows = [axis if row['assignment_id'] == axis['assignment_id'] else row for row in self.rows]
+                    self.config['executions'] = [merge.execution_binding(row) for row in rows]
+                    try:
+                        self.assert_refused('execution_required')
+                    finally:
+                        self.config['executions'] = approved
+                        self.store(original)
+
+    def test_changed_builder_and_other_stage_transcripts_or_responses_are_rejected(self):
+        for row in self.rows:
+            for relative in ('scratch/conversation.json', 'model-evidence/response-local.json'):
+                path = Path(row['runtime']['artifacts']) / relative
+                raw = path.read_bytes()
+                with self.subTest(stage=row['handoff']['stage'], artifact=relative):
+                    approved = copy.deepcopy(self.config['executions'])
+                    path.write_bytes(raw + b'\n')
+                    if row in self.axes:
+                        self.config['executions'] = [merge.execution_binding(a) for a in self.rows]
+                    try:
+                        self.assert_refused('execution_required')
+                    finally:
+                        self.config['executions'] = approved
+                        path.write_bytes(raw)
+
+    def test_reused_review_axis_cannot_supply_two_independent_passes(self):
+        self.config['spec_assignment'] = self.config['standards_assignment']
+        self.reseal_axis_authority([self.axes[0], self.axes[0]])
+        self.assert_refused('stale_review')
+
+    def test_reused_profiles_or_artifacts_cannot_supply_fresh_axes(self):
+        original = copy.deepcopy(self.axes)
+        for field in ('name', 'home', 'artifacts'):
+            with self.subTest(field=field):
+                standards, spec = copy.deepcopy(original)
+                if field == 'artifacts':
+                    spec['runtime'] = copy.deepcopy(standards['runtime'])
+                    spec['submitted_result']['run_id'] = spec['runtime']['run_id']
+                else:
+                    spec['handoff']['profile'][field] = standards['handoff']['profile'][field]
+                    self.seal(spec)
+                self.reseal_axis_authority([standards, spec])
+                self.assert_refused('stale_review')
+        for axis in original:
+            self.store(axis)
+
+    def test_changed_selected_source_bytes_do_not_qualify(self):
+        for skill in self.selected.values():
+            path = Path(skill['path'])
+            raw = path.read_bytes()
+            with self.subTest(source=skill['source']):
+                path.write_bytes(raw + b'\nchanged')
+                try:
+                    self.assert_refused('skill_blocked')
+                finally:
+                    path.write_bytes(raw)
+
+    def test_each_review_pin_must_equal_the_immutable_candidate(self):
+        for index, original in enumerate(self.axes):
+            for field in self.pins:
+                with self.subTest(axis=original['handoff']['stage'], pin=field):
+                    axes = copy.deepcopy(self.axes)
+                    axis = axes[index]
+                    root = Path(axis['runtime']['artifacts'])
+                    changed_path = None
+                    raw_source = b''
+                    raw_receipt = (root / 'controller-checks.json').read_bytes()
+                    if field in ('tree_sha256', 'baseline_sha256'):
+                        folder = 'workspace' if field == 'tree_sha256' else 'inputs/baseline'
+                        changed_path = root / folder / 'hello.py'
+                        raw_source = changed_path.read_bytes()
+                        changed_path.write_bytes(raw_source + b'\n')
+                        changed_manifest = manifest(root / folder)
+                        pin = assignments.digest(changed_manifest)
+                        runtime_field = 'candidate_sha256' if field == 'tree_sha256' else 'baseline_sha256'
+                        axis['runtime'][runtime_field] = pin
+                        if field == 'tree_sha256':
+                            receipt = json.loads(raw_receipt)
+                            receipt['candidate'] = changed_manifest
+                            (root / 'controller-checks.json').write_text(json.dumps(receipt))
+                            axis['runtime']['checks_sha256'] = hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest()
+                    else:
+                        pin = '0' * len(str(self.pins[field]))
+                    axis['handoff']['review']['pins'][field] = pin
+                    artifact = axis['submitted_result']['artifacts'][0]
+                    report = json.loads(artifact['content'])
+                    report['pins'] = copy.deepcopy(axis['handoff']['review']['pins'])
+                    axis['submitted_result']['artifacts'][0] = merge.simplification.artifact('review-result', json.dumps(report))
+                    self.seal(axis)
+                    try:
+                        axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+                        self.reseal_axis_authority(axes)
+                        self.assert_refused('stale_review')
+                    finally:
+                        if changed_path is not None:
+                            changed_path.write_bytes(raw_source)
+                        (root / 'controller-checks.json').write_bytes(raw_receipt)
+                        for restored in self.axes:
+                            self.store(restored)
+
+    def test_rejected_spec_with_valid_resealed_authority_cannot_pass_real_chain(self):
+        self.admit()  # Identical bytes, checks and independent bindings qualify first.
+        axes = copy.deepcopy(self.axes)
+        spec = axes[1]
+        report = json.loads(spec['submitted_result']['artifacts'][0]['content'])
+        report.update(verdict='reject', findings=[{'id': 'requirement-gap', 'kind': 'missing',
+            'path': 'hello.py', 'requirement': 'Greeting must meet the pinned work issue',
+            'evidence': 'LOCAL semantic rejection despite the declared passing checks',
+            'correction': 'Correct the greeting and obtain both fresh axes'}])
+        spec['submitted_result']['artifacts'] = [merge.simplification.artifact('review-result', json.dumps(report))]
+        self.seal(spec)
+        spec['review_result'] = merge.review.validate_result(spec, spec['submitted_result'])
+        self.reseal_axis_authority(axes)
+        before = list(self.db.iterdump())
+        with self.assertRaises(RepositoryError) as refusal:
+            self.admit()
+        self.assertEqual(refusal.exception.code, 'stale_review')
+        self.assertEqual(str(refusal.exception), 'Exact candidate requires both independent passes.')
+        self.assertEqual(list(self.db.iterdump()), before)
+        self.assertEqual(spec['review_result']['verdict'], 'reject')
+        self.assertTrue(spec['result_disposition']['checks_verified'])
+
+    def test_private_artifact_envelope_and_oversized_model_evidence_fail_real_chain(self):
+        self.admit()
+        root = Path(self.builder['runtime']['artifacts'])
+        root.chmod(0o755)
+        try:
+            self.assert_refused('execution_required')
+        finally:
+            root.chmod(0o700)
+        response = root / 'model-evidence/response-local.json'
+        raw = response.read_bytes()
+        with response.open('wb') as stream:
+            stream.truncate(16_000_001)
+        try:
+            self.assert_refused('execution_required')
+        finally:
+            response.write_bytes(raw)
+
+
+class MappedCandidateTests(unittest.TestCase):
+    """Real Git object assembly from local byte/mode pins; metadata IO only is mocked."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        self.source = self.root / 'workspace'
+        self.baseline = self.root / 'inputs/baseline'
+        for folder in (self.source, self.baseline):
+            folder.mkdir(parents=True)
+            (folder / 'hello.py').write_bytes(b'print("baseline")\n')
+            (folder / 'AGENTS.md').write_bytes(b'Unchanged operator policy\n')
+            for path in folder.iterdir():
+                path.chmod(0o644)
+        (self.source / 'hello.py').write_bytes(b'print("candidate")\n')
+        self.assignment = {'assignment_id': 'a' * 64, 'claim_id': 'local-mapping', 'handoff_digest': 'd' * 64,
+            'revision': {'spec': {'commit': 'c' * 40}},
+            'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
+            'handoff': {'stage': 'simplify', 'profile': {'name': 'local-mapping'}, 'spec_commit': 'c' * 40,
+                        'baseline': 'a' * 40, 'candidate': 'b' * 40, 'issue': {'number': 10}}}
+        self.config = {'repository': 'example/product', 'repository_id': 123, 'base': 'main',
+            'branch': 'factory/10', 'issue': 10, 'pr_number': 20, 'head': 'b' * 40, 'baseline': 'a' * 40,
+            'api_base': 'https://api.github.com', 'bearer': 'LOCAL metadata-only nonsecret'}
+        self.approval = {k: self.config[k] for k in ('repository', 'repository_id', 'base', 'branch', 'issue', 'api_base')}
+        self.approval.update(binding=publication.binding(self.assignment), expected_head=self.config['baseline'],
+                             paths=['hello.py'], policy_paths=[], commit_date='2026-01-01T00:00:00Z')
+        self.reseal_source()
+        baseline = manifest(self.baseline)
+        (self.root / 'initial-source.json').write_text(json.dumps({'baseline': baseline}))
+        self.entries = [{'path': path, 'type': 'blob', 'mode': '100644',
+                         'sha': publication.object_sha('blob', (self.baseline / path).read_bytes())} for path in baseline]
+        self.base_tree = publication.tree_sha(self.entries)
+        self.commits = {self.config['baseline']: {'sha': self.config['baseline'], 'tree': {'sha': self.base_tree}}}
+        self.calls = []
+        self.api = merge.MergeGitHub(self.config)
+        self.api.github.request = Mock(side_effect=self.external)
+        self.plan, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+        self.config['head'] = self.plan['candidate']
+        self.commits[self.config['head']] = {'sha': self.config['head'], 'tree': {'sha': self.plan['tree']},
+            'parents': [{'sha': self.config['baseline']}], 'message': self.plan['message']}
+        self.assignment['publication'] = {'status': 'published', 'pr_number': 20,
+                                         'candidate': self.config['head'], 'approval': self.approval}
+        self.calls.clear()
+
+    def reseal_source(self):
+        self.approval['manifest'] = manifest(self.source)
+        (self.root / 'source-artifacts.json').write_text(json.dumps(self.approval['manifest']))
+
+    def external(self, path, body=None, method=None):
+        self.assertIsNone(body)
+        self.assertIn(method, (None, 'GET'))
+        self.calls.append(path)
+        suffix = path.removeprefix('/repos/example/product')
+        if suffix.startswith('/git/commits/'):
+            return copy.deepcopy(self.commits[suffix.split('/')[-1]])
+        if suffix == '/git/trees/' + self.base_tree + '?recursive=1':
+            return {'sha': self.base_tree, 'tree': copy.deepcopy(self.entries), 'truncated': False}
+        self.fail('Unexpected mapping read: ' + suffix)
+
+    def mapped(self):
+        return merge.mapped_candidate(self.api, self.config, self.assignment, self.root)
+
+    def test_reviewed_bytes_and_modes_cannot_map_to_the_old_git_head(self):
+        self.assertEqual(self.mapped(), self.plan)
+        file = self.source / 'hello.py'
+        original = file.read_bytes()
+        for mode in ('bytes', 'executable'):
+            with self.subTest(drift=mode):
+                file.write_bytes(original)
+                file.chmod(0o644)
+                self.reseal_source()
+                if mode == 'bytes':
+                    file.write_bytes(original + b'# changed after review\n')
+                else:
+                    file.chmod(0o755)
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.mapped()
+                self.assertEqual(refusal.exception.code, 'manifest_mismatch')
+                # Reseal manifest comparisons to reach actual content/mode -> Git HEAD equality.
+                self.reseal_source()
+                changed, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+                self.commits[changed['candidate']] = {'sha': changed['candidate'], 'tree': {'sha': changed['tree']},
+                    'parents': [{'sha': self.config['baseline']}], 'message': changed['message']}
+                self.assertNotEqual(changed['tree'], self.plan['tree'])
+                self.assertNotEqual(changed['candidate'], self.config['head'])
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.mapped()
+                self.assertEqual(refusal.exception.code, 'stale_head')
+                self.assertEqual(str(refusal.exception), 'Reviewed byte/mode tree differs from Git head.')
+
+    def test_unchanged_policy_is_preserved_and_changed_policy_needs_explicit_authority(self):
+        mapped = self.mapped()
+        policy = next(e for e in self.entries if e['path'] == 'AGENTS.md')
+        expected = publication.tree_sha([policy, {'path': 'hello.py', 'type': 'blob', 'mode': '100644',
+            'sha': publication.object_sha('blob', (self.source / 'hello.py').read_bytes())}])
+        self.assertEqual(mapped['tree'], expected)
+        self.assertEqual([e['path'] for e in mapped['changes']], ['hello.py'])
+        self.assertEqual(manifest(self.source)['AGENTS.md'], manifest(self.baseline)['AGENTS.md'])
+        file = self.source / 'AGENTS.md'
+        file.write_bytes(file.read_bytes() + b'Unapproved policy change\n')
+        self.reseal_source()
+        self.approval['paths'] = ['hello.py', 'AGENTS.md']
+        with self.assertRaises(RepositoryError) as refusal:
+            publication.assemble(self.api, self.approval, self.assignment, self.root)
+        self.assertEqual(refusal.exception.code, 'policy_held')
+        with self.assertRaises(RepositoryError) as refusal:
+            self.mapped()
+        self.assertEqual(refusal.exception.code, 'policy_held')
+
+    def test_exact_published_git_commit_tree_and_parent_cannot_be_replaced(self):
+        original = copy.deepcopy(self.commits[self.config['head']])
+        for field, value in (('tree', {'sha': '0' * 40}), ('parents', [{'sha': '0' * 40}]), ('message', 'unreviewed')):
+            with self.subTest(field=field):
+                self.commits[self.config['head']] = {**original, field: value}
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.mapped()
+                self.assertEqual(refusal.exception.code, 'github_mismatch')
+                self.assertEqual(str(refusal.exception), 'Exact commit readback failed.')
+
 
 if __name__ == "__main__":
     unittest.main()

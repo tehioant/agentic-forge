@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import time
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -143,7 +144,7 @@ class AssignmentTests(unittest.TestCase):
         self.assertEqual(mutations, [])
 
 from unittest.mock import Mock, patch
-from factory_v1 import assignments, controls, spending, requirements
+from factory_v1 import assignments, attention, controls, spending, requirements
 from factory_v1.repositories import RepositoryError
 
 
@@ -178,6 +179,25 @@ class AssignmentComponentTests(unittest.TestCase):
         self.db.execute('DELETE FROM iterations')
         self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
         self.db.commit()
+
+    def load_item(self, database=None):
+        database = self.db if database is None else database
+        return json.loads(database.execute('SELECT payload FROM iterations').fetchone()[0])
+
+    def assert_refused(self, code, operation, *args, **kwargs):
+        with self.assertRaises(RepositoryError) as refusal:
+            operation(*args, **kwargs)
+        self.assertEqual(refusal.exception.code, code)
+
+    def copied_skills(self, request):
+        request = copy.deepcopy(request)
+        for selected in request['skills']:
+            source = Path(selected['path'])
+            target = self.root / 'selected-inputs' / selected['name']
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            selected['path'] = str(target)
+        return request
 
     def configuration(self, stage='implementation'):
         names = {'implementation': ENGINEERING, 'corrections': ENGINEERING, 'simplify': ['simplify-code'],
@@ -228,38 +248,59 @@ class AssignmentComponentTests(unittest.TestCase):
     def test_real_claim_dry_replay_restart_and_repair_order(self):
         before = self.db.total_changes
         dry = self.prepare(dry=True)
+        self.assertEqual(self.prepare(dry=True), dry)
         self.assertEqual(self.db.total_changes, before)
         self.assertFalse(dry['claim_persisted'])
+        self.assert_refused('not_found', assignments.inspect, self.db, 'product', 'm1', '42', dry['assignment_id'])
         row = self.prepare()
         self.assertEqual(row['assignment_id'], dry['assignment_id'])
         self.assertEqual(self.prepare()['handoff_digest'], row['handoff_digest'])
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
             self.assertEqual(assignments.inspect(restarted, 'product', 'm1', '42', row['assignment_id'])['handoff'], row['handoff'])
         self.assertFalse(row['execution_allowed'])
+        self.assertTrue(row['assignment_ready'])
+        self.assertTrue(row['claim_persisted'])
+        self.assertFalse(row['launchable'])
+        self.assertFalse(row['spending_admission']['reserved'])
+        self.assertEqual(row['handoff']['credentials'], [])
+        self.assertFalse(row['handoff']['inherited_memory'])
         request = self.configuration('repair')
         first = self.prepare(request, dry=True)
         request['skills'].reverse()
         self.assertEqual(self.prepare(request, dry=True)['assignment_id'], first['assignment_id'])
         self.assertEqual(first['handoff']['skill_entry_points'], ['diagnosing-bugs', 'implement'])
+        # Repair owns a fresh profile but shares the same eligible ticket.
+        repaired = self.prepare(request)
+        replay = self.prepare({**request, 'skills': list(reversed(request['skills']))})
+        self.assertEqual(replay['assignment_id'], repaired['assignment_id'])
+        self.assertEqual(repaired['assignment_id'], first['assignment_id'])
+        self.assertEqual(replay['handoff_digest'], repaired['handoff_digest'])
+        self.assertEqual(len(assignments.rows(self.db)), 2)
+        self.assertEqual([s['name'] for s in replay['handoff']['skills']], ['diagnosing-bugs', 'implement'])
         self.github.request.assert_not_called()
 
     def test_validation_identity_profiles_paths_and_capabilities(self):
         assignments.validate(self.request)
         for field, value, code in [('workspace', 'relative', 'invalid_assignment'),
+            ('workspace', '/workspace/../other', 'invalid_assignment'),
             ('workspace', str(self.root) + '\x00bad', 'invalid_assignment'),
             ('baseline', 'main', 'invalid_assignment'), ('repository_id', True, 'invalid_assignment'),
-            ('capabilities', ['merge'], 'capability_blocked'), ('standards', [], 'invalid_assignment')]:
+            ('capabilities', ['merge'], 'capability_blocked'), ('standards', [], 'invalid_assignment'),
+            ('result_contract', 'success-is-authority', 'capability_blocked'),
+            ('memory', 'ambient-session', 'invalid_assignment'), ('stage', 'unknown', 'invalid_assignment')]:
             with self.subTest(field=field):
                 with self.assertRaises(RepositoryError) as refusal:
-                    assignments.validate({**self.request, field: value})
+                    self.prepare({**self.request, field: value})
                 self.assertEqual(refusal.exception.code, code)
         for field, value, code in [('name', 'default', 'profile_blocked'), ('home', '//aliased', 'profile_blocked'),
-                                  ('role', 'review', 'profile_blocked'), ('model', 'fallback', 'model_blocked')]:
+                                  ('role', 'review', 'profile_blocked'), ('model', 'fallback', 'model_blocked'),
+                                  ('provider', 'paid-api', 'model_blocked'), ('reasoning', None, 'model_blocked'),
+                                  ('operation', 'fallback', 'model_blocked')]:
             request = copy.deepcopy(self.request)
             request['profile'][field] = value
             with self.subTest(field=field):
                 with self.assertRaises(RepositoryError) as refusal:
-                    assignments.validate(request)
+                    self.prepare(request)
                 self.assertEqual(refusal.exception.code, code)
         self.frontier.assert_not_called()
 
@@ -270,19 +311,36 @@ class AssignmentComponentTests(unittest.TestCase):
             self.assertEqual({s['name'] for s in selected}, {s['name'] for s in request['skills']})
             for skill in selected:
                 self.assertEqual(hashlib.sha256(skill['instructions'].encode()).hexdigest(), PINS[skill['name']])
+                self.assertEqual(skill['instructions'].encode(), Path(skill['path']).read_bytes())
             if stage in {'review-spec', 'review-standards', 'diagnosis'}:
                 self.assertNotIn('write_workspace', request['capabilities'])
-        for change in ('pin', 'dependencies', 'source', 'missing', 'duplicate'):
+            if assignments.PRECEDING[stage]:
+                self.assert_refused('invalid_assignment', self.prepare, {**request, 'preceding': []}, True)
+        for change in ('pin', 'dependencies', 'source', 'missing', 'duplicate', 'unknown', 'relative', 'absent'):
             request = copy.deepcopy(self.request)
             if change == 'pin': request['skills'][0]['sha256'] = '0' * 64
             if change == 'dependencies': request['skills'][0]['dependencies'] = ['unknown']
             if change == 'source': request['skills'][0]['source'] = '/wrong/SKILL.md'
             if change == 'missing': request['skills'] = []
             if change == 'duplicate': request['skills'] *= 2
+            if change == 'unknown': request['skills'][0]['name'] = 'beta-role'
+            if change == 'relative': request['skills'][0]['path'] = 'SKILL.md'
+            if change == 'absent': request['skills'][0]['path'] = str(self.root / 'absent.md')
             with self.subTest(change=change):
                 with self.assertRaises(RepositoryError) as refusal:
                     assignments.validate(request)
                 self.assertEqual(refusal.exception.code, 'skill_blocked')
+
+        request = self.copied_skills(self.request)
+        selected = Path(request['skills'][0]['path'])
+        raw = selected.read_bytes()
+        selected.write_bytes(raw + b'\nchanged')
+        self.assert_refused('skill_blocked', assignments.validate, request)
+        selected.write_bytes(raw)
+        alias = self.root / 'alias.md'
+        alias.symlink_to(selected)
+        request['skills'][0]['path'] = str(alias)
+        self.assert_refused('skill_blocked', assignments.validate, request)
 
     def test_scope_and_frontier_refuse_before_claim(self):
         for field, value in [('repository', 'other/product'), ('repository_id', 124), ('spec_commit', 'f' * 40)]:
@@ -349,9 +407,14 @@ class AssignmentComponentTests(unittest.TestCase):
         with self.assertRaises(RepositoryError) as refusal:
             assignments.claims(self.db, request, scope, 'e' * 64)
         self.assertEqual(refusal.exception.code, 'profile_claim_conflict')
+        request['profile']['name'] = 'different-name-same-home'
+        self.assert_refused('profile_claim_conflict', assignments.claims, self.db, request, scope, 'e' * 64)
         self.item['reservation'] = {'issue_number': 10, 'assignment_id': 'ticket-input', 'input_digest': 'd' * 64}
         self.save_item()
         assignments.claims(self.db, self.request, scope, row['assignment_id'])
+        reservation = copy.deepcopy(self.item['reservation'])
+        self.assertEqual(self.prepare()['assignment_id'], row['assignment_id'])
+        self.assertEqual(self.load_item()['reservation'], reservation)
         self.item['reservation']['status'] = 'invalidated'
         self.save_item()
         with self.assertRaises(RepositoryError):
@@ -359,6 +422,7 @@ class AssignmentComponentTests(unittest.TestCase):
         debug = self.configuration('diagnosis')
         assignments.claims(self.db, debug, {**scope, 'issue_number': 12}, 'f' * 64)
         self.assertEqual(len(assignments.rows(self.db)), 1)
+        self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['claim_id'], self.request['claim_id'])
 
     def test_result_truthful_untrusted_replay_and_conflict(self):
         row = self.prepare()
@@ -382,6 +446,10 @@ class AssignmentComponentTests(unittest.TestCase):
                 with self.assertRaises(RepositoryError) as refusal:
                     self.store(row, {**result, field: value})
                 self.assertEqual(refusal.exception.code, 'invalid_result')
+        changed = copy.deepcopy(result)
+        changed['loads'][0]['sha256'] = '0' * 64
+        self.assert_refused('invalid_result', self.store, row, changed)
+        self.assert_refused('invalid_result', self.store, row, {'status': 'done'})
         self.assertNotIn('submitted_result', assignments.rows(self.db)[0])
 
     def test_late_pause_blocks_claim_and_result_but_keeps_inspection(self):
@@ -403,6 +471,14 @@ class AssignmentComponentTests(unittest.TestCase):
         record = controls.read(self.db, 'product', 'm1')
         assert record is not None
         self.assertEqual(record['action'], 'pause')
+        self.assert_refused('iteration_paused', self.prepare)
+        control_path.unlink()  # Isolate stored-status refusal from the sidecar guard.
+        self.assertIsNone(controls.read(self.db, 'product', 'm1'))
+        self.item['status'] = 'paused'
+        self.save_item()
+        self.assert_refused('iteration_paused', self.prepare)
+        self.assert_refused('iteration_paused', self.store, row, result)
+        self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['handoff_digest'], row['handoff_digest'])
 
     def test_revision_inspection_and_result_independent_holds(self):
         row = self.prepare()
@@ -446,23 +522,270 @@ class AssignmentComponentTests(unittest.TestCase):
         from factory_v1.__main__ import unique_fields, IntakeError
         with self.assertRaises(IntakeError):
             json.loads('{"stage":"implementation","stage":"diagnosis"}', object_pairs_hook=unique_fields)
-        for field in ('issue', 'profile', 'skills', 'standards', 'stage'):
+        for field in ('issue', 'profile', 'skills', 'standards', 'preceding', 'stage'):
             for value in (None, [], {}, 3):
+                if field == 'preceding' and value == []:
+                    continue
                 with self.subTest(field=field, value=value):
                     with self.assertRaises(RepositoryError):
                         assignments.validate({**self.request, field: value})
         self.assertEqual(assignments.rows(self.db), [])
         self.frontier.assert_not_called()
 
+    def test_inprocess_cli_malformed_requests_keep_structured_refusal(self):
+        import io
+        import sys
+        from contextlib import redirect_stderr, redirect_stdout
+        from factory_v1 import __main__ as cli
+        request_path = self.root / 'malformed.json'
+        lock = self.root / 'state.sqlite.onboarding.lock'
+        lock.touch()
+        entrypoint = compile(Path(cli.__file__).read_text(), cli.__file__, 'exec')
+        argv = ['factory_v1', '--state', str(self.root / 'state.sqlite'), '--operator-id', '42',
+                'prepare-assignment', '--project', 'product', '--iteration', 'm1',
+                '--request', str(request_path), '--api-base', 'https://api.github.com']
+        for raw in ('{"stage":"implementation","stage":"diagnosis"}', '{',
+                    json.dumps({**self.request, 'preceding': None})):
+            with self.subTest(raw=raw[:40]):
+                request_path.write_text(raw)
+                before = self.load_item()
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with patch.object(sys, 'argv', argv), patch.object(cli.os, 'umask'), \
+                        redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as exit:
+                        # Execute the actual CLI envelope in-process, with no launcher.
+                        exec(entrypoint, {'__name__': '__main__', '__package__': 'factory_v1'})
+                self.assertEqual(exit.exception.code, 2)
+                self.assertEqual(json.loads(stderr.getvalue())['error'], 'invalid_assignment')
+                self.assertEqual(stdout.getvalue(), '')
+                self.assertEqual(self.load_item(), before)
+                self.assertEqual(assignments.rows(self.db), [])
+        self.frontier.assert_not_called()
+        self.read_issue.assert_not_called()
+        self.github.request.assert_not_called()
+
+    def test_path_malformations_refuse_dry_and_persisted_before_reads(self):
+        for existing in (False, True):
+            row = self.prepare() if existing else None
+            for field in ('workspace', 'home'):
+                for malformed in ('nul', 'double-leading-slash'):
+                    for dry in (False, True):
+                        with self.subTest(existing=existing, field=field, malformed=malformed, dry=dry):
+                            request = copy.deepcopy(self.request)
+                            holder = request if field == 'workspace' else request['profile']
+                            holder[field] = holder[field] + '\x00suffix' if malformed == 'nul' else '/' + holder[field]
+                            before = self.db.total_changes
+                            self.frontier.reset_mock()
+                            self.read_issue.reset_mock()
+                            self.assert_refused('invalid_assignment' if field == 'workspace' else 'profile_blocked',
+                                                self.prepare, request, dry)
+                            self.assertEqual(self.db.total_changes, before)
+                            self.frontier.assert_not_called()
+                            self.read_issue.assert_not_called()
+            if row:
+                self.assertEqual(self.prepare()['handoff_digest'], row['handoff_digest'])
+
+    def test_reservation_owned_other_ticket_refuses_prepare_without_effects(self):
+        self.item['reservation'] = {'issue_number': 12, 'assignment_id': 'ticket-input',
+                                    'input_digest': 'd' * 64, 'status': 'reserved'}
+        self.save_item()
+        before = self.load_item()
+        for dry in (False, True):
+            with self.subTest(dry=dry):
+                self.assert_refused('claim_conflict', self.prepare, dry=dry)
+                self.assertEqual(self.load_item(), before)
+                self.assertEqual(assignments.rows(self.db), [])
+        self.frontier.assert_not_called()
+        self.read_issue.assert_not_called()
+        self.github.request.assert_not_called()
+
+    def reservation_boundary(self):
+        # Fixture tracker rows and outbound status writes, not reservation guards.
+        statuses = {10: 'ready', 12: 'ready'}
+        self.item['correlation'] = {'project_id': 'product', 'iteration_id': 'm1',
+            'stage': 'tickets_published', 'control_run_id': 'local-control', 'evidence_id': 'local-evidence'}
+        self.item['ticket_work'].update(board={'project_id': 'BOARD', 'status': {
+            'id': 'STATUS', 'options': {'Active': 'ACTIVE'}}},
+            request={'tracker': {'statuses': {'active': 'Active'}}})
+        self.save_item()
+        def observed(database, item, github):
+            item = copy.deepcopy(item)
+            item['ticket_work']['frontier'] = {'foreign_active': [],
+                'active': [n for n, s in statuses.items() if s == 'active'],
+                'eligible': [n for n, s in statuses.items() if s == 'ready'],
+                'items': [{'number': n, 'id': 100 if n == 10 else 112, 'node_id': f'ISSUE{n}',
+                           'membership_id': str(n), 'admissible': True, 'status': s} for n, s in statuses.items()]}
+            assignments.tickets.checkpoint(database, item)
+            return item
+        def set_status(github, board, member, field, option):
+            self.assertEqual((board, field, option), ('BOARD', 'STATUS', 'ACTIVE'))
+            statuses[int(member)] = 'active'
+        self.frontier.side_effect = observed
+        writes = self.enterContext(patch.object(assignments.tickets.gh, 'set_field', side_effect=set_status))
+        return statuses, writes
+
+    def test_prepare_and_reserve_real_lock_interleavings_share_or_refuse(self):
+        from factory_v1.repositories import state_lock
+        for number in (10, 12):
+            for prepare_first in (False, True):
+                with self.subTest(number=number, prepare_first=prepare_first):
+                    self.db.execute('DELETE FROM role_assignments')
+                    self.db.commit()
+                    statuses, writes = self.reservation_boundary()
+                    acquired, contender = threading.Event(), threading.Event()
+                    def operation(kind, first):
+                        with closing(sqlite3.connect(self.root / 'state.sqlite')) as database:
+                            if not first:
+                                self.assertTrue(acquired.wait(2), 'first writer never acquired lock')
+                                contender.set()
+                            with state_lock(database):
+                                if first:
+                                    acquired.set()
+                                    self.assertTrue(contender.wait(2), 'second writer never attempted admission')
+                                try:
+                                    if kind == 'prepare':
+                                        return assignments.prepare(database, 'product', 'm1', '42', self.request, self.github)
+                                    # Intentionally stale caller item: reserve must reload under lock.
+                                    return assignments.tickets.reserve(database, self.item, self.github, number)
+                                except RepositoryError as refusal:
+                                    return refusal.code
+                                finally:
+                                    database.rollback()
+                    # No lock is held by the thread that joins these futures.
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        prepare = pool.submit(operation, 'prepare', prepare_first)
+                        reserve = pool.submit(operation, 'reserve', not prepare_first)
+                        prepared, reserved = prepare.result(timeout=5), reserve.result(timeout=5)
+                    observed = self.load_item()
+                    if number == 10:
+                        self.assertIsInstance(prepared, dict)
+                        self.assertIsInstance(reserved, dict)
+                        self.assertEqual(observed['reservation'], reserved['reservation'])
+                        self.assertEqual(observed['ticket_work']['frontier']['active'], [10])
+                        self.assertEqual(prepared['ticket_scope']['issue_number'], 10)
+                        self.assertEqual(self.prepare()['assignment_id'], prepared['assignment_id'])
+                        replay = assignments.tickets.reserve(self.db, self.item, self.github, 10)
+                        self.assertEqual(replay['reservation'], reserved['reservation'])
+                        self.assertEqual(writes.call_count, 1)
+                        self.assertEqual(len(assignments.rows(self.db)), 1)
+                    elif prepare_first:
+                        self.assertEqual(reserved, 'claim_conflict')
+                        self.assertEqual(prepared['ticket_scope']['issue_number'], 10)
+                        self.assertNotIn('reservation', observed)
+                        self.assertEqual(observed, self.item)
+                        self.assertEqual(statuses, {10: 'ready', 12: 'ready'})
+                        writes.assert_not_called()
+                    else:
+                        self.assertEqual(prepared, 'claim_conflict')
+                        self.assertEqual(observed['reservation']['issue_number'], 12)
+                        self.assertEqual(observed['ticket_work']['frontier']['active'], [12])
+                        self.assertEqual(statuses[10], 'ready')
+                        self.assertEqual(assignments.rows(self.db), [])
+                        self.assertEqual(writes.call_count, 1)
+                        self.assert_refused('claim_conflict', self.prepare)
+                    self.github.request.assert_not_called()
+
+    def test_result_revalidates_external_body_and_copied_selected_bytes(self):
+        request = self.copied_skills(self.request)
+        row = self.prepare(request)
+        result = self.result(row)
+        before = assignments.rows(self.db)
+        self.read_issue.return_value = {'body': 'Local issue\nChanged scope',
+                                      'html_url': 'https://example.invalid/issues/10'}
+        self.assert_refused('scope_mismatch', self.store, row, result)
+        self.assertEqual(assignments.rows(self.db), before)
+        # Repinning the new body cannot steal the original claim.
+        changed = copy.deepcopy(request)
+        changed['issue']['body_sha256'] = hashlib.sha256(b'Local issue\nChanged scope').hexdigest()
+        self.assert_refused('claim_conflict', self.prepare, changed)
+        self.read_issue.return_value = {'body': 'Local issue', 'html_url': 'https://example.invalid/issues/10'}
+        Path(request['skills'][0]['path']).write_text('Changed selected input')
+        self.assert_refused('skill_blocked', self.store, row, result)
+        inspected = assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])
+        self.assertNotIn('submitted_result', inspected)
+        self.assertEqual(assignments.rows(self.db), before)
+        self.github.request.assert_not_called()
+
+    def test_generic_prepare_refuses_placeholder_stage_precursors(self):
+        for stage in ('review-standards', 'review-spec', 'simplify', 'corrections', 'diagnosis'):
+            with self.subTest(stage=stage):
+                request = self.configuration(stage)
+                self.assert_refused('implementation_unverified', self.prepare, request)
+                self.assert_refused('implementation_unverified', self.prepare, request, True)
+        self.assertEqual(assignments.rows(self.db), [])
+        self.frontier.assert_not_called()
+        self.read_issue.assert_not_called()
+        self.github.request.assert_not_called()
+
+    def test_operator_and_unknown_assignment_refuse_before_effects(self):
+        row = self.prepare()
+        result = self.result(row)
+        before = assignments.rows(self.db)
+        self.frontier.reset_mock()
+        self.read_issue.reset_mock()
+        for operator, identity, code in (('other', row['assignment_id'], 'approval_required'),
+                                         ('42', 'unknown', 'not_found')):
+            with self.subTest(operator=operator, identity=identity):
+                self.assert_refused(code, assignments.inspect, self.db, 'product', 'm1', operator, identity)
+                self.assert_refused(code, assignments.store_result, self.db, 'product', 'm1', operator, identity, result, self.github)
+        self.assertEqual(assignments.rows(self.db), before)
+        self.frontier.assert_not_called()
+        self.read_issue.assert_not_called()
+        self.github.request.assert_not_called()
+
+    def test_attention_read_return_preserves_other_writer_checkpoint(self):
+        from factory_v1.repositories import state_lock
+        self.item['origin'] = {'platform': 'discord', 'chat_id': '123', 'thread_id': '123',
+                               'parent_chat_id': '456', 'scope_id': '789'}
+        self.item['correlation'] = {'project_id': 'product', 'iteration_id': 'm1',
+            'stage': 'tickets_published', 'control_run_id': 'local-control', 'evidence_id': 'local-evidence'}
+        self.save_item()
+        event = {'event_id': 'local-attention', 'kind': 'incident', 'message': 'Local incident',
+                 'issue_number': 10, 'run_id': 'local-run', 'evidence_ids': ['local-evidence']}
+        saved = []
+        def observe(database, stale, github):
+            with closing(sqlite3.connect(self.root / 'state.sqlite')) as writer:
+                record = attention.lifecycle(writer, 'product', 'm1', '42', 'attention', event)
+                with state_lock(writer):
+                    fresh = self.load_item(writer)
+                    fresh['ticket_work']['other_writer_checkpoint'] = 'must survive stale observation'
+                    assignments.tickets.checkpoint(writer, fresh)
+                saved.append((fresh, record))
+            # The real checkpoint uses the supplied observation connection. Passing
+            # the main connection here would overwrite the other writer's change.
+            observed = self.observation(database, stale, github)
+            assignments.tickets.checkpoint(database, observed)
+            return observed
+        self.frontier.side_effect = observe
+        row = self.prepare()
+        self.assertEqual(self.load_item(), saved[0][0])
+        self.assertEqual(attention.records(self.db, 'product', 'm1', self.load_item()), [saved[0][1]])
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['ticket_scope']['issue_number'], 10)
+        self.github.request.assert_not_called()
+
     def test_released_direction_binds_each_affected_identity_and_body(self):
         response = {'response': 'Local explicit retry'}
-        issue = self.request['issue']
-        for change in ({}, {'id': 999}, {'node_id': 'wrong'}, {'body_sha256': '0' * 64}):
-            self.item['stuck_work'] = {'old': {'status': 'released', 'sequence': 1, 'affected': [10, 11],
-                'issues': {'10': {**issue, **change}, '11': {**issue, 'id': 111}}, 'applied_response': response}}
-            self.save_item()
-            row = self.prepare(dry=True)
-            self.assertEqual(row['handoff'].get('operator_direction'), None if change else response)
+        issues = {'10': self.request['issue'], '11': {'number': 11, 'id': 111, 'node_id': 'ISSUE11',
+                  'body_sha256': hashlib.sha256(b'Own issue 11 body').hexdigest()}}
+        for number, body in ((10, 'Local issue'), (11, 'Own issue 11 body')):
+            request = {**self.request, 'issue': issues[str(number)]}
+            self.read_issue.return_value = {'body': body, 'html_url': f'https://example.invalid/issues/{number}'}
+            observed = self.observation(None, self.item, None)
+            observed['ticket_work']['frontier']['items'].append({'number': 11, 'id': 111, 'node_id': 'ISSUE11', 'admissible': True})
+            self.frontier.side_effect = None
+            self.frontier.return_value = observed
+            for change in ({}, {'id': 999}, {'node_id': 'wrong'}, {'body_sha256': '0' * 64}):
+                with self.subTest(number=number, change=change):
+                    retained = copy.deepcopy(issues)
+                    retained[str(number)].update(change)
+                    self.item['stuck_work'] = {'old': {'status': 'released', 'sequence': 1, 'affected': [10, 11],
+                        'issues': retained, 'applied_response': response}}
+                    self.save_item()
+                    before = self.db.total_changes
+                    row = self.prepare(request, dry=True)
+                    self.assertEqual(row['handoff'].get('operator_direction'), None if change else response)
+                    self.assertEqual(self.db.total_changes, before)
 
 
 if __name__ == "__main__":

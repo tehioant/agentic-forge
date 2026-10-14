@@ -500,6 +500,287 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.set_field.assert_not_called()
         self.assertNotIn('stuck_disposition', diagnosis.assignments.rows(self.database)[0])
 
+    def completed_inputs(self):
+        """Direct local records/artifacts, not a native worker or stage execution."""
+        record = self.declare()
+        root = self.root / 'completed-debug'
+        root.mkdir(mode=0o700)
+        e = test_simplification.LocalStageEvidence(root)
+        axis = copy.deepcopy(self.prior)
+        axis.pop('stuck_disposition', None)
+        axis.update(assignment_id='b' * 64, claim_id='completed-debug', runtime=e.runtime,
+                    result_disposition={'isolated_execution': True})
+        axis['handoff'].update(stage='diagnosis', diagnosis={'pins': record['pins']}, skills=[],
+            workspace=str(root / 'workspace'), profile={'name': 'completed-debug', 'home': str(self.root / 'debug-home')},
+            adaptation='LABELED local read-only diagnosis input; no native execution', preceding=[],
+            capabilities=['read_workspace', 'scratch', 'model'], result_contract=diagnosis.assignments.CONTRACT,
+            claim_id=axis['claim_id'])
+        axis['handoff_digest'] = diagnosis.assignments.digest(axis['handoff'])
+        command = {'command': 'python symptom.py', 'result': 'LABELED local red feedback; exit_code=1'}
+        report = {'contract': diagnosis.CONTRACT, 'adaptation': axis['handoff']['adaptation'], 'pins': record['pins'],
+            'feedback_loop': {**command, 'symptom': 'Wrong greeting'}, 'commands': [command],
+            'hypotheses': [{'hypothesis': 'Wrong literal', 'prediction': 'Greeting assertion is red', 'evidence': 'Local mismatch'}],
+            'attempted_repairs': ['Responsible literal repair stayed red'], 'findings': ['Local mismatch'],
+            'cause_or_uncertainty': 'Wrong literal or hidden transform', 'blockers': [],
+            'directions': [{'id': 'retry', 'direction': 'Investigate original requirement', 'tradeoff': 'More investigation'}],
+            'recommendation': 'retry'}
+        result = {'status': 'done', 'run_id': e.runtime['run_id'], 'loads': [],
+            'work': ['LABELED local read-only investigation input'], 'tests': [command],
+            'artifacts': [diagnosis.simplification.artifact('diagnosis-report', json.dumps(report))]}
+        conversation = {'messages': [
+            {'role': 'assistant', 'tool_calls': [{'id': 'repro', 'function': {
+                'name': 'terminal', 'arguments': json.dumps({'command': command['command']})}}]},
+            {'role': 'tool', 'tool_call_id': 'repro', 'content': command['result']}]}
+        files = {'scratch/result.json': result, 'scratch/loads.json': [], 'scratch/events.jsonl': {},
+            'scratch/conversation.json': conversation, 'scratch/probes.json': {}, 'inputs/worker.py': {},
+            'inputs/sandbox_relay.py': {}, 'inputs/assignment.json': {'assignment_id': axis['assignment_id']},
+            'inputs/handoff.json': axis['handoff'], 'container-inspection.json': {}, 'launch-command.json': {},
+            'source-artifacts.json': {}, 'worker-reported-tests.json': [command],
+            'model-evidence/response-local.json': {'label': 'Local binding input; no native/model execution'}}
+        for name, content in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(content))
+        axis['submitted_result'] = result
+        axis['diagnosis_result'] = diagnosis.validate_result(axis, result)
+        self.store(axis)
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        record = item['stuck_work'][self.prior['assignment_id']]
+        record['diagnosis_assignment'] = axis['assignment_id']
+        item.update(origin={'platform': 'discord', 'chat_id': '42', 'thread_id': '42',
+                            'parent_chat_id': '41', 'scope_id': '40'},
+                    correlation={'project_id': 'product', 'iteration_id': 'm1', 'control_run_id': 'local-control',
+                                 'evidence_id': 'local-evidence', 'stage': 'diagnosis'})
+        diagnosis.tickets.checkpoint(self.database, item)
+        # Assignment eligibility is an outside prerequisite. Completed/report/auth readers stay real.
+        self.eligibility = self.enterContext(patch.object(diagnosis.assignments, 'prepare', return_value=axis))
+        return record, axis
+
+    def host_grant(self, axis, path=None):
+        path = path or self.root / 'host-authorization.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config = {'operator_id': '42', 'execution_reference': 'LABELED local host grant; not native acceptance',
+                  'diagnosis': diagnosis.execution_binding(axis)}
+        path.write_text(json.dumps(config))
+        path.chmod(0o600)
+        return path, config
+
+    def durable_snapshot(self):
+        return {table: self.database.execute('SELECT * FROM ' + table + ' ORDER BY rowid').fetchall()
+                for table in ('iterations', 'role_assignments', 'notifications')
+                if self.database.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()}
+
+    def test_completed_reader_requires_isolation_terminal_removal_and_exact_report(self):
+        record, good = self.completed_inputs()
+        self.assertEqual(diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github), good)
+        self.assertFalse(good['diagnosis_result']['native_execution_trusted'])
+        self.eligibility.assert_called_once()
+        self.assertTrue(self.eligibility.call_args.kwargs['dry_run'])
+        for group, field, value in [('runtime', 'status', 'running'), ('runtime', 'container_removed', False),
+                                    ('result_disposition', 'isolated_execution', False),
+                                    ('diagnosis_result', 'cause_or_uncertainty', 'Changed stored report')]:
+            with self.subTest(group=group, field=field):
+                row = copy.deepcopy(good)
+                row[group][field] = value
+                self.store(row)
+                before = self.durable_snapshot()
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github)
+                self.assertEqual(refusal.exception.code, 'invalid_result' if group == 'diagnosis_result' else 'diagnosis_incomplete')
+                self.assertEqual(self.durable_snapshot(), before)
+        row = copy.deepcopy(good)
+        del row['diagnosis_result']
+        self.store(row)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.completed(self.database, 'product', 'm1', '42', record, self.github)
+        self.assertEqual(refusal.exception.code, 'diagnosis_incomplete')
+        self.store(good)
+        before = self.durable_snapshot()
+        self.assertEqual(diagnosis.completed(self.database, 'product', 'm1', '42', {**record, 'status': 'release-pending'}, self.github), good)
+        self.assertEqual(self.eligibility.call_args.kwargs['diagnosis_revalidation'], good['assignment_id'])
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+
+    def test_authorization_reader_requires_private_exact_host_grant_outside_every_worker_scope(self):
+        _, axis = self.completed_inputs()
+        path, config = self.host_grant(axis)
+        before = self.durable_snapshot()
+        self.assertEqual(diagnosis.authorization(self.database, path, '42', axis), config)
+        for mode in (0o400, 0o640, 0o644):
+            with self.subTest(mode=mode):
+                path.chmod(mode)
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.authorization(self.database, path, '42', axis)
+                self.assertEqual(refusal.exception.code, 'approval_required')
+        path.chmod(0o600)
+        link = self.root / 'linked-grant.json'
+        os.link(path, link)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'approval_required')
+        link.unlink()
+        for assignment in (self.prior, axis):
+            for scope in (assignment['handoff']['workspace'], assignment['handoff']['profile']['home'],
+                          assignment['runtime']['artifacts']):
+                with self.subTest(assignment=assignment['assignment_id'], scope=scope):
+                    mounted, _ = self.host_grant(axis, Path(scope) / 'mounted-grant.json')
+                    with self.assertRaises(RepositoryError) as refusal:
+                        diagnosis.authorization(self.database, mounted, '42', axis)
+                    self.assertEqual(refusal.exception.code, 'approval_required')
+                    mounted.unlink()
+        root = Path(axis['runtime']['artifacts'])
+        root.chmod(0o755)
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        root.chmod(0o700)
+        for change in ({'operator_id': 'other'}, {'execution_reference': ''}, {'extra': True},
+                       {'diagnosis': {**config['diagnosis'], 'report_sha256': '0' * 64}},
+                       {'diagnosis': {**config['diagnosis'], 'pins': {}}}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps({**config, **change}))
+                with self.assertRaises(RepositoryError) as refusal:
+                    diagnosis.authorization(self.database, path, '42', axis)
+                self.assertEqual(refusal.exception.code, 'execution_required')
+        path.write_text(json.dumps(config))
+        evidence = root / 'model-evidence/response-local.json'
+        original = evidence.read_bytes()
+        evidence.write_bytes(original + b'\n')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.authorization(self.database, path, '42', axis)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        evidence.write_bytes(original)
+        self.assertEqual(diagnosis.authorization(self.database, path, '42', axis), config)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+
+    def test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay(self):
+        _, axis = self.completed_inputs()
+        request = {'stuck_assignment': self.prior['assignment_id']}
+        path, config = self.host_grant(axis)
+        before = self.durable_snapshot()
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.assertEqual(self.durable_snapshot(), before)
+        for config_change in ({'operator_id': 'other'}, {'diagnosis': {**config['diagnosis'], 'run_id': 'stale-run'}}):
+            item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+            item['stuck_work'][self.prior['assignment_id']]['authorization'] = {**config, **config_change}
+            diagnosis.tickets.checkpoint(self.database, item)
+            before = self.durable_snapshot()
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+            self.assertEqual(refusal.exception.code, 'execution_required')
+            self.assertEqual(self.durable_snapshot(), before)
+        result = diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github, path)
+        notification = result['attention']
+        event = notification['event']
+        self.assertEqual(result['stuck']['authorization'], config)
+        self.assertEqual(result['stuck']['status'], 'awaiting-direction')
+        self.assertEqual(event['event_id'], 'stuck-' + self.prior['assignment_id'])
+        self.assertEqual(event['decision_id'], event['event_id'])
+        self.assertEqual(event['evidence_ids'], [self.prior['assignment_id'], axis['assignment_id'], axis['diagnosis_result']['report_sha256']])
+        self.assertEqual(json.loads(event['message'])['directions'], axis['diagnosis_result']['directions'])
+        self.assertEqual((notification['state'], notification['attempts'], notification['decision_response']), ('pending', 0, None))
+        before = self.durable_snapshot()
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            item = diagnosis.assignments.current(restarted, 'product', 'm1', '42')
+            self.assertEqual(diagnosis.attention.get_record(restarted, item, event['event_id']), notification)
+            self.assertEqual(diagnosis.request_direction(restarted, 'product', 'm1', '42', request, self.github), result)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.database.execute('SELECT count(*) FROM notifications').fetchone()[0], 1)
+        evidence = Path(axis['runtime']['artifacts']) / 'model-evidence/response-local.json'
+        evidence.write_bytes(evidence.read_bytes() + b'\n')
+        with self.assertRaises(RepositoryError) as refusal:
+            diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'execution_required')
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+
+    def test_unrelated_direction_event_refuses_before_response_read_or_release_effect(self):
+        _, axis = self.completed_inputs()
+        path, _ = self.host_grant(axis)
+        request = {'stuck_assignment': self.prior['assignment_id']}
+        result = diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github, path)
+        notification = result['attention']
+        notification['decision_response'] = {'event_id': notification['event']['event_id'],
+            'decision_id': notification['event']['decision_id'], 'operator_id': '42', 'origin': notification['destination'],
+            'reference': 'LABELED local authenticated operator input',
+            'response': json.dumps({'action': 'revise', 'direction': 'Version original requirements explicitly'})}
+        diagnosis.attention.save(self.database, notification)
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        unrelated = diagnosis.attention.enqueue(self.database, item,
+            {**notification['event'], 'event_id': 'unrelated', 'decision_id': 'unrelated'})
+        unrelated['decision_response'] = {**notification['decision_response'],
+                                          'event_id': 'unrelated', 'decision_id': 'unrelated'}
+        diagnosis.attention.save(self.database, unrelated)
+        self.database.commit()
+        before = self.durable_snapshot()
+        with patch.object(diagnosis.attention, 'get_record', wraps=diagnosis.attention.get_record) as read:
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.apply_direction(self.database, 'product', 'm1', '42', {**request, 'event_id': 'unrelated'}, self.github)
+            self.assertEqual(refusal.exception.code, 'invalid_decision')
+            read.assert_not_called()
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+        revised = diagnosis.apply_direction(self.database, 'product', 'm1', '42',
+                                           {**request, 'event_id': notification['event']['event_id']}, self.github)
+        self.assertEqual(revised['status'], 'revision-required')
+        self.assertEqual(revised['applied_response'], notification['decision_response'])
+        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual([r['status'] for r in self.rows], ['blocked', 'blocked', 'ready', 'blocked'])
+
+    def test_declaration_ack_without_block_readback_keeps_durable_claim_owned_until_reconciliation(self):
+        self.set_field.side_effect = None  # External acknowledgement deliberately omits its status effect.
+        with self.assertRaises(RepositoryError) as refusal:
+            self.declare()
+        self.assertEqual(refusal.exception.code, 'publication_mismatch')
+        self.assertEqual(self.set_field.call_count, 1)  # Refuse before any dependent status effects.
+        self.assertEqual({r['status'] for r in self.rows}, {'ready'})
+        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
+            item = diagnosis.assignments.current(restarted, 'product', 'm1', '42')
+            held = diagnosis.assignments.rows(restarted)[0]
+            record = item['stuck_work'][held['assignment_id']]
+            self.assertEqual(record['status'], 'blocking')
+            self.assertFalse(record['blocks_verified'])
+            self.assertEqual(record['retired_assignments'], [held['assignment_id']])
+            self.assertEqual(held['stuck_disposition'], 'held')
+            self.assertFalse(diagnosis.released_claim(restarted, held))
+            self.assertEqual(diagnosis.held_numbers(item), {10, 11, 13})
+        self.set_field.side_effect = self.change_status
+        reconciled = diagnosis.declare(self.database, 'product', 'm1', '42',
+                                       {'stuck_assignment': self.prior['assignment_id']}, self.github)
+        self.assertTrue(reconciled['blocks_verified'])
+        self.assertEqual(reconciled['status'], 'diagnosis')
+        self.assertTrue(diagnosis.released_claim(self.database, diagnosis.assignments.rows(self.database)[0]))
+        self.assertEqual(self.set_field.call_count, 4)
+        self.assertEqual(self.rows[2]['status'], 'ready')
+
+    def test_declaration_replay_after_live_body_revision_refuses_without_new_effect_or_ownership_change(self):
+        record = self.declare()
+        before = self.durable_snapshot()
+        reads = 0
+        def revised_at_replay_admission(github, repository, number):
+            nonlocal reads
+            reads += 1
+            # Isolate declare's first body read; a later sync_blocks check must not mask it.
+            return {'body': 'Revised original requirement'} if reads == 1 else self.read_issue(github, repository, number)
+        with patch.object(diagnosis.tickets.gh, 'read_issue', side_effect=revised_at_replay_admission):
+            with self.assertRaises(RepositoryError) as refusal:
+                diagnosis.declare(self.database, 'product', 'm1', '42',
+                                  {'stuck_assignment': self.prior['assignment_id']}, self.github)
+        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+        self.assertEqual(reads, 1)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual([r['status'] for r in self.rows], ['blocked', 'blocked', 'ready', 'blocked'])
+        held = diagnosis.assignments.rows(self.database)[0]
+        self.assertEqual(held['stuck_disposition'], 'held')
+        self.assertEqual(diagnosis.assignments.current(self.database, 'product', 'm1', '42')['stuck_work'][held['assignment_id']], record)
+        self.assertEqual(diagnosis.declare(self.database, 'product', 'm1', '42',
+                                        {'stuck_assignment': held['assignment_id']}, self.github), record)
+        self.assertEqual(self.set_field.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

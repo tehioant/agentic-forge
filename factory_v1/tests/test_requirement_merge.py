@@ -6,8 +6,8 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, merge, repositories, requirements, review, sandbox, sandbox_source, tickets
-from factory_v1.tests import test_tickets
+from factory_v1 import assignments, delivery, merge, repositories, requirements, review, sandbox, sandbox_source, simplification, tickets
+from factory_v1.tests import test_simplification, test_tickets
 
 
 def record_change(case, fixture, tracker):
@@ -58,9 +58,6 @@ class RequirementMergeTests(unittest.TestCase):
                        'protection_sha256': assignments.digest({'rules': [], 'protection': classic})}
         self.api.read.side_effect = lambda path: [] if path == '/rules/branches/main' else copy.deepcopy(classic)
 
-    def admission(self):
-        return assignments.prepare(self.database, 'product', 'm1', '42', self.request, self.github, dry_run=True)
-
     def test_material_revision_after_approval_refuses_result_and_merge_inspection_retains_history(self):
         old = candidate_record(self.fixture); old['requirement_disposition'] = {'change_id': 'change', 'status': 'obsolete'}
         old['assignment_ready'] = False; old['result_disposition']['requirements_valid'] = False
@@ -97,24 +94,164 @@ class RequirementMergeTests(unittest.TestCase):
             with self.assertRaises(repositories.RepositoryError) as caught: requirements.validity(self.database, self.item, self.github, {10})
         self.assertEqual(caught.exception.code, 'stale_assignment'); self.assertEqual(assignments.rows(self.database), [old])
 
-    def assert_protection_read_drift_refused(self, fault, code):
-        before = self.fixture.stored()
-        admitted = self.admission(); self.assertTrue(admitted['assignment_ready']); self.assertFalse(admitted['claim_persisted'])
-        fired = []
-        def read(path):
-            if path == '/branches/main/protection': fault(); fired.append(path); return copy.deepcopy(self.classic)
-            return []
-        self.api.read.side_effect = read
-        merge.protection(self.api, self.config)
-        with self.assertRaises(repositories.RepositoryError) as caught: self.admission()
-        self.assertEqual(caught.exception.code, code); self.database.rollback()
-        self.assertEqual(fired, ['/branches/main/protection']); self.assertEqual(self.fixture.stored(), before)
-        self.assertEqual(assignments.rows(self.database), []); self.api.request.assert_not_called(); self.github.request.assert_not_called()
+    def final_merge_fixture(self, fault=lambda: None):
+        """Declared completed evidence; real review -> prepare -> frontier, no workers.
 
-    def test_native_textual_blocker_drift_at_protection_read_refuses_admission(self):
+        Only native-chain/Git assembly and delivery sampling are prerequisite seams.
+        Tracker state is mutable, while pinned specification document bytes stay exact.
+        """
+        root = self.fixture.root
+        evidence_root = root / 'candidate'; evidence_root.mkdir(mode=0o700)
+        evidence = test_simplification.LocalStageEvidence(evidence_root)
+        candidate = evidence.assignment
+        candidate['handoff'].update(copy.deepcopy(self.request), stage='simplify', candidate='c' * 40,
+                                    claim_id=candidate['claim_id'])
+        candidate['revision'] = requirements.authority(self.item, 10)
+        candidate['ticket_scope'] = {'project': 'product', 'iteration': 'm1', 'repository': 'example/product',
+                                    'repository_id': 123, 'issue_number': 10, 'issue_id': self.request['issue']['id'],
+                                    'workspace': self.request['workspace']}
+        evidence.seal_handoff()
+        candidate['submitted_result'] = evidence.result(evidence.report())
+        candidate['simplification_result'] = simplification.validate_result(candidate, candidate['submitted_result'])
+        self.store(candidate)
+        source, baseline = evidence.initial, evidence.baseline
+        preceding = review.preceding(candidate, evidence_root, source, baseline, evidence.receipt)
+        axes = []
+        for stage in ('review-standards', 'review-spec'):
+            request = {key: copy.deepcopy(candidate['handoff'][key]) for key in assignments.REQUEST_FIELDS}
+            request.update(stage=stage, claim_id=stage, preceding=preceding,
+                           profile={**self.request['profile'], 'name': stage, 'home': str(root / stage)})
+            axis = assignments.prepare(self.database, 'product', 'm1', '42', request, self.github, dry_run=True)
+            axis_root = root / (stage + '-evidence'); axis_root.mkdir(mode=0o700)
+            local = test_simplification.LocalStageEvidence(axis_root)
+            axis['runtime'] = local.runtime
+            report = {'contract': review.CONTRACT, 'axis': review.AXES[stage], 'pins': axis['handoff']['review']['pins'],
+                      'adaptation': axis['handoff']['adaptation'], 'verdict': 'pass', 'findings': [],
+                      'test_assessment': 'SIMULATED independent assessment', 'stuckness': None}
+            result = local.result(report, 'review-result')
+            result.update(assignment_id=axis['assignment_id'], claim_id=axis['claim_id'], handoff_digest=axis['handoff_digest'])
+            axis.update(submitted_result=result, result_disposition={'checks_verified': True})
+            axis['review_result'] = review.validate_result(axis, result)
+            # Hash inputs are labeled fixtures, not claims of native execution.
+            for relative in ('scratch/loads.json', 'scratch/events.jsonl', 'scratch/conversation.json', 'scratch/probes.json',
+                             'inputs/worker.py', 'inputs/sandbox_relay.py', 'inputs/assignment.json', 'inputs/handoff.json',
+                             'container-inspection.json', 'launch-command.json', 'source-artifacts.json',
+                             'model-evidence/response-local.json'):
+                path = axis_root / relative; path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('SIMULATED evidence input; no execution\n')
+            (axis_root / 'scratch/result.json').write_text(json.dumps(result))
+            self.store(axis); axes.append(axis)
+        authorization = {'operator_id': '42', 'execution_reference': 'SIMULATED host verification input',
+                         'axes': [review.execution_binding(axis) for axis in axes], 'policy_decision': None}
+        for axis in axes:
+            axis['review_authorization'] = authorization; self.store(axis)
+        self.config.update(operator_id='42', execution_reference='SIMULATED merge authority',
+                           executions=[{'fixture': n} for n in range(4)], candidate_assignment=candidate['assignment_id'],
+                           standards_assignment=axes[0]['assignment_id'], spec_assignment=axes[1]['assignment_id'],
+                           repository='example/product', repository_id=123, branch='factory/10', pr_number=20,
+                           head='c' * 40, baseline='b' * 40, issue=10, api_base=self.github.base,
+                           bearer='SIMULATED-NONSECRET', recovery=None)
+        self.config_path = root / 'merge.json'; self.config_path.write_text(json.dumps(self.config)); self.config_path.chmod(0o600)
+        self.api = merge.MergeGitHub(self.config)
+        self.api.github = self.github
+        self.protection_reads = 0; self.frontier_reads = []
+        repo = {'id': 123, 'full_name': 'example/product', 'default_branch': 'main'}
+        self.pr = {'number': 20, 'state': 'open', 'merged': False, 'draft': False, 'mergeable': True, 'mergeable_state': 'clean',
+                   'base': {'ref': 'main', 'sha': self.config['baseline'], 'repo': repo},
+                   'head': {'ref': 'factory/10', 'sha': self.config['head'], 'repo': repo}}
+        tracker_request = self.fixture.request
+        def external(path, body=None, method=None):
+            suffix = path.removeprefix('/repos/example/product')
+            if method == 'PUT':
+                self.assertEqual(self.stored_candidate()['merge']['status'], 'pending')
+                # Stop at the effect boundary: no fabricated merge or delivery journey.
+                return {'merged': False}
+            if suffix == '': return copy.deepcopy(repo)
+            if suffix == '/issues/10': return copy.deepcopy(self.fixture.issues[10])
+            if suffix == '/pulls/20': return copy.deepcopy(self.pr)
+            if suffix == '/rules/branches/main': return []
+            if suffix == '/branches/main/protection':
+                self.protection_reads += 1
+                if self.protection_reads == 3: fault()
+                return copy.deepcopy(self.classic)
+            if suffix.startswith('/git/ref/heads/'):
+                branch = suffix.removeprefix('/git/ref/heads/')
+                return {'ref': 'refs/heads/' + branch, 'object': {'type': 'commit', 'sha': self.config['baseline' if branch == 'main' else 'head']}}
+            if suffix.startswith('/commits/'):
+                return {'total_count': 1, 'check_runs': [{'id': 1, 'name': 'unit', 'app': {'id': 1},
+                        'head_sha': suffix.split('/')[2], 'status': 'completed', 'conclusion': 'success'}]}
+            return tracker_request(path, body, method)
+        self.github.request.side_effect = external
+        self.enterContext(patch.object(merge, 'MergeGitHub', return_value=self.api))
+        self.enterContext(patch.object(merge, 'chain', side_effect=lambda *a: (self.stored_candidate(), {}, evidence_root)))
+        self.enterContext(patch.object(merge, 'mapped_candidate', return_value={'tree': 'd' * 40}))
+        self.enterContext(patch.object(delivery, 'mutation_boundary', side_effect=lambda *a: assignments.current(*a)))
+        # A transparent observation of the real external tracker read records timing;
+        # evaluate/prepare/frontier themselves are never replaced.
+        project_items = self.fixture.project_items
+        def observe():
+            self.frontier_reads.append(self.protection_reads)
+            return project_items()
+        self.enterContext(patch.object(tickets.gh, 'project_items', side_effect=lambda *a: observe()))
+        self.candidate_id = candidate['assignment_id']
+        self.github.request.reset_mock()
+
+    def store(self, row):
+        self.database.execute('DELETE FROM role_assignments WHERE assignment_id=?', (row['assignment_id'],))
+        self.database.execute('INSERT INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.database.commit()
+
+    def stored_candidate(self):
+        return next(row for row in assignments.rows(self.database) if row['assignment_id'] == self.config['candidate_assignment'])
+
+    def run_final_merge(self):
+        return merge.lifecycle(self.database, 'product', 'm1', '42', self.config_path, 'merge-candidate')
+
+    def assert_protection_read_drift_refused(self, fault, code):
+        self.final_merge_fixture(fault)
+        before = self.fixture.stored(); rows = assignments.rows(self.database)
+        documents = copy.deepcopy(self.fixture.inputs['documents'])
+        body = self.fixture.issues[10]['body']
+        with self.assertRaises(repositories.RepositoryError) as caught: self.run_final_merge()
+        stored = self.stored_candidate()
+        self.assertFalse('merge' in stored, 'Final frontier refusal must not persist merge intent')
+        self.assertEqual([call for call in self.github.request.call_args_list if call.args[1] is not None], [])
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(self.protection_reads, 3)
+        self.assertIn(0, self.frontier_reads)  # Initially valid at actual merge admission.
+        if code != 'stale_admission':
+            self.assertIn(3, self.frontier_reads)  # Re-read by the FINAL review checkpoint.
+            self.assertEqual(self.fixture.issues[10]['body'], body)
+        self.assertEqual(self.fixture.inputs['documents'], documents)
+        self.assertEqual(self.fixture.stored(), before)
+        self.assertEqual(stored.pop('merge_refusal')['code'], code)
+        self.assertEqual([stored if row['assignment_id'] == self.candidate_id else row for row in assignments.rows(self.database)], rows)
+
+    def test_unchanged_final_frontier_reaches_intent_and_single_put(self):
+        self.final_merge_fixture()
+        with self.assertRaises(repositories.RepositoryError) as caught: self.run_final_merge()
+        self.assertEqual(caught.exception.code, 'merge_uncertain')
+        self.assertEqual(self.protection_reads, 3)
+        self.assertEqual(self.frontier_reads, [0, 0, 3, 3])
+        self.assertEqual(self.stored_candidate()['merge']['status'], 'pending')
+        puts = [call for call in self.github.request.call_args_list if call.args[2:] == ('PUT',)]
+        self.assertEqual(len(puts), 1)
+        self.assertEqual(puts[0].args, ('/repos/example/product/pulls/20/merge', {'sha': self.config['head'], 'merge_method': 'merge'}, 'PUT'))
+
+    def test_native_blocker_drift_at_protection_read_refuses_merge(self):
+        self.assert_protection_read_drift_refused(lambda: self.fixture.deps.update({10: [12]}), 'github_mismatch')
+
+    def test_completed_blocker_reopened_at_last_protection_read_refuses_merge(self):
+        # Declare the blocker before pinning the candidate. Only its completion
+        # changes late; no issue-10 byte drift can mask the frontier invariant.
+        self.fixture.deps[10] = [12]
+        self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #12')
+        self.request['issue'] = requirements.issue_pin(self.fixture.issues[10])
+        self.fixture.issues[12].update(state='closed', state_reason='completed')
+        self.fixture.members[12]['fields']['STATUS'] = 'Done'
         def fault():
-            self.fixture.deps[10] = [12]
-            self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #12')
+            self.fixture.issues[12].update(state='open', state_reason=None)
+            self.fixture.members[12]['fields']['STATUS'] = 'Ready'
         self.assert_protection_read_drift_refused(fault, 'ticket_ineligible')
 
     def test_board_scope_drift_at_protection_read_refuses_admission(self):
@@ -124,7 +261,7 @@ class RequirementMergeTests(unittest.TestCase):
         self.assert_protection_read_drift_refused(lambda: self.fixture.members[10]['fields'].update(STATUS='Blocked'), 'ticket_ineligible')
 
     def test_exact_ticket_body_drift_at_protection_read_refuses_admission(self):
-        self.assert_protection_read_drift_refused(lambda: self.fixture.issues[10].update(body=self.fixture.issues[10]['body'] + '\nNew requirement.'), 'scope_mismatch')
+        self.assert_protection_read_drift_refused(lambda: self.fixture.issues[10].update(body=self.fixture.issues[10]['body'] + '\nNew requirement.'), 'stale_admission')
 
     def test_last_publication_guard_rejects_remote_doc_drift_without_mutation(self):
         merge.require_publication(self.database, self.item, self.api, 10)

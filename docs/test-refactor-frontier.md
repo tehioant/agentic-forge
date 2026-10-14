@@ -199,9 +199,9 @@ Old methods: 13; new unique methods: 11.
 
 ### `factory_v1/tests/test_requirement_merge.py`
 
-`review.authority`, `requirements.validity/released_claim`, `merge.inspect`, and `assignments.prepare` final protection-read admission. Local controller-check bytes and declared SQLite assignment evidence replace worker/CLI/review/merge journeys; no native candidate, actual Git, worker, or merge publication runs.
+`review.authority`, `requirements.validity/released_claim`, and `merge.inspect` retain their direct checks. The S1 correction now exercises real `merge.lifecycle` → final `review.evaluate` → `assignments.prepare` → `tickets.frontier` after the last protection read, with tracker responses mocked and unchanged specification bytes. Local controller-check bytes and declared SQLite assignment evidence are explicit prerequisites, not native execution. Native-chain/Git assembly prerequisites remain isolated outside this frontier invariant. Blocker, scope and progress drift assert zero intent/PUT; an unchanged-frontier control reaches one mocked PUT, and reopening a previously completed blocker is checked separately.
 
-Old methods: 8; new unique methods: 9.
+Old methods: 8; current unique methods after S1: 11. The delivered correction passed 11 focused tests in 0.787s; bypassing only the final review checkpoint produced five expected assertion failures and no errors. Initial builder counts, IDs and fingerprints below remain historical rather than final-head evidence.
 
 | Old method | Direct replacement method(s) |
 | --- | --- |
@@ -209,7 +209,7 @@ Old methods: 8; new unique methods: 9.
 | `RequirementMergeTests.test_material_revision_after_approval_refuses_merge_even_after_restart` | `test_requirement_merge.RequirementMergeTests.test_material_revision_after_approval_refuses_result_and_merge_inspection_retains_history` |
 | `RequirementMergeTests.test_independent_approved_candidate_retains_evidence_after_explicit_validity_checks` | `test_requirement_merge.RequirementMergeTests.test_independent_candidate_retains_exact_revision_evidence_when_other_issue_held` |
 | `RequirementMergeTests.test_minor_prose_never_revalidates_changed_review_checks` | `test_requirement_merge.RequirementMergeTests.test_minor_prose_cannot_revalidate_changed_controller_check_bytes` |
-| `RequirementMergeTests.test_native_blocker_drift_at_protection_read_refuses_merge` | `test_requirement_merge.RequirementMergeTests.test_native_textual_blocker_drift_at_protection_read_refuses_admission` |
+| `RequirementMergeTests.test_native_blocker_drift_at_protection_read_refuses_merge` | `test_requirement_merge.RequirementMergeTests.test_native_blocker_drift_at_protection_read_refuses_merge`<br>`test_requirement_merge.RequirementMergeTests.test_completed_blocker_reopened_at_last_protection_read_refuses_merge` |
 | `RequirementMergeTests.test_board_scope_drift_at_protection_read_refuses_merge` | `test_requirement_merge.RequirementMergeTests.test_board_scope_drift_at_protection_read_refuses_admission` |
 | `RequirementMergeTests.test_board_progress_drift_at_last_protection_read_refuses_merge` | `test_requirement_merge.RequirementMergeTests.test_board_progress_drift_at_last_protection_read_refuses_admission` |
 | `RequirementMergeTests.test_exact_ticket_revision_at_last_protection_read_refuses_approved_candidate` | `test_requirement_merge.RequirementMergeTests.test_exact_ticket_body_drift_at_protection_read_refuses_admission` |

@@ -264,6 +264,107 @@ class SandboxComponentTests(unittest.TestCase):
                 fixture.config = self.root / 'launcher.json'
         fixture.docker.call.assert_not_called()
 
+    def test_noncanonical_state_alias_refuses_before_attempt(self):
+        fixture = self.fixture
+        alias = self.root / 'existing-parent'
+        alias.mkdir()
+        fixture.state = alias / '..' / 'state.sqlite'
+        model = Mock()
+        result_store = Mock(wraps=assignments.store_result)
+        def setup(mocks):
+            mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
+            mocks.enter_context(patch.object(assignments, 'store_result', result_store))
+        self.refusal('unsafe_path', lambda: fixture.launch(setup=setup))
+        self.assertNotIn('runtime', fixture.stored())
+        self.assertEqual(list(fixture.artifacts.iterdir()), [])
+        fixture.docker.call.assert_not_called()
+        fixture.helper.start.assert_not_called()
+        model.assert_not_called()
+        result_store.assert_not_called()
+
+    def test_running_pause_observed_in_wait_loop_retains_scratch_and_retires_capability(self):
+        from factory_v1 import controls
+        fixture = self.fixture
+        inspections = []
+        def inspect(name):
+            observed = fixture.docker_inspect(name)
+            inspections.append(observed)
+            observed['State']['Running'] = len(inspections) == 2
+            return observed
+        fixture.docker.inspect.side_effect = inspect
+        def leave_running_scratch(root):
+            (root / 'scratch/in-progress.txt').write_text('retained partial work')
+            (root / 'scratch/result.json').unlink()
+        fixture.worker_boundary = leave_running_scratch
+        pauses = []
+        def pause_after_running(seconds):
+            self.assertEqual(seconds, .1)
+            self.assertTrue(inspections[-1]['State']['Running'])
+            self.assertEqual(fixture.stored()['runtime']['status'], 'running')
+            pauses.append(controls.request(fixture.db, 'product', 'm1', '42', 'pause', 'mock running boundary'))
+        stored_result = Mock(wraps=assignments.store_result)
+        evidence = Mock(wraps=sandbox.check_worker_evidence)
+        def setup(mocks):
+            mocks.enter_context(patch.object(sandbox.time, 'sleep', side_effect=pause_after_running))
+            mocks.enter_context(patch.object(sandbox_guard, 'process_identity', return_value='labeled identity'))
+            mocks.enter_context(patch.object(assignments, 'store_result', stored_result))
+            mocks.enter_context(patch.object(sandbox, 'check_worker_evidence', evidence))
+        result = fixture.launch(setup=setup)
+        self.assertEqual(len(inspections), 2)  # No worker completion read after durable pause.
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0]['action'], 'pause')
+        self.assertFalse(pauses[0]['dispatch_allowed'])
+        self.assertEqual(result['runtime']['status'], 'stopped')
+        self.assertEqual(result['runtime']['error'], 'iteration_paused')
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertTrue(result['runtime']['container_removed'])
+        self.assertEqual(fixture.stored(), result)
+        root = fixture.attempt_root()
+        self.assertEqual((root / 'scratch/in-progress.txt').read_text(), 'retained partial work')
+        self.assertFalse((root / 'scratch/result.json').exists())
+        self.assertFalse((root / 'stop').exists())  # Pause is not a fabricated cancellation signal.
+        capability = Path(json.loads((root / 'capability-path.json').read_text()))
+        self.assertFalse(capability.exists())
+        fixture.helper.join.assert_called_once_with(timeout=1)
+        fixture.guard.wait.assert_called_once_with(timeout=35)
+        fixture.docker.remove.assert_called_once_with(result['runtime']['container'])
+        stored_result.assert_not_called()
+        evidence.assert_not_called()
+        self.assertNotIn('submitted_result', result)
+        with sqlite3.connect(fixture.state) as fresh:
+            self.assertTrue(controls.blocked(fresh, 'product', 'm1'))
+            self.assertEqual(json.loads(fresh.execute('SELECT payload FROM role_assignments').fetchone()[0]), result)
+
+    def test_launch_anonymous_mount_calls_real_verifier_before_any_model_or_start(self):
+        fixture = self.fixture
+        def inspect(name):
+            observed = fixture.docker_inspect(name)
+            observed['Mounts'].append({'Destination': '/anonymous', 'Type': 'volume'})
+            return observed
+        fixture.docker.inspect.side_effect = inspect
+        verifier = Mock(wraps=sandbox.verify)
+        model = Mock()
+        stored_result = Mock(wraps=assignments.store_result)
+        def setup(mocks):
+            mocks.enter_context(patch.object(sandbox, 'verify', verifier))
+            mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
+            mocks.enter_context(patch.object(assignments, 'store_result', stored_result))
+        result = fixture.launch(setup=setup)
+        verifier.assert_called_once()
+        self.assertEqual(result['runtime']['error'], 'isolation_unavailable')
+        self.assertEqual(result['runtime']['status'], 'failed')
+        self.assertTrue(result['runtime']['container_removed'])
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertEqual(fixture.stored(), result)
+        self.assertEqual([call.args[0] for call in fixture.docker.call.call_args_list], ['create'])
+        fixture.docker.remove.assert_called_once_with(result['runtime']['container'])
+        fixture.helper.join.assert_called_once_with(timeout=1)
+        self.assertFalse(Path(json.loads((fixture.attempt_root() / 'capability-path.json').read_text())).exists())
+        model.assert_not_called()
+        self.assertEqual(list((fixture.attempt_root() / 'model-evidence').iterdir()), [])
+        stored_result.assert_not_called()
+        self.assertNotIn('submitted_result', result)
+
     def test_launch_retains_scoped_artifacts_and_never_promotes_worker_claims(self):
         fixture = self.fixture
         result = fixture.launch()
@@ -683,6 +784,56 @@ class DockerRemovalTests(unittest.TestCase):
             self.docker.remove(self.name)
         self.assertEqual([call.args[0][1:] for call in run.call_args_list],
                          [['rm', '-f', self.name], ['inspect', self.name], ['inspect', self.name]])
+
+    def test_stop_and_guard_competing_removal_keep_fresh_readback_consistent(self):
+        fixture = LauncherFixture(self)
+        root = fixture.root / 'running-attempt'
+        root.mkdir()
+        (root / 'scratch').mkdir()
+        (root / 'scratch/partial.txt').write_text('retained work')
+        assignment = fixture.stored()
+        assignment['runtime'] = {'run_id': 'removal-run', 'status': 'running', 'container': self.name,
+                                 'artifacts': str(root), 'controller_pid': 123, 'controller_start': 'mock-start'}
+        with fixture.db:
+            fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+        record = root / 'guard.json'
+        record.write_text(json.dumps({'seconds': 30, 'controller_pid': 123, 'controller_start': 'mock-start',
+                                     'container': self.name, 'capability': str(root / 'capability')}))
+        removals, inspections = [], []
+        def boundary(argv, **kwargs):
+            args = argv[1:]
+            if args[0] == 'logs':
+                return self.response(args, stdout=b'labeled retained log')
+            if args[0] == 'rm':
+                removals.append(args)
+                return self.response(args, 1, stderr=b'removal is already in progress' if len(removals) == 1 else b'No such container')
+            self.assertEqual(args, ['inspect', self.name])
+            inspections.append(args)
+            if len(inspections) == 1:
+                return self.response(args, stdout=b'[{"State":{"Status":"removing"}}]')
+            return self.response(args, 1, stderr=b'Error: No such object')
+        with patch.object(sandbox, 'Docker', return_value=self.docker), \
+                patch.object(sandbox_guard, 'Docker', return_value=self.docker), \
+                patch('factory_v1.sandbox_policy.subprocess.run', side_effect=boundary), \
+                patch('factory_v1.sandbox_policy.time.monotonic', return_value=100), \
+                patch('factory_v1.sandbox_policy.time.sleep') as sleep:
+            stopped = sandbox.stop_assignment(fixture.db, 'product', 'm1', '42', assignment['assignment_id'])
+            assert stopped is not None
+            self.assertEqual(len(inspections), 2)  # rm conflict -> still present -> absent before success.
+            with patch('sys.argv', ['guard', str(record)]):
+                sandbox_guard.main()
+        sleep.assert_called_once_with(.1)
+        self.assertEqual(len(removals), 2)
+        self.assertEqual(len(inspections), 3)
+        proof = json.loads((root / 'guard-result.json').read_text())
+        self.assertEqual(proof, {'status': 'stopped', 'reason': 'cancelled'})
+        self.assertEqual(stopped['runtime']['status'], proof['status'])
+        self.assertEqual(stopped['runtime']['error'], proof['reason'])
+        self.assertTrue(stopped['runtime']['container_removed'])
+        self.assertEqual((root / 'scratch/partial.txt').read_text(), 'retained work')
+        self.assertEqual((root / 'container.log').read_bytes(), b'labeled retained log')
+        with sqlite3.connect(fixture.state) as fresh:
+            self.assertEqual(json.loads(fresh.execute('SELECT payload FROM role_assignments').fetchone()[0]), stopped)
 
     def test_already_removed_is_idempotent_but_still_inspected(self):
         responses = [self.response(['rm', '-f', self.name], 1, stderr=b'No such container'),

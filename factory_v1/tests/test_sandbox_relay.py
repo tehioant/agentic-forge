@@ -33,11 +33,16 @@ class RelayTests(unittest.TestCase):
         def outbound(socket_path, payload):
             self.calls.append((socket_path, payload))
             return self.response
+        scheduled = False
         def wait(seconds):
-            if not done.is_set():
-                target[0]()
-                return False
-            return True
+            nonlocal scheduled
+            if done.is_set():
+                return True
+            self.assertFalse(scheduled, 'Relay completion signal missing after one upstream invocation.')
+            self.assertEqual(len(target), 1)
+            scheduled = True
+            target[0]()
+            return False
         with patch.object(relay.threading, 'Thread', side_effect=lambda **kwargs: target.append(kwargs['target']) or Mock()), \
                 patch.object(relay.threading, 'Event', return_value=done), \
                 patch.object(done, 'wait', side_effect=wait), patch.object(relay, 'call', side_effect=outbound):

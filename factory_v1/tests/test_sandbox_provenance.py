@@ -108,6 +108,82 @@ class ProvenanceTests(unittest.TestCase):
         self.assertFalse((check.root / 'controller-checks.json').exists())
         check.docker.remove.assert_called_once()
 
+    def launch_with_controller_checks(self, *, exit_code=0):
+        fixture = self.fixture
+        config = test_sandbox.launcher_config(fixture.root)
+        config['verification_commands'] = ['python -m unittest selected_component']
+        fixture.config.write_text(json.dumps(config))
+        docker = Mock()
+        docker.image.return_value = 'fixture-image-id'
+        inspections = []
+        def inspect(name):
+            root = fixture.attempt_root()
+            mounts = {'/workspace': (str(root / 'workspace'), False),
+                      '/scratch': (str(root / 'checks/scratch'), True),
+                      '/inputs': (str(root / 'checks/inputs'), False)}
+            observed = test_sandbox.container_inspection(config, name, mounts, exit_code=exit_code)
+            inspections.append(observed)
+            return observed
+        docker.inspect.side_effect = inspect
+        records = [{'command': config['verification_commands'][0], 'exit_code': exit_code,
+                    'stdout': 'labeled controller output', 'stderr': '', 'output_truncated': False}]
+        def call(*args, **kwargs):
+            if args[0] == 'logs':
+                return json.dumps({'run_id': fixture.stored()['runtime']['run_id'], 'records': records}).encode()
+            return b''
+        docker.call.side_effect = call
+        verifier = Mock(wraps=sandbox_checks.verify_checks)
+        store = Mock(wraps=assignments.store_result)
+        def setup(mocks):
+            mocks.enter_context(patch.object(sandbox_checks, 'Docker', return_value=docker))
+            mocks.enter_context(patch.object(sandbox_checks.time, 'monotonic', return_value=100))
+            mocks.enter_context(patch.object(sandbox, 'verify_checks', verifier))
+            mocks.enter_context(patch.object(assignments, 'store_result', store))
+        result = fixture.launch(setup=setup)
+        verifier.assert_called_once()
+        self.assertEqual(len(inspections), 2)
+        docker.remove.assert_called_once_with(result['runtime']['container'])
+        self.assertEqual([call.args[0] for call in docker.call.call_args_list], ['create', 'start', 'logs'] if exit_code else
+                         ['create', 'start', 'logs', 'logs'])
+        return result, store, records
+
+    def test_launch_successful_controller_checks_are_wired_once_and_remain_untrusted(self):
+        result, store, records = self.launch_with_controller_checks()
+        root = self.fixture.attempt_root()
+        self.assertEqual(result['runtime']['status'], 'complete')
+        self.assertEqual(self.fixture.stored(), result)
+        self.assertTrue(result['result_disposition']['checks_verified'])
+        self.assertTrue(result['result_disposition']['isolated_execution'])
+        for flag in ('trusted_execution', 'advance_allowed', 'close_allowed'):
+            self.assertFalse(result['result_disposition'][flag])
+        proof = json.loads((root / 'controller-checks.json').read_text())
+        self.assertEqual(proof['run_id'], result['runtime']['run_id'])
+        self.assertEqual(proof['records'], records)
+        self.assertEqual(proof['provenance'], 'controller_admitted_read_only_sandbox_checks')
+        self.assertEqual(result['runtime']['checks_sha256'], test_sandbox.hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest())
+        self.assertEqual((root / 'worker-container.log').read_bytes(), b'labeled mock container log')
+        self.assertNotEqual((root / 'worker-container.log').read_bytes(), (root / 'checks/container.log').read_bytes())
+        inspection = json.loads((root / 'checks/container-inspection.json').read_text())
+        self.assertFalse(next(m for m in inspection['Mounts'] if m['Destination'] == '/workspace')['RW'])
+        store.assert_called_once()
+
+    def test_launch_failed_real_controller_checks_retain_scratch_without_store_result(self):
+        result, store, _ = self.launch_with_controller_checks(exit_code=3)
+        root = self.fixture.attempt_root()
+        self.assertEqual(result['runtime']['status'], 'failed')
+        self.assertEqual(result['runtime']['error'], 'verification_failed')
+        self.assertTrue(result['runtime']['recoverable'])
+        self.assertTrue(result['runtime']['container_removed'])
+        self.assertEqual(self.fixture.stored(), result)
+        self.assertNotIn('submitted_result', result)
+        self.assertNotIn('result_disposition', result)
+        self.assertNotIn('checks_sha256', result['runtime'])
+        self.assertTrue((root / 'scratch/result.json').exists())
+        self.assertTrue((root / 'checks/container.log').exists())
+        self.assertTrue((root / 'worker-container.log').exists())
+        self.assertFalse((root / 'controller-checks.json').exists())
+        store.assert_not_called()
+
     def cancelled_checks(self, boundary):
         check = CheckFixture(self)
         def interrupt(command):

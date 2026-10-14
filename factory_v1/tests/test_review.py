@@ -1,5 +1,6 @@
 """Direct engineering seams; legacy sibling fixture helpers are not discovered."""
 import copy
+import hashlib
 import json
 import os
 import sqlite3
@@ -311,6 +312,160 @@ class ReviewComponentTests(unittest.TestCase):
         self.store(child)
         feedback = self.evaluate()
         self.assertEqual(feedback['debug_evidence'][0]['result'], child['submitted_result'])
+
+    def test_stuck_corrective_child_routes_diagnosis_and_refuses_fresh_corrections(self):
+        self.adverse(self.axes[1])  # Ordinary rejecting pair; no stuck reviewer masks the child.
+        feedback = self.evaluate()
+        self.assertEqual(feedback['status'], 'corrections')
+        self.assertFalse(feedback['advance_allowed'])
+        request = {**self.request, 'profile': {'name': 'fresh-correction', 'home': str(self.root / 'fresh-home')},
+                   'skills': [], 'claim_id': 'fresh-correction'}
+        review.prepare_corrections(self.database, 'product', 'm1', '42', request, self.github, dry_run=True)
+        self.assertEqual(self.preflight.call_args.args[4]['stage'], 'corrections')
+        child = {'assignment_id': '6' * 64, 'handoff': {'corrections': {'pins': self.pins}},
+                 'runtime': {'status': 'complete'},
+                 'submitted_result': {'status': 'stuck', 'work': ['Retained failed correction']}}
+        self.store(child)
+        before = assignments.rows(self.database)
+        feedback = self.evaluate()
+        self.assertEqual(feedback['status'], 'diagnosis')
+        self.assertFalse(feedback['advance_allowed'])
+        self.assertEqual(feedback['debug_evidence'], [{'assignment_id': child['assignment_id'],
+            'runtime': child['runtime'], 'result': child['submitted_result']}])
+        self.preflight.reset_mock()
+        with self.assertRaises(RepositoryError) as refusal:
+            review.prepare_corrections(self.database, 'product', 'm1', '42', request, self.github)
+        self.assertEqual(refusal.exception.code, 'corrections_held')
+        self.assertTrue(all(call.args[4]['stage'] in review.AXES for call in self.preflight.call_args_list))
+        self.assertEqual(assignments.rows(self.database), before)
+        self.assertEqual(self.evaluate()['status'], 'diagnosis')
+
+    def test_prepare_rejects_malformed_requests_before_candidate_or_assignment_admission(self):
+        # Complete the minimal record for the wrapper's bounded-request assembly.
+        self.candidate['handoff'].update(claim_id=self.candidate['claim_id'], preceding=[],
+            capabilities=['read_workspace', 'scratch', 'model', 'write_workspace'],
+            result_contract=assignments.CONTRACT)
+        self.e.seal_handoff()
+        self.store(self.candidate)
+        request = {'candidate_assignment': self.candidate['assignment_id'], 'axis': 'review-spec',
+                   'profile': {'name': 'fresh-spec', 'home': str(self.root / 'fresh-spec-home')},
+                   'skills': [], 'claim_id': 'fresh-spec'}
+        before = assignments.rows(self.database)
+        invalid = [None, [], {}, {**request, 'approval': True}]
+        invalid += [{**request, 'candidate_assignment': value} for value in (None, 7, '', 'a' * 63, 'g' * 64)]
+        invalid += [{**request, 'axis': value} for value in (None, [], 7, 'combined')]
+        admitted = review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
+        with patch.object(review, 'candidate', return_value=admitted) as candidate_reader:
+            for value in invalid:
+                with self.subTest(request=value):
+                    candidate_reader.reset_mock()
+                    self.preflight.reset_mock()
+                    with self.assertRaises(RepositoryError) as refusal:
+                        review.prepare(self.database, 'product', 'm1', '42', value, self.github)
+                    self.assertEqual(refusal.exception.code, 'invalid_review')
+                    candidate_reader.assert_not_called()
+                    self.preflight.assert_not_called()
+                    self.assertEqual(assignments.rows(self.database), before)
+        prior, root, source, baseline, checks = review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
+        expected = {key: prior['handoff'][key] for key in assignments.REQUEST_FIELDS}
+        expected.update(stage=request['axis'], profile=request['profile'], skills=request['skills'],
+            claim_id=request['claim_id'], capabilities=['read_workspace', 'scratch', 'model'],
+            preceding=review.preceding(prior, root, source, baseline, checks))
+        self.preflight.reset_mock()
+        self.assertEqual(review.prepare(self.database, 'product', 'm1', '42', request, self.github, dry_run=True), {'dry_run': True})
+        self.preflight.assert_called_once_with(self.database, 'product', 'm1', '42', expected, self.github, True)
+        self.assertEqual(assignments.rows(self.database), before)
+
+    def test_security_weakening_requires_exact_scoped_policy_grant_and_still_corrections(self):
+        self.adverse(self.axes[1], kind='security-weakening')
+        feedback = self.evaluate()
+        self.assertEqual(feedback['status'], 'operator-decision')
+        self.assertEqual(feedback['policy_findings'], ['Spec:R1'])
+        self.assertFalse(feedback['advance_allowed'])
+        for decision in (None,
+                         {'reference': 'Local unrelated axis grant', 'paths': [], 'findings': ['Standards:R1']},
+                         {'reference': 'Local unrelated finding grant', 'paths': [], 'findings': ['Spec:R2']},
+                         {'reference': 'Local excess path grant', 'paths': ['hello.py'], 'findings': ['Spec:R1']}):
+            with self.subTest(decision=decision):
+                feedback = self.evaluate(self.authorization(decision))
+                self.assertEqual(feedback['status'], 'operator-decision')
+                self.assertFalse(feedback['advance_allowed'])
+        exact = {'reference': 'Local explicit security decision', 'paths': [], 'findings': ['Spec:R1']}
+        feedback = self.evaluate(self.authorization(exact))
+        self.assertEqual(feedback['status'], 'corrections')
+        self.assertEqual(feedback['policy_findings'], ['Spec:R1'])
+        self.assertEqual(feedback['findings'][0]['kind'], 'security-weakening')
+        self.assertFalse(feedback['advance_allowed'])
+        self.assertFalse(feedback['merge_allowed'])
+        self.assertFalse(feedback['close_allowed'])
+        self.assertEqual(self.evaluate(), feedback)
+
+    def test_handoff_refuses_each_changed_scope_or_preceding_with_valid_candidate(self):
+        prior, root, source, baseline, checks = review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
+        request = copy.deepcopy(prior['handoff'])
+        request.update(stage='review-spec', preceding=review.preceding(prior, root, source, baseline, checks))
+        contract = review.handoff(self.database, 'product', 'm1', '42', request)
+        self.assertEqual(contract['pins'], self.pins)
+        before = assignments.rows(self.database)
+        changes = {'repository': 'example/other', 'repository_id': 456, 'workspace': str(self.root / 'other'),
+                   'issue': {**request['issue'], 'body_sha256': 'f' * 64}, 'spec_commit': 'f' * 40,
+                   'baseline': 'f' * 40, 'candidate': 'f' * 40,
+                   'standards': [simplification.artifact('AGENTS.md', 'Unrelated standards')]}
+        changed_preceding = copy.deepcopy(request['preceding'])
+        changed_preceding[-1] = simplification.artifact('implementation-diff', 'Unrelated diff')
+        changes['preceding'] = changed_preceding  # Keep the authentic candidate identity/evidence.
+        for field, value in changes.items():
+            with self.subTest(field=field):
+                altered = {**request, field: value}
+                with self.assertRaises(RepositoryError) as refusal:
+                    review.handoff(self.database, 'product', 'm1', '42', altered)
+                self.assertEqual(refusal.exception.code, 'scope_mismatch')
+                self.assertEqual(assignments.rows(self.database), before)
+        self.assertEqual(review.handoff(self.database, 'product', 'm1', '42', request), contract)
+
+    def test_candidate_reader_binds_raw_receipt_baseline_and_resealed_check_commands(self):
+        def read():
+            return review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
+        self.assertEqual(read()[2], self.e.initial)
+        receipt_path = self.e.root / 'controller-checks.json'
+        raw = receipt_path.read_bytes()
+        # Identical JSON semantics cannot authorize changed private raw bytes.
+        receipt_path.write_bytes(raw + b'\n')
+        self.assertEqual(json.loads(receipt_path.read_bytes()), json.loads(raw))
+        with self.assertRaises(RepositoryError) as refusal:
+            read()
+        self.assertEqual(refusal.exception.code, 'candidate_unverified')
+        receipt_path.write_bytes(raw)
+        self.assertEqual(read()[2], self.e.initial)
+        baseline_path = self.e.root / 'inputs/baseline/hello.py'
+        baseline_raw = baseline_path.read_bytes()
+        initial_path = self.e.root / 'initial-source.json'
+        initial_raw = initial_path.read_bytes()
+        baseline_path.write_text('changed baseline\n')
+        changed_baseline = review.manifest(self.e.root / 'inputs/baseline')
+        # Reseal ancillary source metadata; retain the admitted runtime baseline pin.
+        initial_path.write_text(json.dumps({'workspace': self.e.initial, 'baseline': changed_baseline}))
+        self.assertEqual(simplification.check_receipt(self.e.root, self.e.runtime)[0], self.e.initial)
+        with self.assertRaises(RepositoryError) as refusal:
+            read()
+        self.assertEqual(refusal.exception.code, 'candidate_unverified')
+        baseline_path.write_bytes(baseline_raw)
+        initial_path.write_bytes(initial_raw)
+        self.assertEqual(read()[3], self.e.baseline)
+        # Valid passing receipt, correctly resealed raw digest, but an unadmitted command.
+        changed = json.loads(raw)
+        changed['records'][0]['command'] = 'python -m unittest unrelated_tests -v'
+        receipt_path.write_text(json.dumps(changed))
+        row = copy.deepcopy(self.candidate)
+        row['runtime']['checks_sha256'] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
+        self.store(row)
+        self.assertEqual(simplification.check_receipt(self.e.root, row['runtime'])[2], changed)
+        with self.assertRaises(RepositoryError) as refusal:
+            read()
+        self.assertEqual(refusal.exception.code, 'candidate_unverified')
+        receipt_path.write_bytes(raw)
+        self.store(self.candidate)
+        self.assertEqual(read()[2:4], (self.e.initial, self.e.baseline))
 
     def test_pair_independence_checks_and_resealed_pin_matrix(self):
         for field, value, code in [('status', 'failed', 'review_incomplete'), ('container_removed', False, 'review_incomplete')]:

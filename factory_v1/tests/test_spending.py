@@ -244,6 +244,37 @@ class ModelSpendingTests(unittest.TestCase):
             self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
         self.assertNotIn(marker.encode(), self.state.read_bytes())
 
+    def test_controller_and_startup_refusals_have_exact_durable_order(self):
+        self.grant()
+        marker = 'never-persist-rejected-grant-secret'
+        self.refused('grant_conflict', self.grant, ceiling=6)
+        self.refused('invalid_grant', self.grant, ceiling=0, reference=marker)
+        path = self.root / 'capability.sock'
+        with patch.object(spending.socket, 'socket') as socket, \
+                patch.object(spending.threading, 'Thread') as thread, \
+                patch.object(spending, 'transport') as transport:
+            self.refused('approval_required', spending.serve_unix_socket, str(path), str(self.state),
+                         self.scope, operator_id='other')
+            item = self.item()
+            item['status'] = 'paused'
+            with self.db:
+                self.db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+            self.refused('iteration_paused', spending.serve_unix_socket, str(path), str(self.state),
+                         self.scope, operator_id='42')
+            socket.assert_not_called()
+            thread.assert_not_called()
+            transport.assert_not_called()
+        with closing(sqlite3.connect(self.state)) as fresh:
+            self.assertEqual(fresh.execute('SELECT decision,reason FROM model_decisions ORDER BY rowid').fetchall(),
+                             [('grant_recorded', 'allowance'), ('refused', 'grant_conflict'),
+                              ('refused', 'invalid_grant'), ('refused', 'approval_required'),
+                              ('refused', 'iteration_paused')])
+            self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+            self.assertEqual(fresh.execute('SELECT COUNT(*) FROM model_operations').fetchone()[0], 0)
+        self.assertFalse(path.exists())
+        self.assertNotIn(marker.encode(), self.state.read_bytes())
+        self.adapter.call.assert_not_called()
+
     def test_invalid_json_bounds_and_grant_replays_are_structured(self):
         self.grant()
         self.refused('grant_conflict', self.grant, ceiling=6)
