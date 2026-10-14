@@ -198,6 +198,7 @@ class LauncherFixture:
             mocks.enter_context(patch.object(assignments, 'prepare', side_effect=self.prepare))
             mocks.enter_context(patch.object(sandbox, 'snapshot', side_effect=self.snapshot))
             mocks.enter_context(patch.object(sandbox, 'process_identity', return_value='labeled identity'))
+            mocks.enter_context(patch('factory_v1.restart.process_identity', return_value='labeled identity'))
             mocks.enter_context(patch.object(sandbox.signal, 'signal', side_effect=self.install_signal))
             mocks.enter_context(patch.object(sandbox.threading, 'Thread', side_effect=self.thread))
             mocks.enter_context(patch.object(sandbox.subprocess, 'Popen', return_value=self.guard))
