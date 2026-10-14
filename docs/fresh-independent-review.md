@@ -36,7 +36,13 @@ python -m factory_v1 --state /controller/state.sqlite --operator-id 42 \
     "name": "code-review",
     "source": "/home/ops/.hermes/skills/code-review/SKILL.md",
     "path": "/home/ops/.hermes/skills/code-review/SKILL.md",
-    "sha256": "0eec800da607853d6038c4fae3815896588b25a6ba84bcbcefb26218cef4df0f",
+    "sha256": "1ff8f642af17fe58110d991738b8d881cb8ae3a1b5bc6b1abddc380f8b26212e",
+    "dependencies": ["code-review/references/structured-text-contracts.md"]
+  }, {
+    "name": "code-review/references/structured-text-contracts.md",
+    "source": "/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md",
+    "path": "/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md",
+    "sha256": "3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530ddfa0031b02a8",
     "dependencies": []
   }],
   "claim_id": "standards-attempt-1"
@@ -52,11 +58,17 @@ axis, using the full skill instructions (including Standards' smell baseline).
 Serial execution is supported; separate read-only assignments may run concurrently
 when the host's enforced resources permit it. This slice does not add scheduling.
 
-The approved current installed revision adds a whole-repository release-readiness
-branch; that branch and its conditional reference are **not selected** by these
-two diff-review assignments. The required inline closure remains `code-review`
-alone. Tracker/standards/requirements are pinned handoff inputs, not ambient skill
-discovery. Revision-v2 adaptations preserve reports and exact pins on corrections,
+The approved current installed revision adds the bounded structured-text review
+recipe, relevant to #21's Markdown admission and source-span mutation. Both axes
+explicitly load `code-review` and `code-review/references/structured-text-contracts.md`
+with the exact pins above; the existing loader stages and checks both inputs.
+Apply the recipe when structured text is in scope: one semantic grammar, byte-exact
+unrelated spans, a cheap formatting/negative matrix and bounded public replay
+evidence. Its conditional applicability does not permit omitting its descriptor or
+dependency edge. The whole-repository release-readiness branch and its separate
+conditional reference remain **not selected**. Tracker/standards/requirements are
+pinned handoff inputs, not ambient skill discovery. Revision-v3 adaptations preserve
+reports and exact pins on corrections,
 review only the correction delta when prior assumptions are unchanged, and retain
 separate fresh verdicts for both axes. Final full-suite evidence belongs to the
 controller's stabilized reviewed candidate; interrupted or older-head checks and

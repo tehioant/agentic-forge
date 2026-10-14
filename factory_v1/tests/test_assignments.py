@@ -15,16 +15,18 @@ from factory_v1.tests import test_tickets
 
 SOURCE_ROOT = Path(os.environ.get('FACTORY_ROLE_SKILL_FIXTURES', str(Path(__file__).parent / 'role_skill_snapshots')))
 PINS = {
-    'implement': '290299fd286a7bab61001e3c0f0b898079332511e39b2772faac42ce99514288',
+    'implement': '136a8987143241a0229952a56d9c41042646073769fcad466d808bd5e40bb4f0',
     'tdd': '93ea419b76e9caaf26153b828e984f7c3fb136f4caa67b14af95f32ea965a1cc',
     'codebase-design': '2c20617f87ec8af6a434859f381b2f061a69b530444e74eb39e78bb016a6d1e2',
-    'code-review': '0eec800da607853d6038c4fae3815896588b25a6ba84bcbcefb26218cef4df0f',
+    'code-review': '1ff8f642af17fe58110d991738b8d881cb8ae3a1b5bc6b1abddc380f8b26212e',
+    'code-review/references/structured-text-contracts.md': '3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530ddfa0031b02a8',
     'simplify-code': '9ee977c3362a1c07f2e327198e066ddb3c0ed67709706fc410165ee820b2ca01',
     'diagnosing-bugs': '9168404abda0967a5d32977e3498cd95fda6807018852f3de736a78357c82b40',
     'tdd/tests.md': '859f9e592c188fda4fc7277dd180e4ce9c7a2e13f6efe1f6f29eccc9d28c106a',
     'tdd/mocking.md': '3ceb807fdf4a47d6a93d4d9a891e5ba6d362a6247bd08adc451feebfc17361ef',
 }
 ENGINEERING = ['implement']
+REVIEW = ['code-review', 'code-review/references/structured-text-contracts.md']
 
 
 def artifact(name, content):
@@ -65,7 +67,8 @@ class AssignmentTests(unittest.TestCase):
             source_suffix = 'software-development/' + suffix if name == 'simplify-code' else suffix
             result.append({'name': name, 'source': '/home/ops/.hermes/skills/' + source_suffix,
                            'path': str(self.skills / suffix), 'sha256': PINS[name],
-                           'dependencies': {'tdd': ['codebase-design', 'tdd/tests.md', 'tdd/mocking.md']}.get(name, [])})
+                           'dependencies': {'tdd': ['codebase-design', 'tdd/tests.md', 'tdd/mocking.md'],
+                                            'code-review': ['code-review/references/structured-text-contracts.md']}.get(name, [])})
         return result
 
     def configuration(self, number=10, stage='implementation'):
@@ -73,8 +76,8 @@ class AssignmentTests(unittest.TestCase):
             'implementation': (ENGINEERING, 'implementation', []),
             'corrections': (ENGINEERING, 'implementation', ['candidate', 'findings']),
             'simplify': (['simplify-code'], 'simplification', ['candidate', 'implementation-evidence']),
-            'review-standards': (['code-review'], 'review', ['candidate', 'simplification-evidence']),
-            'review-spec': (['code-review'], 'review', ['candidate', 'simplification-evidence']),
+            'review-standards': (REVIEW, 'review', ['candidate', 'simplification-evidence']),
+            'review-spec': (REVIEW, 'review', ['candidate', 'simplification-evidence']),
             'diagnosis': (['diagnosing-bugs'], 'debug', ['failure-evidence']),
             'repair': (ENGINEERING + ['diagnosing-bugs'], 'repair', ['incident-evidence']),
         }[stage]
@@ -282,6 +285,22 @@ class AssignmentTests(unittest.TestCase):
         request['skills'][-1]['path'] = str(symlink)
         self.refused(self.command(request=request), 'skill_blocked')
         self.assertEqual(self.fixture.calls, [])
+
+    def test_review_dependency_omission_refuses_before_tracker_or_claim(self):
+        before = self.fixture.state.read_bytes()
+        for stage in ('review-standards', 'review-spec'):
+            for defect in ('missing-reference', 'missing-edge', 'reference-pin'):
+                with self.subTest(stage=stage, defect=defect):
+                    request = self.configuration(stage=stage)
+                    if defect == 'missing-reference':
+                        request['skills'].pop()
+                    elif defect == 'missing-edge':
+                        request['skills'][0]['dependencies'] = []
+                    else:
+                        request['skills'][1]['sha256'] = '0' * 64
+                    self.refused(self.command(request=request), 'skill_blocked')
+                    self.assertEqual(self.fixture.state.read_bytes(), before)
+                    self.assertEqual(self.fixture.calls, [])
 
     def test_scope_repository_id_issue_identity_body_and_spec_refusals(self):
         for field, value in [('repository', 'other/product'), ('repository_id', 124), ('spec_commit', 'c' * 40)]:

@@ -84,11 +84,18 @@ class ReviewTests(unittest.TestCase):
             handoff = axis['handoff']
             self.assertEqual(handoff['review']['axis'], label)
             self.assertEqual(handoff['skill_entry_points'], ['code-review'])
+            self.assertEqual([s['name'] for s in handoff['skills']], test_assignments.REVIEW)
+            self.assertEqual(handoff['skills'][0]['dependencies'], [test_assignments.REVIEW[1]])
             self.assertEqual(handoff['skills'][0]['instructions'], Path(handoff['skills'][0]['path']).read_text())
             self.assertEqual(handoff['capabilities'], ['read_workspace', 'scratch', 'model'])
             self.assertEqual(handoff['review']['pins']['tree_sha256'], self.candidate['runtime']['candidate_sha256'])
             self.assertFalse(axis['review_result']['native_execution_trusted'])
             root = Path(axis['runtime']['artifacts'])
+            for index, selected in enumerate(handoff['skills']):
+                self.assertEqual((root / f'inputs/instruction-{index}.txt').read_bytes(),
+                                 Path(selected['path']).read_bytes())
+                self.assertIn((selected['source'], selected['sha256']),
+                              [(load['source'], load['sha256']) for load in axis['submitted_result']['loads']])
             inspection = json.loads((root / 'container-inspection.json').read_text())
             self.assertFalse(next(m['RW'] for m in inspection['Mounts'] if m['Destination'] == '/workspace'))
             self.assertTrue(next(m['RW'] for m in inspection['Mounts'] if m['Destination'] == '/scratch'))

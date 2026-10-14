@@ -341,7 +341,7 @@ caller-selected new pins are not accepted. For example, the implementation entry
   "name": "implement",
   "source": "/home/ops/.hermes/skills/implement/SKILL.md",
   "path": "/absolute/selected-snapshots/implement/SKILL.md",
-  "sha256": "290299fd286a7bab61001e3c0f0b898079332511e39b2772faac42ce99514288",
+  "sha256": "136a8987143241a0229952a56d9c41042646073769fcad466d808bd5e40bb4f0",
   "dependencies": []
 }
 ```
@@ -355,12 +355,19 @@ The approved current revision requires typechecking and focused tests during wor
 and after corrections; the controller retains the completed final full-suite
 command, runtime, exit and exact stabilized reviewed HEAD/tree. Interrupted or
 older-head runs do not qualify a later candidate. Engineering/correction/repair
-adaptations are revision v2; mandatory meaningful tests and optional test-first
-ordering are unchanged.
-Repair additionally uses diagnosis;
-simplification, each review axis and diagnosis use only their own entry.
+adaptations are revision v3; mandatory meaningful tests and optional test-first
+ordering are unchanged. Tightened assignment/persisted-state contracts require a
+test-tree audit of hand-built records and local validator fixtures before review.
+For failed-suite fixture repairs, preserve the complete trace, reproduce the exact
+failing test before changes, retain red/green evidence, verify unchanged production
+bytes and assertion ASTs, and obtain narrow review continuation. A targeted repair
+does not turn an earlier failed suite into a pass; final canonical verification
+remains controller-owned on the new stabilized reviewed candidate.
+Repair additionally uses diagnosis; simplification and diagnosis use only their
+own entry, while each review axis also loads the explicit reference below.
 Matt's installed identities are `/home/ops/.hermes/skills/<name>/SKILL.md`, with
-the two support files under `tdd/`; the non-Matt simplifier is
+the two support files under `tdd/` and the selected reference under `code-review/`;
+the non-Matt simplifier is
 `/home/ops/.hermes/skills/software-development/simplify-code/SKILL.md`.
 `role_skills.py` retains all exact reviewed pins and dependency lists from the
 selected sources; test snapshots retain those bytes unchanged. Unknown, duplicate,
@@ -378,11 +385,17 @@ context without fan-out, preserving behavior or retaining evidence-backed no-op.
 Standards and Spec receive separate fresh read-only assignments and separate
 verdicts; they cannot share a top-level profile name or home.
 Code-review's approved current pin is
-`0eec800da607853d6038c4fae3815896588b25a6ba84bcbcefb26218cef4df0f`.
+`1ff8f642af17fe58110d991738b8d881cb8ae3a1b5bc6b1abddc380f8b26212e`.
 Only its diff-review branch is selected, with pinned tracker, requirements and
-standards supplied by the handoff. The whole-repository release-readiness workflow
-and its conditional reference are unselected, so the two axes still have no inline
-skill dependencies. Revision-v2 review adaptations preserve prior reports/pins,
+standards supplied by the handoff. Both axes explicitly require
+`code-review/references/structured-text-contracts.md`, installed at
+`/home/ops/.hermes/skills/code-review/references/structured-text-contracts.md`, pin
+`3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530ddfa0031b02a8`.
+The reference's bounded recipe applies when structured Markdown admission or
+source-span mutation is in scope (including #21); it is always in the reviewed
+two-axis closure, never discovered from ambient files. The whole-repository
+release-readiness workflow and its different conditional reference remain
+unselected. Revision-v3 review adaptations preserve prior reports/pins,
 use correction-only review when assumptions are unchanged, and distinguish code
 disposition from native/live acceptance. No new review bypass or source updater
 is introduced. Diagnosis is read-only
