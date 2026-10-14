@@ -131,8 +131,11 @@ def validity(database, item, github, numbers):
     return checked
 
 
-def checkpoint(database, item):
-    tickets.checkpoint(database, item)
+def checkpoint(database, item, *, receipt=False):
+    if receipt:
+        tickets.checkpoint(database, item)
+    else:
+        tickets.admitted_checkpoint(database, item)
 
 
 def sync_blocks(database, item, record, github, release=False):
@@ -146,6 +149,7 @@ def sync_blocks(database, item, record, github, release=False):
         require(issue_pin(issue) == expected, 'Affected identity or body changed.', 'stale_requirements')
         if issue['state'] != 'open':
             require(not release, 'Revised work closed before revalidation.', 'stale_requirements')
+            tickets.active(item, database)
             github.request('/repos/' + item['repository'] + '/issues/' + str(number), {'state': 'open'}, 'PATCH')
             issue = tickets.gh.read_issue(github, item['repository'], number)
             require(issue['state'] == 'open' and issue_pin(issue) == expected, 'Exact reopened work did not read back.', 'publication_mismatch')
@@ -166,6 +170,7 @@ def sync_blocks(database, item, record, github, release=False):
             require(member['status'] in {blocked, option},
                     'External progress changed independently of the requirement release.', 'publication_mismatch')
         if member['status'] != option:
+            tickets.active(item, database)
             tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
         member = tickets.gh.membership(github, board, item['repository'], issue)
         require(member is not None and member['id'] == record['memberships'][str(number)] and member['status'] == option,
