@@ -1,0 +1,218 @@
+{
+  "issue": 27,
+  "evidence_kind": "focused_component_contract_map_not_live_trace",
+  "baseline_commit": "21633ef987ff95e0b6ae96e3871a0814963463e2",
+  "policy": {
+    "path": "docs/specs/no-live-verification-amendment.md",
+    "sha256": "1b2786398ed9f95a097e3f8883ddc4488740da5c4b8665cff7994459a7c4810e",
+    "live_comment": "https://github.com/tehioant/agentic-forge/issues/27#issuecomment-6187443505"
+  },
+  "delivery_scope": "Focused underlying behavior coverage and explicit limitations under the operator no-live amendment. Historical live requirements are not claimed passed.",
+  "criteria": [
+    {
+      "id": 1,
+      "original": "Conversation choices \u2192 versioned specs/decisions; current-milestone issues, native dependencies and linked board readbacks",
+      "entrypoints": [
+        "factory_v1/conversation_binding.py:ConversationBinding",
+        "factory_v1/planning_publication.py:publish",
+        "factory_v1/tickets.py:synthesize",
+        "factory_v1/tickets.py:complete_synthesis",
+        "factory_v1/tickets.py:publish",
+        "factory_v1/tickets.py:frontier"
+      ],
+      "adapter_seams": [
+        "Native PluginContext skill loading and host binding",
+        "Controlled GitHub docs/issue publisher",
+        "ticket_github read_issue/dependencies/membership/project_items/set_field"
+      ],
+      "tests": [
+        "test_conversation_binding.ConversationBindingTests.test_sufficient_judgment_automatically_loads_to_spec_in_same_tool_loop",
+        "test_planning_publication.PlanningPublicationTests.test_real_publisher_functions_complete_durable_exact_mock_readbacks",
+        "test_tickets.TicketTests.test_batch_orders_blockers_and_rejects_invalid_scope_and_cycles",
+        "test_ticket_native_scope.NativeScopeTests.test_native_single_issue_publication_and_lost_membership_receipt",
+        "test_ticket_native_scope.NativeScopeTests.test_completed_blocker_requires_closed_completed_done_current_scope"
+      ],
+      "limits": "Native context and GitHub responses mocked. Publisher and completion are separated by seed_verified_publication; not one live interview/publication journey."
+    },
+    {
+      "id": 2,
+      "original": "Fresh isolated selected installed skills, model capacity, exact source/dependency/adaptation pins and execution provenance",
+      "entrypoints": [
+        "factory_v1/service_dispatch.py:installed",
+        "factory_v1/service_dispatch.py:run_assignment",
+        "factory_v1/role_skills.py",
+        "factory_v1/assignments.py",
+        "factory_v1/merge.py:chain",
+        "factory_v1/readiness_capabilities.py:HostReaders"
+      ],
+      "adapter_seams": [
+        "Approved installed skill sources",
+        "Existing owned public launcher and sandbox execution",
+        "Independent host execution bindings and approved capacity"
+      ],
+      "tests": [
+        "test_role_skills.ReviewedImplementTests.test_reviewed_snapshot_is_admitted_but_later_byte_drift_is_refused",
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_admit_reviewed_bytes_and_refuse_drift_or_caller_repins",
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_refuse_dependency_omission_without_hiding_the_graph_guard",
+        "test_service_dispatch.DispatchBoundaryTests.test_installed_source_cannot_be_replaced_by_pinned_snapshot",
+        "test_service_dispatch.DispatchBoundaryTests.test_review_refuses_worker_claim_without_independent_host_provenance",
+        "test_merge.ChainAdmissionTests.test_forged_execution_declarations_never_qualify",
+        "test_merge.ChainAdmissionTests.test_reused_profiles_or_artifacts_cannot_supply_fresh_axes",
+        "test_readiness.CoreReadinessTests.test_exact_prepared_running_terminal_run_and_launcher_selection"
+      ],
+      "limits": "Existing direct admission checks, not actual full-process worker/installed skill execution. Fixture snapshots do not establish installed runtime provenance. No security/process/model exercise requested or performed."
+    },
+    {
+      "id": 3,
+      "original": "Automatic sufficient-interview \u2192 synthesis \u2192 frontier \u2192 initial and next ticket \u2192 engineering/reporting, with genuine blocks",
+      "entrypoints": [
+        "factory_v1/service_dispatch.py:tick",
+        "factory_v1/service_dispatch.py:synthesize",
+        "factory_v1/service_dispatch.py:continuation_tick",
+        "factory_v1/planning_wakeup.py:supervise",
+        "factory_v1/planning_wakeup.py:adopt_original",
+        "factory_v1/planning_wakeup.py:receipt",
+        "factory_v1/continuation_dispatch.py:select",
+        "factory_v1/continuation_dispatch.py:execute",
+        "factory_v1/tickets.py:advance_delivered"
+      ],
+      "adapter_seams": [
+        "Original native turn or authorized correlated wakeup",
+        "Host synthesis executor invoke with short admission lane",
+        "Existing ticket reserve/assignment prepare/launcher/publication/merge/completion callers"
+      ],
+      "tests": [
+        "test_service_dispatch.DispatchSelectionTests.test_complete_interview_automatically_selects_ticket_synthesis",
+        "test_synthesis_safety.SynthesisAdmissionTests.test_actual_caller_passes_short_scoped_admission_and_payload",
+        "test_synthesis_safety.SynthesisAdmissionTests.test_receipt_survives_pause_without_result_admission",
+        "test_planning_wakeup.PlanningWakeupTests.test_original_completion_adopted_without_request_enqueue_or_execution_turn",
+        "test_planning_wakeup.PlanningWakeupTests.test_correlated_completion_consumes_only_after_fresh_immutable_readback",
+        "test_planning_wakeup.PlanningWakeupTests.test_service_pending_branch_routes_one_operation_and_holds_next_stage",
+        "test_continuation_dispatch.SelectionComponents.test_next_eligible_ignores_old_seed_and_consumed_retired_roots",
+        "test_continuation_dispatch.PersistentAdmissionComponents.test_next_ticket_tick_prepares_fresh_envelope_without_old_claim",
+        "test_continuation_dispatch.PersistentAdmissionComponents.test_delivered_retirement_precedes_restart_even_with_persisted_old_hold",
+        "test_continuation_dispatch.PersistentAdmissionComponents.test_selected_launch_calls_actual_existing_executor_and_requires_readback",
+        "test_delivered_ownership.DeliveredOwnershipComponents.test_role_claim_then_second_reservation_uses_the_same_retirement_authority",
+        "test_delivered_ownership.DeliveredOwnershipComponents.test_second_reservation_reaches_real_ownership_guard_with_direct_receipt",
+        "test_service_components.DispatchComponentTests.test_initial_planning_routes_only_the_selected_public_operation"
+      ],
+      "limits": "Both native completion orders use explicit records: original_completion has no wakeup; complete_record seeds a running request and correlated execution turn. Neither helper executes earlier stages. Initial selector and synthesis component are covered separately; successful public tick routing at lines 281\u2013289 is a small apparent wiring-coverage gap, not a demonstrated source defect. Initial public tick routing is checked independently for preparation, execution and publication using three explicit states; downstream operations are mocked, no output feeds the next case."
+    },
+    {
+      "id": 4,
+      "original": "Exact candidate/reviews/checks, gated merge, integrated-main checks, correctly timed closure and board progress",
+      "entrypoints": [
+        "factory_v1/publication.py:publish",
+        "factory_v1/review.py:evaluate",
+        "factory_v1/merge.py:lifecycle",
+        "factory_v1/tickets.py:advance_delivered"
+      ],
+      "adapter_seams": [
+        "Controlled GitHub branch/PR publisher",
+        "Exact-head check/protection reader and SHA-pinned merge",
+        "Issue state plus authoritative board readback"
+      ],
+      "tests": [
+        "test_publication.PublicationComponentTests.test_happy_publication_durable_exact_commit_pr_and_no_delivery_authority",
+        "test_review.ReviewComponentTests.test_pair_authority_replay_and_private_exact_binding",
+        "test_merge.MergeComponentTests.test_final_review_admission_cannot_use_earlier_pass",
+        "test_merge.MergeComponentTests.test_late_pause_after_last_protection_read_blocks_intent_and_put",
+        "test_merge.MergeComponentTests.test_integrated_checks_only_delivery_and_lost_closure_readback",
+        "test_merge.MergeComponentTests.test_missing_or_failed_integrated_checks_reopen_without_another_merge",
+        "test_delivered_ownership.DeliveredOwnershipComponents.test_exact_delivery_atomically_archives_reservation_and_is_idempotent"
+      ],
+      "limits": "MergeComponentTests uses real lifecycle with mocked chain/mapped_candidate/review/delivery prerequisites and in-memory GitHub transport. Dormant legacy MergeTests setup is NOT the cited coverage. Real #26 integrated CI is a source-delivery receipt only, not #27 campaign evidence."
+    },
+    {
+      "id": 5,
+      "original": "Concrete secure non-billable CI/CD deployment and observed workload health, not CI success alone",
+      "entrypoints": [
+        "factory_v1/delivery.py:validate_config",
+        "factory_v1/delivery.py:observe",
+        "factory_v1/delivery.py:sample",
+        "factory_v1/iteration.py:complete"
+      ],
+      "adapter_seams": [
+        "Exact repository/main checks/workflows/deployment statuses",
+        "Configured HTTP health acceptance response independent of workflow status"
+      ],
+      "tests": [
+        "test_delivery.DeliveryComponentTests.test_ci_workflow_deployment_failure_pending_skipped_and_unknown_matrix",
+        "test_delivery.DeliveryComponentTests.test_health_status_and_exact_contract_refusals",
+        "test_delivery.DeliveryComponentTests.test_late_main_check_workflow_and_deployment_races_never_claim_health",
+        "test_iteration.IterationComponents.test_unknown_failed_health_incident_and_pending_decisions_refuse",
+        "test_readiness.ReadinessTests.test_health_notification_scope_and_spending_refusals"
+      ],
+      "limits": "DeliveryTarget is an in-memory response fixture, http_json mocked, socket/Popen denied. No workload deployed or observed. CI/CD owns credentials by contract; no concrete deployment target/capacity inferred or created. Unknown configured runtime health remains unknown."
+    },
+    {
+      "id": 6,
+      "original": "Routine silence, completion reaches exact approved origin, next iteration waits for input",
+      "entrypoints": [
+        "factory_v1/attention.py",
+        "factory_v1/messaging.py",
+        "factory_v1/iteration.py:complete",
+        "factory_v1/iteration.py:next_iteration",
+        "factory_v1/continuation_dispatch.py:execute"
+      ],
+      "adapter_seams": [
+        "Durable exact-origin attention outbox",
+        "Approved Hermes messaging command and separate delivery receipt",
+        "Later authenticated same-product origin input"
+      ],
+      "tests": [
+        "test_attention.AttentionComponentTests.test_enqueue_exact_correlations_reopen_and_routine_silence",
+        "test_attention.AttentionComponentTests.test_transport_exact_command_privacy_ack_is_not_receipt",
+        "test_attention.AttentionComponentTests.test_no_effect_retry_new_attempt_and_uncertain_effect_no_blind_retry",
+        "test_iteration.IterationComponents.test_report_wait_and_outbox_are_atomic_restart_idempotent_and_silent",
+        "test_iteration.ContinuationComponents.test_explicit_same_product_input_starts_only_pinned_pending_interview",
+        "test_iteration.ContinuationComponents.test_wrong_operator_origin_event_empty_input_and_unverified_delivery_refuse",
+        "test_continuation_dispatch.ExecutionComponents.test_complete_uses_real_completion_caller_and_readback_not_next_iteration",
+        "test_continuation_dispatch.PersistentAdmissionComponents.test_completed_wait_is_idempotent_without_restart_or_worker"
+      ],
+      "limits": "Completion outbox is pending until real delivery reconciles. Mock CLI acknowledgement is accepted, NOT delivered; explicit receipt is separately admitted. No platform message sent."
+    },
+    {
+      "id": 7,
+      "original": "Machine-readable correlated execution/issue/PR/commit/check/deployment/notification evidence and truthful unavailable-capability blockers",
+      "entrypoints": [
+        "factory_v1/assignments.py",
+        "factory_v1/publication.py",
+        "factory_v1/merge.py",
+        "factory_v1/delivery.py",
+        "factory_v1/attention.py",
+        "factory_v1/iteration.py:complete",
+        "factory_v1/readiness.py",
+        "factory_v1/readiness_gate.py"
+      ],
+      "adapter_seams": [
+        "Existing durable assignment/publication/merge/delivery/notification records",
+        "Host capability readers and readiness admission"
+      ],
+      "tests": [
+        "test_iteration.IterationComponents.test_report_wait_and_outbox_are_atomic_restart_idempotent_and_silent",
+        "test_iteration.DeliveredEvidenceComponents.test_closed_issue_and_delivered_boolean_never_replace_original_proof",
+        "test_readiness.ReadinessTests.test_default_unsupported_and_unverified_booleans_are_denied",
+        "test_readiness.ReadinessTests.test_independent_authority_and_executor_denials_are_redacted",
+        "test_readiness.GitHubCapabilityTests.test_read_success_or_role_alone_never_proves_effective_writes",
+        "test_readiness.EnforcedReadinessTests.test_direct_public_tick_refuses_missing_readiness_before_selection",
+        "test_service_components.DispatchComponentTests.test_child_exit_and_claims_need_fresh_durable_complete_and_removal"
+      ],
+      "limits": "Existing records are sufficient evidence surfaces; no new trace framework needed. Test report explicitly says simulation. Live execution/deployment/notification handles are unavailable because not executed; never populate fake handles."
+    }
+  ],
+  "live_qualification": {
+    "status": "not_executed",
+    "disposition": "waived_for_ticket_delivery",
+    "worker_execution_handles": null,
+    "disposable_repository": null,
+    "deployment_handles": null,
+    "workload_health_observation": null,
+    "platform_delivery_receipt": null
+  },
+  "verification": {
+    "canonical_command": "python scripts/run_factory_tests.py",
+    "compile_command": "python -m compileall -q factory_v1",
+    "results": "Use exact-head CI linked from the delivery PR and retained candidate-bound local receipts; this static map is not execution evidence."
+  }
+}
