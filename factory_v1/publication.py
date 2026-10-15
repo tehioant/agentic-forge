@@ -109,6 +109,7 @@ class PublicationGitHub:
     """No arbitrary URLs or operations; every write payload is preapproved verbatim."""
     def __init__(self, github, config):
         self.github = github
+        self.base = github.base
         self.config = config
         self.prefix = '/repos/' + config['repository']
         self.reads = set()

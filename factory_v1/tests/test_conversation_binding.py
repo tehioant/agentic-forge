@@ -45,7 +45,11 @@ class ConversationBindingTests(unittest.TestCase):
         self.assertIn('factory_planning_sufficient', result['context'])
         self.assertEqual([c.args[1]['name'] for c in self.ctx.dispatch_tool.call_args_list], ['grill-me', 'grilling'])
         self.assertTrue(all(c.kwargs == {'session_id': 'native-origin'} for c in self.ctx.dispatch_tool.call_args_list))
-        self.assertEqual(self.fixture.stored(), self.item)
+        stored = self.fixture.stored()
+        self.assertEqual(stored['planning'].pop('native_binding'),
+                         {'assignment_id': 'origin-assignment', 'session_id': 'native-origin',
+                          'reference': self.config['reference']})
+        self.assertEqual(stored, self.item)
 
     def test_sufficient_judgment_automatically_loads_to_spec_in_same_tool_loop(self):
         self.binding.context('native-origin')
@@ -85,11 +89,10 @@ class ConversationBindingTests(unittest.TestCase):
         self.binding.register()
         self.ctx.register_hook.assert_called_once_with('pre_llm_call', self.binding.context)
         self.assertEqual([c.kwargs['name'] for c in self.ctx.register_tool.call_args_list],
-                         ['factory_planning_sufficient', 'factory_planning_complete'])
+                         ['factory_planning_sufficient', 'factory_planning_publish', 'factory_planning_complete'])
 
-    def test_synthesized_output_requires_real_publication_readback_before_scheduler_handoff(self):
+    def test_supplied_publication_pointers_cannot_substitute_native_host_execution(self):
         from factory_v1.tests.test_planning import PlanningTests
-        from factory_v1.service_dispatch import select
         self.item.pop('handoff'); self.item.pop('ticket_work'); self.fixture.persist()
         self.binding.context('native-origin')
         self.binding.sufficient(self.judgment, session_id='native-origin')
@@ -102,9 +105,10 @@ class ConversationBindingTests(unittest.TestCase):
         self.repo = {'id': 123, 'full_name': 'example/product', 'name': 'product', 'owner': {'login': 'example'}, 'private': True}
         PlanningTests.publication(self, request)
         self.fixture.github.request.side_effect = lambda path: copy.deepcopy(self.published[path])
-        output = json.loads(self.binding.complete(request, session_id='native-origin'))
-        self.assertEqual(output, {'status': 'complete', 'stage': 'planning_complete'})
-        self.assertEqual(select(self.fixture.stored(), [], {}), ('synthesize', None))
+        with self.assertRaises(repositories.RepositoryError) as error:
+            self.binding.complete(request, session_id='native-origin')
+        self.assertEqual(error.exception.code, 'execution_required')
+        self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
 
     def test_pause_or_origin_drift_prevents_native_instruction_admission(self):
         for key, value in (('status', 'paused'), ('origin', {'platform': 'discord', 'chat_id': 'different'})):

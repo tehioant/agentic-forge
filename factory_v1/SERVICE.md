@@ -160,11 +160,14 @@ A reviewed merge authority is still required by the existing human-approved seam
    session. It loads the reviewed installed interview sources into actual origin
    turns. Sufficient clarification returns the installed `to-spec` instructions
    directly to that same native tool loop, without another operator advancement.
-   Completion still requires actual immutable publication readback through the
-   existing planning verifier. The service waits at `origin_conversation_pending`
-   until that verifier completes; a load or enqueue is not completion. The plugin
-   has not been installed/enabled or exercised with a model. See the integration
-   README for the source boundary and the remaining host-publication limitation.
+   The native `factory_planning_publish` tool now accepts actual same-origin
+   synthesis and uses a separately approved HOST capability for controlled
+   initial docs/issue publication and exact durable readback. Native-bound
+   completion cannot substitute loader receipts or supplied GitHub pointers.
+   The service still waits at `origin_conversation_pending`: supervisor wakeup
+   and correlated asynchronous receipt consumption remain the S1 wiring gap.
+   The plugin has not been installed/enabled or exercised with a model. See
+   its README for authorization fields and the tested source/runtime boundary.
 2. **Bounded scope:** automation drives one configured frontier ticket through
    existing gates. Corrections, diagnosis, repair, changed requirements, uncertain
    effects and next-ticket/iteration enrollment still stop at the existing public

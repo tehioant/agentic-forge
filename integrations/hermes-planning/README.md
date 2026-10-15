@@ -1,62 +1,78 @@
-# Native originating-conversation planning seam (source candidate)
+# Native originating-conversation planning
 
-This opt-in native Hermes plugin is **not installed or enabled** by this change.
-It requires `factory_v1` to be importable in the separately approved Hermes host
-runtime. No provider/auth/profile configuration is modified.
+This opt-in plugin is source only, **not installed/enabled**. It requires
+`factory_v1` in the approved native Hermes runtime. No provider/profile/auth
+settings are changed by this change.
 
-The host supplies plugin settings `binding` (exact `state`, `operator_id`,
-`project`, `iteration`, native `session_id`, unchanged factory `origin`, and
-explicit approval `reference`) and `api_base`. The SQLite file must already
-exist. The binding maps an existing origin session; it must not be inferred from
-model text or a newly created worker session. Enablement/session mapping and any
-host model allowance are separate operator-authorized deployment operations.
+Host settings: `binding` contains exact durable SQLite `state`, `operator_id`,
+`project`, `iteration`, existing native `session_id`, original factory `origin`
+and approval `reference`; `api_base` is the existing readback route.
+`publication_config` is the absolute path to a separately approved private,
+controller-owned, single-link mode-0600 JSON file. No ambient credential lookup.
+Its exact fields are:
 
-## Native boundary
+- `operator_id`, `reference`, `repository`, positive immutable `repository_id`,
+  Boolean `private`, exact `api_base`, `bearer` for that approved HOST route;
+- `assignment_id`, native `session_id`, immutable full-SHA `parent`.
 
-- `register(ctx)` registers documented `pre_llm_call` and two native tools.
-- `pre_llm_call` reads the existing planning assignment and current controls,
-  verifies all three reviewed installed source pins, and calls the actual native
-  `ctx.dispatch_tool('skill_view', ...)` for `grill-me` and `grilling`. The exact
-  returned instructions become current-turn context. Unrelated sessions get no
-  context. No helper, agent, subprocess or model is started.
-- The already-running origin agent judges clarification. Missing decisions stay
-  in this conversation. `factory_planning_sufficient` requires no pending
-  questions, loads the actual selected installed `to-spec`, and returns its
-  instructions to that same tool loop. The agent continues synthesis without a
-  new operator confirmation; its genuine conversation supplies the answers.
-- `factory_planning_complete` is available only after that same native-turn load.
-  It takes the existing complete-planning request (`assignment_id`, `origin`,
-  `sufficient`, `rationale`, `reference`, `pending_questions`, `documents`,
-  `commit`, `issue_number`; continuation assignments retain their existing
-  additional `execution` contract). It calls `planning.complete`, which freshly
-  verifies repository identity, exact immutable docs/commit and issue bytes.
-  Merely loading instructions does not admit completion. The scheduler's existing
-  selector then selects ticket synthesis from the completed durable handoff.
+The bearer stays in host memory/configuration, never durable iteration state,
+model context or tool output. Deployment must supply native sender/operator
+mapping, actual session ownership and a scoped GitHub capability. This code
+neither invents credentials nor authorizes a model call.
 
-## Deliberate remaining limits
+## Same-origin route
 
-This seam does **not** turn a native loader receipt into authoritative behavioral
-execution provenance. The native model run and real user-answer provenance have
-not been qualified. The unit tests mock the native loader boundary, not synthesis
-execution, and label documents/readbacks as explicit fixtures.
+1. Documented native `pre_llm_call` supplies actual session/task/turn/sender,
+   original user message and host conversation history. The binding retains
+   host-observed inputs separately from model-authored work claims, source pins,
+   adaptation, a generated run ID and exact native loader results. History
+   references are host-generated run-local indexes, not invented platform IDs.
+   Repeated hooks and a new adapter instance preserve the same correlated run,
+   sufficiency and loaded to-spec across tool iterations. A genuinely new user
+   turn starts fresh correlation; an unresolved publication must reconcile first.
+2. `factory_planning_sufficient` takes `assignment_id`, `rationale`, empty
+   `pending_questions`; it loads the selected installed to-spec into the same
+   running agent. Loading alone cannot publish or complete planning.
+3. `factory_planning_publish` receives actual three-document output plus
+   `assignment_id`, `run_id`, `reference`, `answers` (each exact host-observed
+   `reference`/`answer`) and ordered `work` entries (`skill`/`result` for grill-me,
+   grilling, to-spec). All original host-observed answers and references must
+   remain verbatim in provenance.md. Work summaries are explicitly model claims,
+   **not independent HOST attestations**. The executing native tool route and
+   host-observed loads/input/output correlation are retained independently.
+4. HOST publishes only adjacent milestone.md/vision.md/provenance.md under the
+   assignment's fixed docs path, on `factory/planning/ITERATION/ASSIGNMENT` based
+   on the approved immutable parent. Exact tree readback proves no other leaves
+   changed. It creates one deterministic-title specification issue whose exact
+   body equals milestone.md and explicitly labels it ready-for-agent. No parent
+   issue, main/base ref, merge, protection, shell, arbitrary repository/ref/path
+   or model-supplied issue identity is writable.
+5. Every write has a committed intent before I/O. Exact blobs, tree, commit/
+   parent, branch and issue/docs read back before `planning.complete` is called.
+   Unknown blob/tree/commit outcomes remain held, never blindly repeated. Lost
+   branch/issue-create responses reconcile only their exact intended effect;
+   absent effects or duplicates remain held. Authority/privacy/source/native
+   correlation and durable controls are rechecked at mutation and success gates.
+6. Native-bound planning cannot use caller-supplied publication pointers or the
+   legacy complete tool as execution proof. The existing public planning API
+   remains compatible for non-native assignments. A successful publish call
+   completes the durable handoff, so the existing scheduler can select synthesis.
 
-Initial `planning.INSTRUCTIONS` still delegates publication to the HOST. There
-is no initial-spec controlled publisher exposed by this plugin. If the origin
-host lacks its separately approved publication route, synthesized output remains
-pending; the plugin cannot complete the automatic published handoff by itself.
-The plugin's readback client is credential-blind like the supervisor; private
-repository readback needs the approved host route. These are explicit remaining
-integration gaps, not credentials that this code invents or execution it claims.
-A supervisor with no active origin turn does not inject a new model turn. Native
-`inject_message` is supported, but its `True` is enqueue-only and is deliberately
-not treated as completion or permission to start a model.
+## Remaining scope
 
-Consequently this is a tested source seam, **not full S1 or #25 acceptance**. S2
-next-ticket/recovery sequencing and #26 aggregate readiness remain separate.
+The only remaining **initial S1 source integration** is supervisor-to-native
+wakeup and correlated asynchronous receipt consumption. Native injection is
+supported; Boolean enqueue acceptance is not completion. The supervisor must
+read the exact durable assignment/run completion, never infer it from enqueue.
+Initial publication is implemented here; continuation/revision publication uses
+its existing separate contract. S2/frontier progression is not changed.
 
-References: official Hermes developer-guide `plugins`, `programmatic-integration`,
-and user-guide `features/hooks`; installed `hermes_cli/plugins.py` methods
-`register_hook`, `register_tool`, `dispatch_tool`, `inject_message` and
-`hermes_cli/plugins_injection.py`. The retained offline contract probe executes
-actual installed routing/dispatch function bodies with the native external
-registry/host mocked; it does not import auth, install anything or invoke models.
+Tests exercise real publisher/admission functions using explicitly labeled fake
+GitHub/native boundaries and retained durable state. No real native model
+execution or live GitHub publication is claimed. Plugin installation, native
+runtime/provider credentials, live qualification and external publication remain
+separately authorized deployment work.
+
+References: official Hermes developer-guide plugins/programmatic-integration and
+user-guide features/hooks; installed `agent/turn_context.py` and
+`hermes_cli/plugins.py` pre_llm_call/register_tool/dispatch_tool interfaces.

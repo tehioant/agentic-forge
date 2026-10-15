@@ -6,7 +6,7 @@ from factory_v1.repositories import GitHub
 def register(ctx):
     binding = ctx.get_config('binding')
     api_base = ctx.get_config('api_base')
-    # Readback only, as in the supervisor. Private-repository readback requires
-    # the separately approved host route; no ambient credential discovery.
+    # Legacy readback is credential-blind. The strict publisher separately loads
+    # its private exact host authorization; no ambient credential discovery.
     github = GitHub(api_base, 'credential-blind-controller', 10)
-    return ConversationBinding(ctx, binding, github).register()
+    return ConversationBinding(ctx, binding, github, ctx.get_config('publication_config')).register()
