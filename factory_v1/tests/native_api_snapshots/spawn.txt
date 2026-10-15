@@ -1,0 +1,4 @@
+    def spawn(self, coro: Any, *, name: Optional[str] = None) -> Any:
+        if not inspect.iscoroutine(coro):
+            raise TypeError("spawn_task() requires a coroutine object")
+        return asyncio.run_coroutine_threadsafe(_on_behalf_of(coro, serving_request()), self.loop)

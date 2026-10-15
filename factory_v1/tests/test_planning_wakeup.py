@@ -1,7 +1,8 @@
 """Direct mailbox/native contract tests; explicit records, no journey or running tasks."""
-import ast
 import copy
 import json
+import hashlib
+import textwrap
 from pathlib import Path
 import time
 from types import SimpleNamespace, ModuleType
@@ -12,6 +13,16 @@ from typing import Mapping, Any
 
 from factory_v1 import assignments, planning, planning_wakeup as wakeup, repositories
 from factory_v1.tests import test_conversation_binding as binding_tests
+
+
+def native_contract(name, namespace):
+    """Pinned external API slice, NOT proof of an installed/runtime Hermes host."""
+    root = Path(__file__).parent / 'native_api_snapshots'
+    metadata = json.loads((root / 'metadata.json').read_text())[name]
+    raw = (root / (name + '.txt')).read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == metadata['sha256']
+    exec(compile(textwrap.dedent(raw.decode()), metadata['path'], 'exec'), namespace)
+    return namespace.get(name)
 
 
 class PlanningWakeupTests(unittest.TestCase):
@@ -212,18 +223,14 @@ class PlanningWakeupTests(unittest.TestCase):
             self.supervise()
         self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
 
-    def test_actual_native_host_spawn_body_and_bounded_join(self):
+    def test_pinned_native_host_spawn_body_and_bounded_join(self):
         import concurrent.futures
-        source = Path('/home/ops/.hermes/hermes-agent/hermes_cli/plugin_host_child.py')
-        tree = ast.parse(source.read_bytes())
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'HostRuntime')
-        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'spawn')
         future = concurrent.futures.Future()
         scheduler = Mock(return_value=future)
         ns = {'Any': Any, 'Optional': __import__('typing').Optional, 'inspect': __import__('inspect'),
               'asyncio': SimpleNamespace(run_coroutine_threadsafe=scheduler),
               '_on_behalf_of': lambda coro, request: coro, 'serving_request': lambda: 'native-host-request'}
-        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), ns)
+        native_contract('spawn', ns)
         coro = self.native.run()
         try:
             host = SimpleNamespace(loop='existing-native-loop')
@@ -237,34 +244,25 @@ class PlanningWakeupTests(unittest.TestCase):
         self.native.joined.wait.assert_called_once_with(2)
         self.assertEqual(self.native.status, 'shutdown_unconfirmed')
 
-    def test_actual_native_injection_router_rechecks_grant_and_same_origin(self):
+    def test_pinned_native_injection_router_rechecks_grant_and_same_origin(self):
         import logging
-        source = Path('/home/ops/.hermes/hermes-agent/hermes_cli/plugins_injection.py')
-        tree = ast.parse(source.read_bytes())
-        method = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'inject_plugin_message')
         ns = {'Any': Any, 'Optional': __import__('typing').Optional, 'Mapping': Mapping,
               'logger': logging.getLogger('native-body-probe')}
-        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), ns)
+        native_contract('inject_plugin_message', ns)
         manager = SimpleNamespace(_cli_ref=None, has_gateway_message_injector=True,
                                   home_path=Path('/explicit-approved-profile'), inject_gateway_message=Mock(return_value=True))
         ctx = SimpleNamespace(_manager=manager, plugin_id='factory-planning', _gateway_injection_allowed=Mock(return_value=False))
         kwargs = {'session_key': None, 'origin': self.item['origin']}
-        self.assertFalse(ns[method.name](ctx, 'wake', 'user', **kwargs))
+        self.assertFalse(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs))
         manager.inject_gateway_message.assert_not_called()
         ctx._gateway_injection_allowed.return_value = True
-        self.assertTrue(ns[method.name](ctx, 'wake', 'user', **kwargs))
+        self.assertTrue(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs))
         manager.inject_gateway_message.assert_called_once_with(origin=self.item['origin'],
             plugin_home=manager.home_path, content='wake', plugin_id='factory-planning')
 
-    def test_actual_installed_inject_body_preserves_origin_and_boolean_semantics(self):
-        # Extract only the real method body: no Hermes/auth/provider imports.
-        source = Path('/home/ops/.hermes/hermes-agent/hermes_cli/plugins.py')
-        if not source.exists(): self.skipTest('installed native source unavailable')
-        tree = ast.parse(source.read_bytes())
-        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PluginContext')
-        method = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == 'inject_message')
+    def test_pinned_native_inject_body_preserves_origin_and_boolean_semantics(self):
         ns = {'Mapping': Mapping, 'Any': Any}
-        exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), ns)
+        native_contract('inject_message', ns)
         seam = ModuleType('hermes_cli.plugins_injection'); seam.inject_plugin_message = Mock(return_value=True)
         with patch.dict(sys.modules, {'hermes_cli': ModuleType('hermes_cli'), 'hermes_cli.plugins_injection': seam}):
             self.assertIs(ns['inject_message'](self.ctx, 'wake', role='user', origin=self.item['origin']), True)
@@ -284,3 +282,112 @@ class PlanningWakeupTests(unittest.TestCase):
         self.assertEqual(result['stage'], 'planning-wakeup')
         self.assertEqual(result['status'], 'requested')
         self.ctx.inject_message.assert_not_called()
+
+
+    def test_pinned_gateway_input_slice_reaches_real_strict_hook(self):
+        """Pure dispatch/preparation/hook slices; no adapter loop, provider or turn journey."""
+        import asyncio
+        import logging
+        from contextlib import asynccontextmanager
+        logger = logging.getLogger('pinned-native-contract')
+        source = SimpleNamespace(platform=SimpleNamespace(value='telegram'), chat_id='chat',
+                                 user_id='42', user_name='Operator')
+        events = []
+        async def handle(event):
+            events.append(event)
+        @asynccontextmanager
+        async def injection_scope(origin):
+            yield
+        host = SimpleNamespace(_plugin_injection_accepting=lambda: True,
+            _delivery_adapter_for=lambda origin: SimpleNamespace(handle_message=handle),
+            _plugin_injection_authorized=lambda *a, **kw: True,
+            _session_key_for_source=lambda origin: 'native-key', _plugin_injection_scope=injection_scope)
+        dispatch = native_contract('_dispatch_plugin_origin_injection', {
+            'SessionSource': Any, 'MessageEvent': SimpleNamespace,
+            'MessageType': SimpleNamespace(TEXT='text'), 'logger': logger})
+        self.mailbox('enqueued')
+        raw = wakeup.message(self.item['planning']['native_wakeup'])
+        self.assertTrue(asyncio.run(dispatch(host, source=source, content=raw, plugin_id='factory-planning')))
+        event, = events
+        self.assertIs(event.source, source)
+        self.assertEqual(event.source.user_id, '42')
+        self.assertTrue(event.internal)
+        self.assertFalse(event.allow_gateway_control)
+        self.assertEqual(event.metadata, {'hermes_plugin_id': 'factory-planning',
+            'hermes_plugin_injection': True, 'gateway_session_key': 'native-key'})
+        self.assertEqual(event.text, raw)
+
+        prefix = native_contract('_prefix_inbound_sender_context', {
+            'MessageEvent': Any, 'SessionSource': Any, 'Platform': SimpleNamespace(SLACK='slack'),
+            'is_shared_multi_user_session': lambda *a, **kw: shared,
+            'neutralize_untrusted_inline_text': lambda name: name})
+        timestamp = native_contract('_hmwa_apply_message_timestamp', {'logger': logger})
+        collect = native_contract('_collect_pre_llm_call_context', {
+            'Any': Any, 'Optional': __import__('typing').Optional, 'logger': logger})
+        prep_host = SimpleNamespace(config=SimpleNamespace())
+        # Timestamp primitives/config are explicit external mocks; native selection and
+        # hook bodies remain exact. No auth/config/provider modules are imported.
+        run = ModuleType('gateway.run')
+        run._load_gateway_config = lambda: {}
+        run._message_timestamps_enabled = lambda config: timestamps
+        inbound = ModuleType('gateway.run_inbound')
+        inbound.strip_discord_triggering_note = lambda event, text: text
+        stamps = ModuleType('gateway.message_timestamps')
+        stamps.strip_leading_message_timestamps = lambda text, **kw: (text, None)
+        stamps.coerce_message_timestamp = lambda value, **kw: 123.0
+        stamps.render_user_content_with_timestamp = lambda text, *a, **kw: '[timestamp-fixture] ' + text
+        clock = ModuleType('hermes_time'); clock.get_timezone = lambda: None
+        lifecycle = ModuleType('hermes_cli.lifecycle')
+        hook_calls = []
+        errors = []
+        def invoke(name, **kwargs):
+            self.assertEqual(name, 'pre_llm_call')
+            hook_calls.append(kwargs)
+            try:
+                return [self.binding.context(**kwargs)]
+            except repositories.RepositoryError as error:
+                errors.append(error.code)
+                raise
+        lifecycle.invoke_hook = invoke
+        spill = ModuleType('tools.hook_output_spill')
+        spill.get_spill_config = lambda: {}
+        spill.spill_if_oversized = lambda piece, **kw: piece
+        modules = {'gateway': ModuleType('gateway'), 'gateway.run': run,
+            'gateway.run_inbound': inbound, 'gateway.message_timestamps': stamps,
+            'hermes_time': clock, 'hermes_cli': ModuleType('hermes_cli'),
+            'hermes_cli.lifecycle': lifecycle, 'tools': ModuleType('tools'), 'tools.hook_output_spill': spill}
+        history = [{'role': 'user', 'content': 'Use Python.'}]
+        agent = SimpleNamespace(session_id='native-origin', model='fixture-model', _user_id=source.user_id)
+        for shared, timestamps, sender in ((False, False, '42'), (False, True, '42'),
+                                            (True, True, '42'), (False, True, 'forged')):
+            with self.subTest(shared=shared, timestamps=timestamps, sender=sender), patch.dict(sys.modules, modules):
+                self.mailbox('enqueued')
+                original = copy.deepcopy(self.item['planning']['native_execution'])
+                prepared = prefix(prep_host, event, source, event.text)
+                rendered, persisted, epoch = timestamp(prep_host, event, prepared)
+                selected = {'user_message': rendered, 'persist_user_message': persisted}
+                native_contract('original_user_message', selected)
+                self.assertEqual(selected['original_user_message'], prepared)
+                if timestamps:
+                    self.assertTrue(rendered.startswith('[timestamp-fixture] '))
+                messages = history + [{'role': 'user', 'content': rendered}]
+                agent._user_id = sender
+                result = collect(agent, effective_task_id='wake-task', turn_id='wake-turn',
+                    original_user_message=selected['original_user_message'], messages=messages,
+                    conversation_history=history)
+                self.assertEqual(hook_calls[-1]['user_message'], prepared)
+                self.assertEqual(hook_calls[-1]['conversation_history'], messages)
+                self.assertIsNot(hook_calls[-1]['conversation_history'], messages)
+                self.assertEqual(hook_calls[-1]['sender_id'], sender)
+                stored = self.fixture.stored()['planning']
+                self.assertEqual(stored['native_execution'], original)
+                if shared or sender != '42':
+                    self.assertEqual(result, '')  # native hook collector logs/refuses failures
+                    self.assertEqual(errors[-1], 'scope_mismatch')
+                    self.assertEqual(stored['native_wakeup']['status'], 'enqueued')
+                    self.assertNotIn('execution_turn', stored['native_wakeup'])
+                else:
+                    self.assertTrue(result)
+                    self.assertEqual(stored['native_wakeup']['status'], 'running')
+                    self.assertEqual(stored['native_wakeup']['execution_turn'],
+                                     {'task_id': 'wake-task', 'turn_id': 'wake-turn'})
