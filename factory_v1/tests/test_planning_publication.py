@@ -136,7 +136,8 @@ class PlanningPublicationTests(unittest.TestCase):
         # Completion is a separate component; do not feed real publisher output into it.
         completed = {'planning': {'status': 'complete'}, 'stage': 'planning_complete', 'handoff': {'commit': 'e' * 40}}
         with patch.object(planning, 'complete', return_value=completed):
-            return self.publish()
+            self.publish()
+        return self.fixture.stored()['planning']['host_publication']
 
     def test_real_publisher_functions_complete_durable_exact_mock_readbacks(self):
         self.publish_only()
@@ -208,7 +209,7 @@ class PlanningPublicationTests(unittest.TestCase):
                 with self.assertRaises(repositories.RepositoryError): self.publish_only()
                 self.fail_after = None
                 output = self.publish_only()
-                self.assertEqual(output['status'], 'complete')
+                self.assertEqual(output['status'], 'verified')
                 self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
                 self.assertEqual(sum(p == suffix for p, _ in self.writes), 1)
                 if suffix == '/git/refs':
