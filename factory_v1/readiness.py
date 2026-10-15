@@ -2,7 +2,7 @@
 
 Use collect() from trusted host Python. Independent capability readers must validate
 actual scoped authority, not caller booleans or future worker completion evidence.
-The built-in readers deliberately refuse unsupported authority introspection.
+The default readers support only the existing direct classic OAuth host route.
 """
 from copy import deepcopy
 import hashlib
@@ -17,24 +17,11 @@ from . import requirement_execution, role_skills, sandbox_policy, service_dispat
 from .model_access import SUBSCRIPTION_SCOPE, SubscriptionTransport
 from .origin import validate_origin
 from .planning import require
+from .readiness_capabilities import HostReaders, REMEDIATIONS
 
 FIELDS = {'operator_id', 'project', 'iteration', 'reference', 'slots', 'planning_skills',
           'ticket_skill', 'board', 'board_pin', 'protection', 'synthesis_config'}
 WRITES = ('issues', 'projects', 'contents', 'pull_requests', 'merge')
-
-
-class UnsupportedReaders:
-    """No existing adapter proves these general infrastructure capabilities.
-
-    Host integrations may supply read-only validators here. Return a SHA-256 of
-    exact validated authority inputs; raise on absent, insufficient or stale
-    authority. These methods are trusted code, never configured user values.
-    """
-    def github_authority(self, scope, operations):
-        raise repositories.RepositoryError('unsupported', 'No scoped write-authority reader installed.')
-
-    def execution_support(self, scope, stages):
-        raise repositories.RepositoryError('unsupported', 'No independent executor/verifier capacity reader installed.')
 
 
 class ReadAPI:
@@ -60,19 +47,22 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     and compare input_identity at sensitive boundaries; never reuse a green report.
     """
     service, config = deepcopy(service), deepcopy(config)
-    readers = readers or UnsupportedReaders()
+    readers = readers or HostReaders(database, service, config, github)
     now = int(time.time()) if now is None else now
     results, pins = {}, {}
 
     def check(name, remediation, action):
         try:
             value = action()
-            pins[name] = assignments.digest(value)
+            if name not in {'scope', 'controls', 'capacity', 'delivery'}:
+                pins[name] = assignments.digest(value)
             results[name] = {'state': 'ready', 'code': 'verified', 'remediation': None}
             return value
-        except Exception:
+        except Exception as error:
             # Neither arbitrary exceptions nor adapter-supplied error codes are safe.
-            results[name] = {'state': 'blocked', 'code': name + '_blocked', 'remediation': remediation}
+            code = getattr(error, 'code', None)
+            safe = code if isinstance(code, str) and code in REMEDIATIONS else name + '_blocked'
+            results[name] = {'state': 'blocked', 'code': safe, 'remediation': REMEDIATIONS.get(safe, remediation)}
             return None
 
     def scope_check():
@@ -100,6 +90,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     scope = {'project': config['project'], 'iteration': config['iteration'], 'operator_id': config['operator_id'],
              'repository': item['repository'], 'repository_id': item['repository_onboarding']['metadata']['id'],
              'api_base': github.base, 'board': config['board_pin']}
+    pins['scope'] = assignments.digest({**scope, 'approval': item['approval'], 'origin': item['origin']})
     readonly = assignments.ReadOnlyGitHub(github)
 
     def repository():
@@ -128,17 +119,12 @@ def collect(database, service, config, github, *, readers=None, running=None, no
                 {s['stage'] for s in slots} == set(assignments.ROLES), 'Inventory every configured engineering stage.', 'invalid_dispatch')
         names, homes, claims = set(), set(), set()
         sources = {}
-        existing = assignments.rows(database)
         for slot in slots:
             require(set(slot) == {'stage', 'profile', 'skills', 'claim_id', 'launcher'} and
                     assignments.identifier(slot['claim_id']), 'Explicit finite slots required.', 'invalid_dispatch')
             profile = assignments.validate_profile(slot['stage'], slot['profile'])
-            require(profile['name'] not in names and profile['home'] not in homes and slot['claim_id'] not in claims and
-                    not Path(profile['home']).exists() and not Path(profile['home']).is_symlink(),
-                    'Fresh distinct profiles required.', 'claim_conflict')
-            require(not any(r['claim_id'] == slot['claim_id'] or r['handoff']['profile']['name'] == profile['name'] or
-                            r['handoff']['profile']['home'] == profile['home'] for r in existing),
-                    'Slot already consumed.', 'claim_conflict')
+            require(profile['name'] not in names and profile['home'] not in homes and slot['claim_id'] not in claims,
+                    'Distinct configured profiles required.', 'claim_conflict')
             names.add(profile['name']); homes.add(profile['home']); claims.add(slot['claim_id'])
             sources[slot['claim_id']] = service_dispatch.installed(slot['stage'], slot['skills'])
         sources['planning'] = skills.resolve_installed(config['planning_skills'])
@@ -150,6 +136,8 @@ def collect(database, service, config, github, *, readers=None, running=None, no
         return {'sources': sources, 'adaptations': role_skills.ADAPTATIONS,
                 'planning_adaptation': planning.INSTRUCTIONS, 'tickets_adaptation': tickets.INSTRUCTIONS}
     stages = check('stages', 'Review installed source/dependency/adaptation drift and provide unused distinct finite stage slots; never repin automatically.', stage_inputs)
+    capacity = check('capacity', 'Select remaining unused approved capacity, not historical claims.',
+                     lambda: slot_capacity(database, config['slots'], scope))
 
     def containers():
         configurations = []
@@ -162,7 +150,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     check('containers', 'Restore reviewed image, private launcher limits/artifact paths and owned fixed subscription socket; no container is started by inspection.', containers)
 
     check('spending', 'Restore unexpired exact approved subscription allowance or reconcile quota/uncertain operation; no new grant or fallback.',
-          lambda: spending.admission_preview(database, (config['project'], config['iteration'], *SUBSCRIPTION_SCOPE), now=now))
+          lambda: spending.capacity_preview(database, (config['project'], config['iteration'], *SUBSCRIPTION_SCOPE), now=now))
 
     def execution():
         require(stages is not None, 'Installed sources required.', 'skill_blocked')
@@ -182,6 +170,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
         protected = merge.protection(ReadAPI(readonly, scope['repository']), protection)
         observation = delivery.observe(contract, ReadAPI(readonly, scope['repository']))
         require(observation['status'] == 'healthy', 'Configured health unknown or failed.', 'delivery_unknown')
+        pins['delivery'] = assignments.digest({'config': contract, 'protection': protected})
         return {'config': contract, 'protection': protected, 'observation': observation}
     check('delivery', 'Restore exact main protection/check/workflow/deployment-health contract; no-deployment contracts are currently unsupported.', health)
 
@@ -198,7 +187,52 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     eligible = check('controls', 'Explicitly resume and reconcile existing pause/stop/iteration holds; cleanup remains available.',
                      lambda: _controls(database, item))
     pins['configuration'] = assignments.digest({'service': service, 'readiness': config})
-    return _report(results, pins, eligible, now, running)
+    return _report(results, pins, eligible, now, running, capacity)
+
+
+def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run_id=None):
+    """Non-reserving finite inventory; selected existing work must bind its run.
+
+    This does not release ownership or relax global ticket/iteration concurrency.
+    A consumed slot is history, never fresh capacity, even after retirement.
+    """
+    available, active = [], []
+    existing = assignments.rows(database)
+    for slot in slots:
+        profile = assignments.validate_profile(slot['stage'], slot['profile'])
+        matches = [r for r in existing if r['claim_id'] == slot['claim_id'] or
+                   r['handoff']['profile']['name'] == profile['name'] or
+                   r['handoff']['profile']['home'] == profile['home']]
+        if not matches:
+            if not Path(profile['home']).exists() and not Path(profile['home']).is_symlink():
+                available.append({'stage': slot['stage'], 'claim_id': slot['claim_id']})
+            continue
+        require(len(matches) == 1, 'Ambiguous slot binding.', 'slot_binding_changed')
+        row = matches[0]
+        require(row['claim_id'] == slot['claim_id'] and row['handoff']['profile'] == profile and
+                row['handoff']['stage'] == slot['stage'] and
+                row['handoff_digest'] == assignments.digest(row['handoff']) and
+                all(row['ticket_scope'].get(k) == scope[k] for k in ('project', 'iteration', 'repository', 'repository_id')),
+                'Exact historical slot binding required.', 'slot_binding_changed')
+        runtime = row.get('runtime') or {}
+        retired = any(row.get(k) for k in ('requirement_disposition', 'recovery_disposition', 'restart_disposition',
+                                          'stuck_disposition', 'ownership_retirement'))
+        retired = retired or assignments.delivered_ticket_receipt(database, row)[1] is not None
+        if not retired and (not runtime or runtime.get('status') in {'preparing', 'running'}):
+            require(assignments.identifier(row['assignment_id']) and
+                    (not runtime or assignments.identifier(runtime.get('run_id'))),
+                    'Exact active run required.', 'slot_binding_changed')
+            active.append({'stage': slot['stage'], 'claim_id': slot['claim_id'],
+                           'assignment_id': row['assignment_id'], 'run_id': runtime.get('run_id')})
+    if assignment_id is not None:
+        require(stage in assignments.ROLES and any(r['stage'] == stage and r['assignment_id'] == assignment_id and
+                r['run_id'] == run_id for r in active), 'Selected binding unavailable.', 'slot_binding_changed')
+    elif stage is not None:
+        require(stage in assignments.ROLES and any(r['stage'] == stage for r in available),
+                'No fresh selected stage slot.', 'slot_capacity_unavailable')
+    else:
+        require(available or active, 'No remaining capacity.', 'slot_capacity_unavailable')
+    return {'available': available, 'active': active}
 
 
 def _controls(database, item):
@@ -207,10 +241,10 @@ def _controls(database, item):
     return {'eligible': True}
 
 
-def _report(results, pins, eligible, now, running):
+def _report(results, pins, eligible, now, running, capacity=None):
     capabilities = {k: v for k, v in results.items() if k != 'controls'}
     return {'version': 1, 'observed_at': now, 'service_running': running if type(running) is bool else None,
             'capability_ready': bool(capabilities) and all(r['state'] == 'ready' for r in capabilities.values()),
             'iteration_eligible': eligible is not None, 'iteration_runnable': False, 'dispatch_allowed': False,
             'boundary_wiring': 'not_implemented', 'retained_report_is_authority': False,
-            'input_identity': assignments.digest(pins), 'checks': results}
+            'input_identity': assignments.digest(pins), 'checks': results, 'slot_capacity': capacity}
