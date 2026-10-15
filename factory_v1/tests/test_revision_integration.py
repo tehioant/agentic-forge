@@ -200,7 +200,7 @@ class RevisionIntegrationTests(unittest.TestCase):
     def prepare_publication(self):
         # Real synthesis controller/validation; only its external helper transport is replaced.
         self.install_record('resolved')
-        with patch.object(synthesis, 'invoke', side_effect=lambda config, work: self.produced(work)):
+        with patch.object(synthesis, 'invoke', side_effect=lambda config, work, *, cancelled, admission: self.produced(work)):
             self.item = self.execute()
         record = self.item['requirement_changes']['durable-notes']
         record.update(status='publication-pending', new_inputs=self.new_inputs,
@@ -383,7 +383,7 @@ class RevisionIntegrationTests(unittest.TestCase):
                 self.interrupt(malformed=malformed)
             return self.old_inputs
         self.pinned.side_effect = final_input
-        with patch.object(synthesis, 'invoke', side_effect=lambda config, work: self.produced(work)) as invoke:
+        with patch.object(synthesis, 'invoke', side_effect=lambda config, work, *, cancelled, admission: self.produced(work)) as invoke:
             after = self.refused(self.execute, 'invalid_control' if malformed else 'iteration_paused')
             self.assertEqual(reads, 2)
             record = after['requirement_changes']['durable-notes']
@@ -401,7 +401,7 @@ class RevisionIntegrationTests(unittest.TestCase):
 
     def test_pause_at_synthesis_return_retains_untrusted_receipt_not_admitted_result(self):
         self.install_record('resolved')
-        def returned(config, work):
+        def returned(config, work, *, cancelled, admission):
             produced = self.produced(work)
             self.interrupt()
             return produced

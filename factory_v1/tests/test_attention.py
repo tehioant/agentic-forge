@@ -432,7 +432,7 @@ class AttentionComponentTests(unittest.TestCase):
             spending.initialize(db)
         request = {'origin': self.origin, 'expected_revision': 0, 'skills': {'fixture': 'selected'}}
         def plan():
-            with closing(sqlite3.connect(self.state)) as db, repositories.state_lock(db), db, mock.patch.object(planning, 'resolve', return_value={'fixture': 'selected'}):
+            with closing(sqlite3.connect(self.state)) as db, repositories.state_lock(db), db, mock.patch.object(planning, 'resolve_planning', return_value={'fixture': 'selected'}):
                 return planning.plan(db, self.item, request)
         def grant():
             with closing(sqlite3.connect(self.state)) as db, repositories.state_lock(db), db:
