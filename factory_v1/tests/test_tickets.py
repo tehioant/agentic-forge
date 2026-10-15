@@ -6,7 +6,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -152,7 +152,7 @@ class FrontierFixture:
         self.database.commit()
 
     def stored(self):
-        with sqlite3.connect(self.state) as database:
+        with closing(sqlite3.connect(self.state)) as database:
             return json.loads(database.execute('SELECT payload FROM iterations').fetchone()[0])
 
     def pause(self):

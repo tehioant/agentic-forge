@@ -148,7 +148,9 @@ class RevisionIntegrationTests(unittest.TestCase):
             record = json.loads(path.read_text())
             record['request_id'] = 'repaired-fixture'
             path.write_text(json.dumps(record))
-        controls.resume(self.database, 'product', 'm1', '42', 'SIMULATED explicit resume')
+        # Revision components mock the independent restart observation boundary.
+        with patch('factory_v1.restart.reconcile', return_value={'status': 'ready'}):
+            controls.resume(self.database, 'product', 'm1', '42', 'SIMULATED explicit resume', self.github)
 
     def refused(self, operation, code='iteration_paused'):
         with self.assertRaises(RepositoryError) as caught:

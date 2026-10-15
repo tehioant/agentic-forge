@@ -70,8 +70,10 @@ def blocked(database, project, iteration):
     return record is not None and record['action'] != 'resume'
 
 
-def require_active(database, project, iteration):
+def require_active(database, project, iteration, *, resolution=None):
     require(not blocked(database, project, iteration), 'Operator interruption prevents admission until explicit resume.', 'iteration_paused')
+    from .restart import require_reconciled
+    require_reconciled(database, project, iteration, resolution=resolution)
 
 
 @contextmanager
@@ -91,11 +93,11 @@ def lane(database, project, iteration):
 
 
 @contextmanager
-def admission(database, project, iteration, error_class: type[Exception] = RepositoryError):
+def admission(database, project, iteration, error_class: type[Exception] = RepositoryError, *, resolution=None):
     """Linearize short durable claims with requests; never hold across worker/network I/O."""
     try:
         with lane(database, project, iteration):
-            require_active(database, project, iteration)
+            require_active(database, project, iteration, resolution=resolution)
             yield
     except RepositoryError as error:
         if error_class is RepositoryError:
@@ -204,13 +206,13 @@ def quiescent_lock(database):
 
 
 def live_attempts(checkpoint):
-    from .sandbox_guard import process_identity
+    from .sandbox_guard import process_identity, same_process
     result = []
     for assignment in checkpoint['assignments']:
         runtime = assignment.get('runtime')
         if not runtime:
             continue
-        live_controller = process_identity(runtime['controller_pid']) == runtime['controller_start']
+        live_controller = same_process(process_identity(runtime['controller_pid']), runtime['controller_start'])
         if (live_controller or runtime.get('container_removed') is not True or
                 runtime.get('status') in {'preparing', 'running', 'unconfirmed'} or runtime.get('error') == 'stop_unconfirmed'):
             result.append(assignment)
@@ -223,9 +225,12 @@ def inspect(database, project, iteration, operator):
         checkpoint = snapshot(database, project, iteration)
         validate_owner(checkpoint, operator)
         record = read(database, project, iteration)
+        from .recovery import pending_registration
+        restart_ready = (checkpoint['iteration'].get('restart_reconciliation', {}).get('status', 'ready') == 'ready' and
+                         not checkpoint['iteration'].get('main_incident') and not pending_registration(checkpoint['iteration']))
         if record is None:
             return {'project': project, 'iteration': iteration, 'action': None, 'state': None,
-                    'dispatch_allowed': checkpoint['iteration']['status'] == 'active', 'checkpoint': checkpoint}
+                    'dispatch_allowed': restart_ready and checkpoint['iteration']['status'] == 'active', 'checkpoint': checkpoint}
         require(record['operator_id'] == operator, 'Control operator binding changed.', 'approval_required')
         if record['action'] != 'resume':
             record['checkpoint'] = checkpoint
@@ -238,7 +243,7 @@ def inspect(database, project, iteration, operator):
                     a['runtime']['status'] not in {'preparing', 'running'} for a in active))
                 record['state'] = 'acknowledged' if acknowledged else 'requested'
             write(database, record)
-        return {**record, 'dispatch_allowed': record['action'] == 'resume' and checkpoint['iteration']['status'] == 'active',
+        return {**record, 'dispatch_allowed': restart_ready and record['action'] == 'resume' and checkpoint['iteration']['status'] == 'active',
                 'external_effects_undone': False}
 
 
@@ -267,7 +272,7 @@ def request(database, project, iteration, operator, action, reference):
 
 
 def stop_attempts(database, project, iteration, operator):
-    from .sandbox_guard import process_identity
+    from .sandbox_guard import process_identity, same_process
     from .sandbox_policy import Docker, retain_logs
     from .sandbox_source import physical
     with lane(database, project, iteration):
@@ -319,35 +324,48 @@ def stop_attempts(database, project, iteration, operator):
         assert root is not None
         from .assignments import digest
         for broker in checkpoint['brokers']:
-            if process_identity(broker['pid']) != broker['start'] and not os.path.lexists(broker['socket']):
+            if not same_process(process_identity(broker['pid']), broker['start']) and not os.path.lexists(broker['socket']):
                 # Explicit stop can retire a dead owner only after its capability is absent.
                 (root / ('broker-' + digest(broker['socket']) + '.json')).unlink()
 
 
-def resume(database, project, iteration, operator, reference):
+def resume_scope(database, project, iteration):
+    iterations = (json.loads(row[0]) for row in database.execute('SELECT payload FROM iterations'))
+    require(not any(other.get('status') == 'active' and
+                    (other['project_id'], other['iteration_id']) != (project, iteration)
+                    for other in iterations),
+            'Another iteration is active; resume cannot steal its scope.', 'control_conflict')
+
+
+def resume(database, project, iteration, operator, reference, github=None):
     require(text(reference) and len(reference) <= 500, 'Explicit resume reference required.', 'invalid_control')
     owner(database, project, iteration, operator)
     with quiescent_lock(database) as quiet:
         require(quiet, 'Controller operation still in flight; reconcile before resume.', 'control_busy')
         with lane(database, project, iteration):
-            checkpoint = snapshot(database, project, iteration)
-            validate_owner(checkpoint, operator)
             old = read(database, project, iteration)
             require(old is not None and old['operator_id'] == operator and old['action'] != 'resume',
                     'Explicit interrupted scope required.', 'control_conflict')
             assert old is not None
+            resume_scope(database, project, iteration)
+        require(github is not None, 'Explicit resume requires a fresh exact tracker/health capability.', 'reconciliation_required')
+        from .restart import reconcile
+        result = reconcile(database, project, iteration, operator, github)
+        require(result['status'] == 'ready', 'Fresh restart observations prevent resume.', 'reconciliation_required')
+        with lane(database, project, iteration):
+            checkpoint = snapshot(database, project, iteration)
+            validate_owner(checkpoint, operator)
+            latest = read(database, project, iteration)
+            require(latest is not None and latest['request_id'] == old['request_id'] and latest['action'] == old['action'],
+                    'Interruption changed during revalidation; obtain fresh explicit resume.', 'control_conflict')
             require(not live_attempts(checkpoint) and not checkpoint['brokers'] and not checkpoint['pending_model_operations'] and
                     not any(a.get('merge', {}).get('status') == 'pending' or a.get('publication', {}).get('status') == 'pending'
                             for a in checkpoint['assignments']),
                     'Reconcile live/unconfirmed workers and pending external intents first.', 'control_busy')
             item = checkpoint['iteration']
-            iterations = (json.loads(row[0]) for row in database.execute('SELECT payload FROM iterations'))
-            require(not any(other.get('status') == 'active' and
-                            (other['project_id'], other['iteration_id']) != (project, iteration)
-                            for other in iterations),
-                    'Another iteration is active; resume cannot steal its scope.', 'control_conflict')
+            resume_scope(database, project, iteration)
             with database:
-                if item['status'] != 'waiting-for-operator':
+                if item['status'] == 'paused':
                     item['status'] = 'active'
                 from .repositories import save_iteration
                 save_iteration(database, item)

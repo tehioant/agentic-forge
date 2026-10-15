@@ -88,7 +88,11 @@ class ControlFixture(unittest.TestCase):
         return controls.inspect(self.db, 'product', 'm1', '42')
 
     def resume(self):
-        return controls.resume(self.db, 'product', 'm1', '42', 'LABELED explicit resume')
+        # This component isolates interruption; fresh restart observation has its
+        # own exact-readback matrix in test_restart (no native precursors here).
+        with patch('factory_v1.restart.reconcile', return_value={'status': 'ready'}):
+            return controls.resume(self.db, 'product', 'm1', '42', 'LABELED explicit resume',
+                                   Mock(base='https://api.github.com'))
 
     def refused(self, code, function, *args, error_class: type[RepositoryError] | type[spending.SpendingError] = RepositoryError, **kwargs):
         with self.assertRaises(error_class) as caught:

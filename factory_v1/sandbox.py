@@ -148,6 +148,8 @@ def check_worker_evidence(assignment, root, inputs):
 def launch(state, project, iteration, operator, assignment_id, config_path, github):
     config = load_config(config_path)
     with closing(sqlite3.connect(state)) as database, state_lock(database):
+        from .restart import before_dispatch
+        before_dispatch(database, project, iteration, operator, github, force=True, assignment_id=assignment_id)
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
         if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
@@ -430,7 +432,8 @@ def reconcile(database, project, iteration, operator, assignment_id):
         assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         runtime = assignment.get('runtime')
         require(runtime is not None, 'Assignment has no attempt to reconcile.', 'not_found')
-        require(process_identity(runtime['controller_pid']) != runtime['controller_start'],
+        from .sandbox_guard import same_process
+        require(not same_process(process_identity(runtime['controller_pid']), runtime['controller_start']),
                 'Live controller still owns this attempt; stop it instead.', 'run_conflict')
     result = stop_assignment(database, project, iteration, operator, assignment_id)
     result['runtime']['error'] = 'controller_lost'

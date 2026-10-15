@@ -69,9 +69,7 @@ def load_config(path, operator):
             type(config['repository_id']) is int and config['repository_id'] > 0,
             'Exact host execution and merge target bindings required.', 'invalid_merge')
     require(valid_repository(config['repository']) and
-            all(isinstance(config[k], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,150}', config[k]) and
-                all(p not in {'', '.', '..'} and not p.endswith(('.', '.lock')) for p in config[k].split('/')) and
-                '..' not in config[k] and '@{' not in config[k] for k in ('base', 'branch')) and config['base'] != config['branch'],
+            all(publication.valid_ref(config[k]) for k in ('base', 'branch')) and config['base'] != config['branch'],
             'Unsafe or wrong fixed merge scope.', 'scope_mismatch')
     url = urllib.parse.urlsplit(config['api_base'])
     require(config['api_base'] == 'https://api.github.com' or

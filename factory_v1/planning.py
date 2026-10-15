@@ -128,9 +128,9 @@ def validate_documents(docs):
                 for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
 
 
-def checkpoint(database, item):
+def checkpoint(database, item, *, resolution=None):
     from .controls import admission
-    with admission(database, item['project_id'], item['iteration_id']):
+    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution):
         require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
         save_iteration(database, item)
         database.commit()

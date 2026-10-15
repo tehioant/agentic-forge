@@ -2,8 +2,9 @@
 
 Trusted host/operator controls for US-35/US-36 and pinned scenario 8 at
 `cccb21e35cc989a1ecd5a3c88f0689a694d77d9c`. This slice interrupts existing
-assignments; it does not introduce a scheduler, live provider capability, automatic
-restart reconciliation, rollback, issue closure or a new spending grant.
+assignments; it does not introduce a scheduler, live provider capability, rollback,
+issue closure or a new spending grant. The later deterministic restart boundary
+and fresh-readback resume contract are documented in [RESTART.md](RESTART.md) (#22).
 
 ## Public commands
 
@@ -25,7 +26,7 @@ mise exec -- python -m factory_v1 --state "$FACTORY_STATE" --operator-id "$FACTO
 
 mise exec -- python -m factory_v1 --state "$FACTORY_STATE" --operator-id "$FACTORY_OPERATOR" \
   resume --project "$FACTORY_PROJECT" --iteration "$FACTORY_ITERATION" \
-  --reference "$FACTORY_EXPLICIT_RESUME_MESSAGE"
+  --api-base "$FACTORY_GITHUB_CAPABILITY" --reference "$FACTORY_EXPLICIT_RESUME_MESSAGE"
 ```
 
 Success returns JSON/exit 0; structured refusals exit 2. Unknown scope, a different
@@ -120,8 +121,9 @@ steal another iteration's active scope or reset budgets, deadlines, input pins,
 claims or worker evidence. Resolve existing uncertainty with the existing exact
 `spend-reconcile`, `reconcile-assignment`, publication and merge readbacks first.
 An explicit emergency stop can retire a dead broker lease only after its socket is
-absent; a live or orphaned capability stays held for reconciliation. General
-restart reconciliation is the next slice, not implicit resume authorization here.
+absent; a live or orphaned capability stays held for reconciliation. `resume` now
+performs the fresh deterministic [restart reconciliation](RESTART.md) before releasing
+the hold. Reconciliation itself supplies no implicit resume authorization.
 
 Resume releases only the iteration hold. It does not replay a stopped attempt;
 `launch-assignment` still refuses an existing runtime. Prepare a valid fresh

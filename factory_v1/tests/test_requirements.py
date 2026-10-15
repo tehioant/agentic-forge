@@ -194,9 +194,12 @@ class RequirementChangeTests(unittest.TestCase):
 
     def test_unconfirmed_old_worker_cleanup_prevents_resume(self):
         self.published(); old = {'assignment_id': 'old', 'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
-                                'requirement_disposition': {'change_id': 'durable-notes'}, 'runtime': {'status': 'unconfirmed', 'container_removed': False}}
+                                'requirement_disposition': {'change_id': 'durable-notes'},
+                                'runtime': {'status': 'unconfirmed', 'container_removed': False,
+                                            'controller_pid': 123, 'controller_start': 'LABELED live fixture controller'}}
         self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('old', json.dumps(old))); self.database.commit()
-        with patch.object(requirement_publication, 'verify_synthesis'), self.assertRaises(repositories.RepositoryError) as caught: self.resume(self.fixture.stored())
+        with patch('factory_v1.restart.process_identity', return_value='LABELED live fixture controller'), \
+                patch.object(requirement_publication, 'verify_synthesis'), self.assertRaises(repositories.RepositoryError) as caught: self.resume(self.fixture.stored())
         self.assertEqual(caught.exception.code, 'worker_active'); self.fixture.set_field.assert_not_called()
         self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['status'], 'published')
 

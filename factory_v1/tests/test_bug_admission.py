@@ -53,7 +53,7 @@ class BugAdmissionTests(unittest.TestCase):
                      'correlation': {'stage': 'bug_synthesis_pending'}, 'execution_allowed': False,
                      'approval': {'operator_id': 'operator', 'reference': 'fixture:approval'},
                      'origin': {'conversation': 'fixture:origin'},
-                     'repository_onboarding': {'status': 'verified'},
+                     'repository_onboarding': {'status': 'verified', 'api_base': 'https://api.github.com', 'metadata': {'id': 123}},
                      'planning': {'revision': 1}, 'handoff': self.inputs['handoff'],
                      'budget': {'remaining': 3},
                      'ticket_work': {'assignment_id': 'tickets-assignment', 'input_digest': 'tickets-input-pin',
@@ -76,7 +76,7 @@ class BugAdmissionTests(unittest.TestCase):
         self.enterContext(patch.object(tickets, 'skill', return_value=self.work['skill']))
         self.enterContext(patch.object(tickets, 'external_contract', return_value=True))
         self.enterContext(patch.object(tickets, 'validate_contract'))
-        self.frontier = self.enterContext(patch.object(tickets, 'frontier', side_effect=lambda db, item, gh: item))
+        self.frontier = self.enterContext(patch.object(tickets, 'frontier', side_effect=lambda db, item, gh, **kwargs: item))
         self.observations = self.enterContext(patch.object(bugs, 'observations', return_value=[
             *self.work['candidates'], {'issue': self.issue}]))
         self.read_issue = self.enterContext(patch.object(bugs.gh, 'read_issue', side_effect=lambda gh, repo, n: copy.deepcopy(self.issues[n])))
@@ -145,7 +145,7 @@ class BugAdmissionTests(unittest.TestCase):
         self.item['bug_work'] = {key: self.work}
         self.item['bug_discoveries'] = {'original-observer': {'key': key, 'request_digest': 'original-request'}}
         self.save()
-        self.context.side_effect = lambda *args: self.pause((self.inputs, self.board, {'10': self.inputs}))
+        self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
         before = self.stored()
         after = self.assert_paused(lambda: bugs.synthesize(self.database, self.item, {
             'discovery_id': 'new-observer', 'skill': 'fixture:to-tickets', 'discovery': self.discovery}, self.github))
@@ -158,7 +158,7 @@ class BugAdmissionTests(unittest.TestCase):
         self.work.pop('bug')
         evidence = self.work.pop('execution')
         self.save()
-        self.context.side_effect = lambda *args: self.pause((self.inputs, self.board, {'10': self.inputs}))
+        self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
         before = self.stored()
         after = self.assert_paused(lambda: bugs.complete(self.database, self.item, {
             'assignment_id': self.work['assignment_id'], 'input_digest': self.work['input_digest'],

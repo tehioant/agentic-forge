@@ -114,6 +114,8 @@ class CleanupErrorTests(unittest.TestCase):
                       'handoff': {'stage': 'implementation', 'profile': {'home': str(self.root / 'absent-home')},
                                   'workspace': str(self.root / 'source'), 'baseline': 'b' * 40,
                                   'candidate': None}}
+        self.database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment), 'a'))
+        self.database.commit()
         config = {'subscription_socket': str(self.root / 'unused-socket'),
                   'artifacts_root': str(artifacts), 'image': 'fixture', 'limits': {'seconds': 1}}
         (self.root / 'source').mkdir()
@@ -122,6 +124,7 @@ class CleanupErrorTests(unittest.TestCase):
         docker.image.return_value = 'fixture'
         docker.remove.side_effect = FileNotFoundError('injected Docker disappearance during cleanup')
         with ExitStack() as stack:
+            stack.enter_context(patch('factory_v1.restart.before_dispatch'))
             stack.enter_context(patch('factory_v1.sandbox.load_config', return_value=config))
             stack.enter_context(patch('factory_v1.sandbox.Docker', return_value=docker))
             stack.enter_context(patch('factory_v1.model_access.transport'))
