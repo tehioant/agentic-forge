@@ -354,7 +354,19 @@ class PublicationComponentTests(unittest.TestCase):
         patcher = mock.patch.object(publication.GitHub, 'request', side_effect=self.external)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.plan = self.publish(plan_only=True)
+        # Explicit Git byte inputs; no publisher or assembler precursor runs here.
+        change = {'path': 'factory_v1/behavior.py', 'mode': '100644', 'type': 'blob',
+                  'sha': git_object('blob', b'new behavior\n')}
+        subtree = git_tree([{**change, 'path': 'behavior.py'}])
+        tree = git_tree([dict(e, sha=subtree) if e['path'] == 'factory_v1' else e
+                         for e in self.entries if '/' not in e['path']])
+        message = 'Factory candidate: Refs #10'
+        raw = (f"tree {tree}\nparent {'a' * 40}\n"
+               'author Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               'committer Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               f'\n{message}\n').encode()
+        self.plan = {'status': 'plan_only', 'candidate': git_object('commit', raw),
+                     'tree': tree, 'base_tree': self.tree, 'changes': [change], 'message': message}
         self.config['candidate'] = self.plan['candidate']
         self.write_config()
         self.calls.clear()

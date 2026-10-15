@@ -65,23 +65,23 @@ class ProvenanceTests(unittest.TestCase):
 
     def test_forged_terminal_transcript_cannot_be_promoted_to_trusted_execution(self):
         fixture = self.fixture
-        def forge(root):
-            result_path = root / 'scratch/result.json'
-            result = json.loads(result_path.read_text())
-            result['tests'][0]['result'] = 'FORGED: 99 tests OK'
-            conversation_path = root / 'scratch/conversation.json'
-            conversation = json.loads(conversation_path.read_text())
-            conversation['messages'][1]['content'] = 'FORGED: 99 tests OK'
-            result_path.write_text(json.dumps(result))
-            conversation_path.write_text(json.dumps(conversation))
-        fixture.worker_boundary = forge
-        result = fixture.launch()
-        self.assertEqual(result['runtime']['status'], 'complete', result)
+        component = test_sandbox.FinalizationFixture(self, fixture)
+        root = component.root
+        result_path = root / 'scratch/result.json'
+        report = json.loads(result_path.read_text())
+        report['tests'][0]['result'] = 'FORGED: 99 tests OK'
+        conversation_path = root / 'scratch/conversation.json'
+        conversation = json.loads(conversation_path.read_text())
+        conversation['messages'][1]['content'] = 'FORGED: 99 tests OK'
+        result_path.write_text(json.dumps(report))
+        conversation_path.write_text(json.dumps(conversation))
+        result = component.finalize()
         self.assertFalse(result['result_disposition']['trusted_execution'])
         self.assertFalse(result['result_disposition']['advance_allowed'])
         self.assertFalse(result['result_disposition']['close_allowed'])
         self.assertFalse(result['result_disposition']['checks_verified'])
         self.assertFalse((fixture.attempt_root() / 'verified-tests.json').exists())
+        self.assertEqual(result['submitted_result'], report)
 
     def test_controller_checks_are_private_read_only_and_separate_from_worker_claims(self):
         check = CheckFixture(self)
@@ -110,28 +110,19 @@ class ProvenanceTests(unittest.TestCase):
 
     def launch_with_controller_checks(self, *, exit_code=0):
         fixture = self.fixture
-        config = test_sandbox.launcher_config(fixture.root)
-        config['verification_commands'] = ['python -m unittest selected_component']
-        fixture.config.write_text(json.dumps(config))
+        component = test_sandbox.FinalizationFixture(self, fixture)
+        component.config['verification_commands'] = ['python -m unittest selected_component']
         docker = Mock()
         docker.image.return_value = 'fixture-image-id'
-        inspections = []
-        def inspect(name):
-            root = fixture.attempt_root()
-            mounts = {'/workspace': (str(root / 'workspace'), False),
-                      '/scratch': (str(root / 'checks/scratch'), True),
-                      '/inputs': (str(root / 'checks/inputs'), False)}
-            observed = test_sandbox.container_inspection(config, name, mounts, exit_code=exit_code)
-            inspections.append(observed)
-            return observed
-        docker.inspect.side_effect = inspect
-        records = [{'command': config['verification_commands'][0], 'exit_code': exit_code,
+        mounts = {'/workspace': (str(component.root / 'workspace'), False),
+                  '/scratch': (str(component.root / 'checks/scratch'), True),
+                  '/inputs': (str(component.root / 'checks/inputs'), False)}
+        docker.inspect.side_effect = [test_sandbox.container_inspection(component.config, component.runtime['container'], mounts),
+                                      {'State': {'Running': False, 'ExitCode': exit_code}}]
+        records = [{'command': component.config['verification_commands'][0], 'exit_code': exit_code,
                     'stdout': 'labeled controller output', 'stderr': '', 'output_truncated': False}]
-        def call(*args, **kwargs):
-            if args[0] == 'logs':
-                return json.dumps({'run_id': fixture.stored()['runtime']['run_id'], 'records': records}).encode()
-            return b''
-        docker.call.side_effect = call
+        docker.call.side_effect = lambda *args, **kwargs: (json.dumps({'run_id': component.runtime['run_id'], 'records': records}).encode()
+                                                         if args[0] == 'logs' else b'')
         verifier = Mock(wraps=sandbox_checks.verify_checks)
         store = Mock(wraps=assignments.store_result)
         def setup(mocks):
@@ -139,9 +130,14 @@ class ProvenanceTests(unittest.TestCase):
             mocks.enter_context(patch.object(sandbox_checks.time, 'monotonic', return_value=100))
             mocks.enter_context(patch.object(sandbox, 'verify_checks', verifier))
             mocks.enter_context(patch.object(assignments, 'store_result', store))
-        result = fixture.launch(setup=setup)
+        if exit_code:
+            with self.assertRaises(RepositoryError) as error:
+                component.finalize(setup=setup)
+            self.assertEqual(error.exception.code, 'verification_failed')
+            result = fixture.stored()
+        else:
+            result = component.finalize(setup=setup)
         verifier.assert_called_once()
-        self.assertEqual(len(inspections), 2)
         docker.remove.assert_called_once_with(result['runtime']['container'])
         self.assertEqual([call.args[0] for call in docker.call.call_args_list], ['create', 'start', 'logs'] if exit_code else
                          ['create', 'start', 'logs', 'logs'])
@@ -150,7 +146,7 @@ class ProvenanceTests(unittest.TestCase):
     def test_launch_successful_controller_checks_are_wired_once_and_remain_untrusted(self):
         result, store, records = self.launch_with_controller_checks()
         root = self.fixture.attempt_root()
-        self.assertEqual(result['runtime']['status'], 'complete')
+        self.assertEqual(result['runtime']['status'], 'running')  # Admission does not finish ownership.
         self.assertEqual(self.fixture.stored(), result)
         self.assertTrue(result['result_disposition']['checks_verified'])
         self.assertTrue(result['result_disposition']['isolated_execution'])
@@ -170,10 +166,7 @@ class ProvenanceTests(unittest.TestCase):
     def test_launch_failed_real_controller_checks_retain_scratch_without_store_result(self):
         result, store, _ = self.launch_with_controller_checks(exit_code=3)
         root = self.fixture.attempt_root()
-        self.assertEqual(result['runtime']['status'], 'failed')
-        self.assertEqual(result['runtime']['error'], 'verification_failed')
-        self.assertTrue(result['runtime']['recoverable'])
-        self.assertTrue(result['runtime']['container_removed'])
+        self.assertEqual(result['runtime']['status'], 'running')
         self.assertEqual(self.fixture.stored(), result)
         self.assertNotIn('submitted_result', result)
         self.assertNotIn('result_disposition', result)
@@ -262,12 +255,25 @@ class ProvenanceTests(unittest.TestCase):
                 check.docker.remove.assert_called_once()
 
     def signal_during_checks(self, number):
-        fixture = self.fixture
-        def cancel_checks(root, config, runtime, deadline):
-            fixture.cancel(number)
-            raise RepositoryError('cancelled', 'labeled check boundary interrupted')
-        self.assert_stopped(fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch.object(sandbox, 'verify_checks', side_effect=cancel_checks))))
+        component = test_sandbox.FinalizationFixture(self, self.fixture)
+        check = CheckFixture(self)
+        check.root = component.root
+        check.runtime = component.runtime
+        check.mounts = {'/workspace': (str(check.root / 'workspace'), False),
+                        '/scratch': (str(check.root / 'checks/scratch'), True),
+                        '/inputs': (str(check.root / 'checks/inputs'), False)}
+        check.docker.inspect.side_effect = [test_sandbox.container_inspection(check.config, check.runtime['container'], check.mounts)]
+        check.boundary = lambda command: component.cancel(number, None) if command == 'start' else None
+        with patch.object(sandbox_checks, 'Docker', return_value=check.docker), \
+                patch.object(sandbox_checks.time, 'monotonic', return_value=100), \
+                self.assertRaises(RepositoryError) as error:
+            sandbox.verify_checks(component.root, check.config, component.runtime, 103)
+        self.assertEqual(error.exception.code, 'cancelled')
+        self.assertTrue(component.stop.is_set())
+        self.assertTrue((component.root / 'stop').exists())
+        self.assertNotIn('submitted_result', self.fixture.stored())
+        self.assertFalse((component.root / 'controller-checks.json').exists())
+        check.docker.remove.assert_called_once()
 
     def test_sigterm_handler_during_controller_checks_cancels_launch(self):
         self.signal_during_checks(signal.SIGTERM)
@@ -277,25 +283,41 @@ class ProvenanceTests(unittest.TestCase):
 
     def test_cancellation_after_worker_evidence_cannot_submit_result(self):
         fixture = self.fixture
+        component = test_sandbox.FinalizationFixture(self, fixture)
         original = sandbox.check_worker_evidence
+        injected = []
         def interrupted(*args):
             result = original(*args)
-            fixture.cancel()
+            component.cancel(signal.SIGTERM, None)
+            injected.append(True)
             return result
-        self.assert_stopped(fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch.object(sandbox, 'check_worker_evidence', side_effect=interrupted))))
+        with self.assertRaises(RepositoryError) as error:
+            component.finalize(setup=lambda mocks: mocks.enter_context(
+                patch.object(sandbox, 'check_worker_evidence', side_effect=interrupted)))
+        self.assertEqual(error.exception.code, 'cancelled')
+        self.assertTrue(injected)
+        self.assertNotIn('submitted_result', fixture.stored())
 
     def signal_during_result_revalidation(self, number):
         fixture = self.fixture
+        component = test_sandbox.FinalizationFixture(self, fixture)
+        injected = []
+        def pause(db):
+            component.cancel(number, None)
+            injected.append(True)
         original = assignments.store_result
         def store(*args, **kwargs):
-            fixture.preparing = lambda db: fixture.cancel(number)
+            fixture.preparing = pause
             try:
                 return original(*args, **kwargs)
             finally:
                 fixture.preparing = None
-        self.assert_stopped(fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch.object(assignments, 'store_result', side_effect=store))))
+        with self.assertRaises(RepositoryError) as error:
+            component.finalize(setup=lambda mocks: mocks.enter_context(
+                patch.object(assignments, 'store_result', side_effect=store)))
+        self.assertEqual(error.exception.code, 'cancelled')
+        self.assertTrue(injected)
+        self.assertNotIn('submitted_result', fixture.stored())
 
     def test_sigterm_handler_during_final_result_revalidation_is_not_admitted(self):
         self.signal_during_result_revalidation(signal.SIGTERM)
@@ -305,49 +327,72 @@ class ProvenanceTests(unittest.TestCase):
 
     def test_signal_after_result_commit_cannot_report_complete(self):
         fixture = self.fixture
+        component = test_sandbox.FinalizationFixture(self, fixture)
         original = assignments.store_result
+        committed = []
         def interrupted(*args, **kwargs):
             result = original(*args, **kwargs)
-            fixture.cancel()
+            committed.append(fixture.stored()['submitted_result'])
+            component.cancel(signal.SIGTERM, None)
             return result
-        self.assert_stopped(fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch.object(assignments, 'store_result', side_effect=interrupted))), submitted=True)
+        with self.assertRaises(RepositoryError) as error:
+            component.finalize(setup=lambda mocks: mocks.enter_context(
+                patch.object(assignments, 'store_result', side_effect=interrupted)))
+        self.assertEqual(error.exception.code, 'cancelled')
+        self.assertEqual(committed, [component.result])
+        result = fixture.stored()
+        self.assertEqual(result['submitted_result'], component.result)
+        for flag in ('trusted_execution', 'advance_allowed', 'close_allowed'):
+            self.assertFalse(result['result_disposition'][flag])
+        self.assertNotEqual(result['runtime']['status'], 'complete')
 
     def test_signal_before_result_commit_rolls_back_submission(self):
         fixture = self.fixture
+        component = test_sandbox.FinalizationFixture(self, fixture)
         connect = sqlite3.connect
         updated = []
         class CancelledCommit(sqlite3.Connection):
             def execute(connection, sql, parameters=()):
                 cursor = super().execute(sql, parameters)
                 if not updated and sql.startswith('UPDATE role_assignments') and 'submitted_result' in str(parameters):
-                    fixture.cancel()
+                    component.cancel(signal.SIGTERM, None)
                     updated.append(True)
                 return cursor
         def controlled_connect(*args, **kwargs):
             return connect(*args, **kwargs, factory=CancelledCommit)
-        self.assert_stopped(fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch.object(sqlite3, 'connect', side_effect=controlled_connect))))
+        with self.assertRaises(RepositoryError) as error:
+            component.finalize(setup=lambda mocks: mocks.enter_context(
+                patch.object(sqlite3, 'connect', side_effect=controlled_connect)))
+        self.assertEqual(error.exception.code, 'cancelled')
         self.assertTrue(updated)
+        self.assertNotIn('submitted_result', fixture.stored())
+        with connect(fixture.state) as fresh:
+            self.assertNotIn('submitted_result', json.loads(fresh.execute('SELECT payload FROM role_assignments').fetchone()[0]))
 
     def test_signal_during_final_cleanup_cannot_report_complete(self):
         fixture = self.fixture
-        def interrupted(name):
-            if (fixture.attempt_root() / 'worker-reported-tests.json').exists():
-                fixture.cancel()
-        fixture.docker.remove.side_effect = interrupted
-        self.assert_stopped(fixture.launch(), submitted=True)
+        component = test_sandbox.FinalizationFixture(self, fixture)
+        assignment = fixture.stored()
+        assignment['submitted_result'] = component.result
+        assignment['result_disposition'] = {'trusted_execution': False, 'advance_allowed': False, 'close_allowed': False}
+        with fixture.db:
+            fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+        fixture.docker.remove.side_effect = lambda name: component.cancel(signal.SIGTERM, None)
+        self.assert_stopped(component.cleanup(), submitted=True)
+        fixture.helper.join.assert_called_once_with(timeout=1)
+        fixture.guard.wait.assert_called_once_with(timeout=35)
 
     def test_launcher_does_not_release_ownership_when_broker_join_is_unconfirmed(self):
         fixture = self.fixture
+        component = test_sandbox.FinalizationFixture(self, fixture)
         fixture.helper.is_alive.return_value = True
         fixture.helper.is_alive.side_effect = None
-        result = fixture.launch()
+        component.cancel(signal.SIGTERM, None)
+        result = component.cleanup()
         self.assertEqual(result['runtime']['status'], 'unconfirmed', result)
         self.assertEqual(result['runtime']['error'], 'stop_unconfirmed')
         self.assertFalse(result['runtime']['container_removed'])
         capability = Path(json.loads((fixture.attempt_root() / 'capability-path.json').read_text()))
-        self.addCleanup(test_sandbox.shutil.rmtree, capability, ignore_errors=True)
         self.assertTrue(capability.exists())
         fixture.helper.join.assert_called_once_with(timeout=1)
         self.assertEqual(fixture.stored(), result)

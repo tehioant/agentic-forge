@@ -17,7 +17,8 @@ from factory_v1.repositories import RepositoryError, save_iteration
 
 def item():
     return {'project_id': 'p', 'iteration_id': 'm1', 'repository': 'example/product',
-            'repository_onboarding': {'metadata': {'id': 7}}, 'approval': {'operator_id': '42', 'reference': 'approved'},
+            'repository_onboarding': {'metadata': {'id': 7}, 'api_base': 'https://api.github.com'},
+            'approval': {'operator_id': '42', 'reference': 'approved'},
             'status': 'active', 'execution_allowed': False, 'planning': {'status': 'complete'},
             'ticket_work': {'publication_complete': True}}
 
@@ -284,7 +285,7 @@ class PersistentAdmissionComponents(unittest.TestCase):
         save_iteration(self.db, self.saved)
         self.db.commit()
         delivered = row('candidate', 'simplify')
-        delivered['merge'] = {'status': 'delivered'}
+        delivered['merge'] = {'status': 'delivered', 'close_allowed': True, 'failure': None}
         calls = []
         with patch.object(dispatch.merge, 'controller_paths'), patch.object(dispatch.publication, 'read_json', return_value=config()), \
              patch.object(dispatch, 'validate', side_effect=lambda value, _: value), patch.object(assignments, 'rows', return_value=[delivered]), \
@@ -399,7 +400,9 @@ class PersistentAdmissionComponents(unittest.TestCase):
     def test_unhealthy_cycle_dispatches_only_for_registered_repair_selection(self):
         self.service['delivery_config'] = '/private/delivery'
         with patch.object(service.delivery, 'load_config', return_value={}), patch.object(service.delivery, 'sample', return_value={'evidence': {'status': 'unknown'}}), \
-             patch.object(dispatch.merge, 'controller_paths'), patch.object(service, 'dispatch') as invoke:
+             patch.object(dispatch.merge, 'controller_paths'), \
+             patch.object(service, 'inspect_readiness', return_value={'iteration_runnable': True}), \
+             patch.object(service, 'dispatch') as invoke:
             self.assertEqual(service.cycle(self.service, Mock())['blockers'], ['delivery_not_healthy'])
             invoke.assert_not_called()
             self.saved.update(main_incident={'incident_id': 'incident'}, main_recoveries={'incident': {'status': 'registered'}})

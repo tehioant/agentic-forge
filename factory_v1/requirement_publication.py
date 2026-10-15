@@ -73,11 +73,11 @@ def version_documents(database, item, record, github):
             for name, content in record['documents'].items():
                 raw = content.encode()
                 blob = publication.object_sha('blob', raw)
-                tickets.active(item, database)
+                tickets.effect_check(database, item)
                 created = github.request(prefix + '/git/blobs', {'encoding': 'base64', 'content': base64.b64encode(raw).decode()})
                 require(created.get('sha') == blob, 'Exact versioned blob did not read back.', 'publication_mismatch')
                 blobs.append({'path': path + '/' + name, 'mode': '100644', 'type': 'blob', 'sha': blob})
-            tickets.active(item, database)
+            tickets.effect_check(database, item)
             tree = github.request(prefix + '/git/trees', {'base_tree': commit['tree']['sha'], 'tree': blobs})
             require(isinstance(tree, dict) and isinstance(tree.get('sha'), str) and len(tree['sha']) == 40,
                     'Versioned tree unavailable.', 'publication_mismatch')
@@ -86,6 +86,7 @@ def version_documents(database, item, record, github):
         require(not journal.get('commit_intent'), 'Unknown commit outcome needs reconciliation; no repeated commit creation.', 'publication_uncertain')
         journal['commit_intent'] = True
         requirements.checkpoint(database, item)
+        tickets.effect_check(database, item)
         result = github.request(prefix + '/git/commits', {'message': 'Factory requirement revision ' + change_id + '\n',
                                  'tree': journal['tree'], 'parents': [journal['parent']]})
         require(isinstance(result, dict) and isinstance(result.get('sha'), str) and len(result['sha']) == 40,
@@ -98,6 +99,7 @@ def version_documents(database, item, record, github):
         require(not journal.get('ref_intent'), 'Unknown revision ref outcome; no duplicate mutation.', 'publication_uncertain')
         journal['ref_intent'] = True
         requirements.checkpoint(database, item)
+        tickets.effect_check(database, item)
         try:
             github.request(prefix + '/git/refs', {'ref': 'refs/heads/' + branch, 'sha': journal['commit']})
         except RepositoryError:
@@ -122,6 +124,7 @@ def spec_issue(database, item, record, github):
         require(not journal.get('issue_intent'), 'Uncertain spec creation; no duplicate issue.', 'publication_uncertain')
         journal['issue_intent'] = True
         requirements.checkpoint(database, item)
+        tickets.effect_check(database, item)
         created = github.request(prefix + '/issues', {'title': title, 'body': record['documents']['milestone.md'], 'labels': ['ready-for-agent']})
         identity = tickets.gh.issue_identity(created, item['repository'])
         number = identity['number']
@@ -180,6 +183,7 @@ def publish(database, project, iteration, operator, request, github):
     requirements.checkpoint(database, item)
     if record['status'] == 'published':
         verify_publication(database, item, record, github)
+        requirements.checkpoint(database, item)
         return item
     record['status'] = 'publication-pending'
     requirements.checkpoint(database, item)
@@ -209,6 +213,7 @@ def publish(database, project, iteration, operator, request, github):
                     'Affected update drift or uncertain response requires reconciliation.', 'publication_uncertain')
             record.setdefault('update_intents', []).append(key)
             requirements.checkpoint(database, item)
+            tickets.effect_check(database, item)
             try:
                 github.request('/repos/' + item['repository'] + '/issues/' + key, expected, 'PATCH')
             except RepositoryError:

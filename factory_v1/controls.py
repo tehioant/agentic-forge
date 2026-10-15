@@ -73,7 +73,9 @@ def blocked(database, project, iteration):
 def require_active(database, project, iteration, *, resolution=None):
     require(not blocked(database, project, iteration), 'Operator interruption prevents admission until explicit resume.', 'iteration_paused')
     from .restart import require_reconciled
-    require_reconciled(database, project, iteration, resolution=resolution)
+    from .readiness_gate import active_repair
+    require_reconciled(database, project, iteration, resolution=resolution,
+                       allow_recovery=active_repair(database, project, iteration))
 
 
 @contextmanager
@@ -93,11 +95,13 @@ def lane(database, project, iteration):
 
 
 @contextmanager
-def admission(database, project, iteration, error_class: type[Exception] = RepositoryError, *, resolution=None):
+def admission(database, project, iteration, error_class: type[Exception] = RepositoryError, *, resolution=None, selection=None, operation='work'):
     """Linearize short durable claims with requests; never hold across worker/network I/O."""
     try:
-        with lane(database, project, iteration):
-            require_active(database, project, iteration, resolution=resolution)
+        from .readiness_gate import admission as supervised_admission
+        with supervised_admission(database, project, iteration, resolution=resolution, selection=selection, operation=operation):
+            if operation != 'notification':
+                require_active(database, project, iteration, resolution=resolution)
             yield
     except RepositoryError as error:
         if error_class is RepositoryError:

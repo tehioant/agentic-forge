@@ -130,18 +130,22 @@ class SynthesisAdmissionTests(unittest.TestCase):
         return dispatch.synthesize(self.db, self.item, self.config, Mock(), **kwargs)
 
     def test_pause_after_last_outside_read_prevents_spawn(self):
-        original = controls.blocked
-        reads = 0
+        original = execution.invoke
         paused = threading.Event()
-        def read_return_pause(*args):
-            nonlocal reads
-            prior = original(*args)
-            reads += 1
-            if reads == 2:
+        def invoke(config, payload, *, cancelled, admission):
+            def read_return_pause():
+                prior = cancelled()
+                # This is invoke's last outside-lane read, not checkpoint's
+                # internal admission reads. Fail promptly if it moves under a lock.
+                root, _ = controls.paths(self.db, 'p', 'i')
+                assert root is not None
+                with (root / 'lock').open('r+') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 self.pause()
                 paused.set()
-            return prior
-        with patch.object(controls, 'blocked', side_effect=read_return_pause):
+                return prior
+            return original(config, payload, cancelled=read_return_pause, admission=admission)
+        with patch.object(execution, 'invoke', side_effect=invoke):
             with self.assertRaises(RepositoryError) as caught:
                 self.synthesize()
         self.assertTrue(paused.is_set())
@@ -241,7 +245,9 @@ class SynthesisAdmissionTests(unittest.TestCase):
         self.complete.assert_not_called()
 
     def test_revision_spawn_uses_existing_checkpoint_hold_semantics(self):
-        record = {'status': 'resolved', 'affected': [10], 'requirements': {'10': 'changed'}}
+        self.item['execution_allowed'] = False
+        record = {'request': {'change_id': 'change'}, 'status': 'resolved',
+                  'affected': [10], 'requirements': {'10': 'changed'}}
         self.item['requirement_changes'] = {'change': record}
         observed = []
         def approved(_config, _work, *, cancelled, admission):

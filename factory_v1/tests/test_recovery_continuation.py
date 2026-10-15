@@ -11,8 +11,7 @@ from factory_v1.tests.test_recovery_components import RecoveryComponentFixture
 
 class RecoveryContinuationTests(RecoveryComponentFixture):
     def failed_root(self):
-        self.register()
-        prior = self.prepare()
+        prior = self.seed_assignment()
         prior['runtime'] = {'status': 'stopped', 'container_removed': True, 'error': 'controller_lost',
                             'recoverable': True, 'run_id': 'lost-run', 'artifacts': str(self.root / 'failed'),
                             'controller_pid': -1, 'controller_start': 'SIMULATED absent controller'}
@@ -38,6 +37,25 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         with patch.object(assignments, 'admission_preview', return_value={'scope': 'simulated'}):
             return recovery.continue_recovery(self.db, 'p', 'i', '42', path, self.github)
 
+    def seed_continued(self, before, prior, authorization):
+        item = copy.deepcopy(before)
+        record = recovery.active(item)
+        assert record is not None
+        record['continuations'] = [{'authorization': authorization, 'prior_config': record['config'],
+            'prior_assignment': prior['assignment_id'], 'prior_handoff_digest': prior['handoff_digest'],
+            'prior_runtime': prior['runtime'], 'prior_revision': prior['revision']}]
+        config = {k: authorization[k] for k in recovery.CONFIG_FIELDS}
+        record.update(config=config, assignment=None, status='registered')
+        record['parked'] = list(dict.fromkeys([*record['parked'], prior['assignment_id']]))
+        item['main_incident'].update(recovery_assignment=assignments.digest(config), recovery_issue=20)
+        historical = prior | {'recovery_disposition': config['incident_id']}
+        with self.db:
+            self.db.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
+                (json.dumps(historical), prior['assignment_id']))
+            save_iteration(self.db, item)
+            self.db.execute('UPDATE delivery_incidents SET payload=? WHERE id=?',
+                (json.dumps(item['main_incident']), config['incident_id']))
+
     def test_reconciled_infrastructure_continuation_preserves_failed_execution_and_budget(self):
         prior = self.failed_root()
         before = self.stored()
@@ -46,6 +64,17 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
             self.prepare('fresh')  # An implicit retry is still forbidden.
         record = self.continue_recovery(path)
         self.assertEqual(record, self.continue_recovery(path))
+        durable = self.stored()
+        history = recovery.active(durable)['continuations'][0]
+        self.assertEqual(history['prior_runtime'], prior['runtime'])
+        self.assertEqual(history['prior_config'], recovery.active(before)['config'])
+        self.assertEqual(history['authorization'], config)
+        old = next(a for a in assignments.rows(self.db) if a['assignment_id'] == prior['assignment_id'])
+        self.assertEqual(old['runtime'], prior['runtime'])
+        self.assertEqual(old['recovery_disposition'], self.authorization['incident_id'])
+        self.assertEqual(durable['budget'], before['budget'])
+        self.assertEqual(durable['main_incident']['incident_id'], before['main_incident']['incident_id'])
+        self.seed_continued(before, prior, config)
         fresh = self.prepare('fresh')
         self.assertNotIn('runtime', fresh)
         self.assertNotEqual(fresh['assignment_id'], prior['assignment_id'])
@@ -166,6 +195,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         path, config = self.continuation_file(prior, 'revision', 'repair-v2')
         config['issue'] = updated
         path.write_text(json.dumps(config))
+        before = self.stored()
         with self.revision_seams(axis, binding):
             for mutate in (lambda i: i['requirement_changes']['repair-v2'].update(status='published'),
                            lambda i: i['stuck_work'][prior['assignment_id']]['applied_response'].update(reference='unrelated'),
@@ -184,6 +214,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
             record = self.continue_recovery(path)
         self.assertEqual(record['config']['issue'], updated)
         self.assertEqual(record['continuations'][0]['prior_config']['issue'], self.pin)
+        self.seed_continued(before, prior, config)
         self.pin = updated
         with self.preparation_seams():
             fresh = recovery.prepare(self.db, 'p', 'i', '42', self.request('revised') | {'spec_commit': 'b' * 40}, self.github)
@@ -201,7 +232,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
         with self.db:
             save_iteration(self.db, item)
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         write = self.github.request.side_effect
         def block(*args):
@@ -342,7 +373,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         item['ticket_work']['board']['scope'] = {'id': 'S', 'options': {'i': 'I'}}
         with self.db:
             save_iteration(self.db, item)
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         member['scope'] = 'I'
         calls = []

@@ -143,11 +143,20 @@ def _block(database, item, reason, scope):
 
 def admission_preview(database, scope, reserve=1, now=None, allowance_only=True):
     """Read-only policy check; actual operations must still reserve at call time."""
+    return _preview(database, scope, reserve, now, allowance_only, require_active=True)
+
+
+def capacity_preview(database, scope, reserve=1, now=None, allowance_only=True):
+    """Inspect existing allowance while paused; never authorize or reserve a call."""
+    return _preview(database, scope, reserve, now, allowance_only, require_active=False)
+
+
+def _preview(database, scope, reserve, now, allowance_only, *, require_active):
     scope = _scope(*scope)
     if type(reserve) is not int or not 0 < reserve <= MAX_UNITS:
         raise SpendingError('invalid_reservation', 'Reservation must be a bounded positive integer.')
     now = int(time.time()) if now is None else now
-    item = _iteration(database, scope[0], scope[1], require_active=True)
+    item = _iteration(database, scope[0], scope[1], require_active=require_active)
     tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not {'model_operations', 'model_grants'} <= tables:
         raise SpendingError('spending_blocked', 'No durable spending policy is available.')
@@ -276,6 +285,18 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
         with state_lock(database), database:
             _finish(database, operation_id, 'failed', 0, 'expired_before_outbound_io')
         raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O; no operation was initiated.', recorded=True)
+    try:
+        from .readiness_gate import check
+        check(database, scope[0], scope[1], operation='effect')
+        item = _iteration(database, scope[0], scope[1], require_active=True)
+        if item.get('model_access', {}).get('status') == 'blocked':
+            raise SpendingError('spending_blocked', 'Current model access remains blocked.')
+        if admission_check:
+            admission_check(database)
+    except (RepositoryError, SpendingError) as error:
+        with state_lock(database), database:
+            _finish(database, operation_id, 'failed', 0, 'refused_before_outbound_io')
+        raise SpendingError(error.code, 'Final model admission refused; no request forwarded.', recorded=True) from error
     try:
         units, result = adapter.call(payload)
         if ((stop_event is not None and stop_event.is_set())

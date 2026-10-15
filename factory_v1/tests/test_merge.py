@@ -1059,6 +1059,133 @@ class MergeComponentTests(unittest.TestCase):
         self.assertEqual(self.work_issue['state'], 'open')
 
 
+class BranchCorrectiveReopenTests(unittest.TestCase):
+    def case(self):
+        case = MergeComponentTests()
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        case.work_issue['state'] = 'closed'
+        return case
+
+    def refusal(self, case):
+        from factory_v1.effect_resolution import branch_reopen_binding
+        row = case.stored()
+        row['merge_refusal'] = {'code': 'not_integrated', 'candidate': case.config['head'],
+            'revision': row['revision'], 'correction': {
+                'authority': {k: v for k, v in case.config.items() if k != 'bearer'},
+                'config_path': str(case.config_path), 'binding': branch_reopen_binding(row),
+                'issue': copy.deepcopy(case.work_issue), 'pr': copy.deepcopy(case.pr)}}
+        case.store(row)
+        return row
+
+    def reopen(self, case, row):
+        merge.reopen(case.api, row, case.config, copy.deepcopy(case.work_issue), database=case.db)
+
+    def test_branch_refusal_reopens_only_exact_issue_without_delivery_authority(self):
+        from factory_v1 import effect_resolution
+        case = self.case()
+        row = self.refusal(case)
+        resolution = effect_resolution.bound(case.db, case.item, 'branch-reopen', row['assignment_id'])
+        self.assertEqual(effect_resolution.permitted(case.db, 'product', 'm1', resolution), set())
+        self.reopen(case, row)
+        self.assertEqual(case.work_issue['state'], 'open')
+        self.assertEqual(case.mutations(), [('PATCH', '/issues/10', {'state': 'open', 'state_reason': 'reopened'})])
+        self.assertNotIn('merge', case.stored())
+        self.assertEqual(case.stored()['merge_refusal'], row['merge_refusal'])
+
+    def test_branch_lifecycle_lost_open_response_retains_primary_and_no_merge_intent(self):
+        case = self.case()
+        case.drop_state = True
+        with self.assertRaises(RepositoryError) as caught:
+            case.lifecycle('verify-delivery')
+        self.assertEqual(caught.exception.code, 'not_integrated')
+        self.assertEqual(case.work_issue['state'], 'open')
+        self.assertNotIn('merge', case.stored())
+        self.assertEqual(len(case.mutations('PATCH')), 1)
+        self.assertEqual(case.mutations('PUT'), [])
+        reads = sum(c[:2] == ('GET', '/issues/10') for c in case.calls)
+        self.assertGreaterEqual(reads, 4)
+
+    def test_branch_missing_stale_or_wrong_authority_refuses_without_writes(self):
+        from factory_v1.effect_resolution import branch_reopen_binding
+        for fault in ('missing', 'code', 'stage', 'repository', 'config', 'revision', 'source', 'publication', 'obsolete'):
+            with self.subTest(fault=fault):
+                case = self.case()
+                row = self.refusal(case)
+                if fault == 'missing': row.pop('merge_refusal')
+                elif fault == 'code': row['merge_refusal']['code'] = 'checks_failed'
+                elif fault == 'stage':
+                    row['handoff']['stage'] = 'implementation'
+                    row['handoff_digest'] = assignments.digest(row['handoff'])
+                    row['merge_refusal']['correction']['binding'] = branch_reopen_binding(row)
+                elif fault == 'repository': row['merge_refusal']['correction']['authority']['repository_id'] = 999
+                elif fault == 'config':
+                    case.config['execution_reference'] = 'Different current host authority'
+                    case.write_config()
+                elif fault == 'revision':
+                    case.item['handoff']['commit'] = '0' * 40
+                    case.save_item()
+                elif fault == 'source': row['handoff']['skills'] = [{'sha256': '0' * 64}]
+                elif fault == 'publication': row['publication'] = {'candidate': '0' * 40}
+                else: row['requirement_disposition'] = {'status': 'obsolete'}
+                case.store(row)
+                with self.assertRaises(RepositoryError): self.reopen(case, row)
+                self.assertEqual(case.mutations(), [])
+                self.assertEqual(case.work_issue['state'], 'closed')
+                case.doCleanups()
+
+    def test_branch_remote_target_drift_and_independent_holds_refuse_without_writes(self):
+        for fault in ('issue', 'body', 'repository', 'pr', 'head', 'branch', 'base', 'ref', 'integrated', 'hold', 'pause'):
+            with self.subTest(fault=fault):
+                case = self.case()
+                row = self.refusal(case)
+                if fault == 'issue': case.work_issue['id'] = 999
+                elif fault == 'body': case.work_issue['body'] += ' changed'
+                elif fault == 'repository': case.repo['id'] = 999
+                elif fault == 'pr': case.pr['number'] = 99
+                elif fault == 'head': case.pr['head']['sha'] = '0' * 40
+                elif fault == 'branch': case.pr['head']['ref'] = 'other'
+                elif fault == 'base': case.pr['base']['ref'] = 'other'
+                elif fault == 'ref': case.refs[case.config['branch']] = '0' * 40
+                elif fault == 'integrated': case.pr.update(merged=True, state='closed', merge_commit_sha=case.integrated)
+                elif fault == 'hold':
+                    case.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                        'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
+                    case.save_item()
+                else: controls.request(case.db, 'product', 'm1', '42', 'pause', 'exact branch correction hold')
+                with self.assertRaises(RepositoryError): self.reopen(case, row)
+                self.assertEqual(case.mutations(), [])
+                self.assertEqual(case.work_issue['state'], 'closed')
+                case.doCleanups()
+
+    def test_branch_final_issue_read_revalidates_durable_authority_and_host_config(self):
+        for fault in ('authority', 'config', 'hold', 'pause'):
+            with self.subTest(fault=fault):
+                case = self.case()
+                row = self.refusal(case)
+                original = case.external_request.side_effect
+                def read_return(path, body=None, method=None):
+                    result = original(path, body, method)
+                    if path.endswith('/issues/10') and method is None:
+                        if fault == 'authority':
+                            changed = case.stored()
+                            changed['publication'] = {'candidate': '0' * 40}
+                            case.store(changed)
+                        elif fault == 'config':
+                            changed = dict(case.config, execution_reference='Changed at last issue read')
+                            case.config_path.write_text(json.dumps(changed))
+                        elif fault == 'hold':
+                            case.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                                'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
+                            case.save_item()
+                        else: controls.request(case.db, 'product', 'm1', '42', 'pause', 'last issue read')
+                    return result
+                case.external_request.side_effect = read_return
+                with self.assertRaises(RepositoryError): self.reopen(case, row)
+                self.assertEqual(case.mutations(), [])
+                case.doCleanups()
+
+
 class ChainAdmissionTests(unittest.TestCase):
     """Retained local declarations, NOT native/model execution or worker acceptance."""
 
@@ -1154,7 +1281,12 @@ class ChainAdmissionTests(unittest.TestCase):
             'scope': ['hello.py'], 'result_fields': list(report)}
         self.candidate['submitted_result']['artifacts'] = [simplification.artifact('simplification-result', json.dumps(report))]
         self.seal(self.candidate)
-        self.candidate['simplification_result'] = simplification.validate_result(self.candidate, self.candidate['submitted_result'])
+        self.candidate['simplification_result'] = {
+            'contract': simplification.CONTRACT, 'outcome': 'no-op', 'candidate_sha256': digest,
+            'input_candidate_sha256': digest, 'changed_paths': [], 'checks_verified': True,
+            'behavior_preservation_claim': 'preserved', 'native_execution_trusted': False,
+            'approval': False, 'advance_allowed': False, 'review_required': ['Standards', 'Spec'],
+            'findings': [], 'reason': 'native_execution_unattested_and_independent_review_required'}
         root = Path(self.candidate['runtime']['artifacts'])
         self.pins = merge.review.pins(self.candidate, manifest(root / 'workspace'), manifest(root / 'inputs/baseline'))
         for axis in self.axes:
@@ -1169,7 +1301,7 @@ class ChainAdmissionTests(unittest.TestCase):
                 'verdicts': ['pass', 'reject', 'stuck']}
             axis['submitted_result']['artifacts'] = [simplification.artifact('review-result', json.dumps(report))]
             self.seal(axis)
-            axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+            axis['review_result'] = self.admitted_review(axis)
         saved = {'operator_id': '42', 'execution_reference': 'LOCAL declared approved prerequisites, NOT attestation',
             'axes': [merge.review.execution_binding(a) for a in self.axes], 'policy_decision': None}
         for axis in self.axes:
@@ -1186,6 +1318,11 @@ class ChainAdmissionTests(unittest.TestCase):
         # Adverse-candidate holds have their own component tests. Do not let that
         # earlier scan mask the immutable chain-pins comparison being tested here.
         self.enterContext(patch.object(merge.review, 'adverse_reviews', return_value=[]))
+
+    def admitted_review(self, axis):
+        artifact = axis['submitted_result']['artifacts'][0]
+        return {**json.loads(artifact['content']), 'report_sha256': artifact['sha256'],
+                'native_execution_trusted': False, 'advance_allowed': False, 'close_allowed': False}
 
     def seal(self, row):
         row['handoff_digest'] = assignments.digest(row['handoff'])
@@ -1368,7 +1505,7 @@ class ChainAdmissionTests(unittest.TestCase):
                     axis['submitted_result']['artifacts'][0] = merge.simplification.artifact('review-result', json.dumps(report))
                     self.seal(axis)
                     try:
-                        axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+                        axis['review_result'] = self.admitted_review(axis)
                         self.reseal_axis_authority(axes)
                         self.assert_refused('stale_review')
                     finally:
@@ -1389,7 +1526,7 @@ class ChainAdmissionTests(unittest.TestCase):
             'correction': 'Correct the greeting and obtain both fresh axes'}])
         spec['submitted_result']['artifacts'] = [merge.simplification.artifact('review-result', json.dumps(report))]
         self.seal(spec)
-        spec['review_result'] = merge.review.validate_result(spec, spec['submitted_result'])
+        spec['review_result'] = self.admitted_review(spec)
         self.reseal_axis_authority(axes)
         before = list(self.db.iterdump())
         with self.assertRaises(RepositoryError) as refusal:
@@ -1455,7 +1592,7 @@ class MappedCandidateTests(unittest.TestCase):
         self.calls = []
         self.api = merge.MergeGitHub(self.config)
         self.api.github.request = Mock(side_effect=self.external)
-        self.plan, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+        self.plan = self.input_plan()
         self.config['head'] = self.plan['candidate']
         self.commits[self.config['head']] = {'sha': self.config['head'], 'tree': {'sha': self.plan['tree']},
             'parents': [{'sha': self.config['baseline']}], 'message': self.plan['message']}
@@ -1466,6 +1603,21 @@ class MappedCandidateTests(unittest.TestCase):
     def reseal_source(self):
         self.approval['manifest'] = manifest(self.source)
         (self.root / 'source-artifacts.json').write_text(json.dumps(self.approval['manifest']))
+
+    def input_plan(self):
+        from factory_v1.tests.test_publication import git_object, git_tree
+        entries = [{'path': name, 'type': 'blob',
+                    'mode': '100755' if value['executable'] else '100644',
+                    'sha': git_object('blob', (self.source / name).read_bytes())}
+                   for name, value in self.approval['manifest'].items()]
+        tree = git_tree(entries)
+        message = 'Factory candidate: Refs #10'
+        raw = (f"tree {tree}\nparent {'a' * 40}\n"
+               'author Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               'committer Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               f'\n{message}\n').encode()
+        return {'candidate': git_object('commit', raw), 'tree': tree, 'base_tree': self.base_tree,
+                'changes': [e for e in entries if e['path'] == 'hello.py'], 'message': message}
 
     def external(self, path, body=None, method=None):
         self.assertIsNone(body)
@@ -1499,7 +1651,7 @@ class MappedCandidateTests(unittest.TestCase):
                 self.assertEqual(refusal.exception.code, 'manifest_mismatch')
                 # Reseal manifest comparisons to reach actual content/mode -> Git HEAD equality.
                 self.reseal_source()
-                changed, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+                changed = self.input_plan()
                 self.commits[changed['candidate']] = {'sha': changed['candidate'], 'tree': {'sha': changed['tree']},
                     'parents': [{'sha': self.config['baseline']}], 'message': changed['message']}
                 self.assertNotEqual(changed['tree'], self.plan['tree'])

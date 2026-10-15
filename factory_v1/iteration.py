@@ -149,7 +149,9 @@ def complete(database, project, iteration, operator, request, github):
     completion = {'report_id': identity, 'event_id': 'completion-' + identity, 'report': report}
     require(item.get('completion', completion) == completion,
             'Completed report is immutable; changed delivery requires investigation.', 'completion_conflict')
-    with controls.admission(database, project, iteration):
+    from .readiness_gate import admission
+    with admission(database, project, iteration, operation='effect'):
+        controls.require_active(database, project, iteration)
         database.execute('BEGIN IMMEDIATE')
         latest = delivery.context(database, project, iteration, operator)
         require(latest == item, 'Iteration changed across external verification; no report admitted.', 'completion_race')

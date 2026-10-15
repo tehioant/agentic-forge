@@ -111,10 +111,10 @@ class ServiceTests(unittest.TestCase):
         dispatch.assert_not_called()
 
     def test_cycle_passes_shared_shutdown_event_to_stage_launcher(self):
-        self.config['dispatch_config'] = '/private/config.json'
+        from factory_v1 import service_dispatch
         event = Mock()
-        with patch.object(service, 'dispatch', return_value={'status': 'progress'}) as dispatch:
-            service.cycle(self.config, Mock(), stop_event=event)
+        with patch.object(service_dispatch, 'tick', return_value={'status': 'progress'}) as dispatch:
+            service.dispatch(self.config, Mock(), stop_event=event)
         self.assertIs(dispatch.call_args.kwargs['stop_event'], event)
 
     def test_supervisor_refuses_dropins_before_control(self):

@@ -30,6 +30,8 @@ class HermesTransport:
         self.destination = destination
 
     def send(self, record):
+        if record.get('destination') != self.destination:
+            raise IntakeError('invalid_origin', 'Send must match the exact approved notification origin.')
         target = 'discord:' + self.destination['chat_id'] + ':' + self.destination['thread_id']
         # JSON escapes make user text inert, including native mentions and MEDIA:
         # attachment directives. The original content remains in durable state.

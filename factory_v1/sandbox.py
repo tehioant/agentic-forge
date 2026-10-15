@@ -71,6 +71,8 @@ def inputs_for(assignment, root):
 
 
 def authorize(database, project, iteration, operator, assignment_id, run_id, request):
+    from .readiness_gate import check
+    check(database, project, iteration, operation='effect', selection={'assignment_id': assignment_id, 'run_id': run_id})
     assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
     assignments.current(database, project, iteration, operator)
     assignments.claims(database, original(assignment), assignment['ticket_scope'], assignment_id)
@@ -145,11 +147,138 @@ def check_worker_evidence(assignment, root, inputs):
     return result
 
 
+def cancellation_handler(root, stop):
+    def cancel(signum, frame):
+        stop.set()
+        (root / 'stop').touch()
+    return cancel
+
+
+def project_mount_permissions(root, inputs, writable):
+    for tree, mutable in ((root / 'workspace', writable), (inputs, False)):
+        for parent, directories, files in os.walk(tree):
+            Path(parent).chmod(0o777 if mutable else 0o755)
+            for name in files:
+                path = Path(parent) / name
+                executable = bool(path.stat().st_mode & 0o111)
+                path.chmod((0o777 if executable else 0o666) if mutable else (0o755 if executable else 0o644))
+
+
+def wait_for_worker(state, project, iteration, operator, assignment_id, run_id, root, runtime, stop, broker, broker_errors, guard, docker, deadline):
+    status, error_code = 'failed', None
+    while True:
+        if stop.is_set() or (root / 'stop').exists():
+            error_code = 'cancelled'
+            status = 'stopped'
+            break
+        if time.monotonic() >= deadline:
+            error_code = 'time_limit'
+            break
+        require(broker.is_alive() and not broker_errors and guard.poll() is None,
+                'Controller helper failed; worker must stop.', 'helper_failed')
+        with closing(sqlite3.connect(state)) as database, state_lock(database):
+            correlated(database, project, iteration, operator, assignment_id, run_id)
+            assignments.current(database, project, iteration, operator)
+        observed = docker.inspect(runtime['container'])
+        if not observed['State']['Running']:
+            require(observed['State']['ExitCode'] == 0 and not observed['State'].get('OOMKilled'),
+                    'Worker exited without a successful bounded result.', 'worker_failed')
+            status = 'exited'
+            break
+        time.sleep(.1)
+    return status, error_code
+
+
+def finalize_result(state, project, iteration, operator, assignment_id, run_id, root, runtime, writable, pins, selected_inputs, config, deadline, config_path, github):
+    from .controls import admission
+    source = manifest(root / 'workspace')
+    (root / 'source-artifacts.json').write_text(json.dumps(source))
+    if not writable:
+        require(source == pins['workspace'], 'Read-only source changed.', 'invalid_result')
+    require(not (root / 'workspace' / '.git').exists(), 'Worker Git metadata is not a source artifact.', 'invalid_result')
+    if (root / 'container.log').is_file():
+        shutil.copyfile(root / 'container.log', root / 'worker-container.log')
+    with closing(sqlite3.connect(state)) as database, state_lock(database):
+        assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
+        assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
+    # Stuckness and diagnosis retain a red loop; neither claims a verified fix.
+    assert assignment is not None
+    result = check_worker_evidence(assignment, root, selected_inputs)
+    checks_verified = (False if (result.get('status') == 'stuck' and assignment['handoff']['stage'] in
+                                 {'implementation', 'corrections', 'repair'}) or assignment['handoff']['stage'] == 'diagnosis'
+                       else verify_checks(root, config, runtime, deadline))
+    with closing(sqlite3.connect(state)) as database, state_lock(database):
+        assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
+        result = check_worker_evidence(assignment, root, selected_inputs)
+        assignments.require_result_active(assignment)
+        assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github,
+                                            sandbox_run_id=run_id)
+        assert assignment is not None
+        assignments.require_result_active(assignment)
+        assignment['runtime']['candidate_sha256'] = assignments.digest(source)
+        assignment['runtime']['baseline_sha256'] = assignments.digest(pins['baseline'])
+        if checks_verified:
+            assignment['runtime']['checks_sha256'] = hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest()
+        assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
+            checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
+            reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
+        with admission(database, project, iteration, operation='effect',
+                selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path}):
+            save(database, assignment)
+    return assignment
+
+
+def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, root, runtime, stop, docker, guard, broker, broker_errors, capability, signals, status, error_code, config_path):
+    from .readiness_gate import check
+    stop.set()
+    try:
+        docker.remove(runtime['container'])
+    except (RepositoryError, OSError):
+        error_code, status = 'stop_unconfirmed', 'unconfirmed'
+    (root / 'guard-finish').touch()
+    if guard:
+        try:
+            guard.wait(timeout=35)
+        except subprocess.TimeoutExpired:
+            # Do not kill the only independent cleanup guard. Preserve ownership for reconciliation.
+            error_code, status = 'stop_unconfirmed', 'unconfirmed'
+    if broker:
+        broker.join(timeout=1)
+        if broker.is_alive() or broker_errors:
+            error_code, status = 'stop_unconfirmed', 'unconfirmed'
+    if capability and (not broker or not broker.is_alive()):
+        shutil.rmtree(capability, ignore_errors=True)
+    for signum, handler in signals.items():
+        signal.signal(signum, handler)
+    with closing(sqlite3.connect(state)) as database, state_lock(database):
+        assignment = owned_assignment(database, project, iteration, operator, assignment_id)
+        require(assignment['runtime']['run_id'] == run_id, 'Run changed during cleanup.', 'run_conflict')
+        if status != 'unconfirmed' and (root / 'stop').exists():
+            status, error_code = 'stopped', 'cancelled'
+        if status != 'unconfirmed':
+            from .controls import blocked
+            if blocked(database, project, iteration):
+                status = 'stopped'
+                error_code = 'cancelled' if (root / 'stop').exists() else 'iteration_paused'
+        if status == 'complete':
+            try:
+                check(database, project, iteration, operation='effect',
+                      selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
+            except RepositoryError as error:
+                status, error_code = 'failed', error.code
+        assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
+                                     container_removed=status != 'unconfirmed', recoverable=status != 'complete')
+        save(database, assignment)
+    return assignment
+
+
 def launch(state, project, iteration, operator, assignment_id, config_path, github):
     config = load_config(config_path)
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         from .restart import before_dispatch
         before_dispatch(database, project, iteration, operator, github, force=True, assignment_id=assignment_id)
+        from .readiness_gate import check
+        check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': None, 'launcher': config_path})
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
         if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
@@ -186,20 +315,19 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                                      'controller_pid': os.getpid(), 'controller_start': process_identity(os.getpid()),
                                      'advance_allowed': False, 'close_allowed': False}
             from .controls import admission
-            with admission(database, project, iteration):
+            with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': None, 'launcher': config_path}):
                 save(database, assignment)
     runtime = assignment['runtime']
     stop = threading.Event()
     broker = None
+    broker_errors = []
     guard = None
     signals = {}
     error_code = None
     status = 'failed'
     mounts = {}
     capability = None
-    def cancel(signum, frame):
-        stop.set()
-        (root / 'stop').touch()
+    cancel = cancellation_handler(root, stop)
     for signum in (signal.SIGTERM, signal.SIGINT):
         signals[signum] = signal.signal(signum, cancel)
     try:
@@ -234,13 +362,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         writable = 'write_workspace' in assignment['handoff']['capabilities']
         # Controller umask is 077; explicitly make only these scoped mounts readable
         # by the reviewed nonroot worker UID (which need not equal the host UID).
-        for tree, mutable in ((root / 'workspace', writable), (inputs, False)):
-            for parent, directories, files in os.walk(tree):
-                Path(parent).chmod(0o777 if mutable else 0o755)
-                for name in files:
-                    path = Path(parent) / name
-                    executable = bool(path.stat().st_mode & 0o111)
-                    path.chmod((0o777 if executable else 0o666) if mutable else (0o755 if executable else 0o644))
+        project_mount_permissions(root, inputs, writable)
         capability = Path(tempfile.mkdtemp(prefix='f1-'))
         require(len(str(capability / 'capability.sock').encode()) < 108, 'Unix capability path is too long.', 'unsafe_path')
         (root / 'capability-path.json').write_text(json.dumps(str(capability)))
@@ -253,7 +375,6 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 authorize(database, project, iteration, operator, assignment_id, run_id, request)
             except RepositoryError as error:
                 raise spending.SpendingError(error.code, str(error)) from error
-        broker_errors = []
         def serve():
             try:
                 spending.serve_unix_socket(str(capability / 'capability.sock'), state, scope, timeout=180,
@@ -280,6 +401,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         guard_log.close()
         (root / 'guard-process.json').write_text(json.dumps({'pid': guard.pid, 'start': process_identity(guard.pid)}))
         require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before container creation.', 'cancelled')
+        with closing(sqlite3.connect(state)) as database:
+            check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
         docker.call(*command(config, runtime['container'], mounts))
         observed = docker.inspect(runtime['container'])
         verify(observed, config, runtime['container'], image_id, mounts)
@@ -289,69 +412,22 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
             require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt was cancelled before start.', 'cancelled')
             assignment['runtime']['status'] = 'running'
-            with admission(database, project, iteration):
+            with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path}):
                 save(database, assignment)
         require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before worker start.', 'cancelled')
-        docker.call('start', runtime['container'])
+        with closing(sqlite3.connect(state)) as database, state_lock(database):
+            check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
+            docker.call('start', runtime['container'])
         deadline = time.monotonic() + config['limits']['seconds']
-        while True:
-            if stop.is_set() or (root / 'stop').exists():
-                error_code = 'cancelled'
-                status = 'stopped'
-                break
-            if time.monotonic() >= deadline:
-                error_code = 'time_limit'
-                break
-            require(broker.is_alive() and not broker_errors and guard.poll() is None,
-                    'Controller helper failed; worker must stop.', 'helper_failed')
-            with closing(sqlite3.connect(state)) as database, state_lock(database):
-                correlated(database, project, iteration, operator, assignment_id, run_id)
-                assignments.current(database, project, iteration, operator)
-            observed = docker.inspect(runtime['container'])
-            if not observed['State']['Running']:
-                require(observed['State']['ExitCode'] == 0 and not observed['State'].get('OOMKilled'),
-                        'Worker exited without a successful bounded result.', 'worker_failed')
-                status = 'exited'
-                break
-            time.sleep(.1)
+        status, error_code = wait_for_worker(state, project, iteration, operator, assignment_id, run_id,
+            root, runtime, stop, broker, broker_errors, guard, docker, deadline)
         # Stop helpers/container BEFORE inspecting worker-controlled artifacts.
         stop.set()
         retain_logs(docker, runtime['container'], root)
         docker.remove(runtime['container'])
         if status == 'exited':
-            source = manifest(root / 'workspace')
-            (root / 'source-artifacts.json').write_text(json.dumps(source))
-            if not writable:
-                require(source == pins['workspace'], 'Read-only source changed.', 'invalid_result')
-            require(not (root / 'workspace' / '.git').exists(), 'Worker Git metadata is not a source artifact.', 'invalid_result')
-            if (root / 'container.log').is_file():
-                shutil.copyfile(root / 'container.log', root / 'worker-container.log')
-            with closing(sqlite3.connect(state)) as database, state_lock(database):
-                assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
-                assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
-            # Stuckness and diagnosis retain a red loop; neither claims a verified fix.
-            assert assignment is not None
-            result = check_worker_evidence(assignment, root, selected_inputs)
-            checks_verified = (False if (result.get('status') == 'stuck' and assignment['handoff']['stage'] in
-                                         {'implementation', 'corrections', 'repair'}) or assignment['handoff']['stage'] == 'diagnosis'
-                               else verify_checks(root, config, runtime, deadline))
-            with closing(sqlite3.connect(state)) as database, state_lock(database):
-                assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
-                result = check_worker_evidence(assignment, root, selected_inputs)
-                assignments.require_result_active(assignment)
-                assignment = assignments.store_result(database, project, iteration, operator, assignment_id, result, github,
-                                                    sandbox_run_id=run_id)
-                assert assignment is not None
-                assignments.require_result_active(assignment)
-                assignment['runtime']['candidate_sha256'] = assignments.digest(source)
-                assignment['runtime']['baseline_sha256'] = assignments.digest(pins['baseline'])
-                if checks_verified:
-                    assignment['runtime']['checks_sha256'] = hashlib.sha256((root / 'controller-checks.json').read_bytes()).hexdigest()
-                assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
-                    checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
-                    reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
-                with admission(database, project, iteration):
-                    save(database, assignment)
+            assignment = finalize_result(state, project, iteration, operator, assignment_id, run_id,
+                root, runtime, writable, pins, selected_inputs, config, deadline, config_path, github)
             status = 'complete'
     except RepositoryError as error:
         error_code = error.code
@@ -364,39 +440,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         if status != 'stopped':
             status = 'failed'
     finally:
-        stop.set()
-        try:
-            docker.remove(runtime['container'])
-        except (RepositoryError, OSError):
-            error_code, status = 'stop_unconfirmed', 'unconfirmed'
-        (root / 'guard-finish').touch()
-        if guard:
-            try:
-                guard.wait(timeout=35)
-            except subprocess.TimeoutExpired:
-                # Do not kill the only independent cleanup guard. Preserve ownership for reconciliation.
-                error_code, status = 'stop_unconfirmed', 'unconfirmed'
-        if broker:
-            broker.join(timeout=1)
-            if broker.is_alive() or broker_errors:
-                error_code, status = 'stop_unconfirmed', 'unconfirmed'
-        if capability and (not broker or not broker.is_alive()):
-            shutil.rmtree(capability, ignore_errors=True)
-        for signum, handler in signals.items():
-            signal.signal(signum, handler)
-        with closing(sqlite3.connect(state)) as database, state_lock(database):
-            assignment = owned_assignment(database, project, iteration, operator, assignment_id)
-            require(assignment['runtime']['run_id'] == run_id, 'Run changed during cleanup.', 'run_conflict')
-            if status != 'unconfirmed' and (root / 'stop').exists():
-                status, error_code = 'stopped', 'cancelled'
-            if status != 'unconfirmed':
-                from .controls import blocked
-                if blocked(database, project, iteration):
-                    status = 'stopped'
-                    error_code = 'cancelled' if (root / 'stop').exists() else 'iteration_paused'
-            assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
-                                         container_removed=status != 'unconfirmed', recoverable=status != 'complete')
-            save(database, assignment)
+        assignment = cleanup_attempt(state, project, iteration, operator, assignment_id, run_id,
+            root, runtime, stop, docker, guard, broker, broker_errors, capability, signals, status, error_code, config_path)
     return assignment
 
 

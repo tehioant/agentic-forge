@@ -9,7 +9,7 @@ from factory_v1 import assignments, attention, delivery, recovery
 from factory_v1.repositories import RepositoryError, save_iteration
 from factory_v1.tests import test_iteration as fixtures
 from factory_v1.tests import test_recovery as recovery_fixtures
-from factory_v1.tests.test_iteration_regressions import fixture
+from factory_v1.tests.test_iteration_regressions import fixture, seed_monitor
 
 
 class RecoveryIterationTests(unittest.TestCase):
@@ -21,8 +21,7 @@ class RecoveryIterationTests(unittest.TestCase):
 
     def monitor(self, f):
         source = fixture(self, recovery_fixtures.RecoveryFixture)
-        with patch.object(delivery, 'observe', return_value=source.evidence(False)):
-            delivery.sample(f.db, 'product', 'm1', '42', source.config)
+        f.item = seed_monitor(f, source.config, source.evidence(False))
         return source
 
     def test_registered_recovery_cannot_be_stranded_by_next_iteration(self):
@@ -56,16 +55,20 @@ class RecoveryIterationTests(unittest.TestCase):
         f = fixture(self, fixtures.ContinuationComponents)
         source = self.monitor(f)
         old = delivery.context(f.db, 'product', 'm1', '42')
-        started = f.start()
+        started = seed_monitor(f, source.config, source.evidence(False), f.pending_interview(), old['main_incident'], notify=False)
         pin = {'number': 20, 'id': 200, 'node_id': 'I20', 'body_sha256': 'd' * 64}
         config = {'operator_id': '42', 'reference': 'SIMULATED host scope',
                   'incident_id': started['main_incident']['incident_id'],
                   'evidence_id': started['main_incident']['latest_evidence'],
                   'issue': pin, 'paths': ['app.py'], 'removable_assignments': []}
-        with patch.object(recovery, 'load_config', return_value=config), \
-             patch.object(recovery, 'exact_issue', return_value={'state': 'open'}):
-            registered = recovery.register(f.db, 'product', 'm2', '42', 'simulated-host-config',
-                                           SimpleNamespace(base=source.config['api_base']))
+        registered = {'config': config, 'evidence': source.evidence(False), 'assignment': None,
+                      'status': 'registered', 'parked': [], 'removable': {}}
+        started['main_recoveries'] = {config['incident_id']: registered}
+        started['main_incident'].update(recovery_assignment=assignments.digest(config), recovery_issue=20)
+        with f.db:
+            save_iteration(f.db, started)
+            f.db.execute('UPDATE delivery_incidents SET payload=? WHERE iteration=?',
+                         (json.dumps(started['main_incident']), 'm2'))
         with patch.object(delivery, 'observe', return_value=source.evidence(True)):
             sampled = delivery.sample(f.db, 'product', 'm1', '42')
             boundary = delivery.mutation_boundary(f.db, 'product', 'm2', '42')

@@ -155,7 +155,7 @@ def supervise(database, item, path, github, *, stop_event=None):
             fresh['handoff'] == fresh_handoff and fresh['planning'].get('native_wakeup') == request,
             'Fresh immutable publication/native completion changed.', 'execution_required')
     fresh['planning']['native_wakeup'].update(status='consumed', receipt=expected)
-    planning.checkpoint(database, fresh)
+    planning.checkpoint(database, fresh, operation='effect')
     return 'consumed'
 
 
@@ -212,7 +212,7 @@ def adopt_original(database, item, path, github, config, identity, stop_event):
         handoff = planning.read_publication(database, fresh, fresh['planning']['docs_path'],
             fresh['planning']['host_publication']['documents'], expected['commit'], expected['issue_number'], github)
         require(current()['handoff'] == handoff, 'Original immutable publication changed.', 'execution_required')
-    with controls.admission(database, item['project_id'], item['iteration_id']):
+    with controls.admission(database, item['project_id'], item['iteration_id'], operation='effect'):
         fresh = current()
         fresh['planning']['native_wakeup'] = adopted
         save(database, fresh)
@@ -266,13 +266,17 @@ class NativeWakeup:
             require(request.get('config_path') == self.path and all(request.get(k) == v for k, v in identity.items()) and
                     request.get('request_id') == assignments.digest(identity),
                     'Mailbox request scope changed.', 'scope_mismatch')
-            with controls.admission(database, item['project_id'], item['iteration_id']):
+            with controls.admission(database, item['project_id'], item['iteration_id'],
+                    selection={'native_config': self.path, 'identity': identity}):
                 require(not self.stopped and configuration(self.path) == config,
                         'Plugin is stopping or native allowance changed.', 'approval_required')
                 request['status'] = 'enqueue_unknown'
                 save(database, item)  # Unknown survives a crash/exception; no blind re-enqueue.
                 require(not self.stopped and configuration(self.path) == config,
                         'Native allowance changed before enqueue.', 'approval_required')
+                from .readiness_gate import check
+                check(database, item['project_id'], item['iteration_id'],
+                      selection={'native_config': self.path, 'identity': identity})
                 try:
                     accepted = self.binding.ctx.inject_message(message(request), role='user', origin=config['binding']['origin'])
                 except Exception:

@@ -314,8 +314,11 @@ class AdmissionControlTests(ControlFixture):
             self.assertTrue(self.prepare()['claim_persisted'])
 
     def test_pause_on_result_revalidation_prevents_accepting_stage_evidence(self):
-        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
-            prepared = self.prepare()
+        from factory_v1.tests.test_assignments import AssignmentComponentTests
+        # Same normalized claim constructor; only the explicit tracker input differs.
+        self.item['ticket_work']['board'] = {'id': 'BOARD'}
+        self.item['ticket_work'].setdefault('inputs', {'documents': {}})
+        prepared = AssignmentComponentTests.seed_assignment(self, issue=self.issue)
         result = self.result(prepared)
         def final_read(*args):
             self.pause()
@@ -519,17 +522,21 @@ class MergeControlTests(ControlFixture):
         self.api.request.assert_called_once()
 
     def test_pause_after_intent_commit_prevents_final_put_without_erasing_intent(self):
-        original = controls.admission
+        from factory_v1 import readiness_gate
+        original = readiness_gate.admission
+        interrupted = []
         @contextmanager
         def after_admission(*args, **kwargs):
             with original(*args, **kwargs):
                 yield
             # Commit has completed and the real interruption lane is released.
             journal = self.stored_assignment(self.assignment['assignment_id']).get('merge')
-            if journal and journal['status'] == 'pending' and journal['failure'] is None:
-                self.pause()
-        with patch.object(controls, 'admission', after_admission):
+            if journal and journal['status'] == 'pending' and journal['failure'] is None and not interrupted:
+                interrupted.append(self.pause())
+        with patch.object(readiness_gate, 'admission', after_admission):
             self.refused('iteration_paused', self.lifecycle)
+        self.assertEqual(len(interrupted), 1)
+        self.assertFalse(interrupted[0]['dispatch_allowed'])
         self.api.request.assert_not_called()
         stored = self.stored_assignment(self.assignment['assignment_id'])['merge']
         self.assertEqual(stored['status'], 'pending')

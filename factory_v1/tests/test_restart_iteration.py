@@ -11,7 +11,7 @@ from factory_v1.tests import test_restart as restart_fixtures
 from factory_v1.tests import test_restart_recovery as recovery_fixtures
 from factory_v1.tests import test_restart_effects as effect_fixtures
 from factory_v1.tests.test_delivery import DeliveryTarget, configuration
-from factory_v1.tests.test_iteration_regressions import fixture
+from factory_v1.tests.test_iteration_regressions import fixture, seed_monitor
 
 
 class RestartIterationTests(unittest.TestCase):
@@ -69,18 +69,18 @@ class RestartIterationTests(unittest.TestCase):
     def test_restart_health_routes_to_successor_without_rewriting_predecessor_pointers(self):
         f = fixture(self, iteration_fixtures.ContinuationComponents)
         config = configuration('http://127.0.0.1:9876')
-        target = DeliveryTarget(config)
-        with patch.object(delivery, 'http_json', side_effect=lambda *_: target.value('/health')):
-            healthy = delivery.observe(config, api=Mock(read=target.value))
-        with patch.object(delivery, 'observe', return_value=healthy):
-            delivery.sample(f.db, 'product', 'm1', '42', config)
+        from factory_v1.tests.test_recovery import RecoveryFixture
+        source = fixture(self, RecoveryFixture)
+        source.config = config
+        healthy = source.evidence(True)
+        seed_monitor(f, config, healthy)
         previous = delivery.context(f.db, 'product', 'm1', '42')
         successor = copy.deepcopy(previous)
         successor.update(iteration_id='m2', status='active', previous_iteration={'iteration_id': 'm1'})
         successor['correlation']['iteration_id'] = 'm2'
         successor.pop('completion')
-        delivery.inherit_monitor(f.db, previous, successor, '42')
         f.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm2', json.dumps(successor)))
+        seed_monitor(f, config, healthy, successor)
         previous['next_iteration'] = {'iteration_id': 'm2'}
         save_iteration(f.db, previous)
         f.db.commit()

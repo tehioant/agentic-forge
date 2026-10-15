@@ -133,9 +133,30 @@ def validity(database, item, github, numbers):
 
 def checkpoint(database, item, *, receipt=False):
     if receipt:
-        tickets.checkpoint(database, item)
+        fresh = assignments.current(database, item['project_id'], item['iteration_id'],
+                                    item['approval']['operator_id'], require_active=False)
+        for key, record in item.get('requirement_changes', {}).items():
+            target = fresh.get('requirement_changes', {}).get(key)
+            require(target is not None and target.get('request') == record.get('request'),
+                    'Revision receipt authority changed.', 'stale_admission')
+            assert target is not None
+            for stage, produced in record.get('execution_receipts', {}).items():
+                attempt = record.get('attempts', {}).get(stage)
+                require(isinstance(record.get('request'), dict) and isinstance(attempt, dict) and
+                        set(attempt) == {'input_digest', 'capability'} and
+                        attempt == target.get('attempts', {}).get(stage),
+                        'Revision receipt stage attempt changed.', 'stale_admission')
+                receipts = target.setdefault('execution_receipts', {})
+                require(stage not in receipts or receipts[stage] == produced,
+                        'Revision stage receipt conflicts with retained output.', 'stale_admission')
+                receipts[stage] = produced
+            for field in ('tree', 'parent', 'commit', 'issue_identity', 'issue_number'):
+                if field in record.get('publication', {}):
+                    target.setdefault('publication', {})[field] = record['publication'][field]
+            target.setdefault('updated_issues', {}).update(record.get('updated_issues', {}))
+        tickets.checkpoint(database, fresh)
     else:
-        tickets.admitted_checkpoint(database, item)
+        tickets.effect_checkpoint(database, item)
 
 
 def sync_blocks(database, item, record, github, release=False):
@@ -149,7 +170,7 @@ def sync_blocks(database, item, record, github, release=False):
         require(issue_pin(issue) == expected, 'Affected identity or body changed.', 'stale_requirements')
         if issue['state'] != 'open':
             require(not release, 'Revised work closed before revalidation.', 'stale_requirements')
-            tickets.active(item, database)
+            tickets.effect_check(database, item)
             github.request('/repos/' + item['repository'] + '/issues/' + str(number), {'state': 'open'}, 'PATCH')
             issue = tickets.gh.read_issue(github, item['repository'], number)
             require(issue['state'] == 'open' and issue_pin(issue) == expected, 'Exact reopened work did not read back.', 'publication_mismatch')
@@ -170,7 +191,7 @@ def sync_blocks(database, item, record, github, release=False):
             require(member['status'] in {blocked, option},
                     'External progress changed independently of the requirement release.', 'publication_mismatch')
         if member['status'] != option:
-            tickets.active(item, database)
+            tickets.effect_check(database, item)
             tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
         member = tickets.gh.membership(github, board, item['repository'], issue)
         require(member is not None and member['id'] == record['memberships'][str(number)] and member['status'] == option,

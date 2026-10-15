@@ -50,8 +50,40 @@ class PlanningTests(unittest.TestCase):
         self.database.commit()
         return result
 
+    def pending(self):
+        item = self.inspect()
+        selected = {d['name']: {**d, 'instructions': Path(d['path']).read_text()} for d in self.skills}
+        item['planning'] = {'assignment_id': 'planning-fixture', 'revision': 1,
+                            'request': copy.deepcopy(self.plan_request), 'origin': copy.deepcopy(self.origin),
+                            'status': 'pending', 'skills': selected, 'instructions': planning.INSTRUCTIONS,
+                            'docs_path': 'docs/factory/m1/planning-fixture', 'pending_questions': []}
+        item['stage'] = item['correlation']['stage'] = 'planning_pending'
+        self.fixture.item = item
+        self.fixture.persist()
+        return item
+
+    def completed(self, request):
+        item = self.pending()
+        work = item['planning']
+        work.update(status='complete', judgment={k: request[k] for k in ('sufficient', 'rationale', 'reference')},
+                    completion_digest=hashlib.sha256(json.dumps(request, sort_keys=True, ensure_ascii=False,
+                                                               allow_nan=False).encode()).hexdigest())
+        item['handoff'] = {'repository': item['repository'], 'commit': request['commit'],
+                           'issue': {'number': 7, 'id': 700, 'url': 'https://github.com/example/product/issues/7'},
+                           'documents': {}, 'api_base': self.github.base}
+        for name, content in request['documents'].items():
+            raw = content.encode()
+            path = work['docs_path'] + '/' + name
+            item['handoff']['documents'][name] = {
+                'path': path, 'blob': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest(),
+                'url': 'https://github.com/example/product/blob/' + request['commit'] + '/' + path}
+        item['stage'] = item['correlation']['stage'] = 'planning_complete'
+        self.fixture.item = item
+        self.fixture.persist()
+        return item
+
     def completion(self):
-        item = self.start()
+        item = self.pending()
         milestone = ''.join('## ' + section + '\n\n' + content + '\n\n' for section, content in zip(planning.SECTIONS, (
             'Readers lose local notes.', 'Persist exact French notes.', '1. As a reader, retain notes.',
             'Rust selected by operator in message-2.', 'Test exact readback and unsafe-path refusal.',
@@ -96,7 +128,7 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.start(), item); self.assertEqual(self.inspect(), item)
 
     def test_missing_answers_remain_pending_without_publication_access(self):
-        item = self.start()
+        item = self.pending()
         request = {'assignment_id': item['planning']['assignment_id'], 'origin': self.origin, 'sufficient': False,
                    'rationale': 'Language unresolved.', 'reference': 'agent-turn-1', 'pending_questions': ['Rust or Python?']}
         result = self.complete(request)
@@ -148,7 +180,7 @@ class PlanningTests(unittest.TestCase):
             with self.subTest(defect=defect): self.assert_refused(lambda: self.complete(request), before, 'publication_mismatch')
 
     def test_new_assignment_invalidates_handoff_ticket_stage_and_reservation(self):
-        request = self.completion(); self.publication(request); result = self.complete(request)
+        request = self.completion(); self.publication(request); result = self.completed(request)
         result.update(ticket_work={'status': 'published'}, reservation={'status': 'reserved'})
         repositories.save_iteration(self.database, result); self.database.commit()
         replacement = planning.plan(self.database, result, {**self.plan_request, 'expected_revision': 1})
@@ -161,6 +193,7 @@ class PlanningTests(unittest.TestCase):
         stale = self.inspect(); request = self.completion(); self.publication(request)
         result = planning.complete(self.database, stale, request, self.github)
         self.assertEqual(self.inspect(), result); self.assertEqual(result['planning']['status'], 'complete')
+        self.completed(request)
         replacement = planning.plan(self.database, stale, {**self.plan_request, 'expected_revision': 1})
         self.assertEqual(self.inspect(), replacement); self.assertEqual(replacement['planning']['revision'], 2)
         self.assertEqual(replacement['planning_history'][0]['status'], 'complete'); self.assertNotIn('handoff', replacement)

@@ -198,13 +198,13 @@ class RevisionIntegrationTests(unittest.TestCase):
             {'change_id': 'durable-notes', 'skills': self.skills}, self.github, str(self.config))
 
     def prepare_publication(self):
-        # Real synthesis controller/validation; only its external helper transport is replaced.
-        self.install_record('resolved')
-        with patch.object(synthesis, 'invoke', side_effect=lambda config, work, *, cancelled, admission: self.produced(work)):
-            self.item = self.execute()
-        record = self.item['requirement_changes']['durable-notes']
+        record = self.install_record('publication-pending')
+        record['documents'] = {n: d['content'] for n, d in self.new_inputs['documents'].items()}
+        record['tickets'] = self.produced({'stage': 'to-tickets', 'skill': self.skills[0], 'inputs': self.new_inputs})['result']
+        record['executions'] = {'to-spec': {}, 'to-tickets': {}}
         record.update(status='publication-pending', new_inputs=self.new_inputs,
                       publication={'commit': 'd' * 40, 'path': 'docs/revision'})
+        self.stack.enter_context(patch.object(publication, 'verify_synthesis'))
         self.pinned.return_value = self.new_inputs
         self.save(self.item)
         return record
@@ -218,15 +218,20 @@ class RevisionIntegrationTests(unittest.TestCase):
             return publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
 
     def prepare_resume(self):
-        self.prepare_publication()
-        def update(path, payload=None, method=None):
-            assert payload is not None
-            self.assertEqual(method, 'PATCH')
-            self.issues[int(path.split('/')[-1])].update(payload)
-        self.github.request.side_effect = update
-        self.item = self.publish_updates()
-        self.github.request.reset_mock()
-        return self.item['requirement_changes']['durable-notes']
+        record = self.prepare_publication()
+        record.update(status='published', updates={}, updated_issues={}, update_intents=['10', '11'])
+        record['new_revision'] = {'spec': self.new_inputs['handoff'], 'ticket_assignment': 'durable-notes',
+            'ticket_inputs': tickets.digest([self.new_inputs, record['tickets'], self.direction])}
+        for ticket in record['tickets']:
+            n = ticket['number']
+            body = lean_body(self.new_inputs).replace('Retain the exact café note.', ticket['desired_behavior']).replace(
+                '- Reopen café unchanged.', '\n'.join('- ' + c for c in ticket['acceptance_criteria']))
+            self.issues[n].update(title=ticket['title'], body=body)
+            record['updates'][str(n)] = {'title': ticket['title'], 'body': body}
+            record['updated_issues'][str(n)] = requirements.issue_pin(self.issues[n])
+        self.item['requirement_authority'] = {str(n): record['new_revision'] for n in (10, 11)}
+        self.save(self.item)
+        return record
 
     def release(self):
         record = self.read()['requirement_changes']['durable-notes']
@@ -260,6 +265,7 @@ class RevisionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.github.request.call_count, 2)
         self.publish_updates()
         self.assertEqual(self.github.request.call_count, 2, 'Readback recovery must not repeat either issue update')
+        self.prepare_resume()  # Independent published input, not the preceding component's output.
         resumed = self.release()
         self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
         self.assertEqual(self.statuses, {10: 'Ready', 11: 'Ready'})
@@ -393,8 +399,11 @@ class RevisionIntegrationTests(unittest.TestCase):
             invoke.assert_not_called()
             self.resume(malformed=malformed)
             self.pinned.side_effect = None
-            self.assertEqual(self.execute()['requirement_changes']['durable-notes']['status'], 'synthesized')
-            self.assertEqual([call.args[1]['stage'] for call in invoke.call_args_list], ['to-spec', 'to-tickets'])
+            # Routing is independent of stage execution; do not perform two precursor stages.
+            with patch.object(synthesis, 'run_stage', side_effect=lambda db, item, record, stage, config, work: self.produced(work)['result']) as stage:
+                self.assertEqual(self.execute()['requirement_changes']['durable-notes']['status'], 'synthesized')
+            self.assertEqual([call.args[3] for call in stage.call_args_list], ['to-spec', 'to-tickets'])
+            invoke.assert_not_called()
 
     def test_pause_after_synthesis_input_read_prevents_capability_attempt(self):
         self.refuse_synthesis_input()

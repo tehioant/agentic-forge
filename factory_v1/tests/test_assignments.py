@@ -234,6 +234,47 @@ class AssignmentComponentTests(unittest.TestCase):
     def prepare(self, request=None, dry=False):
         return assignments.prepare(self.db, 'product', 'm1', '42', request or self.request, self.github, dry)
 
+    def seed_assignment(self, request=None, issue=None):
+        """Persist normalized claim input, without exercising claim admission."""
+        issue = issue or {'body': 'Local issue', 'html_url': 'https://example.invalid/issues/10'}
+        request = copy.deepcopy(request or self.request)
+        selected = assignments.validate(request)
+        request['skills'] = [{k: v for k, v in s.items() if k != 'instructions'} for s in selected]
+        scope = {'project': 'product', 'iteration': 'm1', 'repository': request['repository'],
+                 'repository_id': request['repository_id'], 'issue_number': request['issue']['number'],
+                 'issue_id': request['issue']['id'], 'workspace': request['workspace']}
+        inputs = requirements.inputs(self.item, scope['issue_number'])
+        loads = {issue['html_url']: request['issue']['body_sha256']}
+        loads.update({d['url']: d['sha256'] for d in inputs['documents'].values()})
+        for group in ('standards', 'preceding'):
+            loads.update({'handoff:' + group + ':' + a['name']: a['sha256'] for a in request[group]})
+        from factory_v1 import role_skills
+        support = {'required', 'repository-inputs', 'implement-review'}
+        handoff = {**request, 'skills': selected, 'issue_body': issue['body'],
+                   'specification': inputs, 'input_loads': loads,
+                   'adaptation': role_skills.ADAPTATIONS[request['stage']],
+                   'stage_rules': role_skills.STAGE_RULES[request['stage']],
+                   'support_policy': {k: role_skills.SUPPORT_POLICY[k] for k in sorted(support)},
+                   'skill_entry_points': list(role_skills.STAGES[request['stage']]),
+                   'tracker': {'api_base': self.github.base, 'board': self.item['ticket_work']['board'],
+                               'issue_url': issue['html_url']},
+                   'fresh_context': True, 'inherited_memory': False, 'inherited_sessions': False,
+                   'credentials': [], 'model_policy': {'scope': ['product', 'm1', 'openai-codex', 'gpt-6.1-sol', 'responses'],
+                       'reservation': 1, 'recheck_at_call': True},
+                   'result_requirements': {'identity': ['assignment_id', 'handoff_digest', 'claim_id', 'run_id'],
+                       'required_evidence': ['actual-selected-instruction-loads', 'observable-skill-guided-work',
+                           'artifacts', 'tests', 'trusted-whole-process-execution'],
+                       'advancement': 'disabled-without-trusted-whole-process-evidence'}}
+        row = {'assignment_id': assignments.digest({'request': request, 'scope': scope}),
+               'claim_id': request['claim_id'], 'ticket_scope': scope, 'handoff': handoff,
+               'handoff_digest': assignments.digest(handoff), 'revision': requirements.authority(self.item, scope['issue_number']),
+               'assignment_ready': True, 'launchable': False, 'execution_allowed': False,
+               'status': 'prepared', 'refusal': 'whole_process_isolation_unavailable'}
+        self.db.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
+        self.db.execute('INSERT INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.db.commit()
+        return row
+
     def result(self, row):
         expected = {s['source']: s['sha256'] for s in row['handoff']['skills']} | row['handoff']['input_loads']
         return {'assignment_id': row['assignment_id'], 'handoff_digest': row['handoff_digest'],
@@ -416,7 +457,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.frontier.assert_not_called()
 
     def test_claims_reservations_profile_conflicts_and_diagnosis_independence(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         request = copy.deepcopy(self.request)
         scope = row['ticket_scope']
         assignments.claims(self.db, request, scope, row['assignment_id'])
@@ -445,7 +486,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['claim_id'], self.request['claim_id'])
 
     def test_result_truthful_untrusted_replay_and_conflict(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         result = self.result(row)
         stored = self.store(row, result)
         self.assertTrue(stored['result_disposition']['structurally_valid'])
@@ -458,7 +499,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['submitted_result'], result)
 
     def test_result_identity_loads_artifacts_and_tests_matrix(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         result = self.result(row)
         for field, value in [('assignment_id', 'wrong'), ('claim_id', 'wrong'), ('handoff_digest', '0' * 64),
             ('loads', []), ('artifacts', []), ('work', []), ('tests', []), ('status', 'success')]:
@@ -473,7 +514,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertNotIn('submitted_result', assignments.rows(self.db)[0])
 
     def test_late_pause_blocks_claim_and_result_but_keeps_inspection(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         result = self.result(row)
         def pause_read(*args, **kwargs):
             controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause at read-return')
@@ -501,7 +542,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['handoff_digest'], row['handoff_digest'])
 
     def test_revision_inspection_and_result_independent_holds(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         for field, code in [('requirement_disposition', 'requirements_held'), ('stuck_disposition', 'stuck_held')]:
             with self.subTest(field=field):
                 with self.assertRaises(RepositoryError) as refusal:
@@ -707,7 +748,7 @@ class AssignmentComponentTests(unittest.TestCase):
 
     def test_result_revalidates_external_body_and_copied_selected_bytes(self):
         request = self.copied_skills(self.request)
-        row = self.prepare(request)
+        row = self.seed_assignment(request)
         result = self.result(row)
         before = assignments.rows(self.db)
         self.read_issue.return_value = {'body': 'Local issue\nChanged scope',
@@ -738,7 +779,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.github.request.assert_not_called()
 
     def test_operator_and_unknown_assignment_refuse_before_effects(self):
-        row = self.prepare()
+        row = self.seed_assignment()
         result = self.result(row)
         before = assignments.rows(self.db)
         self.frontier.reset_mock()

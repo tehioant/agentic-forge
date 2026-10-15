@@ -64,11 +64,9 @@ def artifacts(values, required, code='invalid_assignment'):
     require(required <= names, 'Missing required preceding artifacts or standards.', code)
 
 
-def validate(request):
-    require(isinstance(request, dict) and set(request) == REQUEST_FIELDS, 'Provide only the bounded assignment fields.', 'invalid_assignment')
-    stage = request['stage']
+def validate_profile(stage, profile):
+    """Validate infrastructure identity without manufacturing assignment precursors."""
     role_skills.closure(stage)
-    profile = request['profile']
     require(isinstance(profile, dict) and set(profile) == {'name', 'home', 'role', 'provider', 'model', 'operation', 'reasoning'} and
             identifier(profile['name']) and profile['name'] not in {'default', 'personal'} and
             absolute(profile['home']) and profile['role'] == ROLES[stage],
@@ -76,6 +74,13 @@ def validate(request):
     require((profile['provider'], profile['model'], profile['operation']) == SUBSCRIPTION_SCOPE and
             profile['reasoning'] in ('low', 'medium', 'high', 'xhigh'),
             'Only the existing approved provider/model/operation with explicit reasoning is supported; no fallback.', 'model_blocked')
+    return profile
+
+
+def validate(request):
+    require(isinstance(request, dict) and set(request) == REQUEST_FIELDS, 'Provide only the bounded assignment fields.', 'invalid_assignment')
+    stage = request['stage']
+    profile = validate_profile(stage, request['profile'])
     issue = request['issue']
     require(isinstance(issue, dict) and set(issue) == {'number', 'id', 'node_id', 'body_sha256'} and
             type(issue['number']) is int and issue['number'] > 0 and type(issue['id']) is int and issue['id'] > 0 and
@@ -479,7 +484,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         result = previous
     if not dry_run and previous is None:
         from .controls import admission
-        with admission(database, project, iteration), database:
+        with admission(database, project, iteration, selection=request), database:
             database.execute('BEGIN IMMEDIATE')
             database.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
             database.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment_id, json.dumps(result, sort_keys=True)))
@@ -586,7 +591,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
             result_key = 'simplification_result'
         assignment[result_key] = stage_result
     from .controls import admission
-    with admission(database, project, iteration), database:
+    with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': sandbox_run_id or request['run_id']}, operation='effect'), database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
         database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))

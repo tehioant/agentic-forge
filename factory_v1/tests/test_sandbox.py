@@ -207,6 +207,60 @@ class LauncherFixture:
             return sandbox.launch(str(self.state), 'product', 'm1', '42', self.assignment['assignment_id'], str(self.config), None)
 
 
+
+class FinalizationFixture:
+    """Explicit already-exited input records; never starts a worker or launcher."""
+    def __init__(self, case, launcher):
+        self.launcher = launcher
+        case.enterContext(patch('factory_v1.restart.process_identity', return_value='declared-controller'))
+        case.enterContext(patch.object(sandbox_guard, 'process_identity', return_value='declared-controller'))
+        self.root = launcher.artifacts / 'declared-exited-run'
+        self.root.mkdir(mode=0o700)
+        for directory in ('inputs', 'inputs/baseline', 'workspace', 'scratch'):
+            (self.root / directory).mkdir()
+        for directory in ('inputs/baseline', 'workspace'):
+            (self.root / directory / 'hello.py').write_text('print("baseline")\n')
+        (self.root / 'inputs/worker.py').write_text('explicit inert worker input\n')
+        (self.root / 'inputs/instruction-0.txt').write_text('pinned issue')
+        self.inputs = [{'source': launcher.assignment['handoff']['tracker']['issue_url'],
+                        'sha256': hashlib.sha256(b'pinned issue').hexdigest(), 'path': '/inputs/instruction-0.txt'}]
+        self.pins = {name: {'hello.py': {'sha256': hashlib.sha256(b'print("baseline")\n').hexdigest(),
+                                        'bytes': len(b'print("baseline")\n'), 'executable': False}}
+                     for name in ('workspace', 'baseline')}
+        assignment = launcher.stored()
+        assignment['runtime'] = {'run_id': 'declared-run', 'status': 'running', 'container': 'declared-container',
+                                 'artifacts': str(self.root), 'advance_allowed': False, 'close_allowed': False,
+                                 'controller_pid': 123, 'controller_start': 'declared-controller'}
+        self.runtime = assignment['runtime']
+        with launcher.db:
+            launcher.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+        self.result = write_worker_evidence(self.root, assignment, self.inputs)
+        (self.root / 'container.log').write_bytes(b'labeled mock container log')
+        self.config = load_config(launcher.config)
+        self.stop = threading.Event()
+        self.cancel = sandbox.cancellation_handler(self.root, self.stop)
+        self.capability = launcher.root / 'declared-capability'
+        self.capability.mkdir()
+        (self.root / 'capability-path.json').write_text(json.dumps(str(self.capability)))
+        self.broker_errors = []
+
+    def finalize(self, *, setup=None, writable=True):
+        with ExitStack() as mocks:
+            mocks.enter_context(patch.object(assignments, 'inspect', side_effect=self.launcher.inspect))
+            mocks.enter_context(patch.object(assignments, 'prepare', side_effect=self.launcher.prepare))
+            if setup:
+                setup(mocks)
+            return sandbox.finalize_result(str(self.launcher.state), 'product', 'm1', '42',
+                self.launcher.assignment['assignment_id'], self.runtime['run_id'], self.root, self.runtime,
+                writable, self.pins, self.inputs, self.config, 103, str(self.launcher.config), None)
+
+    def cleanup(self, *, status='complete', error=None):
+        return sandbox.cleanup_attempt(str(self.launcher.state), 'product', 'm1', '42',
+            self.launcher.assignment['assignment_id'], self.runtime['run_id'], self.root, self.runtime,
+            self.stop, self.launcher.docker, self.launcher.guard, self.launcher.helper, self.broker_errors,
+            self.capability, {}, status, error, str(self.launcher.config))
+
+
 class SandboxComponentTests(unittest.TestCase):
     def setUp(self):
         self.fixture = LauncherFixture(self)
@@ -288,55 +342,34 @@ class SandboxComponentTests(unittest.TestCase):
     def test_running_pause_observed_in_wait_loop_retains_scratch_and_retires_capability(self):
         from factory_v1 import controls
         fixture = self.fixture
-        inspections = []
-        def inspect(name):
-            observed = fixture.docker_inspect(name)
-            inspections.append(observed)
-            observed['State']['Running'] = len(inspections) == 2
-            return observed
-        fixture.docker.inspect.side_effect = inspect
-        def leave_running_scratch(root):
-            (root / 'scratch/in-progress.txt').write_text('retained partial work')
-            (root / 'scratch/result.json').unlink()
-        fixture.worker_boundary = leave_running_scratch
+        component = FinalizationFixture(self, fixture)
+        (component.root / 'scratch/in-progress.txt').write_text('retained partial work')
+        (component.root / 'scratch/result.json').unlink()
+        fixture.docker.inspect.side_effect = None
+        fixture.docker.inspect.return_value = {'State': {'Running': True}}
         pauses = []
         def pause_after_running(seconds):
             self.assertEqual(seconds, .1)
-            self.assertTrue(inspections[-1]['State']['Running'])
             self.assertEqual(fixture.stored()['runtime']['status'], 'running')
             pauses.append(controls.request(fixture.db, 'product', 'm1', '42', 'pause', 'mock running boundary'))
-        stored_result = Mock(wraps=assignments.store_result)
-        evidence = Mock(wraps=sandbox.check_worker_evidence)
-        def setup(mocks):
-            mocks.enter_context(patch.object(sandbox.time, 'sleep', side_effect=pause_after_running))
-            mocks.enter_context(patch.object(sandbox_guard, 'process_identity', return_value='labeled identity'))
-            mocks.enter_context(patch.object(assignments, 'store_result', stored_result))
-            mocks.enter_context(patch.object(sandbox, 'check_worker_evidence', evidence))
-        result = fixture.launch(setup=setup)
-        self.assertEqual(len(inspections), 2)  # No worker completion read after durable pause.
+        with patch.object(assignments, 'inspect', side_effect=fixture.inspect), \
+                patch.object(sandbox.time, 'sleep', side_effect=pause_after_running), \
+                patch.object(sandbox.time, 'monotonic', return_value=100), \
+                self.assertRaises(RepositoryError) as error:
+            sandbox.wait_for_worker(str(fixture.state), 'product', 'm1', '42', fixture.assignment['assignment_id'],
+                component.runtime['run_id'], component.root, component.runtime, component.stop, fixture.helper,
+                [], fixture.guard, fixture.docker, 103)
+        self.assertEqual(error.exception.code, 'iteration_paused')
         self.assertEqual(len(pauses), 1)
         self.assertEqual(pauses[0]['action'], 'pause')
         self.assertFalse(pauses[0]['dispatch_allowed'])
-        self.assertEqual(result['runtime']['status'], 'stopped')
-        self.assertEqual(result['runtime']['error'], 'iteration_paused')
-        self.assertTrue(result['runtime']['recoverable'])
-        self.assertTrue(result['runtime']['container_removed'])
-        self.assertEqual(fixture.stored(), result)
-        root = fixture.attempt_root()
-        self.assertEqual((root / 'scratch/in-progress.txt').read_text(), 'retained partial work')
-        self.assertFalse((root / 'scratch/result.json').exists())
-        self.assertFalse((root / 'stop').exists())  # Pause is not a fabricated cancellation signal.
-        capability = Path(json.loads((root / 'capability-path.json').read_text()))
-        self.assertFalse(capability.exists())
-        fixture.helper.join.assert_called_once_with(timeout=1)
-        fixture.guard.wait.assert_called_once_with(timeout=35)
-        fixture.docker.remove.assert_called_once_with(result['runtime']['container'])
-        stored_result.assert_not_called()
-        evidence.assert_not_called()
-        self.assertNotIn('submitted_result', result)
+        self.assertFalse((component.root / 'stop').exists())
+        self.assertEqual((component.root / 'scratch/in-progress.txt').read_text(), 'retained partial work')
+        self.assertFalse((component.root / 'scratch/result.json').exists())
+        self.assertNotIn('submitted_result', fixture.stored())
         with sqlite3.connect(fixture.state) as fresh:
             self.assertTrue(controls.blocked(fresh, 'product', 'm1'))
-            self.assertEqual(json.loads(fresh.execute('SELECT payload FROM role_assignments').fetchone()[0]), result)
+        fixture.docker.inspect.assert_called_once()
 
     def test_launch_anonymous_mount_calls_real_verifier_before_any_model_or_start(self):
         fixture = self.fixture
@@ -370,28 +403,29 @@ class SandboxComponentTests(unittest.TestCase):
 
     def test_launch_retains_scoped_artifacts_and_never_promotes_worker_claims(self):
         fixture = self.fixture
-        result = fixture.launch()
-        self.assertEqual(result['runtime']['status'], 'complete', result)
-        self.assertTrue(result['runtime']['container_removed'])
+        component = FinalizationFixture(self, fixture)
+        result = component.finalize()
         self.assertEqual(fixture.stored(), result)
         self.assertTrue(result['result_disposition']['isolated_execution'])
         for flag in ('trusted_execution', 'checks_verified', 'advance_allowed', 'close_allowed'):
             self.assertFalse(result['result_disposition'][flag])
         self.assertEqual((fixture.source / 'hello.py').read_text(), 'print("baseline")\n')
         self.assertFalse((fixture.attempt_root() / 'workspace/.git').exists())
-        self.refusal('run_conflict', fixture.launch)
-        fixture.helper.join.assert_called_once_with(timeout=1)
-        fixture.guard.wait.assert_called_once_with(timeout=35)
+        self.assertEqual(result['runtime']['candidate_sha256'], assignments.digest(component.pins['workspace']))
+        self.assertEqual(result['runtime']['baseline_sha256'], assignments.digest(component.pins['baseline']))
+        self.assertEqual(result['submitted_result'], component.result)
 
     def test_role_mount_files_are_readable_by_different_nonroot_identity(self):
-        fixture = self.fixture
-        result = fixture.launch()
-        root = Path(result['runtime']['artifacts'])
+        component = FinalizationFixture(self, self.fixture)
+        root = component.root
+        sandbox.project_mount_permissions(root, root / 'inputs', True)
         self.assertEqual((root / 'inputs').stat().st_mode & 0o007, 0o005)
         self.assertEqual((root / 'inputs/worker.py').stat().st_mode & 0o004, 0o004)
         self.assertEqual((root / 'inputs/baseline/hello.py').stat().st_mode & 0o004, 0o004)
         self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o002, 0o002)
         self.assertEqual(root.stat().st_mode & 0o077, 0)
+        sandbox.project_mount_permissions(root, root / 'inputs', False)
+        self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o022, 0)
 
     def test_bad_physical_pin_is_recoverable_and_never_starts_worker(self):
         fixture = self.fixture
@@ -426,15 +460,13 @@ class SandboxComponentTests(unittest.TestCase):
 
     def test_forged_loads_never_advance_and_retain_artifacts(self):
         fixture = self.fixture
-        def tamper(root):
-            path = root / 'scratch/loads.json'
-            path.write_text('[{"source":"forged"}]')
-        fixture.worker_boundary = tamper
-        result = fixture.launch()
-        self.assertEqual(result['runtime']['error'], 'invalid_result')
-        self.assertNotIn('submitted_result', result)
+        component = FinalizationFixture(self, fixture)
+        (component.root / 'scratch/loads.json').write_text('[{"source":"forged"}]')
+        with self.assertRaises(RepositoryError) as error:
+            component.finalize()
+        self.assertEqual(error.exception.code, 'invalid_result')
+        self.assertNotIn('submitted_result', fixture.stored())
         self.assertTrue(fixture.attempt_root().is_dir())
-        fixture.guard.wait.assert_called_once()
 
     def test_pause_and_changed_ticket_refuse_before_any_attempt(self):
         fixture = self.fixture
@@ -586,6 +618,101 @@ class SandboxComponentTests(unittest.TestCase):
                 self.assertEqual(capability.exists(), reason != 'controller_lost')
                 self.assertTrue((self.root / 'container.log').exists())
         self.assertEqual(fixture.docker.remove.call_count, 4)
+
+
+    def test_direct_cleanup_preserves_pause_failure_and_uncertainty_precedence(self):
+        from factory_v1 import controls
+        for reason in ('complete', 'pause', 'verification_failed', 'invalid_result', 'remove', 'guard', 'broker'):
+            with self.subTest(reason=reason):
+                fixture = LauncherFixture(self)
+                component = FinalizationFixture(self, fixture)
+                status, error = 'complete', None
+                if reason == 'pause':
+                    controls.request(fixture.db, 'product', 'm1', '42', 'pause', 'direct cleanup observation')
+                elif reason in {'verification_failed', 'invalid_result'}:
+                    status, error = 'failed', reason
+                elif reason == 'remove':
+                    fixture.docker.remove.side_effect = OSError('declared removal uncertainty')
+                    component.cancel(signal.SIGTERM, None)
+                elif reason == 'guard':
+                    fixture.guard.wait.side_effect = subprocess.TimeoutExpired('declared guard', 35)
+                    component.cancel(signal.SIGTERM, None)
+                elif reason == 'broker':
+                    component.broker_errors.append('DeclaredBrokerFailure')
+                    component.cancel(signal.SIGTERM, None)
+                result = component.cleanup(status=status, error=error)
+                uncertain = reason in {'remove', 'guard', 'broker'}
+                expected = 'unconfirmed' if uncertain else 'stopped' if reason == 'pause' else status
+                self.assertEqual(result['runtime']['status'], expected)
+                self.assertEqual(result['runtime']['error'], 'stop_unconfirmed' if uncertain else 'iteration_paused' if reason == 'pause' else error)
+                self.assertEqual(result['runtime']['container_removed'], not uncertain)
+                self.assertEqual(result['runtime']['recoverable'], expected != 'complete')
+                self.assertEqual(fixture.stored(), result)
+                self.assertFalse(component.capability.exists())
+                self.assertEqual((component.root / 'scratch/result.json').read_text(), json.dumps(component.result))
+                fixture.docker.remove.assert_called_once_with(component.runtime['container'])
+                fixture.guard.wait.assert_called_once_with(timeout=35)
+                fixture.guard.kill.assert_not_called()
+                fixture.helper.join.assert_called_once_with(timeout=1)
+
+    def test_direct_result_read_only_source_and_run_correlation(self):
+        for defect in ('unchanged', 'bytes', 'run'):
+            with self.subTest(defect=defect):
+                fixture = LauncherFixture(self)
+                component = FinalizationFixture(self, fixture)
+                if defect == 'bytes':
+                    (component.root / 'workspace/hello.py').write_text('changed read-only source')
+                elif defect == 'run':
+                    assignment = fixture.stored()
+                    assignment['runtime']['run_id'] = 'other-run'
+                    with fixture.db:
+                        fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+                if defect == 'unchanged':
+                    self.assertTrue(component.finalize(writable=False)['result_disposition']['isolated_execution'])
+                else:
+                    with self.assertRaises(RepositoryError) as error:
+                        component.finalize(writable=False)
+                    self.assertEqual(error.exception.code, 'invalid_result' if defect == 'bytes' else 'stale_assignment')
+                    self.assertNotIn('submitted_result', fixture.stored())
+
+    def test_direct_pause_at_result_revalidation_and_after_commit(self):
+        from factory_v1 import controls
+        for after_commit in (False, True):
+            with self.subTest(after_commit=after_commit):
+                fixture = LauncherFixture(self)
+                component = FinalizationFixture(self, fixture)
+                injected = []
+                def pause(db):
+                    controls.request(db, 'product', 'm1', '42', 'pause', 'direct result checkpoint')
+                    injected.append(True)
+                original = assignments.store_result
+                def store(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    pause(fixture.db)
+                    return result
+                if not after_commit:
+                    fixture.preparing = pause
+                with self.assertRaises(RepositoryError) as error:
+                    component.finalize(setup=lambda mocks: mocks.enter_context(
+                        patch.object(assignments, 'store_result', side_effect=store)) if after_commit else None)
+                self.assertEqual(error.exception.code, 'iteration_paused')
+                self.assertTrue(injected)
+                result = fixture.stored()
+                self.assertEqual('submitted_result' in result, after_commit)
+                if after_commit:
+                    self.assertEqual(result['submitted_result'], component.result)
+                    self.assertFalse(result['result_disposition']['trusted_execution'])
+                self.assertNotEqual(result['runtime']['status'], 'complete')
+                self.assertTrue(controls.blocked(fixture.db, 'product', 'm1'))
+
+    def test_direct_existing_attempt_refuses_relaunch_before_worker_start(self):
+        fixture = self.fixture
+        FinalizationFixture(self, fixture)
+        self.refusal('run_conflict', lambda: fixture.launch(setup=lambda mocks: mocks.enter_context(
+            patch('factory_v1.restart.process_identity', return_value='declared-controller'))))
+        fixture.docker.call.assert_not_called()
+        fixture.guard.wait.assert_not_called()
+        fixture.helper.start.assert_not_called()
 
 
 class SourceSnapshotTests(unittest.TestCase):

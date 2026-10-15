@@ -367,7 +367,13 @@ class DeliveredOwnershipComponents(unittest.TestCase):
     def test_second_reservation_reaches_real_ownership_guard_with_direct_receipt(self):
         self.seed_receipt()
         self.refresh_integration()
+        # Restart readback is its own component; reservation starts from direct records.
+        self.records['candidate']['merge']['integrated_evidence'] = copy.deepcopy(self.evidence)
+        self.store()
         result = self.reserve_second()
+        self.item['reservation'] = {'issue_number': 2, 'status': 'reserved',
+            'assignment_id': 'batch', 'input_digest': 'b' * 64}
+        self.store()
         scope = dict(self.scope, issue_number=2, issue_id=20)
         request = {'stage': 'implementation', 'claim_id': 'fresh', 'profile': {'name': 'fresh', 'home': '/fixture/fresh'}}
         assignments.claims(self.db, request, scope, 'new')
@@ -379,9 +385,9 @@ class DeliveredOwnershipComponents(unittest.TestCase):
     def test_role_claim_then_second_reservation_uses_the_same_retirement_authority(self):
         self.seed_receipt()
         self.refresh_integration()
+        self.records['candidate']['merge']['integrated_evidence'] = copy.deepcopy(self.evidence)
         scope = dict(self.scope, issue_number=2, issue_id=20)
         profile = {'name': 'fresh', 'home': '/fixture/fresh'}
-        assignments.claims(self.db, {'stage': 'implementation', 'claim_id': 'fresh', 'profile': profile}, scope, 'fresh')
         handoff = {'stage': 'implementation', 'profile': profile}
         self.records['fresh'] = {'assignment_id': 'fresh', 'claim_id': 'fresh', 'ticket_scope': scope,
                                  'handoff': handoff, 'handoff_digest': assignments.digest(handoff)}
