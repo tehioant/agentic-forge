@@ -32,7 +32,8 @@ class ResolutionCheckpointTests(unittest.TestCase):
 
     def test_candidate_late_holds_at_intent_receipt_and_success(self):
         for boundary in ('intent', 'write', 'receipt', 'success'):
-            for field, resolving in product(('stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause'), (False, True)):
+            for field, resolving in product(('stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause',
+                                             'execution_trust', 'result_disposition', 'runtime_status', 'runtime_removed', 'runtime_pin'), (False, True)):
                 with self.subTest(boundary=boundary, field=field, resolving=resolving):
                     f = self.fixture(fixtures.CandidateResolutionTests)
                     if not resolving:
@@ -57,7 +58,17 @@ class ResolutionCheckpointTests(unittest.TestCase):
                                 from pathlib import Path
                                 (Path(row['runtime']['artifacts']) / 'stop').touch()
                             else:
-                                row[field] = {'reference': 'fixture:new-hold'}
+                                if field == 'execution_trust':
+                                    row['result_disposition']['isolated_execution'] = False
+                                elif field == 'result_disposition':
+                                    row[field]['reason'] = 'fixture:authority-changed'
+                                elif field.startswith('runtime_'):
+                                    key, value = {'runtime_status': ('status', 'failed'),
+                                                  'runtime_removed': ('container_removed', False),
+                                                  'runtime_pin': ('controller_start', 'fixture:changed-owner')}[field]
+                                    row['runtime'][key] = value
+                                else:
+                                    row[field] = {'reference': 'fixture:new-hold'}
                                 with f.db:
                                     f.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(row),))
                             injected = copy.deepcopy(row)
@@ -68,7 +79,9 @@ class ResolutionCheckpointTests(unittest.TestCase):
                     assert injected is not None
                     stored = json.loads(f.db.execute('SELECT payload FROM role_assignments').fetchone()[0])
                     if field not in {'stop', 'pause'}:
-                        self.assertEqual(stored[field], injected[field])
+                        key = ('runtime' if field.startswith('runtime_') else
+                               'result_disposition' if field == 'execution_trust' else field)
+                        self.assertEqual(stored[key], injected[key])
                     self.assertEqual(stored['publication']['status'], 'pending')
                     self.assertEqual(len(f.writes), 0 if boundary in {'intent', 'write'} else 1)
                     expected = copy.deepcopy(injected)

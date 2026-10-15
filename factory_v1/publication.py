@@ -351,7 +351,9 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         def current_assignment():
             fresh = assignments.inspect(database, project, iteration, operator, assignment_id)
             assignments.require_result_active(fresh)
-            require(binding(fresh) == binding(assignment), 'Candidate authority changed.', 'stale_assignment')
+            require(binding(fresh) == binding(assignment) and fresh.get('runtime') == runtime and
+                    fresh.get('result_disposition') == assignment.get('result_disposition'),
+                    'Candidate authority changed.', 'stale_assignment')
             return fresh
         def write(path, payload, method='POST'):
             controls.require_active(database, project, iteration, resolution=resolution)
