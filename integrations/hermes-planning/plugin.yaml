@@ -1,0 +1,8 @@
+name: factory-planning
+version: 0.1.0
+description: Bind approved origin interviews to installed planning skills
+provides_tools:
+  - factory_planning_sufficient
+  - factory_planning_complete
+provides_hooks:
+  - pre_llm_call

@@ -18,9 +18,9 @@ class DispatchSelectionTests(unittest.TestCase):
                      'ticket_work': {'status': 'published', 'publication_complete': True}}
         self.seed = {'assignment_id': 'a' * 64, 'claim_id': 'seed', 'handoff': {'stage': 'implementation'}}
 
-    def test_pending_interview_reports_missing_conversational_executor(self):
+    def test_pending_interview_waits_for_the_origin_native_binding(self):
         self.item['planning']['status'] = 'pending'
-        self.assertEqual(dispatch.select(self.item, [], self.config), ('blocked', 'same_conversation_executor_unavailable'))
+        self.assertEqual(dispatch.select(self.item, [], self.config), ('blocked', 'origin_conversation_pending'))
 
     def test_complete_interview_automatically_selects_ticket_synthesis(self):
         self.item.pop('ticket_work')

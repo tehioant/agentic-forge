@@ -6,7 +6,7 @@ import re
 import uuid
 
 from .repositories import RepositoryError, reconcile, save_iteration
-from .skills import resolve
+from .skills import resolve_planning
 
 INSTRUCTIONS = """Carry out this assignment in the same originating conversation, not in a
 noninteractive worker. Load and follow the attached pinned grill-me instructions,
@@ -92,7 +92,7 @@ def plan(database, item, request):
     require(request['origin'] == item['origin'], 'Use the exact originating conversation.')
     require(type(request['expected_revision']) is int and request['expected_revision'] >= 0,
             'Use a nonnegative integer planning revision.')
-    skills = resolve(request['skills'])
+    skills = resolve_planning(request['skills'])
     previous = item.get('planning')
     from .requirements import held_numbers
     require(not held_numbers(item) and not item.get('requirement_authority'),
@@ -206,7 +206,7 @@ def complete(database, item, request, github):
         evidence = continuation_evidence(planning, request, selected)
         planning['execution'] = evidence
     else:
-        resolve(planning['request']['skills'])  # Revalidate even on restart/retry.
+        resolve_planning(planning['request']['skills'])  # Revalidate even on restart/retry.
     if not request['sufficient']:
         require(planning['status'] != 'complete', 'Reassign explicitly before changing a completed milestone.', 'planning_conflict')
         planning['pending_questions'] = pending

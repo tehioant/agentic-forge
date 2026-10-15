@@ -70,7 +70,7 @@ def pending(row):
 def select(item, rows, config):
     """Choose only an operation; its public seam must freshly validate all evidence."""
     if item.get('planning', {}).get('status') != 'complete':
-        return 'blocked', 'same_conversation_executor_unavailable'
+        return 'blocked', 'origin_conversation_pending'
     work = item.get('ticket_work')
     if work is None:
         return 'synthesize', None

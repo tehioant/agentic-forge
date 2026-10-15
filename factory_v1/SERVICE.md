@@ -155,13 +155,16 @@ A reviewed merge authority is still required by the existing human-approved seam
 
 ## Explicit remaining gaps (not a #25 Done claim)
 
-1. **Implementation gap:** the repository has no admitted native executor that
-   attaches a new `grill-me`/`grilling`/`to-spec` assignment to the exact originating
-   live conversation and publishes its actual synthesis. The service reports
-   `same_conversation_executor_unavailable` while that planning assignment is
-   pending. It can automatically continue an already admitted completed planning
-   handoff, but does not claim a native interview-to-delivery trace. It does not
-   invent answers or launch a noninteractive substitute.
+1. **Origin conversation binding:** `integrations/hermes-planning` provides an
+   opt-in native `pre_llm_call`/tool adapter for an explicitly host-bound existing
+   session. It loads the reviewed installed interview sources into actual origin
+   turns. Sufficient clarification returns the installed `to-spec` instructions
+   directly to that same native tool loop, without another operator advancement.
+   Completion still requires actual immutable publication readback through the
+   existing planning verifier. The service waits at `origin_conversation_pending`
+   until that verifier completes; a load or enqueue is not completion. The plugin
+   has not been installed/enabled or exercised with a model. See the integration
+   README for the source boundary and the remaining host-publication limitation.
 2. **Bounded scope:** automation drives one configured frontier ticket through
    existing gates. Corrections, diagnosis, repair, changed requirements, uncertain
    effects and next-ticket/iteration enrollment still stop at the existing public
