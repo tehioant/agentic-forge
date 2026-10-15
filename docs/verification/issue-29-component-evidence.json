@@ -1,0 +1,260 @@
+{
+  "issue": 29,
+  "kind": "STATIC_COMPONENT_COVERAGE_MAP_NOT_TEST_RESULT",
+  "inspected_integrated_base": {
+    "head": "79f87db5f63c86f355b8bd5a4a4c5416815ba994",
+    "tree": "0f05624a9aa3a7a55897082ee039e6e2eba0a1a5"
+  },
+  "amendment": "docs/specs/no-live-verification-amendment.md",
+  "amendment_comment": "https://github.com/tehioant/agentic-forge/issues/29#issuecomment-6187444883",
+  "policy_hashes": {
+    "AGENTS.md": "214e4272135eab3174068c86c8f47aa6d2040588fdd13c1841c5a077067ac5bc",
+    "docs/specs/no-live-verification-amendment.md": "1b2786398ed9f95a097e3f8883ddc4488740da5c4b8665cff7994459a7c4810e",
+    "docs/specs/fresh-agentic-factory.md": "5c340368aa0d01c22c05834bf40500c2d88b1d393713530cc75334899717a774",
+    "scripts/run_factory_tests.py": "b55fb12e3badf7a5329dcc8c378e57973cfb680e5b2ec53c2d27616e24ced668",
+    ".github/workflows/fresh-factory-v1.yml": "ae1ca9c55953c766a8877a30a69e61352312a164373d985026a924e1fdb3f3ec"
+  },
+  "criteria": [
+    {
+      "number": 1,
+      "criterion": "Stuck declaration, independent diagnosis, correlated explicit direction; dependent wait and independent progress",
+      "tests": [
+        "test_diagnosis.DiagnosisComponentTests.test_declare_transitive_scope_durable_retirement_and_independent_progress",
+        "test_diagnosis.DiagnosisComponentTests.test_exact_independent_handoff_and_real_staging",
+        "test_diagnosis.DiagnosisComponentTests.test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay",
+        "test_diagnosis.DiagnosisComponentTests.test_unrelated_direction_event_refuses_before_response_read_or_release_effect",
+        "test_diagnosis.DiagnosisComponentTests.test_direction_silence_revise_and_exact_replay_never_imply_retry",
+        "test_diagnosis.DiagnosisComponentTests.test_retry_release_intent_survives_partial_external_effect_then_reconciles"
+      ],
+      "sources": [
+        "factory_v1/diagnosis.py:declare",
+        "factory_v1/diagnosis.py:handoff",
+        "factory_v1/diagnosis.py:completed",
+        "factory_v1/diagnosis.py:request_direction",
+        "factory_v1/diagnosis.py:apply_direction"
+      ],
+      "behavior": "Real declare computes transitive [10,11,13] while 12 stays ready, persists/reloads holds and retires claims. Real handoff/copy stages read-only candidate. completed_inputs patches assignments.prepare only, leaving completed/report/authorization/request correlation real; unrelated event refuses before attention read. direction_inputs patches completed/get_record, leaving response/release guards real.",
+      "adapter_seams": [
+        "tickets.frontier/gh.read_issue/gh.set_field; completed diagnosis read; attention.get_record; private host authorization input"
+      ],
+      "limitations": [
+        "DiagnosisComponentTests.setUp -> LocalStageEvidence is explicit local artifact state. completed_inputs supplies LABELED conversation/report/model files, not native work; host_grant is a local fixture authorization, never an operator grant. No real debug agent or authenticated transport ran."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 2,
+      "criterion": "Main CI/CD or health freeze, bounded roll-forward, exact safe-revert reopening and stuck repair",
+      "tests": [
+        "test_delivery.DeliveryComponentTests.test_durable_incident_unknown_holds_idempotence_and_exact_clearance",
+        "test_delivery.DeliveryComponentTests.test_health_status_and_exact_contract_refusals",
+        "test_recovery_components.RecoveryComponents.test_clearance_requires_merge_integrated_checks_and_fresh_health_after_readbacks",
+        "test_recovery_components.RecoveryComponents.test_final_merge_boundary_checks_simplified_bytes_and_exact_host_scope",
+        "test_recovery_components.RecoveryComponents.test_safe_revert_reopens_exact_ticket_and_status_with_lost_response_reconciliation",
+        "test_recovery_components.RecoveryComponents.test_stuck_retry_waits_for_explicit_separate_debug_direction",
+        "test_recovery.RecoveryObservationTests.test_healthy_sample_cannot_clear_registered_repair_before_merge_and_reopening",
+        "test_restart_recovery.RestartRecoveryTests.test_unregistered_failed_unknown_health_never_admits_ordinary_dispatch"
+      ],
+      "sources": [
+        "factory_v1/delivery.py:observe",
+        "factory_v1/delivery.py:sample",
+        "factory_v1/delivery.py:mutation_boundary",
+        "factory_v1/recovery.py:register",
+        "factory_v1/recovery.py:merge_boundary",
+        "factory_v1/recovery.py:reopen_removed",
+        "factory_v1/recovery.py:verify"
+      ],
+      "behavior": "DeliveryComponentTests routes real observe to in-memory HTTP readback, retaining check/workflow/deployment/health validation. RecoveryComponents.verify mocks merge lifecycle/chain but calls real merge_boundary, reopen and final health/clearance transaction. Healthy->failed last observation refuses, interrupted clearance stays held. Safe-revert validates exact removed assignment/issue and one lost-response replay. Registered repair healthy polling alone cannot clear.",
+      "adapter_seams": [
+        "delivery.http_json/observe; merge.lifecycle/chain/config; gh issue/membership/status adapters; Docker/process observation"
+      ],
+      "limitations": [
+        "RecoveryComponents inherits RecoveryComponentFixture -> RecoveryFixture; explicit failed observation/incident/notification rows. seed_assignment/seed_registered/completed_report supply records, not preparation/worker journeys. Simulated host pins and diagnosis transcript; clearance mocks delivered journal and chain, so not independent review, actual merge, outage, roll-forward or health-restoration proof."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 3,
+      "criterion": "Pause and process/response loss; checkpoints, idempotent effects and explicit resume",
+      "tests": [
+        "test_controls.ControlTests.test_pause_checkpoint_restart_and_explicit_resume_preserve_progress_and_budget",
+        "test_controls.ControlTests.test_resume_requires_reconciled_publication_and_merge_intents",
+        "test_controls.MergeControlTests.test_pause_after_intent_commit_prevents_final_put_without_erasing_intent",
+        "test_restart.RestartTests.test_pause_survives_new_connection_and_reconciliation_never_resumes",
+        "test_restart.RestartTests.test_lost_worker_keeps_artifacts_and_does_not_trust_done_report",
+        "test_restart_effects.CandidateRestartTests.test_lost_merge_response_adopts_exact_commit_and_ci_without_merge_or_closure",
+        "test_restart_effects.CandidateRestartTests.test_lost_pr_response_adopts_exact_existing_effect_without_writes"
+      ],
+      "sources": [
+        "factory_v1/controls.py:request",
+        "factory_v1/controls.py:resume",
+        "factory_v1/controls.py:admission",
+        "factory_v1/restart.py:reconcile",
+        "factory_v1/restart.py:candidate",
+        "factory_v1/restart.py:tracker"
+      ],
+      "behavior": "ControlTests checks fresh SQLite connection, unchanged progress and remaining allowance; unresolved intents refuse resume. Restart guards remain real while observed_restart substitutes absent owner/container and requirement/issue reads. Candidate restart reads exact effects without mutation. MergeControlTests keeps final controls admission real but replaces engineering antecedents.",
+      "adapter_seams": [
+        "process_identity/Docker.inspect; GitHub metadata readback; merge MergeGitHub/chain/mapped_candidate/review/delivery precursor adapters"
+      ],
+      "limitations": [
+        "ControlTests sets durable explicit state and blocks external execution; it does not lose a real service/process. observed_restart mocks absence; fresh DB connections are persistence evidence only. MergeControlTests patches accepted review, candidate mapping, chain and delivery.mutation_boundary: its pause test is not health/review proof. Remote readbacks are fixture responses, not attempted-target receipts."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 4,
+      "criterion": "Material review-time revision obsoletes candidate; resolved resynthesis yields fresh authoritative inputs",
+      "tests": [
+        "test_requirement_merge.RequirementReviewTests.test_material_revision_before_review_refuses_old_candidate_on_durable_reload",
+        "test_requirement_merge.RequirementMergeTests.test_material_revision_after_approval_refuses_result_and_merge_inspection_retains_history",
+        "test_requirement_merge.RequirementMergeTests.test_last_publication_guard_rejects_remote_doc_drift_without_mutation",
+        "test_requirements.RequirementChangeTests.test_material_hold_retires_assignments_dependents_bugs_and_reservation",
+        "test_requirements.RequirementChangeTests.test_scope_authority_and_input_selection_keep_independent_original_inputs",
+        "test_requirements.RequirementChangeTests.test_stage_records_validated_execution_and_reuses_exact_inputs",
+        "test_requirements.RequirementChangeTests.test_post_status_membership_body_native_and_spec_drift_retains_pending_hold"
+      ],
+      "sources": [
+        "factory_v1/requirements.py:record_change",
+        "factory_v1/requirements.py:resolve_change",
+        "factory_v1/requirements.py:resume_change",
+        "factory_v1/requirements.py:inputs",
+        "factory_v1/requirement_execution.py:execute",
+        "factory_v1/requirement_execution.py:run_stage",
+        "factory_v1/review.py:candidate"
+      ],
+      "behavior": "Real review.candidate and require_result_active reject held/obsolete persisted rows; last-publication test targets merge-boundary drift. record_change retires affected assignments/bugs/reservation; inputs selects revised affected versus original independent inputs. run_stage validates receipt/load/work input digest and exact reuse while invoke is mocked. Status-read races retain revision hold.",
+      "adapter_seams": [
+        "FrontierFixture pinned_inputs/verified_board/tracker reads; requirement_execution.invoke; publication.verify_synthesis/version_documents"
+      ],
+      "limitations": [
+        "FrontierFixture constructs explicit ticket state and mocks external reads, not live publication. Material retirement test mocks unrelated validity. stage() builds explicit work/evidence and mocks invoke: no to-spec/to-tickets worker or executing-context native provenance. Publication prerequisites are mocked in status-race checks; new authority is supplied fixture data."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 5,
+      "criterion": "Common-format current/deferred bug publication/readback and semantic deduplication",
+      "tests": [
+        "test_bugs.BugTests.test_single_current_bug_publication_then_read_only_replay_and_completed_release",
+        "test_bugs.BugTests.test_semantic_duplicates_require_symptoms_and_scope_not_title",
+        "test_bugs.BugTests.test_noncurrent_unknown_and_duplicate_normalized_scope_never_reserve",
+        "test_bugs.BugTests.test_unknown_creation_current_or_archived_prevents_duplicate_write",
+        "test_bugs.BugTests.test_final_affected_readback_requires_body_native_identity_membership_scope"
+      ],
+      "sources": [
+        "factory_v1/bugs.py:validate_result",
+        "factory_v1/bugs.py:render",
+        "factory_v1/bugs.py:publish_locked",
+        "factory_v1/tickets.py:frontier",
+        "factory_v1/tickets.py:reserve"
+      ],
+      "behavior": "Real publish_locked checks one current bug issue/body/native edges and frontier: blocker plus independent eligible, read-only replay no new issue/edge/status writes. validate_result compares normalized observable symptoms AND scope; deferred/recovery/unknown scope refuses reserve. Unknown creation retained rather than retried.",
+      "adapter_seams": [
+        "FrontierFixture gh issue/member/field/dependency adapters; bugs.work_context synthesis prerequisite"
+      ],
+      "limitations": [
+        "BugTests.setUp -> FrontierFixture + make_work explicit synthesis record. Single-current publication mocks work_context only; fixture GitHub mutations/readbacks update Python maps. No real bug discovery, external issue publication or milestone execution."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 6,
+      "criterion": "Selected diagnosis/implement/simplifier/both review axes/to-spec/to-tickets source, dependency, adaptation, load/work and provenance contracts",
+      "tests": [
+        "test_assignments.AssignmentComponentTests.test_real_skill_closure_and_stage_bindings",
+        "test_assignments.AssignmentComponentTests.test_result_identity_loads_artifacts_and_tests_matrix",
+        "test_assignments.AssignmentComponentTests.test_result_revalidates_external_body_and_copied_selected_bytes",
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_refuse_dependency_omission_without_hiding_the_graph_guard",
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_admit_reviewed_bytes_and_refuse_drift_or_caller_repins",
+        "test_simplification.SimplificationValidatorTests.test_result_pins_json_four_angles_and_behavior_matrix",
+        "test_review.ReviewValidatorTests.test_exact_axis_pin_schema_findings_stuckness_and_readonly_evidence",
+        "test_diagnosis.ReportPolicyTests.test_commands_and_loop_must_match_retained_results_verbatim",
+        "test_tickets.TicketTests.test_execution_requires_complete_actual_loads_and_result",
+        "test_tickets.TicketTests.test_selected_skill_bytes_are_revalidated_without_repinning",
+        "test_requirements.RequirementChangeTests.test_stage_records_validated_execution_and_reuses_exact_inputs"
+      ],
+      "sources": [
+        "factory_v1/role_skills.py:closure",
+        "factory_v1/role_skills.py:snapshots",
+        "factory_v1/assignments.py:validate",
+        "factory_v1/assignments.py:store_result",
+        "factory_v1/simplification.py:validate_result",
+        "factory_v1/review.py:validate_result",
+        "factory_v1/diagnosis.py:validate_report",
+        "factory_v1/requirement_execution.py:run_stage",
+        "factory_v1/requirement_execution.py:execute",
+        "factory_v1/tickets.py:validate_execution"
+      ],
+      "behavior": "Active AssignmentComponentTests (not dormant AssignmentTests) validates all role closures against immutable local snapshots and declines changed bytes/identity/graph; result matrices exercise load/work pins. Both axes have complete-count missing-edge guard checks. Simplification validates four-angle schema/no-op/candidate bounds and denies native trust. Source execute explicitly calls run_stage(to-spec) then run_stage(to-tickets); direct run_stage contract tests avoid a multistage campaign.",
+      "adapter_seams": [
+        "repository role_skill_snapshots and ticket_skills; assignments copied staging/load artifacts; requirement_execution.invoke; executing-context terminal transcript readers"
+      ],
+      "limitations": [
+        "No installed selected-skill bytes were read here; repository snapshots are not installed-source compatibility proof. LocalStageEvidence.check receipts and debug/recovery terminal conversations are declared test inputs, not native reviewer/diagnosing-bugs execution. to-spec/to-tickets sequencing is statically traced, individual contract coverage is direct; no end-to-end resynthesis claim."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    },
+    {
+      "number": 7,
+      "criterion": "Honest evidence identity, handles/readbacks and injected-versus-real limitations",
+      "tests": [
+        "test_diagnosis.DiagnosisComponentTests.test_completed_reader_requires_isolation_terminal_removal_and_exact_report",
+        "test_diagnosis.ReportPolicyTests.test_commands_and_loop_must_match_retained_results_verbatim",
+        "test_sandbox_provenance.ProvenanceTests.test_forged_terminal_transcript_cannot_be_promoted_to_trusted_execution",
+        "test_restart_effects.CandidateRestartTests.test_failed_integrated_checks_retain_proven_effect_but_not_delivery",
+        "test_recovery_components.RecoveryComponents.test_clearance_requires_merge_integrated_checks_and_fresh_health_after_readbacks"
+      ],
+      "sources": [
+        "factory_v1/diagnosis.py:execution_binding",
+        "factory_v1/diagnosis.py:completed",
+        "factory_v1/recovery.py:verify",
+        "factory_v1/restart.py:integration",
+        "factory_v1/assignments.py:store_result",
+        "factory_v1/sandbox.py:finalize_result"
+      ],
+      "behavior": "Real finalize_result preserves the forged submitted report but denies trusted_execution, advancement, closure and check verification; no verified-tests artifact. completed reader rejects incomplete isolation/removal/report binding; recovery clearance requires exact integrated and fresh configured health evidence. This static map leaves every unperformed live handle null.",
+      "adapter_seams": [
+        "FinalizationFixture result/conversation artifacts; controller checks and trust boundary; exact host binding; GitHub integration/readback adapters"
+      ],
+      "limitations": [
+        "No original campaign incident/issue/PR/commit/check/deployment/run/control handle exists from this preflight. Production-source checks and no-call mocks cannot prove an attempted remote effect/readback, OS denial, cleanup, actual native loading/work or deployment restoration. Metadata issue/PR URLs identify delivery context only, not fault-campaign handles."
+      ],
+      "live_status": "NOT_EXECUTED_WAIVED_FOR_DELIVERY"
+    }
+  ],
+  "unique_mapped_active_test_ids": 46,
+  "class_setup_helper_limits": {
+    "DiagnosisComponentTests / ReportPolicyTests": "LocalStageEvidence, explicit SQLite stuck/diagnosis records and labeled terminal/model/report artifacts; prepare or completed/get_record precursor seams mocked as noted per row. ReportPolicyTests validates declared command/result consistency only. No installed diagnosing-bugs or authenticated direction transport.",
+    "DeliveryComponentTests": "In-memory HTTP response map routes real observe/sample validators; explicit monitor/incident records. No HTTP service or deployment restoration.",
+    "RecoveryComponents / RecoveryObservationTests": "RecoveryComponentFixture inherits RecoveryFixture; explicit failed observation, incident, notification, seed_assignment/seed_registered/completed_report records. Host pins/transcript simulated; delivered journal/chain mocked for clearance. No actual repair/review/merge/outage journey.",
+    "ControlTests / MergeControlTests": "ControlFixture uses durable local state and mocked external prerequisites. MergeControlTests replaces chain, candidate mapping, accepted review and delivery mutation prerequisites; final control admission remains real.",
+    "RestartTests / RestartRecoveryTests / CandidateRestartTests": "Temporary SQLite; process/container absence and requirement/tracker reads are fixture responses. Exact effect adoption is read-only component validation, not actual process loss, measured cleanup or remote reconciliation.",
+    "RequirementReviewTests / RequirementMergeTests / RequirementChangeTests": "Explicit FrontierFixture/candidate records and mocked tracker/publication precursors. stage supplies work/evidence with invoke mocked; no to-spec/to-tickets worker or resynthesis journey.",
+    "BugTests": "FrontierFixture plus explicit make_work synthesis record; work_context mocked for publication. GitHub writes/readbacks update local Python maps, not live issues.",
+    "AssignmentComponentTests / ReviewedImplementTests": "Active direct fixtures, not dormant legacy AssignmentTests setup. Repository snapshot descriptors copied to local artifacts; actual source/hash/dependency/result contracts, not installed-source execution.",
+    "SimplificationValidatorTests / ReviewValidatorTests": "LocalStageEvidence creates declared manifests/checks and completed stage inputs. Explicit four-stage records, where supplied, are not execution of implementation/simplification/two reviews; no native provenance.",
+    "ProvenanceTests": "FinalizationFixture supplies result/conversation artifacts with mocked external boundaries; real finalize_result rejects forged trust. Submitted reports and mocked absence do not establish native work or cleanup."
+  },
+  "interpretation": "Bounded static source/fixture/guard inspection, not a test result or formal proof of all reachable behavior. No demonstrated source bug or unique missing direct coverage was found. Passing claims require separate exact-candidate receipts and source-delivery CI; these are not product fault-campaign evidence.",
+  "product_live_evidence": {
+    "status": "NOT_EXECUTED",
+    "waived_for_delivery": true,
+    "runtime_waiver": false,
+    "handles": {
+      "incident": null,
+      "issue": null,
+      "pr": null,
+      "commit": null,
+      "check": null,
+      "deployment": null,
+      "run": null,
+      "control": null,
+      "debug_run": null,
+      "reopen_readback": null,
+      "pause_readback": null,
+      "restart_readback": null,
+      "health_restoration_readback": null
+    }
+  }
+}
