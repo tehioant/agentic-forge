@@ -1,8 +1,11 @@
-# Read-only readiness inventory (#26 slices 1–2)
+# Supervised readiness (#26)
 
-This Python API is **not an execution gate**. Service/public-operation boundary
-wiring is still outstanding; `dispatch_allowed` and `iteration_runnable` remain
-false. Reports never grant permission, reserve capacity, run skills or prove
+The collector remains read-only and never grants execution authority. The service
+probe composes it with a durable private service selection and liveness. Shared
+`controls.admission` now recollects capabilities outside its short interruption
+lane and compares local policy/state/ownership inside the lane. Boundary coverage
+is incremental; the remaining source criteria below must be completed before
+claiming #26 complete. Reports never reserve capacity, run skills or prove
 iteration completion.
 
 ```python
@@ -117,7 +120,42 @@ health sample. Fresh health/control/selected-capacity checks remain mandatory;
 identity stability never permits skipping them. Reports expose fixed safe codes,
 static remediation and no arbitrary exception details.
 
-## Verification and next source work
+## Host-controlled selection and public probe
+
+Service JSON now requires `readiness_config` and `github_config` (absolute private
+paths or null) in addition to the existing fields. New envelopes initialize both
+to null. Existing envelopes require these explicit fields; no automatic credential
+discovery occurs. `github_config` is a physical owned mode-0600 JSON file with
+exactly `api_base` and `bearer`. Select an **already approved** classic OAuth/PAT
+with the least supported scopes (`repo`, `project`), effective repository push and
+the exact board's update authority. No grant, scope refresh or mutation probe is
+performed. Do not put secrets on command lines, in reports or in the repository.
+Null uses the credential-blind client and cannot pass the supported OAuth reader.
+
+```sh
+mise exec -- python -m factory_v1.service --config /private/service.json pause --reference thread:select
+# Operator supplies the reviewed private configurations, not a report/hash Boolean.
+mise exec -- python -m factory_v1.service --config /private/service.json select-readiness
+mise exec -- python -m factory_v1.service --config /private/service.json readiness
+```
+
+These commands document the operational interface; no live commands were executed
+for ticket verification. Selection pins local configuration, source bytes/full
+modes and immutable allowance terms while paused. Remaining counters, current
+health/main samples and slot consumption are not sealed. Each operation freshly
+checks capacity/permission/health; its short-lived snapshot detects local changes
+during the reads. Installed source drift still fails; selecting policy is not
+permission to repin a skill or repair source permissions silently.
+
+Service initialization/loading persists the service path in the selected SQLite
+iteration scope. A direct CLI caller using that state cannot omit readiness to
+escape shared admission. Missing selection refuses with fixed
+`readiness_configuration_required`; policy/source drift refuses with
+`readiness_inputs_changed`; external capability denial uses `readiness_blocked`.
+The probe distinguishes stopped/unknown/running from capability availability and
+active/paused/waiting iteration eligibility. Retained status is not authority.
+
+## Verification and remaining source criteria
 
 Focused `test_readiness` checks use explicit SQLite/files and mocked independent
 metadata/header/source/image/socket/health boundaries, with no precursor stage,
@@ -125,12 +163,26 @@ worker/controller journey, real process/network/provider, grant or notification.
 Native-source fixture success is not installed-runtime qualification. Known
 installed skill drift remains denied; no skill pins were changed.
 
-Next: wire service inspection/selection and direct public-operation checkpoints,
-including native enqueue, synthesis/worker/model start, claim/result admission,
-publication/merge final mutations and originating notifications. Recheck selected
-capacity and existing global ownership/restart/controls at their real durable
-boundaries. Preserve cleanup, stop/pause, reconciliation, pending incident reports
-and exact existing hold-resolution operations even when ordinary readiness fails.
-Parent owns integration, fresh simplification and independent Standards/Spec
-reviews. Canonical/full CI, publication and real service/container/model/GitHub/
-health/notification qualification remain held. This checkpoint does not finish #26.
+Implemented: service cycle and direct tick/continuation entry, shared durable
+admission used by claims, native wakeup, synthesis spawn, sandbox/model admission,
+results and completion; exact configured stage/profile/claim/source selection on
+role preparation and assignment result save; final candidate publication writes,
+merge PUT and reservation status write. Existing
+pause/restart/ownership guards remain. Stop, cleanup, reconciliation and incident/
+decision attention are not routed through ordinary readiness; truthful existing
+effect receipts retain their original save paths.
+
+Remaining: exhaustive sibling publisher pre-write/final-success coverage (planning,
+ticket/revision/bug publication, merge delivery close/Projects mutations); explicit
+assignment/run/launcher selection at every native/worker/model boundary; terminal
+consumed-slot continuation and notification-after-completion; scoped registered
+repair admission with failed configured health; narrowly authenticated effect
+resolution and independent-hold/receipt regression matrices. Shared admission is
+not proof of those final-effect criteria. Probe runnable reporting also needs
+remaining revision/rejection-specific projection. Do not mark #26 complete
+on this checkpoint.
+
+Under the [operator amendment](../docs/specs/no-live-verification-amendment.md), live
+acceptance is waived for delivery and **not executed**. No live campaign or live
+approval is a next step. Parent owns fresh simplification, independent Standards/
+Spec review, policy-compliant CI and autonomous publication/verified integration.

@@ -93,10 +93,11 @@ def lane(database, project, iteration):
 
 
 @contextmanager
-def admission(database, project, iteration, error_class: type[Exception] = RepositoryError, *, resolution=None):
+def admission(database, project, iteration, error_class: type[Exception] = RepositoryError, *, resolution=None, selection=None):
     """Linearize short durable claims with requests; never hold across worker/network I/O."""
     try:
-        with lane(database, project, iteration):
+        from .readiness_gate import admission as supervised_admission
+        with supervised_admission(database, project, iteration, resolution=resolution, selection=selection):
             require_active(database, project, iteration, resolution=resolution)
             yield
     except RepositoryError as error:

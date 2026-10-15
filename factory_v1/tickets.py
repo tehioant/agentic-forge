@@ -672,6 +672,8 @@ def reserve(database, item, github, number):
     require(row['admissible'], 'Reserved ticket has unresolved authoritative blockers or invalid contract.', 'ticket_ineligible')
     require(set(work['frontier']['active']) <= {number}, 'Conflicting authoritative active work.', 'reservation_conflict')
     if row['status'] != 'active':
+        from .readiness_gate import check
+        check(database, item['project_id'], item['iteration_id'])
         active(item, database)
         gh.set_field(github, work['board']['project_id'], row['membership_id'], work['board']['status']['id'],
                      work['board']['status']['options'][work['request']['tracker']['statuses']['active']])

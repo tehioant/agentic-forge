@@ -23,7 +23,7 @@ from .sandbox_source import physical
 
 UNIT = 'agentic-forge.service'
 FIELDS = {'version', 'state', 'operator_id', 'project', 'iteration', 'api_base', 'interval',
-          'delivery_config', 'transport_config', 'dispatch_config'}
+          'delivery_config', 'transport_config', 'dispatch_config', 'readiness_config', 'github_config'}
 
 
 def isolated_root(root):
@@ -47,7 +47,8 @@ def initialize(root, operator, project, iteration, api_base):
     root.mkdir(mode=0o700)
     config = {'version': 1, 'state': str(root / 'controller.sqlite'), 'operator_id': operator,
               'project': project, 'iteration': iteration, 'api_base': api_base, 'interval': 30,
-              'delivery_config': None, 'transport_config': None, 'dispatch_config': None}
+              'delivery_config': None, 'transport_config': None, 'dispatch_config': None,
+              'readiness_config': None, 'github_config': None}
     with closing(sqlite3.connect(config['state'])) as db:
         db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
         db.commit()
@@ -86,14 +87,57 @@ def load(path):
             config['state'] == str(root / 'controller.sqlite'), 'Malformed service scope/state.', 'invalid_service')
     controls.private(physical(config['state']))
     isolated_root(root)
-    for key in ('delivery_config', 'transport_config', 'dispatch_config'):
+    for key in ('delivery_config', 'transport_config', 'dispatch_config', 'readiness_config', 'github_config'):
         require(config[key] is None or (isinstance(config[key], str) and Path(config[key]).is_absolute()),
                 'Use explicit private capability paths or null.', 'invalid_service')
     GitHub(config['api_base'], 'credential-blind-controller', 10)
     with connect(config) as db:
         from .merge import controller_paths
         controller_paths(db, str(path))
+        from .readiness_gate import register
+        register(db, path, config)
     return config
+
+
+def github_client(config):
+    """Only an explicitly selected private host credential; never ambient discovery."""
+    from .readiness import load_config
+    if config['github_config'] is None:
+        return GitHub(config['api_base'], 'credential-blind-controller', 10)
+    selected = load_config(config['github_config'])
+    require(isinstance(selected, dict) and set(selected) == {'api_base', 'bearer'} and
+            selected['api_base'] == config['api_base'] == 'https://api.github.com' and
+            isinstance(selected['bearer'], str) and selected['bearer'].startswith(('gho_', 'ghp_')),
+            'Select an existing direct classic OAuth host capability.', 'github_route_unsupported')
+    return GitHub(selected['api_base'], selected['bearer'], 10)
+
+
+def inspect_readiness(config, *, running=None, github=None):
+    """Fresh read-only component probe; no notification, skill, grant or dispatch."""
+    from . import readiness, readiness_gate
+    try:
+        selected = readiness.load_config(config['readiness_config'])
+        with connect(config) as db:
+            result = readiness.collect(db, config, selected, github or github_client(config), running=running)
+            bound = readiness_gate.binding(db, config['project'], config['iteration'])
+            pinned = bound is not None and bound[1] == readiness_gate.policy(config, selected, db)
+            runnable = result['capability_ready'] and result['iteration_eligible'] and pinned and running is True
+            if runnable:
+                try:
+                    readiness_gate.check(db, config['project'], config['iteration'])
+                    result['checks']['admission'] = {'state': 'ready', 'code': 'verified', 'remediation': None}
+                except Exception:
+                    runnable = False
+                    result['checks']['admission'] = {'state': 'blocked', 'code': 'readiness_admission_blocked',
+                        'remediation': 'Reconcile exact restart, ownership and independent iteration holds.'}
+            result.update(iteration_runnable=runnable, dispatch_allowed=runnable,
+                          boundary_wiring='shared_admission', policy_selected=pinned)
+            return result
+    except Exception:
+        return {'service_running': running if type(running) is bool else None,
+                'capability_ready': False, 'iteration_runnable': False, 'dispatch_allowed': False,
+                'checks': {'configuration': {'state': 'blocked', 'code': 'readiness_configuration_required',
+                    'remediation': 'Select private readiness/GitHub configuration, pause and run select-readiness.'}}}
 
 
 @contextmanager
@@ -136,7 +180,7 @@ def cycle(config, github, *, stop_event=None):
                 if 'continuation' in dispatch_config:
                     continuation.retire_delivered(db, scope(config), dispatch_config, item, assignments.rows(db), github)
                     item = assignments.current(db, *scope(config), require_active=False)
-        healthy = True
+        healthy = False
         if config['delivery_config'] is not None:
             with state_lock(db):
                 from .merge import controller_paths
@@ -163,6 +207,9 @@ def cycle(config, github, *, stop_event=None):
                     'dispatch_allowed': False, 'blockers': ['iteration_not_active']}
     if config['dispatch_config'] is None:
         return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['dispatch_capability_unavailable']}
+    probe = inspect_readiness(config, running=True, github=github)
+    if not probe['iteration_runnable']:
+        return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['readiness_blocked'], 'readiness': probe}
     return dispatch(config, github, stop_event=stop_event)
 
 
@@ -234,7 +281,7 @@ def run(config, stop=None):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise RepositoryError('service_busy', 'Another service process owns this isolated root.') from error
-        github = GitHub(config['api_base'], 'credential-blind-controller', 10)
+        github = github_client(config)
         run_id = uuid.uuid4().hex
         previous = None
         signals = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
@@ -275,7 +322,7 @@ def main():
         init.add_argument('--' + option, required=True)
     installer = commands.add_parser('install')
     installer.add_argument('--unit-directory', required=True)
-    for name in ('start', 'stop', 'restart', 'status', 'run'):
+    for name in ('start', 'stop', 'restart', 'status', 'run', 'readiness', 'select-readiness'):
         commands.add_parser(name)
     for name in ('pause', 'emergency-stop', 'resume'):
         commands.add_parser(name).add_argument('--reference', required=True)
@@ -294,9 +341,21 @@ def main():
             print(json.dumps({**status(config), 'supervisor': supervisor(config, 'status')}, sort_keys=True))
         elif args.command == 'run':
             run(config)
+        elif args.command == 'select-readiness':
+            from .readiness_gate import seal
+            with connect(config) as db:
+                seal(db, Path(args.config))
+            print(json.dumps({'policy_selected': True, 'dispatch_allowed': False}))
+        elif args.command == 'readiness':
+            try:
+                live = supervisor(config, 'status')
+                running = live.get('ActiveState') == 'active' and live.get('SubState') == 'running' and int(live.get('MainPID', '0')) > 0
+            except Exception:
+                running = None
+            print(json.dumps(inspect_readiness(config, running=running), sort_keys=True))
         else:
             with connect(config) as db:
-                result = controls.resume(db, *scope(config), args.reference, GitHub(config['api_base'], 'credential-blind-controller', 10)) if args.command == 'resume' else controls.request(db, *scope(config), args.command, args.reference)
+                result = controls.resume(db, *scope(config), args.reference, github_client(config)) if args.command == 'resume' else controls.request(db, *scope(config), args.command, args.reference)
             print(json.dumps({'action': result['action'], 'state': result['state'],
                               'dispatch_allowed': result['dispatch_allowed']}, sort_keys=True))
     except (RepositoryError, IntakeError, SpendingError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError, sqlite3.Error, subprocess.SubprocessError) as error:

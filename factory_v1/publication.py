@@ -357,6 +357,8 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
                     'Candidate authority changed.', 'stale_assignment')
             return fresh
         def write(path, payload, method='POST'):
+            from .readiness_gate import check
+            check(database, project, iteration, resolution=resolution)
             controls.require_active(database, project, iteration, resolution=resolution)
             current_assignment()
             return api.write(path, payload, method)

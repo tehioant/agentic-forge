@@ -484,7 +484,7 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
         result = previous
     if not dry_run and previous is None:
         from .controls import admission
-        with admission(database, project, iteration), database:
+        with admission(database, project, iteration, selection=request), database:
             database.execute('BEGIN IMMEDIATE')
             database.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
             database.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment_id, json.dumps(result, sort_keys=True)))
@@ -591,7 +591,7 @@ def store_result(database, project, iteration, operator, assignment_id, request,
             result_key = 'simplification_result'
         assignment[result_key] = stage_result
     from .controls import admission
-    with admission(database, project, iteration), database:
+    with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': sandbox_run_id}), database:
         database.execute('BEGIN IMMEDIATE')
         require_result_active(assignment)
         database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment, sort_keys=True), assignment_id))

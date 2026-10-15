@@ -455,6 +455,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                 save(database, prior, journal)
             # Any outcome, including an HTTP failure, is reconciled by reading this exact PR.
             try:
+                from .readiness_gate import check
+                check(database, project, iteration)
                 require_active(database, project, iteration)
                 api.request(api.prefix + '/pulls/' + str(config['pr_number']) + '/merge',
                             {'sha': config['head'], 'merge_method': 'merge'}, 'PUT')

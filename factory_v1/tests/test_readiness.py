@@ -1,4 +1,4 @@
-"""Focused collector checks: explicit records, independent mocked read seams only."""
+"""Focused collector and admission checks: explicit records, independent read seams."""
 from copy import deepcopy
 from contextlib import ExitStack
 import hashlib
@@ -15,12 +15,32 @@ from unittest.mock import Mock, patch
 
 from factory_v1 import assignments, delivery, model_access, planning, readiness, role_skills, sandbox_policy, skills, tickets
 from factory_v1 import readiness_capabilities as capabilities, repositories, spending
+from factory_v1 import controls, readiness_gate, service
 import io
 from email.message import Message
 
 
 def sha(raw):
     return hashlib.sha256(raw).hexdigest()
+
+
+class SupervisedFixture:
+    def bind_service(self):
+        self.service.update(version=1, state=str(self.root / 'state.sqlite'), interval=30,
+                            dispatch_config=None, github_config=None,
+                            readiness_config=self.file('readiness.json', self.config))
+        self.service_path = self.file('service.json', self.service)
+        readiness_gate.register(self.db, self.service_path, self.service)
+        self.stack.enter_context(patch.object(readiness, 'HostReaders', return_value=self.readers))
+        self.stack.enter_context(patch.object(service, 'github_client', return_value=self.github))
+        self.stack.enter_context(patch.object(readiness.time, 'time', return_value=100))
+        # Explicit preselected policy fixture; selection itself is independently tested.
+        self.db.execute('UPDATE supervised_readiness SET policy=?', (readiness_gate.policy(self.service, self.config, self.db),))
+        self.db.commit()
+
+    def admit(self, **kwargs):
+        with controls.admission(self.db, 'p', 'i', **kwargs):
+            return 'admitted'
 
 
 class ReadinessTests(unittest.TestCase):
@@ -459,3 +479,135 @@ class GitHubCapabilityTests(unittest.TestCase):
         self.github.opener.open.side_effect = drift
         with self.assertRaises(repositories.RepositoryError) as caught: self.check()
         self.assertEqual(caught.exception.code, 'github_identity_changed')
+
+
+class EnforcedReadinessTests(SupervisedFixture, unittest.TestCase):
+    file = ReadinessTests.file
+    save = ReadinessTests.save
+    read = ReadinessTests.read
+
+    def setUp(self):
+        ReadinessTests.setUp(self)
+        for name, kind in (('operation_id', 'TEXT'), ('reservation', 'INTEGER'), ('actual_units', 'INTEGER')):
+            self.db.execute('ALTER TABLE model_operations ADD COLUMN ' + name + ' ' + kind)
+        self.db.commit()
+        self.bind_service()
+
+    def test_service_component_liveness_capability_and_runnable_are_separate(self):
+        for running in (True, False, None):
+            report = service.inspect_readiness(self.service, running=running)
+            self.assertTrue(report['capability_ready'], report)
+            self.assertEqual(report['iteration_runnable'], running is True)
+        self.item['status'] = 'paused'; self.save()
+        report = service.inspect_readiness(self.service, running=True)
+        self.assertTrue(report['capability_ready']); self.assertFalse(report['iteration_runnable'])
+        self.item.update(status='waiting-for-operator', completion={'report_id': 'done'}); self.save()
+        self.assertFalse(service.inspect_readiness(self.service, running=True)['iteration_runnable'])
+
+    def test_real_shared_admission_recollects_without_nested_remote_io(self):
+        with controls.admission(self.db, 'p', 'i'):
+            count = self.github.request.call_count
+            with controls.admission(self.db, 'p', 'i'):
+                self.assertEqual(count, self.github.request.call_count)
+        self.assertGreater(count, 0)
+        self.write_authority['operations'].remove('projects')
+        with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
+        self.assertEqual(caught.exception.code, 'readiness_blocked')
+
+    def test_direct_public_lane_cannot_evade_persisted_missing_configuration(self):
+        self.service['readiness_config'] = None
+        self.file('service.json', self.service)
+        before = '\n'.join(self.db.iterdump())
+        with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
+        self.assertEqual(caught.exception.code, 'readiness_configuration_required')
+        self.assertEqual(before, '\n'.join(self.db.iterdump()))
+        controls.request(self.db, 'p', 'i', 'operator', 'pause', 'missing-config-stop')
+        self.assertTrue(controls.blocked(self.db, 'p', 'i'))
+
+    def test_last_read_source_config_and_local_ownership_drift_refuse_claim(self):
+        original = self.readers.execution_support.side_effect
+        for mutation in ('source', 'config', 'ownership'):
+            with self.subTest(mutation=mutation):
+                source = Path(self.config['slots'][0]['skills'][0]['path'])
+                raw = source.read_bytes()
+                def drift(*args):
+                    result = original(*args)
+                    if mutation == 'source': source.write_bytes(raw + b'drift')
+                    if mutation == 'config':
+                        changed = deepcopy(self.config); changed['reference'] = 'unreviewed'
+                        self.file('readiness.json', changed)
+                    if mutation == 'ownership':
+                        self.item['reservation'] = {'issue_number': 999}; self.save()
+                    return result
+                self.readers.execution_support.side_effect = drift
+                with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
+                self.assertEqual(caught.exception.code, 'readiness_inputs_changed')
+                source.write_bytes(raw); self.file('readiness.json', self.config)
+                self.item.pop('reservation', None); self.save()
+        self.readers.execution_support.side_effect = original
+
+    def test_selected_stage_claim_profile_and_current_capacity_are_real(self):
+        slot = deepcopy(self.config['slots'][0])
+        request = {k: slot[k] for k in ('stage', 'claim_id', 'profile', 'skills')}
+        self.assertEqual(self.admit(selection=request), 'admitted')
+        for key, value in (('stage', 'simplify'), ('claim_id', 'unselected'), ('profile', dict(request['profile'], name='other'))):
+            changed = deepcopy(request); changed[key] = value
+            with self.subTest(key=key), self.assertRaises(repositories.RepositoryError): self.admit(selection=changed)
+        Path(request['profile']['home']).mkdir()
+        with self.assertRaises(repositories.RepositoryError): self.admit(selection=request)
+
+    def test_allowance_use_is_not_a_sealed_identity_change_but_exhaustion_blocks(self):
+        first = readiness_gate.policy(self.service, self.config, self.db)
+        self.assertEqual(self.admit(), 'admitted')
+        self.db.execute('UPDATE model_grants SET remaining=remaining-1'); self.db.commit()
+        self.assertEqual(first, readiness_gate.policy(self.service, self.config, self.db))
+        self.assertEqual(self.admit(), 'admitted')
+        self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
+        with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
+        self.assertEqual(caught.exception.code, 'readiness_blocked')
+
+    def test_health_denial_and_pause_during_read_return_stop_new_claims(self):
+        self.health['sha'] = 'b'*40
+        with self.assertRaises(repositories.RepositoryError): self.admit()
+        self.health['sha'] = 'a'*40
+        original = self.readers.execution_support.side_effect
+        def pause(*args):
+            result = original(*args)
+            controls.request(self.db, 'p', 'i', 'operator', 'pause', 'read-return-pause')
+            return result
+        self.readers.execution_support.side_effect = pause
+        with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
+        self.assertEqual(caught.exception.code, 'iteration_paused')
+        self.assertTrue(controls.blocked(self.db, 'p', 'i'))
+
+    def test_explicit_policy_selection_requires_pause_without_granting_execution(self):
+        with self.assertRaises(repositories.RepositoryError): readiness_gate.seal(self.db, Path(self.service_path))
+        controls.request(self.db, 'p', 'i', 'operator', 'pause', 'select-policy')
+        readiness_gate.seal(self.db, Path(self.service_path))
+        self.assertTrue(controls.blocked(self.db, 'p', 'i'))
+        self.assertFalse(service.inspect_readiness(self.service, running=True)['iteration_runnable'])
+
+    def test_ready_and_denied_cycle_reach_only_existing_dispatch_seam(self):
+        self.service['dispatch_config'] = self.file('dispatch.json', {})
+        self.file('service.json', self.service)
+        self.db.execute('UPDATE supervised_readiness SET policy=?',
+                        (readiness_gate.policy(self.service, self.config, self.db),)); self.db.commit()
+        with patch.object(delivery, 'sample', return_value={'evidence': {'status': 'healthy'}}), \
+             patch.object(service.attention, 'records', return_value=[]), \
+             patch.object(service, 'dispatch', return_value={'status': 'selected-existing-seam'}) as dispatch:
+            self.assertEqual(service.cycle(self.service, self.github)['status'], 'selected-existing-seam')
+            dispatch.assert_called_once()
+            dispatch.reset_mock()
+            self.write_authority['operations'].remove('projects')
+            self.assertEqual(service.cycle(self.service, self.github)['blockers'], ['readiness_blocked'])
+            dispatch.assert_not_called()
+
+    def test_direct_public_tick_refuses_missing_readiness_before_selection(self):
+        from factory_v1 import service_dispatch
+        self.service['readiness_config'] = None
+        self.file('service.json', self.service)
+        with patch.object(service_dispatch, 'select') as select:
+            with self.assertRaises(repositories.RepositoryError) as caught:
+                service_dispatch.tick(self.service, self.github)
+        self.assertEqual(caught.exception.code, 'readiness_configuration_required')
+        select.assert_not_called()
