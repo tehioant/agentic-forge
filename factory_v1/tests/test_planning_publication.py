@@ -110,6 +110,8 @@ class PlanningPublicationTests(unittest.TestCase):
         self.assertEqual({p for p, _ in self.writes}, {'/git/blobs', '/git/trees', '/git/commits', '/git/refs', '/issues'})
         self.assertEqual(record['branch'], 'factory/planning/m1/origin-assignment')
         self.assertFalse(any('main' in json.dumps(body) or 'force' in body for _, body in self.writes))
+        from factory_v1.service_dispatch import select
+        self.assertEqual(select(stored, [], {}), ('synthesize', None))
 
     def test_repeated_native_hook_survives_tool_loop_and_new_adapter_instance(self):
         self.item['planning'].pop('native_execution'); self.fixture.persist()
