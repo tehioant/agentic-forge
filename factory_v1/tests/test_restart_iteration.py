@@ -15,7 +15,7 @@ from factory_v1.tests.test_iteration_regressions import fixture, seed_monitor
 
 
 class RestartIterationTests(unittest.TestCase):
-    def test_nonactive_read_preserves_terminal_status_and_active_admission_refuses(self):
+    def test_terminal_predecessor_and_current_ownership_matrix(self):
         f = fixture(self, restart_fixtures.RestartTests)
         for status in ('waiting-for-operator', 'paused', 'failed', 'stopped'):
             with self.subTest(status=status):
@@ -25,9 +25,6 @@ class RestartIterationTests(unittest.TestCase):
                 with self.assertRaises(RepositoryError):
                     assignments.current(f.db, 'p', 'i', 'operator')
                 self.assertEqual(f.stored(), f.item)
-
-    def test_completed_predecessor_claims_do_not_conflict_with_current_ownership(self):
-        f = fixture(self, restart_fixtures.RestartTests)
         old = f.assignment('complete')
         old['runtime']['container_removed'] = True
         report = {'delivered': [{'issue': {'number': 10, 'id': 100}}]}
@@ -48,25 +45,27 @@ class RestartIterationTests(unittest.TestCase):
         f.db.commit()
         with self.assertRaises(RepositoryError):
             restart.ownership(f.db, f.item)
+        f.db.execute('DELETE FROM role_assignments')
+        f.db.commit()
+        old['runtime']['container_removed'] = True
+        old['requirement_disposition'] = {'change_id': 'revision'}
+        f.item.update(status='active')
+        f.item.pop('completion')
+        f.item['requirement_changes'] = {'revision': {'kind': 'material', 'status': 'resumed', 'affected': [10], 'blocks_verified': True}}
+        f.item['requirement_authority'] = {'10': {'spec': {'commit': 'e' * 40}, 'ticket_assignment': 'new', 'ticket_inputs': 'f' * 64}}
+        f.save_item()
+        f.db.execute('INSERT INTO role_assignments VALUES (?,?)', (old['assignment_id'], json.dumps(old)))
+        f.db.commit()
+        with patch('factory_v1.requirements.revalidate_inputs', side_effect=AssertionError('Obsolete authority must stay historical')):
+            result = f.observed_restart()
+        self.assertEqual(result['status'], 'ready', result['blockers'])
+        self.assertEqual(assignments.rows(f.db)[0]['revision'], old['revision'])
+        self.assertEqual(f.stored()['requirement_authority'], f.item['requirement_authority'])
+        self.assertEqual(restart.ownership(f.db, f.item)['assignments'], [])
 
-    def test_restart_retains_delivered_receipts_without_granting_new_delivery(self):
-        f = fixture(self, effect_fixtures.CandidateRestartTests)
-        f.merged()  # Pure retained journal/ref/check dictionaries.
-        restart.integration(f.assignment, f.api)
-        journal = f.assignment['merge']
-        journal.update(status='delivered', close_allowed=True, delivery_checks=['historical-integrated-checks'])
-        before = copy.deepcopy(journal)
-        restart.integration(f.assignment, f.api)
-        self.assertEqual(journal, before)
-        checks = f.values['/commits/' + 'f' * 40 + '/check-runs?per_page=100&filter=latest']
-        checks['check_runs'][0]['conclusion'] = 'failure'
-        with self.assertRaises(RepositoryError):
-            restart.integration(f.assignment, f.api)
-        self.assertEqual(journal, before)
-        f.api.write.assert_not_called()
-        f.api.issue_state.assert_not_called()
 
-    def test_restart_health_routes_to_successor_without_rewriting_predecessor_pointers(self):
+
+    def test_retained_delivery_and_monitor_scope_matrix(self):
         f = fixture(self, iteration_fixtures.ContinuationComponents)
         config = configuration('http://127.0.0.1:9876')
         from factory_v1.tests.test_recovery import RecoveryFixture
@@ -97,31 +96,3 @@ class RestartIterationTests(unittest.TestCase):
         delivery.inspect(f.db, 'product', 'm1', '42')
         delivery.inspect(f.db, 'product', 'm2', '42')
         self.assertEqual(len(attention.records(f.db, 'product', 'm2', new)), 1)
-
-    def test_superseded_assignment_is_not_revalidated_against_new_authority(self):
-        f = fixture(self, restart_fixtures.RestartTests)
-        old = f.assignment('complete')
-        old['runtime']['container_removed'] = True
-        old['requirement_disposition'] = {'change_id': 'revision'}
-        f.item['requirement_changes'] = {'revision': {'kind': 'material', 'status': 'resumed', 'affected': [10], 'blocks_verified': True}}
-        f.item['requirement_authority'] = {'10': {'spec': {'commit': 'e' * 40}, 'ticket_assignment': 'new', 'ticket_inputs': 'f' * 64}}
-        f.save_item()
-        f.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(old),))
-        f.db.commit()
-        with patch('factory_v1.requirements.revalidate_inputs', side_effect=AssertionError('Obsolete authority must stay historical')):
-            result = f.observed_restart()
-        self.assertEqual(result['status'], 'ready', result['blockers'])
-        self.assertEqual(assignments.rows(f.db)[0]['revision'], old['revision'])
-        self.assertEqual(f.stored()['requirement_authority'], f.item['requirement_authority'])
-        self.assertEqual(restart.ownership(f.db, f.item)['assignments'], [])
-
-    def test_resume_preserves_delivery_owned_incident_snapshot(self):
-        f = fixture(self, recovery_fixtures.RestartRecoveryTests)
-        f.registration()  # Explicit registered authority, not a partial raw incident.
-        incident = copy.deepcopy(f.item['main_incident'])
-        controls.request(f.db, 'p', 'i', 'operator', 'pause', 'intentional')
-        with f.observations('healthy'):
-            controls.resume(f.db, 'p', 'i', 'operator', 'explicit', f.github)
-        self.assertEqual(f.stored()['main_incident'], incident)
-        self.assertFalse(controls.blocked(f.db, 'p', 'i'))
-        self.assertEqual(f.stored()['status'], 'active')

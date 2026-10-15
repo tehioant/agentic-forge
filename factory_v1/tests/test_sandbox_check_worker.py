@@ -21,56 +21,48 @@ class CheckWorkerTests(unittest.TestCase):
             return subprocess.CompletedProcess(argv, code)
         return execute
 
-    def test_records_actual_output_and_exit_status_without_rewriting_command(self):
+    def test_check_command_output_and_verification_matrix(self):
         command = 'python -m unittest selected && python -m compileall selected.py'
-        with patch('factory_v1.sandbox_check_worker.subprocess.run',
-                   side_effect=self.process(stdout=b'labeled process output\n')) as run, \
-                patch('factory_v1.sandbox_check_worker.time.monotonic', side_effect=[10, 11]):
-            records = run_checks([command], self.root, 5)
-        self.assertEqual(records, [{'command': command, 'exit_code': 0,
-                                    'stdout': 'labeled process output\n', 'stderr': '',
-                                    'output_truncated': False}])
-        self.assertEqual(run.call_args.args[0], ['/bin/sh', '-c', command])
-        self.assertEqual(run.call_args.kwargs['cwd'], self.root)
-        self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
-        self.assertEqual(run.call_args.kwargs['timeout'], 4)
+        cases = (
+            ('success', command, 0, b'labeled process output\n', b'', False),
+            ('failure', 'failing check', 3, b'', b'labeled failure\n', False),
+            ('stdout-limit', 'large check', 0, b'X' * (MAX_OUTPUT + 1), b'', True),
+            ('stderr-limit', 'large check', 0, b'', b'X' * (MAX_OUTPUT + 1), True),
+        )
+        for label, actual_command, code, stdout, stderr, truncated in cases:
+            with self.subTest(case=label), patch('factory_v1.sandbox_check_worker.subprocess.run',
+                    side_effect=self.process(code, stdout, stderr)) as run, \
+                    patch('factory_v1.sandbox_check_worker.time.monotonic', side_effect=[10, 11]):
+                commands = [actual_command] if label == 'success' else [actual_command, 'never-executed check']
+                records = run_checks(commands, self.root, 5)
+                self.assertEqual(records, [{'command': actual_command, 'exit_code': code,
+                    'stdout': stdout[:MAX_OUTPUT].decode(), 'stderr': stderr[:MAX_OUTPUT].decode(),
+                    'output_truncated': truncated}])
+                run.assert_called_once()
+                self.assertEqual(run.call_args.args[0], ['/bin/sh', '-c', actual_command])
+                self.assertEqual(run.call_args.kwargs['cwd'], self.root)
+                self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
+                self.assertEqual(run.call_args.kwargs['timeout'], 4)
 
-    def test_failure_stops_sequence_and_retains_stderr(self):
-        with patch('factory_v1.sandbox_check_worker.subprocess.run',
-                   side_effect=self.process(3, stderr=b'labeled failure\n')) as run:
-            records = run_checks(['failing check', 'never-executed check'], self.root, 5)
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]['exit_code'], 3)
-        self.assertEqual(records[0]['stderr'], 'labeled failure\n')
-        run.assert_called_once()
 
-    def test_large_output_is_bounded_and_cannot_count_as_verified(self):
-        for stream in ('stdout', 'stderr'):
-            with self.subTest(stream=stream), patch('factory_v1.sandbox_check_worker.subprocess.run',
-                    side_effect=self.process(stdout=b'X' * (MAX_OUTPUT + 1) if stream == 'stdout' else b'',
-                                             stderr=b'X' * (MAX_OUTPUT + 1) if stream == 'stderr' else b'')) as run:
-                records = run_checks(['large check', 'never-run check'], self.root, 5)
-            self.assertEqual(len(records), 1)
-            self.assertEqual(len(records[0][stream]), MAX_OUTPUT)
-            self.assertTrue(records[0]['output_truncated'])
-            run.assert_called_once()
 
-    def test_expired_deadline_starts_nothing(self):
-        with self.assertRaises(TimeoutError):
-            run_checks(['echo never-run'], self.root, 0)
+    def test_original_deadline_and_timeout_matrix(self):
+        for label, seconds, clock, failure, expected in (
+            ('expired', 0, [10, 10], TimeoutError, []),
+            ('remaining', 5, [10, 11, 14], None, [4, 1]),
+            ('process-timeout', 1, [10, 10], subprocess.TimeoutExpired, [1]),
+        ):
+            with self.subTest(case=label), patch('factory_v1.sandbox_check_worker.time.monotonic', side_effect=clock), \
+                    patch('factory_v1.sandbox_check_worker.subprocess.run', side_effect=(
+                        subprocess.TimeoutExpired('labeled check', 1) if label == 'process-timeout' else self.process())) as run:
+                if failure:
+                    with self.assertRaises(failure):
+                        run_checks(['first', 'second'], self.root, seconds)
+                else:
+                    self.assertEqual(len(run_checks(['first', 'second'], self.root, seconds)), 2)
+                self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], expected)
 
-    def test_following_check_uses_remaining_original_deadline(self):
-        with patch('factory_v1.sandbox_check_worker.time.monotonic', side_effect=[10, 11, 14]), \
-                patch('factory_v1.sandbox_check_worker.subprocess.run', side_effect=self.process()) as run:
-            self.assertEqual(len(run_checks(['first', 'second'], self.root, 5)), 2)
-        self.assertEqual([call.kwargs['timeout'] for call in run.call_args_list], [4, 1])
 
-    def test_process_timeout_is_not_fabricated_as_success(self):
-        with patch('factory_v1.sandbox_check_worker.subprocess.run',
-                   side_effect=subprocess.TimeoutExpired('labeled check', 1)) as run:
-            with self.assertRaises(subprocess.TimeoutExpired):
-                run_checks(['timeout', 'never-run'], self.root, 1)
-        run.assert_called_once()
 
 
 if __name__ == '__main__':

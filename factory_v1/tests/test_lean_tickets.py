@@ -38,18 +38,15 @@ class LeanContractTests(unittest.TestCase):
                 'url': f'https://github.com/tehioant/agentic-forge/blob/{commit}/docs/specs/{name}',
                 'sha256': hashlib.sha256(content.encode()).hexdigest()}
 
-    def test_original_live_issue21_admits_without_fabricated_progress_or_body_rewrite(self):
+    def test_lean_contract_substance_and_scope(self):
         before = copy.deepcopy((self.issue, self.inputs))
         self.assertEqual(hashlib.sha256(self.issue['body'].encode()).hexdigest(), self.issue['body_sha256'])
         self.assertEqual(self.inputs['documents']['milestone.md']['sha256'],
                          'fd80a9650f507fb2791b6820ab16369d6c0f619eb7241c0c0bdd09a4cb480c8c')
         self.assertEqual(self.inputs['documents']['provenance.md']['sha256'],
                          '8c5129e02dcf289dcc146efe5b3ef401ea5b3cb0d37bdbd2f37672f071d93625')
-        self.assertEqual(tickets.external_contract(self.issue, self.inputs), 'contracted')
         self.assertNotIn('Status', tickets.sections(self.issue['body']) or {})
-        self.assertEqual((self.issue, self.inputs), before)
 
-    def test_lean_rejects_missing_substance_ambiguous_or_unpinned_scope(self):
         body = self.issue['body']
         parts = tickets.sections(body)
         assert parts is not None
@@ -74,9 +71,8 @@ class LeanContractTests(unittest.TestCase):
             {'body': body + '\n## Status\n\nready\ndeferred\n'},
             {'body': body.replace('## Blocked by', '## Unknown blockers')},
         ]
-        for defect in defects:
-            with self.subTest(defect=defect):
-                self.assertFalse(tickets.external_contract({**self.issue, **defect}, self.inputs))
+        cases = [('original', self.issue, self.inputs, True)]
+        cases += [(f'body-{index}', {**self.issue, **defect}, self.inputs, False) for index, defect in enumerate(defects)]
         for change in ('missing-parent', 'missing-document', 'unrelated-milestone'):
             inputs = copy.deepcopy(self.inputs)
             if change == 'missing-parent':
@@ -85,81 +81,77 @@ class LeanContractTests(unittest.TestCase):
                 inputs['documents'].pop('provenance.md')
             else:
                 inputs['documents']['milestone.md']['content'] = '## User Stories\n1. Unrelated story.\n'
-            with self.subTest(inputs=change):
-                self.assertFalse(tickets.external_contract(self.issue, inputs))
+            cases.append((change, self.issue, inputs, False))
+        for name, issue, inputs, valid in cases:
+            with self.subTest(case=name):
+                observed = tickets.external_contract(issue, inputs)
+                if valid:
+                    self.assertEqual(observed, 'contracted')
+                else:
+                    self.assertFalse(observed)
+        self.assertEqual((self.issue, self.inputs), before)
 
-    def test_normalized_sections_retain_spans_and_refuse_duplicates(self):
-        body = self.issue['body'].replace('## ', '## \t').replace('\n', '\r\n')
-        self.assertEqual(tickets.external_contract({**self.issue, 'body': body}, self.inputs), 'contracted')
-        spans = tickets.section_spans(body)
-        parts = tickets.sections(body)
-        assert spans is not None and parts is not None
-        self.assertEqual(body[slice(*spans['Blocked by'])].strip(), parts['Blocked by'])
-        self.assertTrue(body[spans['Blocked by'][1]:].startswith('<!-- fresh-factory-m1-ticket:'))
-        self.assertIsNone(tickets.sections(body + '\r\n##\tBlocked  by \t\r\n\r\nNone.\r\n'))
 
-    def test_single_line_comment_tail_matrix_preserves_normalized_spans(self):
+    def test_lean_heading_and_footer_spans_1(self):
+        original_parts = tickets.sections(self.issue['body'])
+        assert original_parts is not None
+        for closing, duplicate in ((False, '##\tBlocked  by \t'), (True, '## Done ##')):
+            with self.subTest(closing=closing):
+                body = self.issue['body']
+                for name in original_parts:
+                    body = body.replace('## ' + name + '\n', '## \t' + name + (' \t### \t' if closing else '') + '\n')
+                body = body.replace('\n', '\r\n')
+                self.assertEqual(tickets.external_contract({**self.issue, 'body': body}, self.inputs), 'contracted')
+                spans = tickets.section_spans(body)
+                parts = tickets.sections(body)
+                assert spans is not None and parts is not None
+                self.assertEqual(parts, {name: value.replace('\n', '\r\n') for name, value in original_parts.items()})
+                self.assertEqual(body[slice(*spans['Blocked by'])].strip(), parts['Blocked by'])
+                self.assertTrue(body[spans['Blocked by'][1]:].startswith('<!-- fresh-factory-m1-ticket:'))
+                self.assertIsNone(tickets.sections(body + '\r\n' + duplicate + '\r\n\r\n- Duplicate.\r\n'))
+        self.assertEqual(tickets.sections('## Literal#\n\nx\n'), {'Literal#': 'x'})
+
+    def test_lean_heading_and_footer_spans_2(self):
         prefix, marker = self.issue['body'].split('<!--', 1)
         marker = '<!--' + marker
         comments = [('<!--' + left + 'neighbor' + right + '-->')
                     for left in ('', ' ') for right in ('', ' ')] + ['<!---->', '<!-- -->']
-        for newline in ('\n', '\r\n'):
-            for heading in ('## Blocked by', '## \tBlocked  by \t###\t'):
-                content = prefix.replace('## Blocked by', heading).replace('\n', newline)
+        def rows():
+            for newline in ('\n', '\r\n'):
+                for heading in ('## Blocked by', '## \tBlocked  by \t###\t'):
+                    content = prefix.replace('## Blocked by', heading).replace('\n', newline)
+                    for indent in ('', '  ', '   ', '\t'):
+                        for comment in comments:
+                            neighbor = indent + comment
+                            for sequence in (neighbor, marker + newline + neighbor, marker + newline * 2 + neighbor + newline + '\t<!---->'):
+                                for ending in ('', '\t', ' \t', newline, newline * 2, '\t' + newline * 2 + ' \t'):
+                                    yield newline, content, sequence + ending, True
+                for tail in ('<!-- neighbor -->\nVisible prose\n', 'Text <!-- neighbor -->\n',
+                             '<!-- first\nsecond -->\n', '<!-- unclosed\n', ' \t\n\n'):
+                    yield newline, '## Blocked by\n\nNone.\n\n'.replace('\n', newline), tail.replace('\n', newline), False
+        for newline, content, tail, footer in rows():
+            with self.subTest(newline=newline, tail=tail, footer=footer):
+                body = content + tail
+                spans = tickets.section_spans(body)
+                self.assertIsNotNone(spans)
+                assert spans is not None
+                start, end = spans['Blocked by']
+                self.assertEqual(end, len(content) if footer else len(body))
+                if not footer: continue
                 expected = tickets.sections(content)
                 assert expected is not None
-                for indent in ('', '  ', '   ', '\t'):
-                    for comment in comments:
-                        neighbor = indent + comment
-                        for sequence in (neighbor, marker + newline + neighbor,
-                                         marker + newline * 2 + neighbor + newline + '\t<!---->'):
-                            for ending in ('', '\t', ' \t', newline, newline * 2,
-                                           '\t' + newline * 2 + ' \t'):
-                                tail = sequence + ending
-                                body = content + tail
-                                with self.subTest(newline=newline, heading=heading, tail=tail):
-                                    spans = tickets.section_spans(body)
-                                    self.assertIsNotNone(spans)
-                                    assert spans is not None
-                                    start, end = spans['Blocked by']
-                                    self.assertEqual(end, len(content))
-                                    self.assertEqual(body[end:], tail)
-                                    self.assertEqual(body[start:end].strip(), expected['Blocked by'])
-                                    self.assertEqual(tickets.sections(body), expected)
-                                    self.assertEqual(tickets.external_contract(
-                                        {**self.issue, 'body': body}, self.inputs), 'contracted')
-                                    target = body[:start] + newline + '- #13' + newline * 2 + body[end:]
-                                    self.assertEqual(target[:start].encode(), body[:start].encode())
-                                    self.assertTrue(target.encode().endswith(tail.encode()))
-                                    target_parts = tickets.sections(target)
-                                    assert target_parts is not None
-                                    self.assertEqual(target_parts['Blocked by'], '- #13')
+                self.assertEqual(body[end:], tail)
+                self.assertEqual(body[start:end].strip(), expected['Blocked by'])
+                self.assertEqual(tickets.sections(body), expected)
+                self.assertEqual(tickets.external_contract({**self.issue, 'body': body}, self.inputs), 'contracted')
+                target = body[:start] + newline + '- #13' + newline * 2 + body[end:]
+                self.assertEqual(target[:start].encode(), body[:start].encode())
+                self.assertTrue(target.encode().endswith(tail.encode()))
+                target_parts = tickets.sections(target)
+                assert target_parts is not None
+                self.assertEqual(target_parts['Blocked by'], '- #13')
 
-    def test_nonterminal_inline_and_multiline_comments_are_not_footer_tails(self):
-        prefix = '## Blocked by\n\nNone.\n\n'
-        for tail in ('<!-- neighbor -->\nVisible prose\n', 'Text <!-- neighbor -->\n',
-                     '<!-- first\nsecond -->\n', '<!-- unclosed\n', ' \t\n\n'):
-            for newline in ('\n', '\r\n'):
-                body = (prefix + tail).replace('\n', newline)
-                with self.subTest(body=body):
-                    spans = tickets.section_spans(body)
-                    assert spans is not None
-                    self.assertEqual(spans['Blocked by'][1], len(body))
 
-    def test_closing_atx_headings_share_contract_names_and_source_spans(self):
-        body = self.issue['body']
-        parts = tickets.sections(body)
-        assert parts is not None
-        for name in parts:
-            body = body.replace('## ' + name + '\n', '## \t' + name + ' \t### \t\n')
-        body = body.replace('\n', '\r\n')
-        self.assertEqual(tickets.external_contract({**self.issue, 'body': body}, self.inputs), 'contracted')
-        self.assertEqual(tickets.sections(body), {name: value.replace('\n', '\r\n') for name, value in parts.items()})
-        spans = tickets.section_spans(body)
-        assert spans is not None
-        self.assertEqual(body[slice(*spans['Blocked by'])].strip(), parts['Blocked by'].replace('\n', '\r\n'))
-        self.assertIsNone(tickets.sections(body + '\r\n## Done ##\r\n\r\n- Duplicate.\r\n'))
-        self.assertEqual(tickets.sections('## Literal#\n\nx\n'), {'Literal#': 'x'})
 
 
 class LeanControllerCase(unittest.TestCase):
@@ -283,7 +275,20 @@ class LeanControllerCase(unittest.TestCase):
 
 
 class LeanFrontierTests(LeanControllerCase):
-    def test_frontier_and_reservation_use_board_progress_not_done_heading(self):
+    def test_lean_frontier_contract_and_holds(self):
+        body = lean_body(self.inputs)
+        variants = ([body.replace('US-1.', 'US-999.'), body + '\n## Status\n\ndeferred\n', body + '\n## Status\n\nunknown\n', body + '\n## Bug scope\n\nrecovery\n', body.replace('## Done', '## Done\n\n- criterion\n\n## Done'), body.replace('## Blocked by', '## \tBlocked  by').replace('None (can start immediately).', '- #10')]) + ([body + f'\n## Parent\n\n{parent}\n' for parent in ('#999', '#' + str(self.inputs['handoff']['issue']['number']), '')] + [body + f'\n## {heading}\n\n{value}\n' for heading, value in [('Iteration', 'other-milestone'), ('Triage', 'other-label')]]) + ([body + f'\n## {heading}\n\n{value}\n' for heading, value in [('Status ##', 'blocked'), ('Status \t### \t', 'deferred'), ('Done ##', '- Conflicting criterion.'), ('Context ###', 'Parent #999; Stories: US-1.'), ('Status ##', 'unknown'), ('Bug scope ##', 'recovery')]] + [body + '\n## Status\n\nready\n\n## Status ##\n\nblocked\n', self.canonical_body.replace('## Status\n', '## Status ##\n').replace('ready (GitHub Projects is authoritative for current progress).', 'blocked')])
+        self.assert_refusals(variants)
+        self.issues[12]['body'] = body + '\n## Status \t\n\ndeferred\n'
+        self.dependencies[12] = []
+        self.assertEqual(self.frontier()['eligible'], [10])
+        self.assertEqual(self.reserve(10)['reservation']['status'], 'reserved')
+        self.item = self.stored()
+        self.item.pop('reservation')
+        self.persist()
+        self.status(10, 'Ready')
+        self.issues[12]['body'] = body
+        self.field_write.reset_mock()
         self.status(12, 'Deferred')
         row = next(r for r in self.frontier()['items'] if r['number'] == 12)
         self.assertTrue(row['contract_valid'])
@@ -324,17 +329,6 @@ class LeanFrontierTests(LeanControllerCase):
                 self.assert_no_external_writes()
                 self.assertEqual(self.stored()['ticket_work']['frontier']['eligible'], [10])
 
-    def test_refusals_preserve_independent_frontier_and_make_no_claim_or_write(self):
-        body = lean_body(self.inputs)
-        self.assert_refusals([
-            body.replace('US-1.', 'US-999.'), body + '\n## Status\n\ndeferred\n',
-            body + '\n## Status\n\nunknown\n', body + '\n## Bug scope\n\nrecovery\n',
-            body.replace('## Done', '## Done\n\n- criterion\n\n## Done'),
-            body.replace('## Blocked by', '## \tBlocked  by').replace('None (can start immediately).', '- #10')])
-        self.issues[12]['body'] = body + '\n## Status \t\n\ndeferred\n'
-        self.dependencies[12] = []
-        self.assertEqual(self.frontier()['eligible'], [10])
-        self.assertEqual(self.reserve(10)['reservation']['status'], 'reserved')
 
     def test_native_textual_blocker_disagreement_refuses_without_claim_or_write(self):
         self.issues[12]['body'] = lean_body(self.inputs, '- #10').replace('## Blocked by', '## \tBlocked  by')
@@ -351,24 +345,7 @@ class LeanFrontierTests(LeanControllerCase):
         self.assertEqual(self.issues[12]['body'], body)
         self.assert_no_external_writes()
 
-    def test_mixed_mechanical_scope_fields_refuse_without_claim_or_write(self):
-        body = lean_body(self.inputs)
-        self.assert_refusals([
-            body + f'\n## Parent\n\n{parent}\n' for parent in
-            ('#999', '#' + str(self.inputs['handoff']['issue']['number']), '')] + [
-            body + f'\n## {heading}\n\n{value}\n' for heading, value in
-            [('Iteration', 'other-milestone'), ('Triage', 'other-label')]])
 
-    def test_closing_atx_control_headings_cannot_evade_holds_or_duplicates(self):
-        body = lean_body(self.inputs)
-        self.assert_refusals([
-            body + f'\n## {heading}\n\n{value}\n' for heading, value in
-            [('Status ##', 'blocked'), ('Status \t### \t', 'deferred'),
-             ('Done ##', '- Conflicting criterion.'), ('Context ###', 'Parent #999; Stories: US-1.'),
-             ('Status ##', 'unknown'), ('Bug scope ##', 'recovery')]] + [
-            body + '\n## Status\n\nready\n\n## Status ##\n\nblocked\n',
-            self.canonical_body.replace('## Status\n', '## Status ##\n').replace(
-                'ready (GitHub Projects is authoritative for current progress).', 'blocked')])
 
 
 class LeanAffectedMutationTests(LeanControllerCase):
@@ -411,29 +388,25 @@ class LeanAffectedMutationTests(LeanControllerCase):
         self.dependencies[12] = []
         self.mutations.clear()
 
-    def test_terminal_comment_tail_survives_crlf_lost_patch_replay(self):
-        variants = [('lean', '\n\n \t\n'), ('lean', '\n<!-- unrelated footer -->\n\n \t'),
-                    ('lean', '<!-- another footer -->\t\n\n<!-- final footer -->\n'),
-                    ('canonical', '\n<!-- unrelated footer -->\n\n \t')]
-        for contract, tail in variants:
-            with self.subTest(contract=contract, tail=tail):
+    def test_lean_affected_patch_exact_bytes(self):
+        variants = [('lean', '## Blocked by', '\n\n \t\n'),
+                    ('lean', '## Blocked by', '\n<!-- unrelated footer -->\n\n \t'),
+                    ('lean', '## Blocked by', '<!-- another footer -->\t\n\n<!-- final footer -->\n'),
+                    ('canonical', '## Blocked by', '\n<!-- unrelated footer -->\n\n \t'),
+                    ('lean', '## \tBlocked  by \t###\t', '\n  <!-- neighbor -->\n'),
+                    ('lean', '## \tBlocked  by \t###\t', '\n<!--neighbor-->\n'),
+                    ('lean', '## \tBlocked  by \t', '')]
+        for contract, heading, tail in variants:
+            with self.subTest(contract=contract, heading=heading, tail=tail):
                 body = lean_body(self.inputs) if contract == 'lean' else self.canonical_body
-                self.assert_lost_patch_replay((body + tail).replace('\n', '\r\n'))
-
-    def test_footer_spelling_neighbors_survive_lost_patch_replay(self):
-        for tail in ('\n  <!-- neighbor -->\n', '\n<!--neighbor-->\n'):
-            with self.subTest(tail=tail):
-                body = lean_body(self.inputs) + tail
-                body = body.replace('## Blocked by', '## \tBlocked  by \t###\t').replace('\n', '\r\n')
+                body = (body.replace('## Blocked by', heading) + tail).replace('\n', '\r\n')
                 self.assert_lost_patch_replay(body)
-                after = self.issues[12]['body']
-                self.assertIn('<!-- factory-ticket:lean-fixture:work -->', after)
-                self.assertTrue(after.endswith(tail.replace('\n', '\r\n')))
+                if 'neighbor' in tail:
+                    after = self.issues[12]['body']
+                    self.assertIn('<!-- factory-ticket:lean-fixture:work -->', after)
+                    self.assertTrue(after.endswith(tail.replace('\n', '\r\n')))
 
-    def test_lean_affected_crlf_body_update_and_lost_response_replay(self):
-        body = lean_body(self.inputs)
-        body = body.replace('## Blocked by', '## \tBlocked  by \t').replace('\n', '\r\n')
-        self.assert_lost_patch_replay(body)
+
 
 
 class LeanAssignmentTests(LeanControllerCase):

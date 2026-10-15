@@ -132,29 +132,67 @@ class PlanningPublicationTests(unittest.TestCase):
         self.fixture.persist()
         return copy.deepcopy(record)
 
+    def seed_publication_stage(self, stage):
+        record = self.seed_verified_publication()
+        changes = []
+        effects = {}
+        for name, content in sorted(self.args['documents'].items()):
+            raw = content.encode()
+            sha = publication.object_sha('blob', raw)
+            payload = {'encoding': 'base64', 'content': base64.b64encode(raw).decode()}
+            response = {'sha': sha, **payload}
+            self.records['/git/blobs/' + sha] = response
+            effects['blob:' + name] = {'path': '/git/blobs', 'payload': payload, 'response': {'sha': sha}}
+            changes.append({'path': record['path'] + '/' + name, 'mode': '100644', 'type': 'blob', 'sha': sha})
+        self.records['/git/trees/' + 'd' * 40 + '?recursive=1'] = {'sha': 'd' * 40, 'truncated': False, 'tree': copy.deepcopy(changes)}
+        commit = {'sha': 'e' * 40, 'tree': {'sha': 'd' * 40}, 'parents': [{'sha': self.auth['parent']}]}
+        self.records['/git/commits/' + 'e' * 40] = commit
+        ref = {'ref': 'refs/heads/' + record['branch'], 'object': {'type': 'commit', 'sha': 'e' * 40}}
+        self.records['/git/ref/heads/' + record['branch']] = ref
+        issue = self.records['/issues/7']
+        effects.update(tree={'path': '/git/trees', 'payload': {'base_tree': 'c' * 40, 'tree': changes}, 'response': {'sha': 'd' * 40}},
+                       commit={'path': '/git/commits', 'payload': {'message': 'Factory initial specification origin-assignment\n',
+                               'tree': 'd' * 40, 'parents': [self.auth['parent']]}, 'response': commit},
+                       ref={'path': '/git/refs', 'payload': {'ref': ref['ref'], 'sha': 'e' * 40}, 'response': ref},
+                       issue={'path': '/issues', 'payload': {'title': issue['title'], 'body': issue['body'], 'labels': ['ready-for-agent']}, 'response': issue})
+        if stage is not None:
+            effects.pop(stage)
+            if stage == 'ref': self.records.pop('/git/ref/heads/' + record['branch'])
+            if stage == 'issue': self.records.pop('/issues/7')
+        record['effects'] = effects
+        record.pop('status', None)
+        self.item['planning']['host_publication'] = record
+        self.fixture.persist()
+        return record
+
     def publish_only(self):
-        # Completion is a separate component; do not feed real publisher output into it.
         completed = {'planning': {'status': 'complete'}, 'stage': 'planning_complete', 'handoff': {'commit': 'e' * 40}}
         with patch.object(planning, 'complete', return_value=completed):
             self.publish()
         return self.fixture.stored()['planning']['host_publication']
 
     def test_real_publisher_functions_complete_durable_exact_mock_readbacks(self):
-        self.publish_only()
-        record = self.fixture.stored()['planning']['host_publication']
+        observed_writes = []
+        for stage in ('blob:milestone.md', 'blob:provenance.md', 'blob:vision.md', 'tree', 'commit', 'ref', 'issue'):
+            with self.subTest(stage=stage):
+                self.records = self.initial_records(); self.writes = []
+                self.seed_publication_stage(stage)
+                record = self.publish_only()
+                self.assertEqual(record['status'], 'verified')
+                self.assertEqual(record['documents'], self.args['documents'])
+                self.assertEqual(record['execution']['native'], self.native)
+                self.assertEqual(record['branch'], 'factory/planning/m1/origin-assignment')
+                self.assertEqual(len(self.writes), 1)
+                observed_writes.extend(self.writes)
+        self.assertEqual(len(observed_writes), 7)
+        self.assertEqual({p for p, _ in observed_writes}, {'/git/blobs', '/git/trees', '/git/commits', '/git/refs', '/issues'})
+        self.assertFalse(any('main' in json.dumps(body) or 'force' in body for _, body in observed_writes))
         independent = self.seed_verified_publication()
         with patch.object(planning_publication, 'publish', return_value=independent):
             output = self.publish()
         self.assertEqual(output['status'], 'complete')
         stored = self.fixture.stored()
-        self.assertEqual(record['status'], 'verified')
         self.assertEqual(stored['handoff']['commit'], 'e' * 40)
-        self.assertEqual(record['documents'], self.args['documents'])
-        self.assertEqual(record['execution']['native'], self.native)
-        self.assertEqual(len(self.writes), 7)
-        self.assertEqual({p for p, _ in self.writes}, {'/git/blobs', '/git/trees', '/git/commits', '/git/refs', '/issues'})
-        self.assertEqual(record['branch'], 'factory/planning/m1/origin-assignment')
-        self.assertFalse(any('main' in json.dumps(body) or 'force' in body for _, body in self.writes))
         from factory_v1.service_dispatch import select
         self.assertEqual(select(stored, [], {}), ('synthesize', None))
 
@@ -191,31 +229,25 @@ class PlanningPublicationTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 'execution_required')
         self.assertEqual(self.writes, [])
 
-    def test_uncertain_commit_never_repeats_write(self):
-        self.fail_after = '/git/commits'
-        with self.assertRaises(repositories.RepositoryError): self.publish()
-        before = copy.deepcopy(self.writes)
-        self.fail_after = None
-        with self.assertRaises(repositories.RepositoryError) as error: self.publish()
-        self.assertEqual(error.exception.code, 'publication_uncertain')
-        self.assertEqual(self.writes, before)
-        self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
-
-    def test_lost_ref_and_issue_responses_reconcile_exact_effect_without_duplicate(self):
-        for suffix in ('/git/refs', '/issues'):
-            with self.subTest(suffix=suffix):
-                # Independent minimal fixture for each single boundary.
+    def test_publisher_effect_reconciliation(self):
+        for stage, suffix in (('commit', '/git/commits'), ('ref', '/git/refs'), ('issue', '/issues')):
+            with self.subTest(stage=stage):
+                self.records = self.initial_records(); self.writes = []
+                self.seed_publication_stage(stage)
                 self.fail_after = suffix
                 with self.assertRaises(repositories.RepositoryError): self.publish_only()
-                self.fail_after = None
-                output = self.publish_only()
-                self.assertEqual(output['status'], 'verified')
-                self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
-                self.assertEqual(sum(p == suffix for p, _ in self.writes), 1)
-                if suffix == '/git/refs':
-                    # Next subcase reuses no admitted publication or native completion.
-                    self.item['planning'].pop('host_publication', None)
-                    self.fixture.persist(); self.records = self.initial_records(); self.writes = []
+                before = copy.deepcopy(self.writes); self.fail_after = None
+                if stage == 'commit':
+                    with self.assertRaises(repositories.RepositoryError) as error: self.publish_only()
+                    self.assertEqual(error.exception.code, 'publication_uncertain')
+                    self.assertEqual(self.writes, before)
+                    self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
+                else:
+                    output = self.publish_only()
+                    self.assertEqual(output['status'], 'verified')
+                    self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
+                    self.assertEqual(sum(p == suffix for p, _ in self.writes), 1)
+
 
     def test_repository_privacy_or_authority_drift_before_write_refuses(self):
         self.repo['private'] = False
@@ -227,47 +259,50 @@ class PlanningPublicationTests(unittest.TestCase):
         with self.assertRaises(repositories.RepositoryError): self.publish()
         self.assertEqual(self.writes, [])
 
-    def test_exact_document_or_issue_readback_drift_never_completes(self):
-        self.drift = lambda path, result: ({**result, 'body': 'wrong'} if path == '/issues/7' else result)
-        with self.assertRaises(repositories.RepositoryError): self.publish()
-        self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
-        self.assertNotIn('handoff', self.fixture.stored())
+    def test_publisher_exact_tree_readback(self):
+        for boundary in ('issue', 'tree'):
+            with self.subTest(boundary=boundary):
+                self.records = self.initial_records(); self.writes = []
+                self.drift = None; self.seed_publication_stage(None)
+                def drift(path, result):
+                    if boundary == 'issue' and path == '/issues/7': return {**result, 'body': 'wrong'}
+                    if boundary == 'tree' and path == '/git/trees/' + 'd' * 40 + '?recursive=1':
+                        result['tree'].append({'path': 'outside.py', 'mode': '100644', 'type': 'blob', 'sha': 'f' * 40})
+                    return result
+                self.drift = drift
+                with self.assertRaises(repositories.RepositoryError): self.publish_only()
+                self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
+                self.assertNotIn('handoff', self.fixture.stored())
+                self.assertFalse(any(p == '/git/commits' for p, _ in self.writes))
 
-    def test_tree_cannot_smuggle_changes_outside_fixed_docs(self):
-        def drift(path, result):
-            if path == '/git/trees/' + 'd' * 40 + '?recursive=1':
-                result['tree'].append({'path': 'outside.py', 'mode': '100644', 'type': 'blob', 'sha': 'f' * 40})
-            return result
-        self.drift = drift
-        with self.assertRaises(repositories.RepositoryError): self.publish()
-        self.assertFalse(any(p == '/git/commits' for p, _ in self.writes))
 
-    def test_pause_at_last_prewrite_read_retains_intent_but_sends_nothing(self):
-        def drift(path, result):
-            journal = self.fixture.stored()['planning'].get('host_publication', {})
-            if path == '' and journal.get('effects'):
+    def test_publisher_last_read_authority_2(self):
+        for boundary in ('completion', 'prewrite'):
+            with self.subTest(boundary=boundary):
+                self.records = self.initial_records(); self.writes = []
+                self.auth_path.write_text(json.dumps(self.auth))
                 self.drift = None
-                self.fixture.pause()
-            return result
-        self.drift = drift
-        with self.assertRaises(repositories.RepositoryError): self.publish()
-        self.assertEqual(self.writes, [])
-        self.assertTrue(self.fixture.stored()['planning']['host_publication']['effects'])
-        self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
+                if boundary == 'prewrite': self.seed_publication_stage('blob:milestone.md')
+                else: record = self.seed_verified_publication()
+                def drift(path, result):
+                    journal = self.fixture.stored()['planning'].get('host_publication', {})
+                    if boundary == 'prewrite' and path == '' and 'blob:milestone.md' in journal.get('effects', {}):
+                        self.drift = None; self.fixture.pause()
+                    if boundary == 'completion' and path == '/issues/7' and journal.get('status') == 'verified':
+                        self.auth_path.write_text(json.dumps({**self.auth, 'reference': 'changed-authority'}))
+                    return result
+                self.drift = drift
+                if boundary == 'prewrite':
+                    with self.assertRaises(repositories.RepositoryError): self.publish_only()
+                    self.assertEqual(self.writes, [])
+                    self.assertTrue(self.fixture.stored()['planning']['host_publication']['effects'])
+                else:
+                    with patch.object(planning_publication, 'publish', return_value=record):
+                        with self.assertRaises(repositories.RepositoryError): self.publish()
+                    self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
+                    self.assertNotIn('handoff', self.fixture.stored())
+                self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
 
-    def test_host_authority_revoked_during_final_completion_read_is_not_admitted(self):
-        record = self.seed_verified_publication()
-        def drift(path, result):
-            if path == '/issues/7' and self.fixture.stored()['planning']['host_publication'].get('status') == 'verified':
-                changed = {**self.auth, 'reference': 'changed-authority'}
-                self.auth_path.write_text(json.dumps(changed))
-            return result
-        self.drift = drift
-        with patch.object(planning_publication, 'publish', return_value=record):
-            with self.assertRaises(repositories.RepositoryError): self.publish()
-        self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
-        self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
-        self.assertNotIn('handoff', self.fixture.stored())
 
     def test_authorization_permissions_and_missing_host_context_refused(self):
         self.auth_path.chmod(0o644)

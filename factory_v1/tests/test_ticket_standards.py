@@ -24,32 +24,35 @@ class StandardsTests(test_lean_tickets.LeanControllerCase):
         self.assertEqual(self.stored(), before)
         self.assert_no_external_writes()
 
-    def test_authoritative_oversized_requirement_preserves_independent_frontier(self):
-        self.issues[12]['body'] = self.canonical_body.replace('US-1', 'US-' + '9' * 5000)
-        snapshot = self.frontier()
-        self.assertEqual(snapshot['eligible'], [10])
-        self.assertFalse(next(r for r in snapshot['items'] if r['number'] == 12)['contract_valid'])
-        self.assert_no_external_writes()
-        before = self.stored()
-        with self.assertRaises(repositories.RepositoryError) as error:
-            self.reserve(12)
-        self.assertEqual(error.exception.code, 'ticket_ineligible')
-        self.assertEqual(self.stored(), before)
-        self.assertEqual(self.members[12]['fieldValues']['nodes'][0]['optionId'], 'Ready')
-        self.assertEqual(self.reserve(10)['reservation']['status'], 'reserved')
+    def test_ticket_oversize_refusal_2(self):
+        for field, original_text, replacement in (
+                ('requirement', 'US-1', 'US-' + '9' * 5000),
+                ('blocker', 'None (can start immediately).', '- #' + '9' * 5000)):
+            with self.subTest(field=field):
+                original = self.canonical_body
+                self.issues[12]['body'] = original.replace(original_text, replacement)
+                self.assertNotEqual(self.issues[12]['body'], original)
+                if field == 'requirement':
+                    snapshot = self.frontier()
+                    self.assertEqual(snapshot['eligible'], [10])
+                    self.assertFalse(next(r for r in snapshot['items'] if r['number'] == 12)['contract_valid'])
+                before = self.stored()
+                with self.assertRaises(repositories.RepositoryError) as error:
+                    if field == 'requirement':
+                        self.reserve(12)
+                    else:
+                        self.frontier()
+                self.assertEqual(error.exception.code, 'ticket_ineligible' if field == 'requirement' else 'github_mismatch')
+                self.assertEqual(self.stored(), before)
+                self.assert_no_external_writes()
+                self.assertEqual(self.members[12]['fieldValues']['nodes'][0]['optionId'], 'Ready')
+                if field == 'requirement':
+                    self.assertEqual(self.reserve(10)['reservation']['status'], 'reserved')
+                    self.item = self.stored(); self.item.pop('reservation'); self.persist()
+                    self.status(10, 'Ready'); self.field_write.reset_mock()
+                self.issues[12]['body'] = original
+                self.assertEqual(self.frontier()['eligible'], [10, 12])
 
-    def test_authoritative_oversized_textual_blocker_is_safe_refusal(self):
-        before = self.stored()
-        original = self.canonical_body
-        self.issues[12]['body'] = original.replace('None (can start immediately).', '- #' + '9' * 5000)
-        self.assertNotEqual(self.issues[12]['body'], original)
-        with self.assertRaises(repositories.RepositoryError) as error:
-            self.frontier()
-        self.assertEqual(error.exception.code, 'github_mismatch')
-        self.assertEqual(self.stored(), before)
-        self.assert_no_external_writes()
-        self.issues[12]['body'] = original
-        self.assertEqual(self.frontier()['eligible'], [10, 12])
 
     def test_deep_generated_graph_and_guards(self):
         template = self.ticket()

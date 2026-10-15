@@ -340,11 +340,10 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual([s['name'] for s in replay['handoff']['skills']], ['diagnosing-bugs', 'implement'])
         self.github.request.assert_not_called()
 
-    def test_validation_identity_profiles_paths_and_capabilities(self):
+    def test_malformed_request_and_path_pre_read_guards_matrix(self):
         assignments.validate(self.request)
         for field, value, code in [('workspace', 'relative', 'invalid_assignment'),
             ('workspace', '/workspace/../other', 'invalid_assignment'),
-            ('workspace', str(self.root) + '\x00bad', 'invalid_assignment'),
             ('baseline', 'main', 'invalid_assignment'), ('repository_id', True, 'invalid_assignment'),
             ('capabilities', ['merge'], 'capability_blocked'), ('standards', [], 'invalid_assignment'),
             ('result_contract', 'success-is-authority', 'capability_blocked'),
@@ -353,7 +352,7 @@ class AssignmentComponentTests(unittest.TestCase):
                 with self.assertRaises(RepositoryError) as refusal:
                     self.prepare({**self.request, field: value})
                 self.assertEqual(refusal.exception.code, code)
-        for field, value, code in [('name', 'default', 'profile_blocked'), ('home', '//aliased', 'profile_blocked'),
+        for field, value, code in [('name', 'default', 'profile_blocked'),
                                   ('role', 'review', 'profile_blocked'), ('model', 'fallback', 'model_blocked'),
                                   ('provider', 'paid-api', 'model_blocked'), ('reasoning', None, 'model_blocked'),
                                   ('operation', 'fallback', 'model_blocked')]:
@@ -365,7 +364,6 @@ class AssignmentComponentTests(unittest.TestCase):
                 self.assertEqual(refusal.exception.code, code)
         self.frontier.assert_not_called()
 
-    def test_real_skill_closure_and_stage_bindings(self):
         for stage in assignments.ROLES:
             request = self.configuration(stage)
             selected = assignments.validate(request)
@@ -430,33 +428,35 @@ class AssignmentComponentTests(unittest.TestCase):
             self.assertEqual(refusal.exception.code, 'ticket_ineligible')
         self.assertEqual(assignments.rows(self.db), [])
 
-    def test_grants_exact_scope_expiry_exhaustion_and_uncertainty(self):
-        scope = ('product', 'm1', 'openai-codex', 'gpt-6.1-sol', 'responses')
-        self.assertFalse(spending.admission_preview(self.db, scope)['reserved'])
-        for sql in ["UPDATE model_grants SET remaining=0", "UPDATE model_grants SET remaining=10,expires=1",
-                    "UPDATE model_grants SET expires=4611686018427387904,model='wrong'",
-                    "UPDATE model_grants SET model='gpt-6.1-sol',kind='approval'", "DELETE FROM model_grants"]:
-            self.db.execute(sql)
-            self.db.commit()
-            with self.assertRaises(RepositoryError) as refusal:
-                self.prepare()
-            self.assertEqual(refusal.exception.code, 'spending_blocked')
-        self.db.execute('INSERT INTO model_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
-            ('uncertain', *scope, None, 1, 'pending', '0' * 64, None, 1, None))
-        self.db.commit()
-        with self.assertRaises(RepositoryError) as refusal:
-            self.prepare()
-        self.assertEqual(refusal.exception.code, 'outcome_uncertain')
-        self.db.execute('DELETE FROM model_operations')
-        self.db.commit()
-        self.item['model_access'] = {'reason': 'quota_exhausted'}
+        self.frontier.side_effect = self.observation
+        self.item['reservation'] = {'issue_number': 12, 'assignment_id': 'ticket-input',
+                                    'input_digest': 'd' * 64, 'status': 'reserved'}
         self.save_item()
-        with self.assertRaises(RepositoryError) as refusal:
-            self.prepare()
-        self.assertEqual(refusal.exception.code, 'quota_exhausted')
+        before = self.load_item()
+        for dry in (False, True):
+            self.frontier.reset_mock()
+            self.read_issue.reset_mock()
+            self.assert_refused('claim_conflict', self.prepare, dry=dry)
+            self.assertEqual(self.load_item(), before)
+            self.assertEqual(assignments.rows(self.db), [])
+            self.frontier.assert_not_called()
+            self.read_issue.assert_not_called()
+        self.item.pop('reservation')
+        self.save_item()
+        row = self.seed_assignment()
+        result = self.result(row)
+        before = assignments.rows(self.db)
+        for operator, identity, code in (('other', row['assignment_id'], 'approval_required'),
+                                         ('42', 'unknown', 'not_found')):
+            with self.subTest(operator=operator, identity=identity):
+                self.assert_refused(code, assignments.inspect, self.db, 'product', 'm1', operator, identity)
+                self.assert_refused(code, assignments.store_result, self.db, 'product', 'm1', operator, identity, result, self.github)
+        self.assertEqual(assignments.rows(self.db), before)
         self.frontier.assert_not_called()
+        self.read_issue.assert_not_called()
+        self.github.request.assert_not_called()
 
-    def test_claims_reservations_profile_conflicts_and_diagnosis_independence(self):
+    def test_grant_capacity_and_claim_independence_matrix(self):
         row = self.seed_assignment()
         request = copy.deepcopy(self.request)
         scope = row['ticket_scope']
@@ -485,21 +485,30 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(len(assignments.rows(self.db)), 1)
         self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['claim_id'], self.request['claim_id'])
 
-    def test_result_truthful_untrusted_replay_and_conflict(self):
-        row = self.seed_assignment()
-        result = self.result(row)
-        stored = self.store(row, result)
-        self.assertTrue(stored['result_disposition']['structurally_valid'])
-        for flag in ('trusted_execution', 'advance_allowed', 'close_allowed'):
-            self.assertFalse(stored['result_disposition'][flag])
-        self.assertEqual(self.store(row, result)['submitted_result'], result)
-        with self.assertRaises(RepositoryError) as refusal:
-            self.store(row, {**result, 'work': ['replacement']})
-        self.assertEqual(refusal.exception.code, 'result_conflict')
-        self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['submitted_result'], result)
+        self.frontier.reset_mock()
+        scope = ('product', 'm1', 'openai-codex', 'gpt-6.1-sol', 'responses')
+        self.assertFalse(spending.admission_preview(self.db, scope)['reserved'])
+        for sql in ["UPDATE model_grants SET remaining=0", "UPDATE model_grants SET remaining=10,expires=1",
+                    "UPDATE model_grants SET expires=4611686018427387904,model='wrong'",
+                    "UPDATE model_grants SET model='gpt-6.1-sol',kind='approval'", "DELETE FROM model_grants"]:
+            with self.subTest(capacity=sql):
+                self.db.execute(sql)
+                self.db.commit()
+                self.assert_refused('spending_blocked', self.prepare)
+        self.db.execute('INSERT INTO model_operations VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            ('uncertain', *scope, None, 1, 'pending', '0' * 64, None, 1, None))
+        self.db.commit()
+        self.assert_refused('outcome_uncertain', self.prepare)
+        self.db.execute('DELETE FROM model_operations')
+        self.db.commit()
+        self.item['model_access'] = {'reason': 'quota_exhausted'}
+        self.save_item()
+        self.assert_refused('quota_exhausted', self.prepare)
+        self.frontier.assert_not_called()
 
-    def test_result_identity_loads_artifacts_and_tests_matrix(self):
-        row = self.seed_assignment()
+    def test_result_identity_truth_and_drift_matrix(self):
+        request = self.copied_skills(self.request)
+        row = self.seed_assignment(request)
         result = self.result(row)
         for field, value in [('assignment_id', 'wrong'), ('claim_id', 'wrong'), ('handoff_digest', '0' * 64),
             ('loads', []), ('artifacts', []), ('work', []), ('tests', []), ('status', 'success')]:
@@ -512,6 +521,32 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assert_refused('invalid_result', self.store, row, changed)
         self.assert_refused('invalid_result', self.store, row, {'status': 'done'})
         self.assertNotIn('submitted_result', assignments.rows(self.db)[0])
+
+        before = assignments.rows(self.db)
+        self.read_issue.return_value = {'body': 'Local issue\nChanged scope',
+                                      'html_url': 'https://example.invalid/issues/10'}
+        self.assert_refused('scope_mismatch', self.store, row, result)
+        self.assertEqual(assignments.rows(self.db), before)
+        changed = copy.deepcopy(request)
+        changed['issue']['body_sha256'] = hashlib.sha256(b'Local issue\nChanged scope').hexdigest()
+        self.assert_refused('claim_conflict', self.prepare, changed)
+        self.read_issue.return_value = {'body': 'Local issue', 'html_url': 'https://example.invalid/issues/10'}
+        selected = Path(request['skills'][0]['path'])
+        raw = selected.read_bytes()
+        selected.write_text('Changed selected input')
+        self.assert_refused('skill_blocked', self.store, row, result)
+        self.assertNotIn('submitted_result', assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id']))
+        self.assertEqual(assignments.rows(self.db), before)
+        selected.write_bytes(raw)
+        self.github.request.assert_not_called()
+
+        stored = self.store(row, result)
+        self.assertTrue(stored['result_disposition']['structurally_valid'])
+        for flag in ('trusted_execution', 'advance_allowed', 'close_allowed'):
+            self.assertFalse(stored['result_disposition'][flag])
+        self.assertEqual(self.store(row, result)['submitted_result'], result)
+        self.assert_refused('result_conflict', self.store, row, {**result, 'work': ['replacement']})
+        self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['submitted_result'], result)
 
     def test_late_pause_blocks_claim_and_result_but_keeps_inspection(self):
         row = self.seed_assignment()
@@ -541,8 +576,6 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assert_refused('iteration_paused', self.store, row, result)
         self.assertEqual(assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])['handoff_digest'], row['handoff_digest'])
 
-    def test_revision_inspection_and_result_independent_holds(self):
-        row = self.seed_assignment()
         for field, code in [('requirement_disposition', 'requirements_held'), ('stuck_disposition', 'stuck_held')]:
             with self.subTest(field=field):
                 with self.assertRaises(RepositoryError) as refusal:
@@ -579,7 +612,7 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(len(assignments.rows(self.db)), 1)
         self.github.request.assert_not_called()
 
-    def test_direct_json_duplicate_hook_and_nested_request_shapes(self):
+    def test_json_cli_and_path_pre_read_guards_matrix(self):
         from factory_v1.__main__ import unique_fields, IntakeError
         with self.assertRaises(IntakeError):
             json.loads('{"stage":"implementation","stage":"diagnosis"}', object_pairs_hook=unique_fields)
@@ -593,7 +626,6 @@ class AssignmentComponentTests(unittest.TestCase):
         self.assertEqual(assignments.rows(self.db), [])
         self.frontier.assert_not_called()
 
-    def test_inprocess_cli_malformed_requests_keep_structured_refusal(self):
         import io
         import sys
         from contextlib import redirect_stderr, redirect_stdout
@@ -625,7 +657,6 @@ class AssignmentComponentTests(unittest.TestCase):
         self.read_issue.assert_not_called()
         self.github.request.assert_not_called()
 
-    def test_path_malformations_refuse_dry_and_persisted_before_reads(self):
         for existing in (False, True):
             row = self.prepare() if existing else None
             for field in ('workspace', 'home'):
@@ -646,19 +677,6 @@ class AssignmentComponentTests(unittest.TestCase):
             if row:
                 self.assertEqual(self.prepare()['handoff_digest'], row['handoff_digest'])
 
-    def test_reservation_owned_other_ticket_refuses_prepare_without_effects(self):
-        self.item['reservation'] = {'issue_number': 12, 'assignment_id': 'ticket-input',
-                                    'input_digest': 'd' * 64, 'status': 'reserved'}
-        self.save_item()
-        before = self.load_item()
-        for dry in (False, True):
-            with self.subTest(dry=dry):
-                self.assert_refused('claim_conflict', self.prepare, dry=dry)
-                self.assertEqual(self.load_item(), before)
-                self.assertEqual(assignments.rows(self.db), [])
-        self.frontier.assert_not_called()
-        self.read_issue.assert_not_called()
-        self.github.request.assert_not_called()
 
     def reservation_boundary(self):
         # Fixture tracker rows and outbound status writes, not reservation guards.
@@ -746,26 +764,6 @@ class AssignmentComponentTests(unittest.TestCase):
                         self.assert_refused('claim_conflict', self.prepare)
                     self.github.request.assert_not_called()
 
-    def test_result_revalidates_external_body_and_copied_selected_bytes(self):
-        request = self.copied_skills(self.request)
-        row = self.seed_assignment(request)
-        result = self.result(row)
-        before = assignments.rows(self.db)
-        self.read_issue.return_value = {'body': 'Local issue\nChanged scope',
-                                      'html_url': 'https://example.invalid/issues/10'}
-        self.assert_refused('scope_mismatch', self.store, row, result)
-        self.assertEqual(assignments.rows(self.db), before)
-        # Repinning the new body cannot steal the original claim.
-        changed = copy.deepcopy(request)
-        changed['issue']['body_sha256'] = hashlib.sha256(b'Local issue\nChanged scope').hexdigest()
-        self.assert_refused('claim_conflict', self.prepare, changed)
-        self.read_issue.return_value = {'body': 'Local issue', 'html_url': 'https://example.invalid/issues/10'}
-        Path(request['skills'][0]['path']).write_text('Changed selected input')
-        self.assert_refused('skill_blocked', self.store, row, result)
-        inspected = assignments.inspect(self.db, 'product', 'm1', '42', row['assignment_id'])
-        self.assertNotIn('submitted_result', inspected)
-        self.assertEqual(assignments.rows(self.db), before)
-        self.github.request.assert_not_called()
 
     def test_generic_prepare_refuses_placeholder_stage_precursors(self):
         for stage in ('review-standards', 'review-spec', 'simplify', 'corrections', 'diagnosis'):
@@ -778,21 +776,6 @@ class AssignmentComponentTests(unittest.TestCase):
         self.read_issue.assert_not_called()
         self.github.request.assert_not_called()
 
-    def test_operator_and_unknown_assignment_refuse_before_effects(self):
-        row = self.seed_assignment()
-        result = self.result(row)
-        before = assignments.rows(self.db)
-        self.frontier.reset_mock()
-        self.read_issue.reset_mock()
-        for operator, identity, code in (('other', row['assignment_id'], 'approval_required'),
-                                         ('42', 'unknown', 'not_found')):
-            with self.subTest(operator=operator, identity=identity):
-                self.assert_refused(code, assignments.inspect, self.db, 'product', 'm1', operator, identity)
-                self.assert_refused(code, assignments.store_result, self.db, 'product', 'm1', operator, identity, result, self.github)
-        self.assertEqual(assignments.rows(self.db), before)
-        self.frontier.assert_not_called()
-        self.read_issue.assert_not_called()
-        self.github.request.assert_not_called()
 
     def test_attention_read_return_preserves_other_writer_checkpoint(self):
         from factory_v1.repositories import state_lock

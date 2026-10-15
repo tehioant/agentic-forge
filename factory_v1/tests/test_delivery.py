@@ -184,13 +184,21 @@ class DeliveryComponentTests(unittest.TestCase):
         with closing(sqlite3.connect(self.state)) as db:
             return db.execute('SELECT * FROM ' + table).fetchall()
 
-    def test_durable_incident_unknown_holds_idempotence_and_exact_clearance(self):
+    def test_incident_lifecycle_and_exact_clearance_matrix(self):
+        from factory_v1 import __main__ as cli
+        from factory_v1.errors import IntakeError
+        for samples, interval in (('0', '1'), ('1', 'nan'), ('1', '0'), ('10001', '1')):
+            with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '42',
+                'watch-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(self.config_path),
+                '--samples', samples, '--interval', interval]), self.assertRaises(IntakeError):
+                cli.main()
         self.assertEqual(self.sample()['evidence']['status'], 'healthy')
         self.assertEqual(self.notifications(), [])
         self.target.healthy = False
         failed = self.sample()
         incident = failed['incident']['incident_id']
         self.assertEqual(failed['evidence']['failure'], 'delivery_unhealthy')
+        self.assertEqual(failed['evidence']['status'], 'failed')
         self.assertEqual(self.stored()['main_incident']['incident_id'], incident)
         self.assertEqual(self.sample(), failed)
         self.assertEqual(len(self.inspect()['observations']), 2)
@@ -222,20 +230,50 @@ class DeliveryComponentTests(unittest.TestCase):
         self.assertEqual(len(self.notifications()), 2)
         self.assertFalse(self.stored()['execution_allowed'])
 
-    def test_ci_workflow_deployment_failure_pending_skipped_and_unknown_matrix(self):
-        for field, values in (('check_conclusion', ('failure', 'cancelled', 'skipped', None)),
-                              ('workflow_conclusion', ('failure', 'cancelled', None)),
-                              ('deployment_state', ('failure', 'error', 'inactive', 'pending'))):
-            for value in values:
-                with self.subTest(field=field, value=value):
+    def test_failed_unknown_and_late_health_samples_matrix(self):
+        cases = [('observation', field, value) for field, values in (
+            ('check_conclusion', ('failure', 'cancelled', 'skipped', None)),
+            ('workflow_conclusion', ('failure', 'cancelled', None)),
+            ('deployment_state', ('failure', 'error', 'inactive', 'pending'))) for value in values]
+        cases += [('late-read', field, 'b' * 40 if 'sha' in field else 'failure') for field in (
+            'sha', 'deploy_sha', 'check_conclusion', 'workflow_conclusion', 'deployment_state')]
+        for phase, field, value in cases:
+            with self.subTest(phase=phase, field=field, value=value):
+                original = getattr(self.target, field)
+                if phase == 'late-read':
+                    self.target.after_health = lambda field=field, value=value: setattr(self.target, field, value)
+                else:
                     setattr(self.target, field, value)
-                    failed = delivery.observe(self.config)
-                    self.assertNotEqual(failed['status'], 'healthy')
-                    self.assertIsNotNone(failed['failure'])
-                    setattr(self.target, field, 'success')
-                    self.assertEqual(delivery.observe(self.config)['status'], 'healthy')
+                try:
+                    evidence = delivery.observe(self.config)
+                    self.assertNotEqual(evidence['status'], 'healthy')
+                    self.assertIsNotNone(evidence['failure'])
+                    if phase == 'late-read':
+                        self.assertEqual(evidence['status'], 'unknown')
+                        self.assertEqual(evidence['failure'], 'delivery_race')
+                finally:
+                    self.target.after_health = None
+                    setattr(self.target, field, original)
+        evidence = delivery.observe(self.config)
+        self.assertEqual(evidence['status'], 'healthy')
+        evidence['checks'] = []
+        evidence_id = assignments.digest(evidence)
+        with self.assertRaises(delivery.RepositoryError) as raised:
+            delivery.validate_evidence(json.dumps(evidence), evidence_id, self.config)
+        self.assertIn('incomplete', str(raised.exception))
+        self.target.after_health = lambda: setattr(self.target, 'sha', 'b' * 40)
+        self.assertEqual(delivery.observe(self.config)['failure'], 'delivery_race')
+        self.target.sha = 'a' * 40
+        import inspect
+        source = inspect.getsource(delivery.observe)
+        source = source.replace("require(all(api.read(suffix) == value for suffix, value in reads.items()) and\n                api.read('/git/ref/heads/main') == main,", 'require(True,')
+        namespace = dict(vars(delivery))
+        exec(compile(source, '<delivery-race-guard-probe>', 'exec'), namespace)
+        broken = namespace['observe'](self.config)
+        self.assertEqual(broken['status'], 'healthy')
+        self.assertEqual(self.target.sha, 'b' * 40)
 
-    def test_concurrent_direct_sampling_creates_one_unknown_incident(self):
+    def test_concurrent_sample_one_incident_matrix(self):
         self.target.github_outage = True
         with ThreadPoolExecutor(max_workers=3) as pool:
             futures = [pool.submit(self.sample) for _ in range(3)]
@@ -244,34 +282,9 @@ class DeliveryComponentTests(unittest.TestCase):
         self.assertEqual(len(self.notifications()), 1)
         self.assertEqual(len(self.inspect()['observations']), 1)
 
-    def test_repeated_observations_replace_sleeping_watcher(self):
-        values = [self.sample()]
-        self.target.healthy = False
-        values += [self.sample(), self.sample()]
-        self.assertEqual([v['evidence']['status'] for v in values], ['healthy', 'failed', 'failed'])
-        self.assertEqual(values[1]['incident']['incident_id'], values[2]['incident']['incident_id'])
-        self.assertEqual(len(self.notifications()), 1)
-        # Watcher argument admission is wrapper-only; refuse without opening state or sleeping.
-        from factory_v1 import __main__ as cli
-        from factory_v1.errors import IntakeError
-        for samples, interval in (('0', '1'), ('1', 'nan'), ('1', '0'), ('10001', '1')):
-            with mock.patch.object(sys, 'argv', ['factory', '--state', str(self.state), '--operator-id', '42',
-                'watch-delivery', '--project', 'product', '--iteration', 'm1', '--delivery-config', str(self.config_path),
-                '--samples', samples, '--interval', interval]), self.assertRaises(IntakeError):
-                cli.main()
 
-    def test_late_main_check_workflow_and_deployment_races_never_claim_health(self):
-        for field in ('sha', 'deploy_sha', 'check_conclusion', 'workflow_conclusion', 'deployment_state'):
-            original = getattr(self.target, field)
-            self.target.after_health = lambda field=field: setattr(self.target, field, 'b' * 40 if 'sha' in field else 'failure')
-            evidence = delivery.observe(self.config)
-            self.assertEqual(evidence['status'], 'unknown')
-            self.assertEqual(evidence['failure'], 'delivery_race')
-            self.target.after_health = None
-            setattr(self.target, field, original)
-            self.assertEqual(delivery.observe(self.config)['status'], 'healthy')
 
-    def test_raw_json_boundaries_ambiguity_nonfinite_unicode_and_pagination(self):
+    def test_wire_json_and_bounded_evidence_matrix(self):
         paths = ['/repos/example/product', '/repos/example/product/git/ref/heads/main',
                  '/repos/example/product/commits/' + self.target.sha + '/check-runs?per_page=100&filter=latest', '/health']
         for path in paths:
@@ -290,9 +303,9 @@ class DeliveryComponentTests(unittest.TestCase):
             with self.assertRaises(delivery.RepositoryError):
                 delivery.decode(raw)
         self.assertEqual(delivery.observe(self.config)['status'], 'healthy')
-
-    def test_large_untrusted_evidence_remains_bounded_and_restart_clearable(self):
+        initial_state = self.state.read_bytes()
         for field in ('check_conclusion', 'workflow_conclusion', 'deploy_sha', 'deployment_state'):
+            self.state.write_bytes(initial_state)
             original = getattr(self.target, field)
             value = '😀' * 200000
             setattr(self.target, field, value)
@@ -304,67 +317,29 @@ class DeliveryComponentTests(unittest.TestCase):
                 self.assertLessEqual(len(row[-1].encode()), delivery.LIMIT)
             setattr(self.target, field, original)
             self.assertIsNone(self.sample()['incident'])
-
-    def test_corrupt_archived_evidence_cannot_promote_pointer_or_clear_incident(self):
-        healthy = self.sample()
-        self.target.healthy = False
-        self.sample()
-        before = self.stored()
-        evidence_id = healthy['monitor']['latest']['evidence_id']
-        original = json.dumps(healthy['evidence'])
-        self.target.healthy = True
-        for raw in ('[]', '{"status":"healthy"}', json.dumps(dict(healthy['evidence'], main='b' * 40)), ' ' * delivery.LIMIT + original):
-            with closing(sqlite3.connect(self.state)) as db, db:
-                db.execute('UPDATE delivery_observations SET payload=? WHERE id=?', (raw, evidence_id))
-            journals, notifications = self.rows('delivery_incidents'), self.rows('notifications')
+        opener = mock.Mock()
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{"ok":true}'
+        opener.open.return_value = response
+        with mock.patch.object(delivery.urllib.request, 'build_opener', return_value=opener):
+            for status in (302, 401, 500):
+                response.status = status
+                with self.assertRaises(delivery.RepositoryError) as raised:
+                    self.real_http_json(self.config['contract']['health_url'], 2)
+                self.assertEqual(raised.exception.code, 'delivery_unknown')
+            response.status = 200
+            self.assertEqual(self.real_http_json(self.config['contract']['health_url'], 2), {'ok': True})
+            response.read.assert_called_with(delivery.LIMIT + 1)
+            response.read.return_value = b'{"ok":true,"ok":false}'
             with self.assertRaises(delivery.RepositoryError):
-                self.sample()
-            self.assertEqual(self.stored(), before)
-            self.assertEqual(self.rows('delivery_incidents'), journals)
-            self.assertEqual(self.rows('notifications'), notifications)
-            self.assertEqual(next(row[-1] for row in self.rows('delivery_observations') if row[2] == evidence_id), raw)
-        with closing(sqlite3.connect(self.state)) as db, db:
-            db.execute('UPDATE delivery_observations SET payload=? WHERE id=?', (original, evidence_id))
-        self.assertIsNone(self.sample()['incident'])
+                self.real_http_json(self.config['contract']['health_url'], 2)
+            opener.open.side_effect = OSError('unreachable')
+            with self.assertRaises(delivery.RepositoryError) as raised:
+                self.real_http_json(self.config['contract']['health_url'], 2)
+            self.assertEqual(raised.exception.code, 'delivery_unavailable')
 
-    def test_new_records_validate_before_atomic_save(self):
-        healthy = self.sample()['evidence']
-        before = self.stored()
-        cases = {'incomplete-healthy': dict(healthy, checks=[]),
-                 'oversized-evidence': dict(healthy, status='unknown', failure='delivery_unknown', health=None, checks=['😀' * 200000]),
-                 'oversized-iteration': dict(healthy, status='unknown', failure='delivery_unknown', health=None)}
-        for mode, evidence in cases.items():
-            item = copy.deepcopy(before)
-            if mode == 'oversized-iteration':
-                item['padding'] = ''
-                item['padding'] = 'x' * (delivery.LIMIT - len(json.dumps(item).encode()) - 1)
-            with closing(sqlite3.connect(self.state)) as db, db:
-                db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-            tables = {t: self.rows(t) for t in ('delivery_observations', 'delivery_incidents', 'notifications')}
-            with mock.patch.object(delivery, 'observe', return_value=evidence), self.assertRaises(delivery.RepositoryError):
-                self.sample()
-            self.assertEqual(self.stored(), item)
-            self.assertEqual({t: self.rows(t) for t in tables}, tables)
-            with closing(sqlite3.connect(self.state)) as db, db:
-                db.execute('UPDATE iterations SET payload=?', (json.dumps(before),))
-        self.assertEqual(self.inspect()['monitor']['latest']['status'], 'healthy')
-
-    def test_health_status_and_exact_contract_refusals(self):
-        for status in (302, 401, 500):
-            self.target.http_status = status
-            self.assertNotEqual(delivery.observe(self.config)['status'], 'healthy')
-        self.target.http_status = None
-        for field, value in (('deployment_id', True), ('sha', 'b' * 40), ('contract_sha256', 'c' * 64),
-                             ('environment', 'other'), ('acceptance', {'journey': 1})):
-            health = self.target.value('/health')
-            assert isinstance(health, dict)
-            health[field] = value
-            self.target.responses['/health'] = json.dumps(health).encode()
-            self.assertEqual(delivery.observe(self.config)['failure'], 'delivery_unhealthy')
-        self.target.responses.clear()
-        self.assertEqual(delivery.observe(self.config)['status'], 'healthy')
-
-    def test_configuration_private_file_parser_pin_and_read_capability_refusals(self):
+    def test_persisted_evidence_and_private_config_guards_matrix(self):
         original = copy.deepcopy(self.config)
         assert isinstance(original, dict) and isinstance(original['contract'], dict)
         cases = [None, [], dict(original, required_checks=[]), dict(original, required_workflows=[]),
@@ -393,97 +368,109 @@ class DeliveryComponentTests(unittest.TestCase):
         self.assertEqual(self.target.calls, [])
         self.config_path.chmod(0o600)
         self.assertEqual(delivery.load_config(self.config_path, '42'), original)
+
+        for status in (302, 401, 500):
+            self.target.http_status = status
+            self.assertNotEqual(delivery.observe(self.config)['status'], 'healthy')
+        self.target.http_status = None
+        for field, value in (('deployment_id', True), ('sha', 'b' * 40), ('contract_sha256', 'c' * 64),
+                             ('environment', 'other'), ('acceptance', {'journey': 1})):
+            health = self.target.value('/health')
+            assert isinstance(health, dict)
+            health[field] = value
+            self.target.responses['/health'] = json.dumps(health).encode()
+            self.assertEqual(delivery.observe(self.config)['failure'], 'delivery_unhealthy')
+        self.target.responses.clear()
+        self.assertEqual(delivery.observe(self.config)['status'], 'healthy')
+        healthy = self.sample()
+        self.target.healthy = False
         self.sample()
+        before = self.stored()
+        evidence_id = healthy['monitor']['latest']['evidence_id']
+        original_rows = {t: self.rows(t) for t in ('iterations', 'delivery_observations', 'delivery_incidents', 'notifications')}
+        archived = json.dumps(healthy['evidence'])
+        cases = [('archive', 'delivery_observations', raw, evidence_id) for raw in (
+            '[]', '{"status":"healthy"}', json.dumps(dict(healthy['evidence'], main='b' * 40)),
+            ' ' * delivery.LIMIT + archived)]
+        cases += [('current', table, raw, None) for table, raw in (
+            ('iterations', json.dumps(dict(before, main_incident=None))),
+            ('iterations', json.dumps(dict(before, main_incident=dict(before['main_incident'], recovery_assignment=True)))),
+            ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], latest={})))),
+            ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], sequence=True)))),
+            ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], config_sha256='b' * 64)))),
+            ('iterations', json.dumps(before)[:-1] + ',"approval":null}'),
+            ('delivery_observations', '[]'), ('delivery_observations', '{"status":"healthy"}'),
+            ('delivery_incidents', 'null'), ('notifications', '[]'))]
+        for phase, table, raw, identity in cases:
+            with self.subTest(phase=phase, table=table, raw=raw[:80]):
+                self.target.healthy = phase == 'archive'
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    suffix, args = (' WHERE id=?', (raw, identity)) if identity else ('', (raw,))
+                    db.execute('UPDATE ' + table + ' SET payload=?' + suffix, args)
+                snapshot = {t: self.rows(t) for t in original_rows}
+                calls = len(self.target.calls)
+                try:
+                    with self.assertRaises((delivery.RepositoryError, attention.IntakeError)):
+                        self.sample()
+                    self.assertEqual({t: self.rows(t) for t in original_rows}, snapshot)
+                    if phase == 'archive':
+                        self.assertEqual(self.stored(), before)
+                        self.assertEqual(self.rows('delivery_incidents'), original_rows['delivery_incidents'])
+                        self.assertEqual(self.rows('notifications'), original_rows['notifications'])
+                        self.assertEqual(next(row[-1] for row in self.rows('delivery_observations') if row[2] == evidence_id), raw)
+                    else:
+                        self.assertEqual(len(self.target.calls), calls)
+                finally:
+                    with closing(sqlite3.connect(self.state)) as db, db:
+                        for name, rows in original_rows.items():
+                            db.execute('DELETE FROM ' + name)
+                            db.executemany('INSERT INTO ' + name + ' VALUES (' + ','.join('?' for _ in rows[0]) + ')', rows)
+        self.target.healthy = False
+        self.assertEqual(self.sample()['incident']['incident_id'], before['main_incident']['incident_id'])
+        self.target.healthy = True
+        self.assertIsNone(self.sample()['incident'])
         before = self.state.read_bytes()
         self.config = dict(original, environment='other')
         with self.assertRaises(delivery.RepositoryError) as raised:
             self.sample()
         self.assertEqual(raised.exception.code, 'delivery_conflict')
         self.assertEqual(self.state.read_bytes(), before)
+        self.config = original
 
-    def test_persisted_monitor_incident_evidence_and_outbox_corruption_refuse_before_reads(self):
-        self.target.healthy = False
-        self.sample()
+    def test_atomic_validate_and_notification_rollback_matrix(self):
+        healthy = self.sample()['evidence']
         before = self.stored()
-        original_rows = {t: self.rows(t) for t in ('iterations', 'delivery_observations', 'delivery_incidents', 'notifications')}
-        calls = len(self.target.calls)
-        cases = [('iterations', json.dumps(dict(before, main_incident=None))),
-                 ('iterations', json.dumps(dict(before, main_incident=dict(before['main_incident'], recovery_assignment=True)))),
-                 ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], latest={})))),
-                 ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], sequence=True)))),
-                 ('iterations', json.dumps(dict(before, delivery_monitor=dict(before['delivery_monitor'], config_sha256='b' * 64)))),
-                 ('iterations', json.dumps(before)[:-1] + ',"approval":null}'),
-                 ('delivery_observations', '[]'), ('delivery_observations', '{"status":"healthy"}'),
-                 ('delivery_incidents', 'null'), ('notifications', '[]')]
-        for table, raw in cases:
-            with closing(sqlite3.connect(self.state)) as db, db:
-                db.execute('UPDATE ' + table + ' SET payload=?', (raw,))
-            snapshot = {t: self.rows(t) for t in original_rows}
-            with self.assertRaises((delivery.RepositoryError, attention.IntakeError)):
-                self.sample()
-            self.assertEqual(len(self.target.calls), calls)
-            self.assertEqual({t: self.rows(t) for t in original_rows}, snapshot)
-            with closing(sqlite3.connect(self.state)) as db, db:
-                for name, rows in original_rows.items():
-                    db.execute('UPDATE ' + name + ' SET payload=?', (rows[0][-1],))
-        self.assertEqual(self.sample()['incident']['incident_id'], before['main_incident']['incident_id'])
-
-    def test_notification_failure_rolls_back_monitor_incident_and_evidence(self):
-        self.sample()
-        before = self.stored()
-        self.target.healthy = False
-        with closing(sqlite3.connect(self.state)) as db, db:
-            db.execute("CREATE TRIGGER refuse_notification BEFORE INSERT ON notifications BEGIN SELECT RAISE(FAIL, 'injected outage'); END")
-        with self.assertRaises(sqlite3.Error):
-            self.sample()
-        self.assertEqual(self.stored(), before)
-        self.assertEqual(len(self.inspect()['observations']), 1)
-        self.assertEqual(self.notifications(), [])
-        with closing(sqlite3.connect(self.state)) as db, db:
-            db.execute('DROP TRIGGER refuse_notification')
+        cases = {'incomplete-healthy': dict(healthy, checks=[]),
+                 'oversized-evidence': dict(healthy, status='unknown', failure='delivery_unknown', health=None, checks=['😀' * 200000]),
+                 'oversized-iteration': dict(healthy, status='unknown', failure='delivery_unknown', health=None),
+                 'notification-failure': None}
+        for mode, evidence in cases.items():
+            with self.subTest(case=mode):
+                item = copy.deepcopy(before)
+                if mode == 'oversized-iteration':
+                    item['padding'] = ''
+                    item['padding'] = 'x' * (delivery.LIMIT - len(json.dumps(item).encode()) - 1)
+                with closing(sqlite3.connect(self.state)) as db, db:
+                    db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+                    if mode == 'notification-failure':
+                        db.execute("CREATE TRIGGER refuse_notification BEFORE INSERT ON notifications BEGIN SELECT RAISE(FAIL, 'injected outage'); END")
+                tables = {t: self.rows(t) for t in ('delivery_observations', 'delivery_incidents', 'notifications')}
+                try:
+                    if mode == 'notification-failure':
+                        self.target.healthy = False
+                        with self.assertRaises(sqlite3.Error):
+                            self.sample()
+                    else:
+                        with mock.patch.object(delivery, 'observe', return_value=evidence), self.assertRaises(delivery.RepositoryError):
+                            self.sample()
+                    self.assertEqual(self.stored(), item)
+                    self.assertEqual({t: self.rows(t) for t in tables}, tables)
+                    self.assertEqual(len(self.inspect()['observations']), 1)
+                    self.assertEqual(self.notifications(), [])
+                finally:
+                    with closing(sqlite3.connect(self.state)) as db, db:
+                        db.execute('DROP TRIGGER IF EXISTS refuse_notification')
+                        db.execute('UPDATE iterations SET payload=?', (json.dumps(before),))
+        self.assertEqual(self.inspect()['monitor']['latest']['status'], 'healthy')
         self.assertIsNotNone(self.sample()['incident'])
         self.assertEqual(len(self.notifications()), 1)
-
-
-    def test_http_adapter_status_decode_and_unreachable_boundary_without_socket(self):
-        opener = mock.Mock()
-        response = mock.MagicMock()
-        response.__enter__.return_value = response
-        response.read.return_value = b'{"ok":true}'
-        opener.open.return_value = response
-        with mock.patch.object(delivery.urllib.request, 'build_opener', return_value=opener):
-            for status in (302, 401, 500):
-                response.status = status
-                with self.assertRaises(delivery.RepositoryError) as raised:
-                    self.real_http_json(self.config['contract']['health_url'], 2)
-                self.assertEqual(raised.exception.code, 'delivery_unknown')
-            response.status = 200
-            self.assertEqual(self.real_http_json(self.config['contract']['health_url'], 2), {'ok': True})
-            response.read.assert_called_with(delivery.LIMIT + 1)
-            response.read.return_value = b'{"ok":true,"ok":false}'
-            with self.assertRaises(delivery.RepositoryError):
-                self.real_http_json(self.config['contract']['health_url'], 2)
-            opener.open.side_effect = OSError('unreachable')
-            with self.assertRaises(delivery.RepositoryError) as raised:
-                self.real_http_json(self.config['contract']['health_url'], 2)
-            self.assertEqual(raised.exception.code, 'delivery_unavailable')
-
-    def test_healthy_semantic_validator_and_late_race_guard_sensitivity(self):
-        # Reseal evidence so shape/checksum guards cannot hide the semantic failure.
-        evidence = delivery.observe(self.config)
-        evidence['checks'] = []
-        evidence_id = assignments.digest(evidence)
-        with self.assertRaises(delivery.RepositoryError) as raised:
-            delivery.validate_evidence(json.dumps(evidence), evidence_id, self.config)
-        self.assertIn('incomplete', str(raised.exception))
-        self.target.after_health = lambda: setattr(self.target, 'sha', 'b' * 40)
-        self.assertEqual(delivery.observe(self.config)['failure'], 'delivery_race')
-        self.target.sha = 'a' * 40
-        import inspect
-        source = inspect.getsource(delivery.observe)
-        source = source.replace("require(all(api.read(suffix) == value for suffix, value in reads.items()) and\n                api.read('/git/ref/heads/main') == main,", 'require(True,')
-        namespace = dict(vars(delivery))
-        exec(compile(source, '<delivery-race-guard-probe>', 'exec'), namespace)
-        broken = namespace['observe'](self.config)
-        self.assertEqual(broken['status'], 'healthy')
-        self.assertEqual(self.target.sha, 'b' * 40)

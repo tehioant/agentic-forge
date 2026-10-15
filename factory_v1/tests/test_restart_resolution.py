@@ -5,7 +5,7 @@ import io
 import json
 import sqlite3
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -30,16 +30,14 @@ def blocked(boundary, code='publication_uncertain'):
 
 
 class PublicRecoveryRegistrationTests(unittest.TestCase):
-    def test_public_host_registration_preserves_restart_hold_and_blocks_ordinary_admission(self):
+    def test_host_registration_keeps_ordinary_hold_matrix(self):
         f = fixture(self, recovery_fixtures.RecoveryRegistrationTests)
         item = f.stored()
         receipt = blocked('delivery', 'main_frozen')
         item['restart_reconciliation'] = receipt
         f.save(item)
         output = io.StringIO()
-        argv = ['factory', '--state', str(f.root / 'state.db'), '--operator-id', 'operator',
-                'register-recovery', '--project', 'p', '--iteration', 'i', '--api-base', f.github.base,
-                '--recovery-config', str(f.config_file)]
+        argv = ['factory', '--state', str(f.root / 'state.db'), '--operator-id', 'operator', 'register-recovery', '--project', 'p', '--iteration', 'i', '--api-base', f.github.base, '--recovery-config', str(f.config_file)]
         with patch('sys.argv', argv), patch.object(repositories, 'GitHub', return_value=f.github), redirect_stdout(output):
             main()
         result = json.loads(output.getvalue())
@@ -75,101 +73,99 @@ class TicketResolutionTests(unittest.TestCase):
             main()
         return json.loads(output.getvalue())
 
-    def test_public_partial_issue_finishes_only_unadmitted_membership_and_requires_fresh_restart(self):
-        receipt = copy.deepcopy(self.f.item['restart_reconciliation'])
-        completed = self.publish()
-        self.assertTrue(completed['ticket_work']['publication_complete'])
-        self.assertEqual(completed['restart_reconciliation'], receipt)
-        self.assertEqual(completed['ticket_work']['published']['note'], {'number': 10, 'id': 1010, 'node_id': 'I10'})
-        self.assertEqual(set(self.f.issues), {10})
-        self.assertEqual(self.f.members[10]['fields'], {'SCOPE': 'M1', 'STATUS': 'Ready'})
-        self.f.github.request.assert_not_called()
-        self.f.add_dependency.assert_not_called()
-        writes = self.f.add_item.call_count, self.f.set_field.call_count
-        replay = self.publish()
-        self.assertTrue(replay['ticket_work']['publication_complete'])
-        self.assertEqual((self.f.add_item.call_count, self.f.set_field.call_count), writes)
-        with self.assertRaises(RepositoryError) as caught:
-            controls.require_active(self.f.database, 'product', 'm1')
-        self.assertEqual(caught.exception.code, 'reconciliation_required')
-        for ordinary in (tickets.synthesize, tickets.complete_synthesis):
-            with self.assertRaises(RepositoryError) as caught:
-                ordinary(self.f.database, completed, {}, self.f.github)
-            self.assertEqual(caught.exception.code, 'reconciliation_required')
-            self.f.database.rollback()
-        self.assertNotIn('reservation', self.f.stored())
-        with patch.object(restart.repositories, 'reconcile', return_value=completed), repositories.state_lock(self.f.database):
-            report = restart.reconcile(self.f.database, 'product', 'm1', '42', self.f.github)
-        self.assertEqual(report['status'], 'ready')
-        controls.require_active(self.f.database, 'product', 'm1')
-
-    def test_unknown_membership_and_issue_effects_do_not_repeat_writes(self):
-        for missing in ('membership', 'issue'):
-            with self.subTest(missing=missing):
-                if missing == 'membership':
-                    self.f.work['intents']['note']['membership'] = True
-                else:
-                    self.f.issues.clear()
+    def test_ticket_exact_partial_membership_matrix(self):
+        baseline = copy.deepcopy(self.f.item)
+        issues = copy.deepcopy(self.f.issues)
+        for defect in ('membership', 'issue', 'identity', 'inputs', None):
+            with self.subTest(defect=defect), ExitStack() as stack:
+                self.f.item = copy.deepcopy(baseline)
+                self.f.work = self.f.item['ticket_work']
+                self.f.issues = copy.deepcopy(issues)
+                self.f.members.clear()
                 self.f.persist()
-                result = self.publish()
-                self.assertFalse(result['ticket_work'].get('publication_complete'))
-                self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_uncertain')
-                self.f.add_item.assert_not_called()
+                self.f.add_item.reset_mock()
+                self.f.set_field.reset_mock()
+                if defect == 'membership':
+                    self.f.work['intents']['note']['membership'] = True
+                if defect == 'issue':
+                    self.f.issues.clear()
+                if defect == 'identity':
+                    self.f.issues[10]['id'] = 999
+                if defect == 'inputs':
+                    stack.enter_context(patch.object(tickets, 'pinned_inputs', return_value={}))
+                self.f.persist()
+                if defect == 'inputs':
+                    with self.assertRaises(IntakeError) as caught:
+                        self.publish()
+                    self.assertEqual(caught.exception.code, 'ticket_conflict')
+                else:
+                    completed = self.publish()
+                    if defect:
+                        self.assertFalse(completed['ticket_work'].get('publication_complete'))
+                        self.assertEqual(completed['ticket_work']['blocker']['code'], 'publication_mismatch' if defect == 'identity' else 'publication_uncertain')
+                    else:
+                        self.assertTrue(completed['ticket_work']['publication_complete'])
+                        self.assertEqual(completed['restart_reconciliation'], baseline['restart_reconciliation'])
+                        self.assertEqual(completed['ticket_work']['published']['note'], {'number': 10, 'id': 1010, 'node_id': 'I10'})
+                        self.assertEqual(set(self.f.issues), {10})
+                        self.assertEqual(self.f.members[10]['fields'], {'SCOPE': 'M1', 'STATUS': 'Ready'})
+                        writes = (self.f.add_item.call_count, self.f.set_field.call_count)
+                        replay = self.publish()
+                        self.assertTrue(replay['ticket_work']['publication_complete'])
+                        self.assertEqual((self.f.add_item.call_count, self.f.set_field.call_count), writes)
+                        with self.assertRaises(RepositoryError) as caught:
+                            controls.require_active(self.f.database, 'product', 'm1')
+                        self.assertEqual(caught.exception.code, 'reconciliation_required')
+                        for ordinary in (tickets.synthesize, tickets.complete_synthesis):
+                            with self.assertRaises(RepositoryError) as caught:
+                                ordinary(self.f.database, completed, {}, self.f.github)
+                            self.assertEqual(caught.exception.code, 'reconciliation_required')
+                            self.f.database.rollback()
+                        self.assertNotIn('reservation', self.f.stored())
+                        with patch.object(restart.repositories, 'reconcile', return_value=completed), repositories.state_lock(self.f.database):
+                            report = restart.reconcile(self.f.database, 'product', 'm1', '42', self.f.github)
+                        self.assertEqual(report['status'], 'ready')
+                        controls.require_active(self.f.database, 'product', 'm1')
+                if defect:
+                    self.f.add_item.assert_not_called()
                 self.f.github.request.assert_not_called()
+                self.f.add_dependency.assert_not_called()
 
-    def test_wrong_issue_identity_or_pinned_inputs_cannot_complete(self):
-        self.f.issues[10]['id'] = 999
-        result = self.publish()
-        self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_mismatch')
-        self.f.add_item.assert_not_called()
-        self.f.issues[10]['id'] = 1010
-        with patch.object(tickets, 'pinned_inputs', return_value={}):
-            with self.assertRaises(IntakeError) as caught:
-                self.publish()
-        self.assertEqual(caught.exception.code, 'ticket_conflict')
-        self.f.github.request.assert_not_called()
 
-    def test_pause_unrelated_and_malformed_holds_refuse_public_continuation(self):
+
+    def test_ticket_scoped_authority_and_hold_guards_matrix(self):
         original = copy.deepcopy(self.f.item['restart_reconciliation'])
-        for report, code in [(blocked('model', 'operation_uncertain'), 'reconciliation_required'),
-                             (blocked('delivery', 'main_frozen'), 'reconciliation_required'),
-                             (original | {'blockers': original['blockers'] + [{'boundary': 'worker', 'code': 'worker_uncertain'}]}, 'reconciliation_required'),
-                             ({'status': 'blocked'}, 'invalid_restart')]:
-            self.f.item['restart_reconciliation'] = report
-            self.f.persist()
-            with self.subTest(report=report), self.assertRaises(IntakeError) as caught:
-                self.publish()
-            self.assertEqual(caught.exception.code, code)
-            self.f.add_item.assert_not_called()
-        self.f.item['restart_reconciliation'] = original
-        self.f.persist()
-        self.f.pause()
-        with self.assertRaises(IntakeError) as caught:
-            self.publish()
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.f.add_item.assert_not_called()
-
-    def test_missing_wrong_and_stale_scoped_authority_is_not_dispatch_permission(self):
         authority = effect_resolution.bound(self.f.database, self.f.stored(), 'ticket-publication', self.f.work['assignment_id'])
-        for forged in (True, replace(authority, target='wrong'), replace(authority, project='other'),
-                       replace(authority, operator='wrong'), replace(authority, authority='0' * 64)):
+        for forged in (None, True, replace(authority, target='wrong'), replace(authority, project='other'), replace(authority, operator='wrong'), replace(authority, authority='0' * 64)):
             with self.subTest(forged=forged), self.assertRaises(RepositoryError):
                 controls.require_active(self.f.database, 'product', 'm1', resolution=forged)
-        with self.assertRaises(RepositoryError):
-            controls.require_active(self.f.database, 'product', 'm1')
         self.f.work['execution']['run_id'] = 'changed'
         self.f.persist()
         with self.assertRaises(RepositoryError) as caught:
             controls.require_active(self.f.database, 'product', 'm1', resolution=authority)
         self.assertEqual(caught.exception.code, 'stale_admission')
+        self.f.work['execution']['run_id'] = 'fixture-run'
+        self.f.persist()
+        cases = [(blocked('model', 'operation_uncertain'), 'reconciliation_required'), (blocked('delivery', 'main_frozen'), 'reconciliation_required'), (original | {'blockers': original['blockers'] + [{'boundary': 'worker', 'code': 'worker_uncertain'}]}, 'reconciliation_required'), ({'status': 'blocked'}, 'invalid_restart'), (original, 'iteration_paused')]
+        for report, code in cases:
+            self.f.item['restart_reconciliation'] = report
+            self.f.persist()
+            if code == 'iteration_paused':
+                self.f.pause()
+            with self.subTest(code=code, report=report), self.assertRaises(IntakeError) as caught:
+                self.publish()
+            self.assertEqual(caught.exception.code, code)
+            self.f.add_item.assert_not_called()
 
-    def test_pause_at_last_membership_read_keeps_receipt_and_no_new_fields(self):
+
+    def test_ticket_last_membership_pause_matrix(self):
         original = self.f.membership
         paused = False
+
         def read(*args):
             nonlocal paused
             member = original(*args)
-            if member is not None and not paused:
+            if member is not None and (not paused):
                 self.f.pause()
                 paused = True
             return member
@@ -246,45 +242,55 @@ class CandidateResolutionTests(unittest.TestCase):
             main()
         return json.loads(output.getvalue())
 
-    def test_public_pending_candidate_finishes_exact_pr_without_rewriting_candidate_or_dispatch(self):
-        result = self.publish()
-        self.assertEqual(result['status'], 'published')
-        self.assertEqual(result['candidate'], 'b' * 40)
-        self.assertEqual(result['pr_number'], 20)
-        self.assertFalse(result['close_allowed']); self.assertFalse(result['merge_allowed'])
-        self.assertEqual([p for p, _ in self.writes], ['/pulls'])
-        self.publish()
-        self.assertEqual([p for p, _ in self.writes], ['/pulls'])
-        with self.assertRaises(RepositoryError):
-            controls.require_active(self.db, 'p', 'i')
-
-    def test_missing_wrong_stale_authority_pause_and_unrelated_holds_do_not_write(self):
+    def test_candidate_exact_pending_pr_matrix(self):
         original = copy.deepcopy(self.f.config)
-        for mutation in ({'candidate': 'f' * 40}, {'binding': {}}, {'operator_id': 'wrong'}):
-            self.config.write_text(json.dumps(original | mutation))
-            with self.subTest(mutation=mutation), self.assertRaises(IntakeError):
-                self.publish()
-            self.assertEqual(self.writes, [])
-        self.config.write_text(json.dumps(original)); self.config.chmod(0o644)
-        with self.assertRaises(IntakeError): self.publish()
-        self.config.chmod(0o600)
-        self.item['restart_reconciliation']['blockers'].append({'boundary': 'model', 'code': 'operation_uncertain'})
-        self.persist()
-        with self.assertRaises(IntakeError): self.publish()
-        self.item['restart_reconciliation']['blockers'].pop()
-        self.persist()
-        controls.request(self.db, 'p', 'i', 'operator', 'pause', 'SIMULATED pause')
-        with self.assertRaises(IntakeError) as caught: self.publish()
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.assertEqual(self.writes, [])
+        baseline = copy.deepcopy(self.item)
+        baseline_values = copy.deepcopy(self.f.values)
+        cases = [({'candidate': 'f' * 40}, 'authority'), ({'binding': {}}, 'authority'), ({'operator_id': 'wrong'}, 'authority'), ({}, 'mode'), ({}, 'hold'), ({}, 'pause'), ({}, None)]
+        for mutation, defect in cases:
+            with self.subTest(mutation=mutation, defect=defect):
+                self.writes.clear()
+                self.f.values = copy.deepcopy(baseline_values)
+                _, control_path = controls.paths(self.db, 'p', 'i')
+                assert control_path is not None
+                control_path.unlink(missing_ok=True)
+                self.item = copy.deepcopy(baseline)
+                self.persist()
+                self.config.write_text(json.dumps(original | mutation))
+                self.config.chmod(420 if defect == 'mode' else 384)
+                if defect == 'hold':
+                    self.item['restart_reconciliation']['blockers'].append({'boundary': 'model', 'code': 'operation_uncertain'})
+                    self.persist()
+                if defect == 'pause':
+                    controls.request(self.db, 'p', 'i', 'operator', 'pause', 'SIMULATED pause')
+                if defect:
+                    with self.assertRaises(IntakeError) as caught:
+                        self.publish()
+                    if defect == 'pause':
+                        self.assertEqual(caught.exception.code, 'iteration_paused')
+                    self.assertEqual(self.writes, [])
+                else:
+                    result = self.publish()
+                    self.assertEqual(result['status'], 'published')
+                    self.assertEqual(result['candidate'], 'b' * 40)
+                    self.assertEqual(result['pr_number'], 20)
+                    self.assertFalse(result['close_allowed'])
+                    self.assertFalse(result['merge_allowed'])
+                    self.assertEqual([p for p, _ in self.writes], ['/pulls'])
+                    self.publish()
+                    self.assertEqual([p for p, _ in self.writes], ['/pulls'])
+                    with self.assertRaises(RepositoryError):
+                        controls.require_active(self.db, 'p', 'i')
 
 
-    def test_pause_at_last_pr_read_prevents_scoped_intent_or_write(self):
+
+    def test_candidate_last_pr_pause_matrix(self):
         paused = False
+
         def read(github, path, payload=None, method=None):
             nonlocal paused
             result = self.transport(github, path, payload, method)
-            if path.endswith(publication.pr_query(self.f.config)) and not paused:
+            if path.endswith(publication.pr_query(self.f.config)) and (not paused):
                 controls.request(self.db, 'p', 'i', 'operator', 'pause', 'SIMULATED last PR read')
                 paused = True
             return result
@@ -339,49 +345,53 @@ class BugResolutionTests(unittest.TestCase):
             main()
         return json.loads(output.getvalue())
 
-    def test_partial_known_bug_finishes_only_missing_membership_under_exact_scope(self):
-        result = self.publish()
-        self.assertTrue(result['bug_work']['defect']['publication_complete'])
-        self.assertEqual(result['bug_work']['defect']['identity'], {'number': 13, 'id': 1013, 'node_id': 'I13'})
-        self.assertEqual(self.member, {'id': 'M13', 'status': 'todo'})
-        self.f.github.request.assert_not_called(); self.f.add_dependency.assert_not_called()
-        count = self.f.add_item.call_count, self.f.set_field.call_count
-        self.publish()
-        self.assertEqual((self.f.add_item.call_count, self.f.set_field.call_count), count)
-        self.assertEqual(result['restart_reconciliation']['status'], 'blocked')
-        with self.assertRaises(RepositoryError): controls.require_active(self.f.database, 'p1', 'm1')
+    def test_bug_exact_missing_membership_and_holds_matrix(self):
+        baseline = copy.deepcopy(self.f.item)
+        for defect in ('membership', 'hold', 'retired', 'archived', None, 'pause'):
+            with self.subTest(defect=defect):
+                self.f.item = copy.deepcopy(baseline)
+                self.f.work = self.f.item['bug_work']['defect']
+                self.member = None
+                self.f.add_item.reset_mock()
+                self.f.set_field.reset_mock()
+                if defect == 'membership':
+                    self.f.work['membership_intent'] = True
+                if defect == 'hold':
+                    self.f.item['restart_reconciliation']['blockers'].append({'boundary': 'delivery', 'code': 'main_frozen'})
+                if defect == 'retired':
+                    self.f.work['requirement_disposition'] = {'change_id': 'retired'}
+                if defect == 'archived':
+                    self.f.item['bug_work_history'] = [{'assignment_id': 'old', 'issue_intent': {'title': 'uncertain'}}]
+                self.f.save()
+                if defect == 'pause':
+                    self.f.pause(None)
+                if defect in ('hold', 'retired', 'pause'):
+                    with self.assertRaises(IntakeError) as caught:
+                        self.publish()
+                    if defect != 'hold':
+                        self.assertEqual(caught.exception.code, 'stale_requirements' if defect == 'retired' else 'iteration_paused')
+                    self.f.add_item.assert_not_called()
+                else:
+                    result = self.publish()
+                    if defect == 'membership':
+                        self.assertEqual(result['bug_work']['defect']['blocker']['code'], 'publication_uncertain')
+                        self.f.add_item.assert_not_called()
+                    else:
+                        self.assertTrue(result['bug_work']['defect']['publication_complete'])
+                        self.assertEqual(result['bug_work']['defect']['identity'], {'number': 13, 'id': 1013, 'node_id': 'I13'})
+                        self.assertEqual(self.member, {'id': 'M13', 'status': 'todo'})
+                        if defect == 'archived':
+                            self.assertEqual(result['bug_work_history'], self.f.item['bug_work_history'])
+                        count = (self.f.add_item.call_count, self.f.set_field.call_count)
+                        self.publish()
+                        self.assertEqual((self.f.add_item.call_count, self.f.set_field.call_count), count)
+                        self.assertEqual(result['restart_reconciliation']['status'], 'blocked')
+                        with self.assertRaises(RepositoryError):
+                            controls.require_active(self.f.database, 'p1', 'm1')
+                self.f.github.request.assert_not_called()
+                self.f.add_dependency.assert_not_called()
 
-    def test_unknown_membership_and_other_archived_effects_cannot_repeat_or_expand(self):
-        self.f.work['membership_intent'] = True
-        self.f.save()
-        result = self.publish()
-        self.assertEqual(result['bug_work']['defect']['blocker']['code'], 'publication_uncertain')
-        self.f.add_item.assert_not_called()
-        self.f.work.pop('membership_intent')
-        self.f.item['bug_work_history'] = [{'assignment_id': 'old', 'issue_intent': {'title': 'uncertain'}}]
-        self.f.save()
-        completed = self.publish()
-        self.assertTrue(completed['bug_work']['defect']['publication_complete'])
-        self.assertEqual(completed['bug_work_history'], self.f.item['bug_work_history'])
-        self.assertEqual(completed['restart_reconciliation']['status'], 'blocked')
-        self.f.github.request.assert_not_called()
-        with self.assertRaises(RepositoryError): controls.require_active(self.f.database, 'p1', 'm1')
 
-    def test_retirement_unrelated_holds_and_pause_refuse_bug_continuation(self):
-        original = copy.deepcopy(self.f.item['restart_reconciliation'])
-        self.f.item['restart_reconciliation']['blockers'].append({'boundary': 'delivery', 'code': 'main_frozen'})
-        self.f.save()
-        with self.assertRaises(IntakeError): self.publish()
-        self.f.item['restart_reconciliation'] = original
-        self.f.work['requirement_disposition'] = {'change_id': 'retired'}
-        self.f.save()
-        with self.assertRaises(IntakeError) as caught: self.publish()
-        self.assertEqual(caught.exception.code, 'stale_requirements')
-        self.f.work.pop('requirement_disposition'); self.f.save()
-        self.f.pause(None)
-        with self.assertRaises(IntakeError) as caught: self.publish()
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.f.add_item.assert_not_called(); self.f.github.request.assert_not_called()
 
 
 class IntegratedBranchResolutionTests(unittest.TestCase):
@@ -390,33 +400,43 @@ class IntegratedBranchResolutionTests(unittest.TestCase):
         self.f.merged()  # Exact PR/commit/check dictionaries, no integration precursor.
         self.f.values['/git/ref/heads/factory/issue-10'] = None
 
-    def test_deleted_branch_requires_exact_integration_and_never_merge_or_closure(self):
-        result = restart.candidate(self.f.assignment, self.f.api)
-        self.assertEqual(result, {'candidate': 'b' * 40, 'tree': 'c' * 40, 'pr_number': 20})
-        self.assertEqual(self.f.assignment['merge']['integrated_evidence']['integrated'], 'f' * 40)
-        self.assertFalse(self.f.assignment['merge']['close_allowed'])
-        self.f.api.write.assert_not_called(); self.f.api.issue_state.assert_not_called()
-
-    def test_missing_unmerged_wrong_tree_ancestry_checks_or_authority_remain_held(self):
+    def test_integrated_deleted_branch_exact_readback_matrix(self):
         f = self.f
-        row, values, pr = copy.deepcopy(f.assignment), copy.deepcopy(f.values), copy.deepcopy(f.pr)
-        for mutation in ('unmerged', 'authority', 'tree', 'ancestry', 'checks', 'missing-merge', 'wrong-branch'):
-            f.assignment = copy.deepcopy(row); f.values = copy.deepcopy(values); f.pr = copy.deepcopy(pr)
+        row, values, pr = (copy.deepcopy(f.assignment), copy.deepcopy(f.values), copy.deepcopy(f.pr))
+        for mutation in (None, 'unmerged', 'authority', 'tree', 'ancestry', 'checks', 'missing-merge', 'wrong-branch'):
+            f.assignment = copy.deepcopy(row)
+            f.values = copy.deepcopy(values)
+            f.pr = copy.deepcopy(pr)
             f.values['/pulls/20'] = f.pr
-            if mutation == 'unmerged': f.pr['merged'] = False
-            elif mutation == 'authority': f.assignment['merge']['authority']['head'] = 'a' * 40
-            elif mutation == 'tree': f.values['/git/commits/' + 'f' * 40]['tree']['sha'] = 'e' * 40
-            elif mutation == 'ancestry': f.values['/compare/' + 'f' * 40 + '...' + 'f' * 40]['merge_base_commit']['sha'] = 'a' * 40
-            elif mutation == 'checks': f.values['/commits/' + 'f' * 40 + '/check-runs?per_page=100&filter=latest']['check_runs'][0]['conclusion'] = 'failure'
-            elif mutation == 'missing-merge': f.assignment.pop('merge')
-            else: f.values['/git/ref/heads/factory/issue-10'] = {'ref': 'refs/heads/factory/issue-10', 'object': {'type': 'commit', 'sha': 'e' * 40}}
-            with self.subTest(mutation=mutation), self.assertRaises(RepositoryError):
-                restart.candidate(f.assignment, f.api)
-        f.api.write.assert_not_called(); f.api.issue_state.assert_not_called()
-
-    def test_public_restart_accepts_deleted_integrated_branch_without_duplicate_writes(self):
-        # Existing public-effect helper creates only persisted dictionaries and one CLI call.
-        saved = self.f.public_effect(merged=True)
+            if mutation == 'unmerged':
+                f.pr['merged'] = False
+            elif mutation == 'authority':
+                f.assignment['merge']['authority']['head'] = 'a' * 40
+            elif mutation == 'tree':
+                f.values['/git/commits/' + 'f' * 40]['tree']['sha'] = 'e' * 40
+            elif mutation == 'ancestry':
+                f.values['/compare/' + 'f' * 40 + '...' + 'f' * 40]['merge_base_commit']['sha'] = 'a' * 40
+            elif mutation == 'checks':
+                f.values['/commits/' + 'f' * 40 + '/check-runs?per_page=100&filter=latest']['check_runs'][0]['conclusion'] = 'failure'
+            elif mutation == 'missing-merge':
+                f.assignment.pop('merge')
+            elif mutation == 'wrong-branch':
+                f.values['/git/ref/heads/factory/issue-10'] = {'ref': 'refs/heads/factory/issue-10', 'object': {'type': 'commit', 'sha': 'e' * 40}}
+            with self.subTest(mutation=mutation):
+                if mutation:
+                    with self.assertRaises(RepositoryError):
+                        restart.candidate(f.assignment, f.api)
+                else:
+                    result = restart.candidate(f.assignment, f.api)
+                    self.assertEqual(result, {'candidate': 'b' * 40, 'tree': 'c' * 40, 'pr_number': 20})
+                    self.assertEqual(f.assignment['merge']['integrated_evidence']['integrated'], 'f' * 40)
+                    self.assertFalse(f.assignment['merge']['close_allowed'])
+                f.api.write.assert_not_called()
+                f.api.issue_state.assert_not_called()
+        f.assignment, f.values, f.pr = (copy.deepcopy(row), copy.deepcopy(values), copy.deepcopy(pr))
+        f.config = f.assignment['publication']['approval']
+        f.values['/pulls/20'] = f.pr
+        saved = f.public_effect(merged=True)
         self.assertEqual(saved['merge']['status'], 'merged')
         self.assertEqual(saved['merge']['integrated_evidence']['integrated'], 'f' * 40)
         self.assertFalse(saved['merge']['close_allowed'])

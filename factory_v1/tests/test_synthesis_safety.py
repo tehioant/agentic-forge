@@ -29,62 +29,56 @@ class SynthesisCleanupTests(unittest.TestCase):
         self.process.communicate.side_effect = subprocess.TimeoutExpired('executor', .1)
         return execution.invoke(self.config, {}, cancelled=Mock(side_effect=[False, False, True]))
 
-    def test_cancellation_joins_with_finite_bound(self):
-        with self.assertRaises(RepositoryError) as caught:
-            self.interrupted()
-        self.assertEqual(caught.exception.code, 'execution_uncertain')
-        self.kill.assert_called_once_with(12345, signal.SIGKILL)
-        self.process.wait.assert_called_once_with(timeout=5)
-
-    def test_signal_error_still_joins_and_remains_uncertain(self):
-        self.kill.side_effect = PermissionError('fixture')
-        with self.assertRaises(RepositoryError) as caught:
-            self.interrupted()
-        self.assertEqual(caught.exception.code, 'execution_uncertain')
-        self.process.wait.assert_called_once_with(timeout=5)
-
-    def test_join_timeout_and_oserror_are_structured(self):
-        for failure in (subprocess.TimeoutExpired('executor', 5), OSError('fixture')):
-            with self.subTest(failure=type(failure).__name__):
-                self.process.wait.side_effect = failure
-                with self.assertRaises(RepositoryError) as caught:
-                    self.interrupted()
-                self.assertEqual(caught.exception.code, 'execution_uncertain')
-                self.assertEqual(self.process.wait.call_args.kwargs, {'timeout': 5})
-
-    def test_execution_oserror_is_uncertain_after_cleanup(self):
-        self.process.communicate.side_effect = OSError('fixture')
-        with self.assertRaises(RepositoryError) as caught:
-            execution.invoke(self.config, {})
-        self.assertEqual(caught.exception.code, 'execution_uncertain')
-        self.process.wait.assert_called_once_with(timeout=5)
-
-    def test_original_control_exception_survives_confirmed_cleanup(self):
+    def test_cancellation_finite_join_and_uncertainty_matrix(self):
         original = RepositoryError('iteration_paused', 'fixture')
-        self.process.communicate.side_effect = original
-        with self.assertRaises(RepositoryError) as caught:
-            execution.invoke(self.config, {})
-        self.assertIs(caught.exception, original)
-        self.process.wait.assert_called_once_with(timeout=5)
+        for label, communication, signal_error, wait_error, expected in (
+            ('cancelled', subprocess.TimeoutExpired('executor', .1), None, None, 'execution_uncertain'),
+            ('signal-error', subprocess.TimeoutExpired('executor', .1), PermissionError('fixture'), None, 'execution_uncertain'),
+            ('join-timeout', subprocess.TimeoutExpired('executor', .1), None, subprocess.TimeoutExpired('executor', 5), 'execution_uncertain'),
+            ('join-oserror', subprocess.TimeoutExpired('executor', .1), None, OSError('fixture'), 'execution_uncertain'),
+            ('execution-oserror', OSError('fixture'), None, None, 'execution_uncertain'),
+            ('original-control', original, None, None, 'iteration_paused'),
+        ):
+            with self.subTest(case=label):
+                self.process.reset_mock()
+                self.kill.reset_mock()
+                self.process.communicate.side_effect = communication
+                self.process.wait.side_effect = wait_error
+                self.kill.side_effect = signal_error
+                with self.assertRaises(RepositoryError) as caught:
+                    execution.invoke(self.config, {}, cancelled=Mock(side_effect=[False, False, True]))
+                self.assertEqual(caught.exception.code, expected)
+                self.kill.assert_called_once_with(12345, signal.SIGKILL)
+                self.process.wait.assert_called_once_with(timeout=5)
+                if label == 'original-control':
+                    self.assertIs(caught.exception, original)
 
-    def test_spawn_oserror_is_structured_without_false_join(self):
-        self.spawn.side_effect = OSError('fixture')
-        with self.assertRaises(RepositoryError) as caught:
-            execution.invoke(self.config, {})
-        self.assertEqual(caught.exception.code, 'execution_uncertain')
-        self.process.wait.assert_not_called()
-        self.kill.assert_not_called()
 
-    def test_default_no_control_success_preserves_result(self):
+
+
+
+    def test_spawn_failure_and_success_result_matrix(self):
         produced = {'result': [], 'execution': {'reference': 'fixture'}}
-        def spawn(*args, **kwargs):
-            kwargs['stdout'].write(json.dumps(produced).encode())
-            return self.process
-        self.spawn.side_effect = spawn
-        self.assertEqual(execution.invoke(self.config, {'input': 'fixture'}), produced)
-        self.process.communicate.assert_called_once_with(b'{"input": "fixture"}', timeout=ANY)
-        self.kill.assert_not_called()
-        self.process.wait.assert_not_called()
+        for fail_spawn in (False, True):
+            with self.subTest(fail_spawn=fail_spawn):
+                self.process.reset_mock()
+                self.kill.reset_mock()
+                def spawn(*args, **kwargs):
+                    if fail_spawn:
+                        raise OSError('fixture')
+                    kwargs['stdout'].write(json.dumps(produced).encode())
+                    return self.process
+                self.spawn.side_effect = spawn
+                if fail_spawn:
+                    with self.assertRaises(RepositoryError) as caught:
+                        execution.invoke(self.config, {'input': 'fixture'})
+                    self.assertEqual(caught.exception.code, 'execution_uncertain')
+                else:
+                    self.assertEqual(execution.invoke(self.config, {'input': 'fixture'}), produced)
+                    self.process.communicate.assert_called_once_with(b'{"input": "fixture"}', timeout=ANY)
+                self.kill.assert_not_called()
+                self.process.wait.assert_not_called()
+
 
 
 class SynthesisAdmissionTests(unittest.TestCase):
@@ -129,111 +123,130 @@ class SynthesisAdmissionTests(unittest.TestCase):
     def synthesize(self, **kwargs):
         return dispatch.synthesize(self.db, self.item, self.config, Mock(), **kwargs)
 
-    def test_pause_after_last_outside_read_prevents_spawn(self):
-        original = execution.invoke
-        paused = threading.Event()
-        def invoke(config, payload, *, cancelled, admission):
-            def read_return_pause():
-                prior = cancelled()
-                # This is invoke's last outside-lane read, not checkpoint's
-                # internal admission reads. Fail promptly if it moves under a lock.
-                root, _ = controls.paths(self.db, 'p', 'i')
-                assert root is not None
-                with (root / 'lock').open('r+') as lock:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                self.pause()
-                paused.set()
-                return prior
-            return original(config, payload, cancelled=read_return_pause, admission=admission)
-        with patch.object(execution, 'invoke', side_effect=invoke):
-            with self.assertRaises(RepositoryError) as caught:
-                self.synthesize()
-        self.assertTrue(paused.is_set())
-        self.spawn.assert_not_called()
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.kill.assert_not_called()
-        self.assertTrue(controls.blocked(self.db, 'p', 'i'))
-        self.assertIn('service_attempt', self.stored()['ticket_work'])
-        self.assertNotIn('service_receipt', self.stored()['ticket_work'])
-        self.complete.assert_not_called()
+    def test_pre_spawn_pause_and_stop_guards_matrix(self):
+        initial = deepcopy(self.item)
+        for phase in ('already-paused', 'last-outside-read', 'stop-in-lane'):
+            with self.subTest(phase=phase):
+                self.item = deepcopy(initial)
+                self.work = self.item['ticket_work']
+                with self.db:
+                    self.db.execute('UPDATE iterations SET payload=?', (json.dumps(initial),))
+                root, marker = controls.paths(self.db, 'p', 'i')
+                if marker.exists():
+                    marker.unlink()
+                self.spawn.reset_mock()
+                self.kill.reset_mock()
+                self.complete.reset_mock()
+                event = threading.Event()
+                paused = threading.Event()
+                assert root is not None and marker is not None
+                def invoke_after_read(config, work, *, cancelled, admission):
+                    def read_return_pause():
+                        prior = cancelled()
+                        if not paused.is_set():
+                            with (root / 'lock').open('r+') as lock:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                fcntl.flock(lock, fcntl.LOCK_UN)
+                            self.pause()
+                            paused.set()
+                        return prior
+                    return real_invoke(config, work, cancelled=read_return_pause, admission=admission)
+                real_invoke = execution.invoke
+                def approved(_config, _work, *, cancelled, admission):
+                    self.assertFalse(cancelled())
+                    event.set()
+                    with admission():
+                        self.fail('stop admitted')
+                if phase == 'already-paused':
+                    self.pause()
+                invoke = real_invoke
+                if phase == 'stop-in-lane':
+                    invoke = approved
+                elif phase == 'last-outside-read':
+                    invoke = invoke_after_read
+                with patch.object(execution, 'invoke', side_effect=invoke):
+                    with self.assertRaises(RepositoryError) as caught:
+                        self.synthesize(stop_event=event)
+                self.spawn.assert_not_called()
+                self.assertEqual(caught.exception.code, 'service_stopping' if phase == 'stop-in-lane' else 'iteration_paused')
+                self.kill.assert_not_called()
+                self.complete.assert_not_called()
+                self.assertNotIn('service_receipt', self.stored()['ticket_work'])
+                if phase == 'last-outside-read':
+                    self.assertTrue(paused.is_set())
+                    self.assertTrue(controls.blocked(self.db, 'p', 'i'))
+                    self.assertIn('service_attempt', self.stored()['ticket_work'])
 
-    def test_already_paused_never_spawns(self):
-        self.pause()
-        with self.assertRaises(RepositoryError) as caught:
-            self.synthesize()
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.spawn.assert_not_called()
 
-    def test_lane_covers_only_actual_spawn_not_execution(self):
+    def test_short_lane_and_payload_binding_matrix(self):
         root, _ = controls.paths(self.db, 'p', 'i')
         assert root is not None
-        process = Mock(pid=12345, returncode=0)
-        def lock_available():
-            with (root / 'lock').open('r+') as lock:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    return False
-                return True
-        def spawn(*args, **kwargs):
-            self.assertFalse(lock_available())
-            kwargs['stdout'].write(json.dumps(self.produced).encode())
-            return process
-        def communicate(*args, **kwargs):
-            self.assertTrue(lock_available())
-        self.spawn.side_effect = spawn
-        process.communicate.side_effect = communicate
-        self.synthesize()
-        self.spawn.assert_called_once()
-        self.kill.assert_not_called()
-        self.complete.assert_called_once()
+        initial = deepcopy(self.item)
+        for seam in ('real-invoke', 'caller-contract'):
+            with self.subTest(seam=seam):
+                self.item = deepcopy(initial)
+                self.work = self.item['ticket_work']
+                with self.db:
+                    self.db.execute('UPDATE iterations SET payload=?', (json.dumps(initial),))
+                self.complete.return_value = self.item
+                for mocked in (self.authority, self.source, self.validate, self.complete, self.spawn, self.kill):
+                    mocked.reset_mock()
+                lane_active = False
+                original = controls.admission
+                @contextmanager
+                def observed(*args, **kwargs):
+                    nonlocal lane_active
+                    self.assertEqual(args, (self.db, 'p', 'i'))
+                    with original(*args, **kwargs):
+                        lane_active = True
+                        try:
+                            yield
+                        finally:
+                            lane_active = False
+                def lock_available():
+                    with (root / 'lock').open('r+') as lock:
+                        try:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return False
+                        return True
+                process = Mock(pid=12345, returncode=0)
+                def spawn(*args, **kwargs):
+                    self.assertTrue(lane_active)
+                    self.assertFalse(lock_available())
+                    kwargs['stdout'].write(json.dumps(self.produced).encode())
+                    return process
+                def communicate(*args, **kwargs):
+                    self.assertFalse(lane_active)
+                    self.assertTrue(lock_available())
+                def approved(capability, work, *, cancelled, admission):
+                    self.assertEqual(capability, self.capability)
+                    self.assertEqual(work['inputs'], self.work['inputs'])
+                    self.assertIn('service_attempt', self.stored()['ticket_work'])
+                    self.assertFalse(cancelled())
+                    with admission():
+                        self.assertTrue(lane_active)
+                    self.assertFalse(lane_active)
+                    return deepcopy(self.produced)
+                self.spawn.side_effect = spawn
+                process.communicate.side_effect = communicate
+                invoke = execution.invoke if seam == 'real-invoke' else approved
+                with patch.object(controls, 'admission', side_effect=observed), patch.object(execution, 'invoke', side_effect=invoke):
+                    self.assertEqual(self.synthesize(stop_event=threading.Event()), self.item)
+                self.assertEqual(self.authority.call_count, 2)
+                self.assertEqual(self.source.call_count, 2)
+                self.validate.assert_called_once_with(self.work, self.produced['execution'], self.produced['result'])
+                self.complete.assert_called_once()
+                self.assertEqual(self.stored()['ticket_work']['service_receipt'], self.produced)
+                self.kill.assert_not_called()
+                if seam == 'real-invoke':
+                    self.spawn.assert_called_once()
+                else:
+                    self.spawn.assert_not_called()
 
-    def test_actual_caller_passes_short_scoped_admission_and_payload(self):
-        event = threading.Event()
-        lane_active = False
-        original = controls.admission
-        @contextmanager
-        def observed(*args, **kwargs):
-            nonlocal lane_active
-            self.assertEqual(args, (self.db, 'p', 'i'))
-            with original(*args, **kwargs):
-                lane_active = True
-                try:
-                    yield
-                finally:
-                    lane_active = False
-        def approved(capability, work, *, cancelled, admission):
-            self.assertEqual(capability, self.capability)
-            self.assertEqual(work['inputs'], self.work['inputs'])
-            self.assertIn('service_attempt', self.stored()['ticket_work'])
-            self.assertFalse(cancelled())
-            with admission():
-                self.assertTrue(lane_active)
-            self.assertFalse(lane_active)
-            return deepcopy(self.produced)
-        with patch.object(controls, 'admission', side_effect=observed), patch.object(execution, 'invoke', side_effect=approved):
-            self.assertEqual(self.synthesize(stop_event=event), self.item)
-        self.assertEqual(self.authority.call_count, 2)
-        self.assertEqual(self.source.call_count, 2)
-        self.validate.assert_called_once_with(self.work, self.produced['execution'], self.produced['result'])
-        self.complete.assert_called_once()
-        self.assertEqual(self.stored()['ticket_work']['service_receipt'], self.produced)
-        self.spawn.assert_not_called()
 
-    def test_stop_reread_inside_spawn_lane(self):
-        event = threading.Event()
-        def approved(_config, _work, *, cancelled, admission):
-            self.assertFalse(cancelled())
-            event.set()
-            with admission():
-                self.fail('stop admitted')
-        with patch.object(execution, 'invoke', side_effect=approved):
-            with self.assertRaises(RepositoryError) as caught:
-                self.synthesize(stop_event=event)
-        self.assertEqual(caught.exception.code, 'service_stopping')
-        self.spawn.assert_not_called()
 
-    def test_receipt_survives_pause_without_result_admission(self):
+    def test_receipt_after_pause_not_admitted_matrix(self):
         def approved(*args, **kwargs):
             self.pause()
             return self.produced
@@ -244,10 +257,9 @@ class SynthesisAdmissionTests(unittest.TestCase):
         self.assertEqual(self.stored()['ticket_work']['service_receipt'], self.produced)
         self.complete.assert_not_called()
 
-    def test_revision_spawn_uses_existing_checkpoint_hold_semantics(self):
+    def test_revision_checkpoint_semantics_matrix(self):
         self.item['execution_allowed'] = False
-        record = {'request': {'change_id': 'change'}, 'status': 'resolved',
-                  'affected': [10], 'requirements': {'10': 'changed'}}
+        record = {'request': {'change_id': 'change'}, 'status': 'resolved', 'affected': [10], 'requirements': {'10': 'changed'}}
         self.item['requirement_changes'] = {'change': record}
         observed = []
         def approved(_config, _work, *, cancelled, admission):

@@ -20,25 +20,31 @@ class NativeScopeTests(unittest.TestCase):
     def frontier(self):
         return tickets.frontier(self.database, self.fixture.stored(), self.github)['ticket_work']['frontier']
 
-    def test_three_state_frontier_and_one_reservation(self):
-        self.assertEqual(self.frontier()['eligible'], [10, 12])
-        reserved = tickets.reserve(self.database, self.item, self.github, 10)
-        self.assertEqual(self.fixture.members[10]['fields'], {'STATUS': 'In Progress'})
-        self.assertEqual(reserved['reservation']['status'], 'reserved')
-        self.assertEqual(self.fixture.stored(), reserved); self.assertFalse(reserved['execution_allowed'])
-        self.assertIsNone(reserved['correlation']['worker_run_id'])
-        with self.assertRaises(repositories.RepositoryError): tickets.reserve(self.database, reserved, self.github, 12)
-        self.database.rollback(); self.assertEqual(self.fixture.stored()['reservation'], reserved['reservation'])
+    def test_native_scope_frontier_and_progress_1(self):
+        original = copy.deepcopy(self.fixture.issues[10])
+        for status, scope in (('blocked', True), ('deferred', True), ('ready', False), ('ready', True)):
+            with self.subTest(status=status, scope=scope):
+                self.fixture.issues[10] = copy.deepcopy(original)
+                self.fixture.issues[10]['body'] = original['body'].replace('ready (GitHub Projects is authoritative for current progress).', status)
+                if not scope:
+                    self.fixture.issues[10]['milestone'] = {'id': 502, 'number': 2, 'title': 'm2', 'state': 'open'}
+                self.assertEqual(self.frontier()['eligible'], [10, 12] if status == 'ready' and scope else [12])
+                if status != 'ready' or not scope:
+                    if scope:
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            tickets.reserve(self.database, self.item, self.github, 10)
+                        self.assertEqual(caught.exception.code, 'ticket_ineligible')
+                        self.database.rollback(); self.assertNotIn('reservation', self.fixture.stored())
+                    continue
+                reserved = tickets.reserve(self.database, self.item, self.github, 10)
+                self.assertEqual(self.fixture.members[10]['fields'], {'STATUS': 'In Progress'})
+                self.assertEqual(reserved['reservation']['status'], 'reserved')
+                self.assertEqual(self.fixture.stored(), reserved); self.assertFalse(reserved['execution_allowed'])
+                self.assertIsNone(reserved['correlation']['worker_run_id'])
+                with self.assertRaises(repositories.RepositoryError):
+                    tickets.reserve(self.database, reserved, self.github, 12)
+                self.database.rollback(); self.assertEqual(self.fixture.stored()['reservation'], reserved['reservation'])
 
-    def test_textual_holds_and_foreign_scope_leave_independent_frontier(self):
-        body = self.fixture.issues[10]['body']
-        for status in ('blocked', 'deferred'):
-            self.fixture.issues[10]['body'] = body.replace('ready (GitHub Projects is authoritative for current progress).', status)
-            self.assertEqual(self.frontier()['eligible'], [12])
-            with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 10)
-            self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback(); self.assertNotIn('reservation', self.fixture.stored())
-        self.fixture.issues[10]['milestone'] = {'id': 502, 'number': 2, 'title': 'm2', 'state': 'open'}
-        self.assertEqual(self.frontier()['eligible'], [12])
 
     def test_completed_blocker_requires_closed_completed_done_current_scope(self):
         for state, reason, status, scope, expected in (
@@ -51,53 +57,56 @@ class NativeScopeTests(unittest.TestCase):
                 self.fixture.members[10]['fields']['STATUS'] = status
                 self.assertEqual(11 in self.frontier()['eligible'], expected)
 
-    def test_native_textual_disagreement_and_cycles_refuse_durable_frontier(self):
+    def test_native_blocker_graph_identity(self):
         before = self.fixture.stored()
-        self.fixture.deps[10] = [12]
-        with self.assertRaises(repositories.RepositoryError) as caught: self.frontier()
-        self.assertEqual(caught.exception.code, 'github_mismatch'); self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
-        self.fixture.deps[10] = [11]; self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #11')
-        with self.assertRaises(repositories.RepositoryError) as caught: self.frontier()
-        self.assertEqual(caught.exception.code, 'github_mismatch'); self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
-
-    def test_exact_native_blocker_identity_checked_outside_board_scope(self):
-        real = REAL_DEPENDENCIES
-        dependency = copy.deepcopy(self.fixture.issues[10]); dependency.update(id=999, node_id='OTHER')
-        for out_of_scope in (False, True):
-            with self.subTest(out_of_scope=out_of_scope), patch.object(gh, 'rest_pages', return_value=[dependency]):
-                if out_of_scope: self.fixture.issues[10]['milestone'] = None
-                with self.assertRaises(repositories.RepositoryError) as caught: real(self.github, 'example/product', 11)
+        original = copy.deepcopy(self.fixture.issues[10])
+        dependency = {**original, 'id': 999, 'node_id': 'OTHER'}
+        for fault in ('textual-disagreement', 'cycle', 'identity-in-scope', 'identity-outside-scope'):
+            with self.subTest(fault=fault):
+                self.fixture.issues[10] = copy.deepcopy(original)
+                if fault == 'textual-disagreement': self.fixture.deps[10] = [12]
+                if fault == 'cycle':
+                    self.fixture.deps[10] = [11]
+                    self.fixture.issues[10]['body'] = original['body'].replace('None (can start immediately).', '- #11')
+                if fault == 'identity-outside-scope': self.fixture.issues[10]['milestone'] = None
+                with patch.object(gh, 'rest_pages', return_value=[dependency]), self.assertRaises(repositories.RepositoryError) as caught:
+                    if fault.startswith('identity'):
+                        REAL_DEPENDENCIES(self.github, 'example/product', 11)
+                    else:
+                        self.frontier()
                 self.assertEqual(caught.exception.code, 'github_mismatch')
-        self.assertEqual(self.fixture.members[11]['fields']['STATUS'], 'Todo')
-        self.assertNotIn('reservation', self.fixture.stored())
+                self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
+                self.assertEqual(self.fixture.members[11]['fields']['STATUS'], 'Todo')
+                self.assertNotIn('reservation', self.fixture.stored())
 
-    def test_native_scope_missing_ambiguous_inaccessible_and_replaced_identity(self):
-        github = Mock()
-        for values in ([], self.milestones * 2, [{**self.milestones[0], 'state': 'closed'}], [{**self.milestones[0], 'id': True}]):
-            with self.subTest(values=values), patch.object(gh, 'rest_pages', return_value=values):
-                with self.assertRaises(repositories.RepositoryError): gh.resolve_milestone(github, 'example/product', 'm1')
-        with patch.object(gh, 'rest_pages', side_effect=repositories.RepositoryError('github_blocked', 'no access')):
-            with self.assertRaises(repositories.RepositoryError): gh.resolve_milestone(github, 'example/product', 'm1')
-        for field, value in (('id', 999), ('number', 2), ('title', 'renamed')):
-            issue = {**self.fixture.issues[10], 'milestone': {**self.milestones[0], field: value}}
-            with self.subTest(field=field), self.assertRaises(repositories.RepositoryError): gh.issue_scope(issue, self.fixture.board)
-        github.request.assert_not_called()
 
-    def test_board_selection_schema_and_access_fail_closed(self):
+    def test_native_board_and_connection_contract_1(self):
         github = Mock()
         config = {'project_id': None, 'status_field': 'Status', 'statuses': {'ready': 'Todo', 'active': 'In Progress', 'done': 'Done'}, 'triage_label': 'agent-triage'}
         fields = [{'id': 'STATUS', 'name': 'Status', 'options': [{'id': name, 'name': name} for name in ('Todo', 'In Progress', 'Done')]}]
         boards = [{'id': 'P1', 'closed': False}, {'id': 'P2', 'closed': False}]
+        rows = [('milestone', values) for values in ([], self.milestones * 2, [{**self.milestones[0], 'state': 'closed'}], [{**self.milestones[0], 'id': True}])]
+        rows += [('fields', values) for values in ([], fields * 2, [{**fields[0], 'options': fields[0]['options'][:-1]}])]
+        rows += [('milestone-access', None), ('board-access', None)]
+        for boundary, values in rows:
+            with self.subTest(boundary=boundary, values=values):
+                with patch.object(gh, 'rest_pages', return_value=values) as rest, \
+                        patch.object(gh, 'linked_projects', return_value=boards[:1]) as linked, \
+                        patch.object(gh, 'project_fields', return_value=values):
+                    if boundary == 'milestone-access': rest.side_effect = repositories.RepositoryError('github_blocked', 'no access')
+                    if boundary == 'board-access': linked.side_effect = repositories.RepositoryError('projects_blocked', 'inaccessible')
+                    with self.assertRaises(repositories.RepositoryError):
+                        if boundary.startswith('milestone'): gh.resolve_milestone(github, 'example/product', 'm1')
+                        else: gh.resolve_board(github, 'example/product', config)
+        for field, value in (('id', 999), ('number', 2), ('title', 'renamed')):
+            issue = {**self.fixture.issues[10], 'milestone': {**self.milestones[0], field: value}}
+            with self.subTest(field=field), self.assertRaises(repositories.RepositoryError): gh.issue_scope(issue, self.fixture.board)
         with patch.object(gh, 'linked_projects', return_value=boards), patch.object(gh, 'project_fields', return_value=fields):
             with self.assertRaises(repositories.RepositoryError): gh.resolve_board(github, 'example/product', config)
             self.assertEqual(gh.resolve_board(github, 'example/product', {**config, 'project_id': 'P1'})['project_id'], 'P1')
             with self.assertRaises(repositories.RepositoryError): gh.resolve_board(github, 'example/product', {**config, 'project_id': 'absent'})
-        for bad_fields in ([], fields * 2, [{**fields[0], 'options': fields[0]['options'][:-1]}]):
-            with patch.object(gh, 'linked_projects', return_value=boards[:1]), patch.object(gh, 'project_fields', return_value=bad_fields):
-                with self.assertRaises(repositories.RepositoryError): gh.resolve_board(github, 'example/product', config)
-        with patch.object(gh, 'linked_projects', side_effect=repositories.RepositoryError('projects_blocked', 'inaccessible')):
-            with self.assertRaises(repositories.RepositoryError): gh.resolve_board(github, 'example/product', config)
         github.request.assert_not_called()
+
 
     def test_connection_pagination_and_project_shape_validation(self):
         fetch = Mock(side_effect=[{'nodes': [1], 'pageInfo': {'hasNextPage': True, 'endCursor': 'next'}}, test_tickets.conn([2])])

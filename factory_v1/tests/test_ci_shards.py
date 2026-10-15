@@ -1,6 +1,7 @@
 """The serial component runner preserves inventory, failures and execution boundaries."""
 from contextlib import redirect_stderr, redirect_stdout
 import io
+import tomllib
 import unittest
 from unittest.mock import Mock, patch
 
@@ -30,6 +31,14 @@ class ComponentRunnerTests(unittest.TestCase):
         case = unittest.FunctionTestCase(lambda: None)
         with self.assertRaises(ValueError):
             run_factory_tests.inventory(unittest.TestSuite([case, case]))
+        for count in (500, 501):
+            identities = [f'case-{index}' for index in range(count)]
+            with self.subTest(count=count), patch.object(run_factory_tests, 'test_ids', return_value=iter(identities)):
+                if count == 500:
+                    self.assertEqual(run_factory_tests.inventory(unittest.TestSuite()), identities)
+                else:
+                    with self.assertRaisesRegex(ValueError, 'maximum is 500'):
+                        run_factory_tests.inventory(unittest.TestSuite())
 
     def test_discovery_errors_refuse_before_execution(self):
         loader = Mock(errors=['LABELED discovery error'])
@@ -53,6 +62,9 @@ class ComponentRunnerTests(unittest.TestCase):
         self.assertIn('Ran 2 tests', errors.getvalue())
 
     def test_single_passing_test_runs_without_empty_shards_or_autodiscovery(self):
+        config = tomllib.loads((run_factory_tests.ROOT / '.mise.toml').read_text())
+        self.assertEqual(config['tasks']['test']['run'], 'python scripts/run_factory_tests.py')
+        self.assertEqual(config['tasks']['test']['env']['PYTHONDONTWRITEBYTECODE'], '1')
         ran = []
         suite = unittest.TestSuite([unittest.FunctionTestCase(lambda: ran.append(True))])
         loader = Mock(errors=[], discover=Mock(return_value=suite))

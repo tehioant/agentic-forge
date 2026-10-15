@@ -115,12 +115,9 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.item['reservation_history'] = [self.item.pop('reservation')]
         self.store()
 
-    def test_contract_exists_before_building_the_dispatcher(self):
-        self.assertTrue(callable(tickets.advance_delivered))
-        self.assertTrue(callable(assignments.delivered_ticket_claim))
 
-    def test_exact_delivery_atomically_archives_reservation_and_is_idempotent(self):
-        before_rows, reservation = self.rows(), copy.deepcopy(self.item['reservation'])
+    def test_atomic_exact_retirement_and_idempotence_matrix(self):
+        before_rows, reservation = (self.rows(), copy.deepcopy(self.item['reservation']))
         result = self.advance()
         self.assertNotIn('reservation', result)
         self.assertEqual(result['reservation_history'], [reservation])
@@ -133,138 +130,93 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.assertEqual(self.advance(), result)
         self.assertEqual(self.stored(), result)
         self.assertEqual(self.rows(), before_rows)
-        self.assertTrue(all(assignments.delivered_ticket_claim(self.db, a) for a in self.records.values()))
+        self.assertTrue(all((assignments.delivered_ticket_claim(self.db, a) for a in self.records.values())))
         self.assertEqual(restart.ownership(self.db, result)['assignments'], [])
         self.reads['chain'].assert_called()
         self.reads['checks'].assert_called()
 
-    def test_delivery_and_cleanup_refusals_leave_rows_and_reservation_unchanged(self):
-        cases = [('issue', 'id', 999), ('issue', 'state', 'open'), ('issue', 'body', 'changed'),
-                 ('evidence', 'candidate', 'f' * 40), ('config', 'repository_id', 99),
-                 ('config', 'head', 'f' * 40), ('config', 'candidate_assignment', 'other'),
-                 ('runtime', 'container_removed', None), ('runtime', 'container_removed', False),
-                 ('runtime', 'status', 'running'), ('journal', 'status', 'merged'),
-                 ('journal', 'failure', {'code': 'rejected'})]
-        for target, field, value in cases:
-            obj = {'issue': self.issue, 'evidence': self.evidence, 'config': self.config,
-                   'runtime': self.records['builder']['runtime'], 'journal': self.records['candidate']['merge']}[target]
-            old = obj[field]
-            obj[field] = value
-            self.store()
-            before, rows = self.stored(), self.rows()
-            with self.subTest(target=target, field=field), self.assertRaises(RepositoryError):
-                self.advance()
-            self.assertEqual(self.stored(), before)
-            self.assertEqual(self.rows(), rows)
-            obj[field] = old
-        self.store()
-        self.reads['checks'].return_value = ['wrong-check']
-        before = self.stored()
-        with self.assertRaises(RepositoryError):
-            self.advance()
-        self.assertEqual(self.stored(), before)
-
-    def test_missing_runtime_is_not_unknown_cleanup_but_only_retired_unlaunched_history(self):
-        self.records['historical'] = copy.deepcopy(self.records['builder'])
-        self.records['historical']['assignment_id'] = 'historical'
-        self.records['historical'].pop('runtime')
-        self.store()
-        with self.assertRaises(RepositoryError) as refused:
-            self.advance()
-        self.assertEqual(refused.exception.code, 'cleanup_required')
-        self.records['historical']['requirement_disposition'] = {'change_id': 'old'}
-        self.item['requirement_changes'] = {'old': {'kind': 'material', 'status': 'resumed', 'affected': [1], 'blocks_verified': True}}
-        self.store()
-        self.assertIn('delivered_ticket_retirements', self.advance())
-
-    def test_shared_predicate_rejects_resealed_identity_revision_authority_and_cleanup_drift(self):
+    def test_delivery_cleanup_and_history_guards_matrix(self):
+        baseline, records = (copy.deepcopy(self.item), copy.deepcopy(self.records))
         self.seed_receipt()
-        original = copy.deepcopy(self.item)
-        records = copy.deepcopy(self.records)
-        for field, value in [('scope', dict(self.scope, issue_id=999)), ('revision', {'spec': {}}),
-                             ('candidate', 'other'), ('merge_authority', dict(self.authority, head='f' * 40))]:
-            proof = self.item['delivered_ticket_retirements']['candidate']['proof']
-            proof[field] = value
-            self.item['delivered_ticket_retirements']['candidate']['receipt_id'] = assignments.digest(proof)
-            self.store()
-            with self.subTest(field=field):
-                self.assertFalse(assignments.delivered_ticket_claim(self.db, self.records['builder']))
-                with self.assertRaises(RepositoryError):
-                    assignments.ticket_claims(self.db, dict(self.scope, issue_number=2, issue_id=20))
-            self.item = copy.deepcopy(original)
-        self.records['builder']['runtime']['container_removed'] = None
-        proof = self.item['delivered_ticket_retirements']['candidate']['proof']
-        proof['lineage']['builder']['record_sha256'] = assignments.digest(self.records['builder'])
-        self.item['delivered_ticket_retirements']['candidate']['receipt_id'] = assignments.digest(proof)
-        self.store()
-        self.assertFalse(assignments.delivered_ticket_claim(self.db, self.records['builder']))
+        sealed = copy.deepcopy(self.item)
+        advance_cases = [('issue', 'id', 999), ('issue', 'state', 'open'), ('issue', 'body', 'changed'), ('evidence', 'candidate', 'f' * 40), ('config', 'repository_id', 99), ('config', 'head', 'f' * 40), ('config', 'candidate_assignment', 'other'), ('runtime', 'container_removed', None), ('runtime', 'container_removed', False), ('runtime', 'status', 'running'), ('journal', 'status', 'merged'), ('journal', 'failure', {'code': 'rejected'})]
+        drift = [(('assignment_id',), 'other'), (('claim_id',), 'other'), (('handoff', 'baseline'), 'f' * 40), (('handoff', 'issue', 'id'), 999), (('handoff', 'source_authority'), {'trusted': False}), (('revision',), {'spec': {}}), (('submitted_result',), {'status': 'changed'}), (('native_execution',), {'trusted': False}), (('runtime', 'run_id'), 'other'), (('runtime', 'container_removed'), False), (('runtime', 'status'), 'running'), (('runtime', 'error'), 'stop_unconfirmed'), (('merge', 'authority', 'head'), 'f' * 40), (('merge', 'authority', 'baseline'), 'f' * 40), (('merge', 'authority', 'standards_assignment'), 'other'), (('merge', 'integrated_evidence', 'candidate'), 'f' * 40), (('merge', 'integrated_evidence', 'tree'), 'f' * 40), (('merge', 'integrated_evidence', 'integrated'), 'f' * 40), (('merge', 'integrated_evidence', 'parents'), ['f' * 40]), (('merge', 'delivery_checks'), ['changed']), (('updated_at',), 'changed')]
+        cases = [('advance', (target, field), value) for target, field, value in advance_cases]
+        cases += [('advance-checks', (), None), ('history', (), False), ('history', (), True)]
+        cases += [('proof', (field,), value) for field, value in [('scope', dict(self.scope, issue_id=999)), ('revision', {'spec': {}}), ('candidate', 'other'), ('merge_authority', dict(self.authority, head='f' * 40))]]
+        cases += [('builder-cleanup', (), None)]
+        cases += [('record', path, value) for path, value in drift]
+        cases += [('resealed', path, value) for path, value in drift if path[0] in {'revision', 'runtime', 'merge'}]
+        cases += [('observation', (), change) for change in [{'main': None}, {'membership': 'unknown'}, {'membership': 'behind'}, {'main': 'f' * 40, 'membership': 'identical'}, {'membership': 'ahead'}]]
+        cases += [('unknown-integration', (), None)]
+        for kind, path, value in cases:
+            with self.subTest(kind=kind, path=path, value=value), ExitStack() as stack:
+                self.item = copy.deepcopy(baseline if kind.startswith('advance') or kind == 'history' else sealed)
+                self.records = copy.deepcopy(records)
+                self.db.execute('DELETE FROM role_assignments')
+                if kind == 'advance':
+                    target, field = path
+                    obj = {'issue': self.issue, 'evidence': self.evidence, 'config': self.config, 'runtime': self.records['builder']['runtime'], 'journal': self.records['candidate']['merge']}[target]
+                    old = copy.deepcopy(obj.get(field))
+                    obj[field] = value
+                    stack.callback(obj.__setitem__, field, old)
+                elif kind == 'advance-checks':
+                    stack.enter_context(patch.object(merge, 'checks', return_value=['wrong-check']))
+                elif kind == 'history':
+                    historical = copy.deepcopy(self.records['builder'])
+                    historical['assignment_id'] = 'historical'
+                    historical.pop('runtime')
+                    self.records['historical'] = historical
+                    if value:
+                        historical['requirement_disposition'] = {'change_id': 'old'}
+                        self.item['requirement_changes'] = {'old': {'kind': 'material', 'status': 'resumed', 'affected': [1], 'blocks_verified': True}}
+                elif kind == 'proof':
+                    receipt = self.item['delivered_ticket_retirements']['candidate']
+                    receipt['proof'][path[0]] = value
+                    receipt['receipt_id'] = assignments.digest(receipt['proof'])
+                elif kind == 'builder-cleanup':
+                    self.records['builder']['runtime']['container_removed'] = None
+                    receipt = self.item['delivered_ticket_retirements']['candidate']
+                    receipt['proof']['lineage']['builder']['record_sha256'] = assignments.digest(self.records['builder'])
+                    receipt['receipt_id'] = assignments.digest(receipt['proof'])
+                elif kind in ('record', 'resealed'):
+                    obj = self.records['candidate']
+                    for key in path[:-1]:
+                        obj = obj[key]
+                    obj[path[-1]] = value
+                    if kind == 'resealed':
+                        candidate = self.records['candidate']
+                        if path == ('merge', 'integrated_evidence', 'integrated'):
+                            candidate['merge']['integrated_evidence']['main'] = value
+                        receipt = self.item['delivered_ticket_retirements']['candidate']
+                        receipt['proof']['lineage']['candidate']['record_sha256'] = assignments.retirement_record_digest(candidate)
+                        receipt['receipt_id'] = assignments.digest(receipt['proof'])
+                elif kind == 'observation':
+                    self.records['candidate']['merge']['integrated_evidence'].update(value)
+                elif kind == 'unknown-integration':
+                    stack.enter_context(patch.object(merge, 'merged_evidence', side_effect=RepositoryError('Unknown membership.', 'not_integrated')))
+                self.store()
+                before, rows = (self.stored(), self.rows())
+                if kind.startswith('advance') or kind in ('history', 'unknown-integration'):
+                    if kind == 'history' and value:
+                        self.assertIn('delivered_ticket_retirements', self.advance())
+                    else:
+                        with self.assertRaises(RepositoryError) as refused:
+                            self.advance()
+                        if kind == 'history':
+                            self.assertEqual(refused.exception.code, 'cleanup_required')
+                        self.assertEqual(self.stored(), before)
+                        self.assertEqual(self.rows(), rows)
+                else:
+                    candidate = self.records['builder'] if kind in ('proof', 'builder-cleanup') else self.records['candidate']
+                    self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
+                    if kind in ('proof', 'observation'):
+                        with self.assertRaises(RepositoryError):
+                            assignments.ticket_claims(self.db, dict(self.scope, issue_number=2, issue_id=20))
 
-        # Record seals still bind every non-observation field, including newly added fields.
-        drift = [(('assignment_id',), 'other'), (('claim_id',), 'other'),
-                 (('handoff', 'baseline'), 'f' * 40), (('handoff', 'issue', 'id'), 999),
-                 (('handoff', 'source_authority'), {'trusted': False}),
-                 (('revision',), {'spec': {}}), (('submitted_result',), {'status': 'changed'}),
-                 (('native_execution',), {'trusted': False}),
-                 (('runtime', 'run_id'), 'other'), (('runtime', 'container_removed'), False),
-                 (('runtime', 'status'), 'running'), (('runtime', 'error'), 'stop_unconfirmed'),
-                 (('merge', 'authority', 'head'), 'f' * 40),
-                 (('merge', 'authority', 'baseline'), 'f' * 40),
-                 (('merge', 'authority', 'standards_assignment'), 'other'),
-                 (('merge', 'integrated_evidence', 'candidate'), 'f' * 40),
-                 (('merge', 'integrated_evidence', 'tree'), 'f' * 40),
-                 (('merge', 'integrated_evidence', 'integrated'), 'f' * 40),
-                 (('merge', 'integrated_evidence', 'parents'), ['f' * 40]),
-                 (('merge', 'delivery_checks'), ['changed']), (('updated_at',), 'changed')]
-        for path, value in drift:
-            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
-            candidate = self.records['candidate']
-            obj = candidate
-            for key in path[:-1]:
-                obj = obj[key]
-            obj[path[-1]] = value
-            self.store()
-            with self.subTest(record_drift=path):
-                self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
 
-        # Reseal correlated hashes so semantic delivery/cleanup guards, not byte drift, refuse.
-        for path, value in [entry for entry in drift if entry[0][0] in {'revision', 'runtime', 'merge'}]:
-            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
-            candidate = self.records['candidate']
-            obj = candidate
-            for key in path[:-1]:
-                obj = obj[key]
-            obj[path[-1]] = value
-            receipt = self.item['delivered_ticket_retirements']['candidate']
-            proof = receipt['proof']
-            # An integrated-identity change must remain a valid observation to isolate identity.
-            if path == ('merge', 'integrated_evidence', 'integrated'):
-                candidate['merge']['integrated_evidence']['main'] = value
-            proof['lineage']['candidate']['record_sha256'] = assignments.retirement_record_digest(candidate)
-            receipt['receipt_id'] = assignments.digest(proof)
-            self.store()
-            with self.subTest(resealed_drift=path):
-                self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
 
-        for change in [{'main': None}, {'membership': 'unknown'}, {'membership': 'behind'},
-                       {'main': 'f' * 40, 'membership': 'identical'}, {'membership': 'ahead'}]:
-            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
-            self.records['candidate']['merge']['integrated_evidence'].update(change)
-            self.store()
-            with self.subTest(unknown_or_contradictory_observation=change):
-                self.assertFalse(assignments.delivered_ticket_claim(self.db, self.records['candidate']))
-                with self.assertRaises(RepositoryError):
-                    assignments.ticket_claims(self.db, dict(self.scope, issue_number=2, issue_id=20))
-
-        self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
-        self.store()
-        self.reads['merged_evidence'].side_effect = RepositoryError('Unknown membership.', 'not_integrated')
-        before, rows = self.stored(), self.rows()
-        with self.assertRaises(RepositoryError):
-            self.advance()
-        self.assertEqual(self.stored(), before)
-        self.assertEqual(self.rows(), rows)
-
-    def test_current_requirement_and_final_frontier_guards_are_not_masked_by_checksums(self):
+    def test_current_requirements_and_pause_guards_matrix(self):
         self.seed_receipt()
         revised = dict(self.revision, ticket_inputs='f' * 64)
         candidate = self.records['candidate']
@@ -277,53 +229,41 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         receipt['receipt_id'] = assignments.digest(proof)
         self.store()
         self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
-        changed = copy.deepcopy(self.observed)
-        changed['items'][0]['held'] = True
-        self.reads['frontier'].side_effect = [copy.deepcopy(self.observed), changed]
-        # Restore the candidate before isolating the final frontier check.
         candidate['revision'] = self.revision
         self.store()
-        before, rows = self.stored(), self.rows()
-        with self.assertRaises(RepositoryError) as refused:
-            self.advance()
-        self.assertEqual(refused.exception.code, 'delivery_race')
-        self.assertEqual(self.stored(), before)
-        self.assertEqual(self.rows(), rows)
-
-    def test_late_pause_and_independent_holds_refuse_without_overwriting_them(self):
-        holds = [{'stuck_work': {'old': {'status': 'awaiting-direction', 'affected': [1]}}},
-                 {'requirement_changes': {'old': {'kind': 'material', 'status': 'held', 'affected': [1]}}},
-                 {'main_recoveries': {'incident': {'status': 'registered', 'removed': {}}}},
-                 {'bug_work': {'defect': {'status': 'discovered', 'discovery': {'scope': 'current',
-                    'affected': [1], 'symptoms': 'x', 'expected': 'y', 'actual': 'z'}}}}]
-        for hold in holds:
-            with self.subTest(hold=hold):
-                original = copy.deepcopy(self.item)
-                def inject(*args):
-                    latest = self.stored()
-                    latest.update(copy.deepcopy(hold))
-                    save_iteration(self.db, latest)
-                    self.db.commit()
-                self.reads['revalidate_inputs'].side_effect = inject
-                before_rows = self.rows()
-                with self.assertRaises(RepositoryError):
-                    self.advance()
-                self.assertEqual(self.stored(), dict(original, **hold))
-                self.assertEqual(self.rows(), before_rows)
-                self.item = original
+        baseline = copy.deepcopy(self.item)
+        holds = [{'stuck_work': {'old': {'status': 'awaiting-direction', 'affected': [1]}}}, {'requirement_changes': {'old': {'kind': 'material', 'status': 'held', 'affected': [1]}}}, {'main_recoveries': {'incident': {'status': 'registered', 'removed': {}}}}, {'bug_work': {'defect': {'status': 'discovered', 'discovery': {'scope': 'current', 'affected': [1], 'symptoms': 'x', 'expected': 'y', 'actual': 'z'}}}}]
+        for schedule in ('frontier', *holds, 'pause'):
+            with self.subTest(schedule=schedule), ExitStack() as stack:
+                self.item = copy.deepcopy(baseline)
                 self.store()
-        def pause(*args):
-            with controls.lane(self.db, 'product', 'm1'):
-                controls.write(self.db, {'project': 'product', 'iteration': 'm1', 'operator_id': '42',
-                    'action': 'pause', 'state': 'requested', 'reference': 'late pause', 'request_id': 'pause1',
-                    'history': [], 'cleanup': {}, 'checkpoint': controls.snapshot(self.db, 'product', 'm1')})
-        self.reads['revalidate_inputs'].side_effect = pause
-        before = self.stored()
-        with self.assertRaises(RepositoryError) as refused:
-            self.advance()
-        self.assertEqual(refused.exception.code, 'iteration_paused')
-        self.assertTrue(controls.blocked(self.db, 'product', 'm1'))
-        self.assertEqual(self.stored(), before)
+                if schedule == 'frontier':
+                    changed = copy.deepcopy(self.observed)
+                    changed['items'][0]['held'] = True
+                    stack.enter_context(patch.object(iteration, 'frontier', side_effect=[copy.deepcopy(self.observed), changed]))
+                else:
+
+                    def inject(*args):
+                        if schedule == 'pause':
+                            with controls.lane(self.db, 'product', 'm1'):
+                                controls.write(self.db, {'project': 'product', 'iteration': 'm1', 'operator_id': '42', 'action': 'pause', 'state': 'requested', 'reference': 'late pause', 'request_id': 'pause1', 'history': [], 'cleanup': {}, 'checkpoint': controls.snapshot(self.db, 'product', 'm1')})
+                        else:
+                            latest = self.stored()
+                            latest.update(copy.deepcopy(schedule))
+                            save_iteration(self.db, latest)
+                            self.db.commit()
+                    stack.enter_context(patch.object(requirements, 'revalidate_inputs', side_effect=inject))
+                before, rows = (self.stored(), self.rows())
+                with self.assertRaises(RepositoryError) as refused:
+                    self.advance()
+                if schedule == 'frontier':
+                    self.assertEqual(refused.exception.code, 'delivery_race')
+                if schedule == 'pause':
+                    self.assertEqual(refused.exception.code, 'iteration_paused')
+                    self.assertTrue(controls.blocked(self.db, 'product', 'm1'))
+                self.assertEqual(self.stored(), dict(before, **schedule) if isinstance(schedule, dict) else before)
+                self.assertEqual(self.rows(), rows)
+
 
     def reserve_second(self):
         state = {'active': False}
@@ -364,59 +304,8 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.assertEqual(self.stored()['delivered_ticket_retirements'], before)
         self.assertEqual(self.rows(), rows)
 
-    def test_second_reservation_reaches_real_ownership_guard_with_direct_receipt(self):
-        self.seed_receipt()
-        self.refresh_integration()
-        # Restart readback is its own component; reservation starts from direct records.
-        self.records['candidate']['merge']['integrated_evidence'] = copy.deepcopy(self.evidence)
-        self.store()
-        result = self.reserve_second()
-        self.item['reservation'] = {'issue_number': 2, 'status': 'reserved',
-            'assignment_id': 'batch', 'input_digest': 'b' * 64}
-        self.store()
-        scope = dict(self.scope, issue_number=2, issue_id=20)
-        request = {'stage': 'implementation', 'claim_id': 'fresh', 'profile': {'name': 'fresh', 'home': '/fixture/fresh'}}
-        assignments.claims(self.db, request, scope, 'new')
-        for key, value in [('claim_id', 'claim-builder'), ('profile', self.records['builder']['handoff']['profile'])]:
-            with self.subTest(reuse=key), self.assertRaises(RepositoryError):
-                assignments.claims(self.db, dict(request, **{key: value}), scope, 'new')
-        self.assertEqual(restart.ownership(self.db, result)['assignments'], [])
-
-    def test_role_claim_then_second_reservation_uses_the_same_retirement_authority(self):
-        self.seed_receipt()
-        self.refresh_integration()
-        self.records['candidate']['merge']['integrated_evidence'] = copy.deepcopy(self.evidence)
-        scope = dict(self.scope, issue_number=2, issue_id=20)
-        profile = {'name': 'fresh', 'home': '/fixture/fresh'}
-        handoff = {'stage': 'implementation', 'profile': profile}
-        self.records['fresh'] = {'assignment_id': 'fresh', 'claim_id': 'fresh', 'ticket_scope': scope,
-                                 'handoff': handoff, 'handoff_digest': assignments.digest(handoff)}
-        self.store()
-        self.reserve_second()
-        self.assertEqual(restart.ownership(self.db, self.stored())['assignments'], ['fresh'])
-
-    def test_restart_old_reservation_hold_can_only_resolve_exact_delivery(self):
-        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
-            'blockers': [{'boundary': 'tracker', 'code': 'reservation_conflict'}]}
-        self.store()
-        result = self.advance()
-        self.assertNotIn('reservation', result)
-        self.assertEqual(result['restart_reconciliation']['status'], 'blocked')
-        with self.assertRaises(RepositoryError):
-            controls.require_active(self.db, 'product', 'm1')
-
-    def test_retirement_resolution_never_bypasses_unrelated_restart_hold(self):
-        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
-            'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
-        self.store()
-        before = self.stored()
-        with self.assertRaises(RepositoryError) as refused:
-            self.advance()
-        self.assertEqual(refused.exception.code, 'reconciliation_required')
-        self.assertEqual(self.stored(), before)
-
-    def test_without_receipt_second_ticket_conflicts_and_retired_results_cannot_be_reused(self):
-        before, rows = self.stored(), self.rows()
+    def test_second_owner_requires_exact_retirement_matrix(self):
+        before, rows = (self.stored(), self.rows())
         with self.assertRaises(RepositoryError) as refused:
             assignments.ticket_claims(self.db, dict(self.scope, issue_number=2, issue_id=20))
         self.assertEqual(refused.exception.code, 'claim_conflict')
@@ -431,3 +320,46 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         with self.assertRaises(RepositoryError) as refused:
             assignments.store_result(self.db, 'product', 'm1', '42', 'builder', {}, self.github)
         self.assertEqual(refused.exception.code, 'stale_assignment')
+        self.refresh_integration()
+        self.records['candidate']['merge']['integrated_evidence'] = copy.deepcopy(self.evidence)
+        baseline, records = (copy.deepcopy(self.item), copy.deepcopy(self.records))
+        scope = dict(self.scope, issue_number=2, issue_id=20)
+        request = {'stage': 'implementation', 'claim_id': 'fresh', 'profile': {'name': 'fresh', 'home': '/fixture/fresh'}}
+        for role_first in (False, True):
+            with self.subTest(role_first=role_first):
+                self.item, self.records = (copy.deepcopy(baseline), copy.deepcopy(records))
+                self.db.execute('DELETE FROM role_assignments')
+                if role_first:
+                    handoff = {'stage': 'implementation', 'profile': request['profile']}
+                    self.records['fresh'] = {'assignment_id': 'fresh', 'claim_id': 'fresh', 'ticket_scope': scope, 'handoff': handoff, 'handoff_digest': assignments.digest(handoff)}
+                self.store()
+                result = self.reserve_second()
+                if not role_first:
+                    self.item['reservation'] = {'issue_number': 2, 'status': 'reserved', 'assignment_id': 'batch', 'input_digest': 'b' * 64}
+                    self.store()
+                    assignments.claims(self.db, request, scope, 'new')
+                    for key, value in [('claim_id', 'claim-builder'), ('profile', self.records['builder']['handoff']['profile'])]:
+                        with self.subTest(reuse=key), self.assertRaises(RepositoryError):
+                            assignments.claims(self.db, dict(request, **{key: value}), scope, 'new')
+                self.assertEqual(restart.ownership(self.db, self.stored() if role_first else result)['assignments'], ['fresh'] if role_first else [])
+
+
+    def test_restart_release_cannot_clear_other_holds_matrix(self):
+        baseline = copy.deepcopy(self.item)
+        for boundary, code in [('tracker', 'reservation_conflict'), ('model', 'operation_uncertain')]:
+            with self.subTest(boundary=boundary):
+                self.item = copy.deepcopy(baseline)
+                self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {}, 'blockers': [{'boundary': boundary, 'code': code}]}
+                self.store()
+                before = self.stored()
+                if boundary == 'tracker':
+                    result = self.advance()
+                    self.assertNotIn('reservation', result)
+                    self.assertEqual(result['restart_reconciliation']['status'], 'blocked')
+                    with self.assertRaises(RepositoryError):
+                        controls.require_active(self.db, 'product', 'm1')
+                else:
+                    with self.assertRaises(RepositoryError) as refused:
+                        self.advance()
+                    self.assertEqual(refused.exception.code, 'reconciliation_required')
+                    self.assertEqual(self.stored(), before)

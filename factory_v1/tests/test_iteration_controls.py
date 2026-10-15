@@ -32,20 +32,36 @@ class IterationControlTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'iteration_paused')
         self.assertTrue(controls.blocked(f.db, 'product', 'm1'))
 
-    def test_preexisting_pause_and_stop_refuse_completion_before_external_reads(self):
-        for action in ('pause', 'emergency-stop'):
-            with self.subTest(action=action):
+    def test_completion_control_before_reads_matrix(self):
+        for seam, action, moment in (
+            ('completion', 'pause', 'before'), ('completion', 'emergency-stop', 'before'),
+            ('frontier', 'pause', 'before'), ('frontier', 'pause', 'after')):
+            with self.subTest(seam=seam, action=action, moment=moment):
                 f = fixture(self, fixtures.IterationComponents)
+                if seam == 'frontier':
+                    f.stack.close()
                 before = f.stored()
-                with state_lock(f.db):
+                def read(db, item, api, *, resolution=None):
+                    self.assertIsNone(resolution)
+                    self.assertNotEqual(db.execute('PRAGMA database_list').fetchone()[2],
+                                        f.db.execute('PRAGMA database_list').fetchone()[2])
                     interrupt(f, action)
-                    self.refused(f, f.complete)
+                    return dict(item, ticket_work={'frontier': f.observed})
+                with patch.object(tickets, 'frontier', side_effect=read) as observe, state_lock(f.db):
+                    if moment == 'before':
+                        interrupt(f, action)
+                    operation = f.complete if seam == 'completion' else lambda: iteration.frontier(f.db, f.item, f.github)
+                    self.refused(f, operation)
+                if moment == 'before':
+                    observe.assert_not_called()
                 self.assertEqual(f.stored(), before)
                 self.assertFalse(f.db.execute("SELECT 1 FROM sqlite_master WHERE name='notifications'").fetchone())
                 f.mocks['delivery.observe'].assert_not_called()
-                f.mocks['iteration.frontier'].assert_not_called()
+                if seam == 'completion':
+                    f.mocks['iteration.frontier'].assert_not_called()
+                f.doCleanups()
 
-    def test_pause_on_last_scoped_read_prevents_atomic_report_and_outbox(self):
+    def test_completion_pause_after_last_read_matrix(self):
         f = fixture(self, fixtures.IterationComponents)
         before = f.stored()
         reads = 0
@@ -64,27 +80,8 @@ class IterationControlTests(unittest.TestCase):
         self.assertEqual(f.stored(), before)
         self.assertFalse(f.db.execute("SELECT 1 FROM sqlite_master WHERE name='notifications'").fetchone())
 
-    def test_frontier_copy_cannot_hide_real_control_before_or_after_read(self):
-        for moment in ('before', 'after'):
-            with self.subTest(moment=moment):
-                f = fixture(self, fixtures.IterationComponents)
-                f.stack.close()  # Exercise the real copy wrapper, not completion's mocked frontier.
-                before = f.stored()
-                def read(db, item, api, *, resolution=None):
-                    self.assertIsNone(resolution)
-                    self.assertNotEqual(db.execute('PRAGMA database_list').fetchone()[2],
-                                        f.db.execute('PRAGMA database_list').fetchone()[2])
-                    interrupt(f)
-                    return dict(item, ticket_work={'frontier': f.observed})
-                if moment == 'before':
-                    interrupt(f)
-                with patch.object(tickets, 'frontier', side_effect=read) as observe, state_lock(f.db):
-                    self.refused(f, lambda: iteration.frontier(f.db, f.item, f.github))
-                if moment == 'before':
-                    observe.assert_not_called()
-                self.assertEqual(f.stored(), before)
 
-    def test_pause_and_stop_prevent_continuation_and_skill_read_race(self):
+    def test_continuation_control_and_skill_read_matrix(self):
         for action, moment in (('pause', 'before'), ('emergency-stop', 'before'), ('pause', 'skills')):
             with self.subTest(action=action, moment=moment):
                 f = fixture(self, fixtures.ContinuationComponents)
@@ -106,7 +103,7 @@ class IterationControlTests(unittest.TestCase):
                 self.assertEqual(json.loads(f.db.execute('SELECT payload FROM iterations').fetchone()[0]), stored)
                 self.assertEqual(stored['repository'], before['repository'])
 
-    def test_explicit_resume_preserves_completed_wait_and_then_allows_next_input(self):
+    def test_completed_wait_explicit_resume_matrix(self):
         f = fixture(self, fixtures.ContinuationComponents)
         before = json.loads(f.db.execute('SELECT payload FROM iterations').fetchone()[0])
         interrupt(f)
@@ -127,7 +124,7 @@ class IterationControlTests(unittest.TestCase):
         self.assertEqual(started['stage'], 'planning_pending')
         self.assertEqual(started['previous_iteration']['completion'], before['completion'])
 
-    def test_continuation_pause_after_last_publication_read_keeps_interview_pending(self):
+    def test_continuation_last_publication_pause_matrix(self):
         f = fixture(self, fixtures.ContinuationComponents)
         item = f.pending_interview()
         request = f.evidence(item)

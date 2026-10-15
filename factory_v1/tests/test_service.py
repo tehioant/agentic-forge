@@ -29,24 +29,27 @@ class ServiceTests(unittest.TestCase):
         self.addCleanup(db.close)
         return db
 
-    def test_startup_persists_pause_before_reconciliation(self):
-        def reconcile(db, *args):
-            self.assertTrue(controls.blocked(db, 'product', 'iteration'))
-            return {'status': 'ready', 'observations': {}, 'blockers': []}
-        with patch.object(service.restart, 'reconcile', side_effect=reconcile) as observed:
-            service.startup(self.config, Mock())
-        observed.assert_called_once()
-        with closing(sqlite3.connect(self.config['state'])) as db, db:
-            self.assertTrue(controls.blocked(db, 'product', 'iteration'))
-
-    def test_restart_never_clears_emergency_hold(self):
+    def test_startup_pause_and_stop_persist_matrix(self):
         db = self.database()
-        controls.request(db, 'product', 'iteration', 'operator', 'emergency-stop', 'stop:1')
-        with patch.object(service.restart, 'reconcile', return_value={'status': 'ready'}):
-            service.startup(self.config, Mock())
-        self.assertEqual(controls.read(db, 'product', 'iteration')['action'], 'emergency-stop')
+        for action in (None, 'emergency-stop'):
+            with self.subTest(action=action):
+                if action:
+                    controls.request(db, 'product', 'iteration', 'operator', action, 'stop:1')
+                def reconcile(observed, *args):
+                    self.assertTrue(controls.blocked(observed, 'product', 'iteration'))
+                    return {'status': 'ready', 'observations': {}, 'blockers': []}
+                with patch.object(service.restart, 'reconcile', side_effect=reconcile) as observed:
+                    service.startup(self.config, Mock())
+                observed.assert_called_once()
+                with closing(sqlite3.connect(self.config['state'])) as fresh:
+                    self.assertTrue(controls.blocked(fresh, 'product', 'iteration'))
+                    if action:
+                        record = controls.read(fresh, 'product', 'iteration')
+                        self.assertIsNotNone(record)
+                        assert record is not None
+                        self.assertEqual(record['action'], action)
 
-    def test_cycle_is_silent_and_never_dispatches_while_paused(self):
+    def test_paused_cycle_is_silent_matrix(self):
         db = self.database()
         controls.request(db, 'product', 'iteration', 'operator', 'pause', 'pause:1')
         with patch.object(service, 'dispatch') as dispatch, patch('builtins.print') as output:
@@ -55,86 +58,95 @@ class ServiceTests(unittest.TestCase):
         dispatch.assert_not_called()
         output.assert_not_called()
 
-    def test_install_renders_fixed_supervisor_without_start_or_enable(self):
+    def test_fixed_unit_and_dropin_status_matrix(self):
         target = Path(self.temp.name) / 'units'
         target.mkdir(mode=0o700)
         with patch.object(service.subprocess, 'run') as run:
             unit = service.install(self.config, target)
-        self.assertIn('KillMode=control-group', unit.read_text())
-        self.assertIn('Restart=on-failure', unit.read_text())
-        self.assertIn('-m factory_v1.service', unit.read_text())
+        text = unit.read_text()
+        for directive in ('KillMode=control-group', 'Restart=on-failure', '-m factory_v1.service'):
+            self.assertIn(directive, text)
         run.assert_called_once_with(['systemctl', '--user', 'daemon-reload'], check=True, timeout=30)
+        cases = [
+            ('dropin', 'start', [Mock(stdout='FragmentPath=/unused/agentic-forge.service\nDropInPaths=/unreviewed/override.conf\n')], None),
+            ('actual-status', 'status', [Mock(stdout='FragmentPath=' + str(unit) + '\nDropInPaths=\n'),
+                                       Mock(stdout='ActiveState=inactive\nSubState=dead\nMainPID=0\n')],
+             {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0'}),
+        ]
+        for label, command, responses, expected in cases:
+            with self.subTest(case=label), patch.object(service.subprocess, 'run', side_effect=responses) as run:
+                if expected is None:
+                    with self.assertRaises(RepositoryError):
+                        service.supervisor(self.config, command)
+                    self.assertEqual(run.call_count, 1)
+                else:
+                    self.assertEqual(service.supervisor(self.config, command), expected)
 
-    def test_config_rejects_ephemeral_or_nonprivate_state(self):
-        path = self.root / 'service.json'
-        os.chmod(path, 0o644)
-        with self.assertRaises(RepositoryError):
-            service.load(path)
-
-    def test_initialize_rejects_source_root_before_writing(self):
+    def test_private_durable_state_and_initialization_matrix(self):
         source = Path(self.temp.name) / 'source'
         source.mkdir(mode=0o700)
         package = source / 'factory_v1'
         package.mkdir(mode=0o700)
-        root = source / 'forbidden'
-        with patch.object(service, '__file__', str(package / 'service.py')):
-            with self.assertRaises(RepositoryError):
-                service.initialize(root, 'operator', 'product', 'iteration', 'https://api.github.com')
-        self.assertFalse(root.exists())
+        forbidden = source / 'forbidden'
+        path = self.root / 'service.json'
+        os.chmod(path, 0o644)
+        for label, seam, args in [
+            ('nonprivate', service.load, (path,)),
+            ('source-root', service.initialize, (forbidden, 'operator', 'product', 'iteration', 'https://api.github.com')),
+        ]:
+            with self.subTest(case=label), patch.object(service, '__file__', str(package / 'service.py')):
+                with self.assertRaises(RepositoryError):
+                    seam(*args)
+        self.assertFalse(forbidden.exists())
 
-    def test_healthy_observer_uses_existing_evidence_shape_and_no_agent(self):
-        capability = self.root / 'delivery.json'
-        service.atomic(capability, {})
-        self.config['delivery_config'] = str(capability)
-        with patch.object(service.delivery, 'load_config', return_value={}), \
-             patch.object(service.delivery, 'sample', return_value={'evidence': {'status': 'healthy'}}) as sample, \
-             patch.object(service, 'dispatch') as dispatch, patch('builtins.print') as output:
-            result = service.cycle(self.config, Mock())
-        self.assertEqual(result['blockers'], ['dispatch_capability_unavailable'])
-        sample.assert_called_once()
-        dispatch.assert_not_called()
-        output.assert_not_called()
-
-    def test_unknown_health_blocks_dispatch_but_delivers_existing_attention(self):
-        capability = self.root / 'delivery.json'
-        transport = self.root / 'transport.json'
+    def test_observer_health_attention_and_shutdown_matrix(self):
+        capability, transport = self.root / 'delivery.json', self.root / 'transport.json'
         service.atomic(capability, {})
         service.atomic(transport, {})
-        self.config.update(delivery_config=str(capability), transport_config=str(transport), dispatch_config='unavailable')
-        with patch.object(service.delivery, 'load_config', return_value={}), \
-             patch.object(service.delivery, 'sample', return_value={'evidence': {'status': 'unknown'}}), \
-             patch.object(service.attention, 'records', return_value=[{'state': 'pending', 'event': {'event_id': 'incident:1'}}]), \
-             patch.object(service.attention, 'deliver') as deliver, patch.object(service, 'dispatch') as dispatch:
-            result = service.cycle(self.config, Mock())
-        self.assertEqual(result['blockers'], ['delivery_not_healthy'])
-        deliver.assert_called_once()
-        dispatch.assert_not_called()
+        baseline = dict(self.config)
+        original_dispatch = service.dispatch
+        for health, attention, dispatch_config, blockers in [
+            ('healthy', [], None, ['dispatch_capability_unavailable']),
+            ('unknown', [{'state': 'pending', 'event': {'event_id': 'incident:1'}}], 'unavailable', ['delivery_not_healthy']),
+            (None, [], '/private/config.json', None),
+        ]:
+            with self.subTest(health=health):
+                config = baseline | {'dispatch_config': dispatch_config}
+                if health:
+                    config['delivery_config'] = str(capability)
+                if attention:
+                    config['transport_config'] = str(transport)
+                event = Mock()
+                with patch.object(service.delivery, 'load_config', return_value={}), \
+                     patch.object(service.delivery, 'sample', return_value={'evidence': {'status': health}}) as sample, \
+                     patch.object(service.attention, 'records', return_value=attention), \
+                     patch.object(service.attention, 'deliver') as deliver, \
+                     patch.object(service, 'inspect_readiness', return_value={'iteration_runnable': True}), \
+                     patch.object(service, 'dispatch', return_value={'status': 'progress'}) as dispatch, \
+                     patch('builtins.print') as output:
+                    if health is None:
+                        from factory_v1 import service_dispatch
+                        with patch.object(service_dispatch, 'tick', return_value={'status': 'progress'}) as tick:
+                            # Public dispatch seam independently of cycle health/readiness admission.
+                            service_dispatch_result = original_dispatch(config, Mock(), stop_event=event)
+                        self.assertIs(tick.call_args.kwargs['stop_event'], event)
+                        result = service_dispatch_result
+                    else:
+                        result = service.cycle(config, Mock(), stop_event=event)
+                if blockers is None:
+                    dispatch.assert_not_called()
+                    sample.assert_not_called()
+                else:
+                    self.assertEqual(result['blockers'], blockers)
+                    sample.assert_called_once()
+                    dispatch.assert_not_called()
+                if attention:
+                    deliver.assert_called_once()
+                else:
+                    deliver.assert_not_called()
+                output.assert_not_called()
 
-    def test_cycle_passes_shared_shutdown_event_to_stage_launcher(self):
-        from factory_v1 import service_dispatch
-        event = Mock()
-        with patch.object(service_dispatch, 'tick', return_value={'status': 'progress'}) as dispatch:
-            service.dispatch(self.config, Mock(), stop_event=event)
-        self.assertIs(dispatch.call_args.kwargs['stop_event'], event)
-
-    def test_supervisor_refuses_dropins_before_control(self):
-        response = Mock(stdout='FragmentPath=/unused/agentic-forge.service\nDropInPaths=/unreviewed/override.conf\n')
-        with patch.object(service.subprocess, 'run', return_value=response) as run:
-            with self.assertRaises(RepositoryError):
-                service.supervisor(self.config, 'start')
-        self.assertEqual(run.call_count, 1)
-
-    def test_supervisor_status_reads_actual_active_state_after_exact_unit_check(self):
-        unit = self.root / service.UNIT
-        unit.write_text(service.unit_text(self.config))
-        unit.chmod(0o600)
-        responses = [Mock(stdout='FragmentPath=' + str(unit) + '\nDropInPaths=\n'),
-                     Mock(stdout='ActiveState=inactive\nSubState=dead\nMainPID=0\n')]
-        with patch.object(service.subprocess, 'run', side_effect=responses):
-            result = service.supervisor(self.config, 'status')
-        self.assertEqual(result, {'ActiveState': 'inactive', 'SubState': 'dead', 'MainPID': '0'})
-
-    def test_status_does_not_report_dispatch_ready_without_capabilities(self):
+    def test_status_requires_capabilities_matrix(self):
         result = service.status(self.config)
         self.assertFalse(result['dispatch_allowed'])
         self.assertIn('service_not_started', result['blockers'])

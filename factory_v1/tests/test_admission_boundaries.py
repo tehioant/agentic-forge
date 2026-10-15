@@ -53,40 +53,44 @@ class AdmissionBoundaryTests(unittest.TestCase):
         self.assertEqual(self.stored(), before)
         self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
 
-    def test_pause_blocks_planning_until_explicit_resume(self):
-        before = self.stored()
-        self.pause()
-        with patch.object(planning, 'resolve_planning', return_value={}) as load:
-            self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
-            load.assert_not_called()
-            self.resume()
-            result = planning.plan(self.database, self.item, self.request)
-        self.assertEqual(result['stage'], 'planning_pending')
-        self.assertEqual(self.stored(), result)
-        self.assertFalse(controls.blocked(self.database, 'product', 'm1'))
+    def test_planning_control_admission(self):
+        baseline = copy.deepcopy(self.item)
+        root = Path(self.database.execute('PRAGMA database_list').fetchone()[2]).parent
+        for boundary in ('before-load', 'during-load', 'independent-revision'):
+            with self.subTest(boundary=boundary):
+                self.database.close()
+                self.database = sqlite3.connect(root / (boundary + '.sqlite'))
+                self.addCleanup(self.database.close)
+                self.database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+                self.item = copy.deepcopy(baseline)
+                if boundary == 'independent-revision': self.item['requirement_authority'] = {'10': {'revision': 'held'}}
+                self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+                self.database.commit(); before = self.stored()
+                if boundary != 'during-load': self.pause()
+                if boundary == 'independent-revision': self.resume()
+                def load(_):
+                    if boundary == 'during-load': self.pause()
+                    return {}
+                with patch.object(planning, 'resolve_planning', side_effect=load) as selected:
+                    if boundary == 'independent-revision':
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            planning.plan(self.database, self.item, self.request)
+                        self.assertEqual(caught.exception.code, 'requirements_held')
+                        self.database.rollback()
+                        self.assertEqual(self.stored()['requirement_authority'], self.item['requirement_authority'])
+                    else:
+                        self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
+                    self.assertNotIn('planning', self.stored())
+                    if boundary == 'during-load': selected.assert_called_once_with(self.request['skills'])
+                    if boundary == 'before-load':
+                        selected.assert_not_called()
+                        self.resume()
+                        result = planning.plan(self.database, self.item, self.request)
+                        self.assertEqual(result['stage'], 'planning_pending')
+                        self.assertEqual(self.stored(), result)
+                        self.assertFalse(controls.blocked(self.database, 'product', 'm1'))
 
-    def test_pause_during_planning_preparation_prevents_final_claim(self):
-        before = self.stored()
-        def load(_):
-            self.pause()
-            return {}
-        with patch.object(planning, 'resolve_planning', side_effect=load) as selected:
-            self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
-        selected.assert_called_once_with(self.request['skills'])
-        self.assertNotIn('planning', self.stored())
 
-    def test_explicit_iteration_resume_does_not_clear_revision_hold(self):
-        self.item['requirement_authority'] = {'10': {'revision': 'held'}}
-        self.persist()
-        self.pause()
-        self.resume()
-        with patch.object(planning, 'resolve_planning', return_value={}):
-            with self.assertRaises(repositories.RepositoryError) as caught:
-                planning.plan(self.database, self.item, self.request)
-        self.assertEqual(caught.exception.code, 'requirements_held')
-        self.database.rollback()
-        self.assertEqual(self.stored()['requirement_authority'], self.item['requirement_authority'])
-        self.assertNotIn('planning', self.stored())
 
     def test_pause_during_publication_read_prevents_planning_completion(self):
         self.item['planning'] = {'assignment_id': 'planning-test', 'status': 'pending',
@@ -142,58 +146,53 @@ class AdmissionBoundaryTests(unittest.TestCase):
                                for source_name, pin in {str(source): tickets.PIN, url: 'a' * 64}.items()]}
         return work, batch, execution
 
-    def test_pause_during_pinned_read_prevents_synthesis_claim(self):
-        work, _, _ = self.ticket_work()
-        before = self.stored()
-        def read(*_):
-            self.pause()
-            return work['inputs']
-        with patch.object(tickets, 'pinned_inputs', side_effect=read) as inputs:
-            self.assert_refused(lambda: tickets.synthesize(self.database, self.item, work['request'], self.github), before)
-        inputs.assert_called_once()
-        self.assertNotIn('ticket_work', self.stored())
-        self.github.request.assert_not_called()
-
-    def test_pause_during_pinned_read_prevents_synthesis_result_admission(self):
-        work, batch, execution = self.ticket_work()
-        self.item['ticket_work'] = copy.deepcopy(work)
-        self.persist()
-        before = self.stored()
-        request = {'assignment_id': work['assignment_id'], 'input_digest': work['input_digest'],
-                   'adaptation': tickets.ADAPTATION, 'execution': execution, 'tickets': batch}
-        def read(*_):
-            self.pause()
-            return work['inputs']
-        with patch.object(tickets, 'pinned_inputs', side_effect=read), patch.object(tickets, 'publish') as publish:
-            self.assert_refused(lambda: tickets.complete_synthesis(self.database, self.item, request, self.github), before)
-        publish.assert_not_called()
-        self.github.request.assert_not_called()
-
-    def test_pause_at_final_issue_list_read_prevents_publication_intent(self):
-        work, batch, execution = self.ticket_work()
-        work.update(tickets=batch, execution=execution, status='publication_pending')
-        self.item['repository_onboarding'] = {'api_base': 'https://api.github.com', 'metadata': {'id': 123}}
-        self.item['execution_allowed'] = False
-        self.item['ticket_work'] = work
-        self.item['stage'] = self.item['correlation']['stage'] = 'ticket_publication_pending'
-        self.persist()
-        board = {'project_id': 'project-test'}
-        def listed(*_):
-            self.pause()
-            return []
-        with patch.object(tickets, 'pinned_inputs', return_value=work['inputs']), \
-                patch.object(tickets, 'verified_board', return_value=board), \
-                patch.object(tickets.gh, 'rest_pages', side_effect=listed) as read:
-            with self.assertRaises(repositories.RepositoryError) as caught:
-                tickets.publish(self.database, self.item, self.github)
-        self.assertEqual(caught.exception.code, 'iteration_paused')
-        self.database.rollback()
-        stored = self.stored()
-        self.assertEqual(stored['ticket_work']['status'], 'publication_pending')
-        self.assertEqual(stored['ticket_work']['board'], board)
-        self.assertNotIn('intents', stored['ticket_work'])
-        self.assertNotIn('blocker', stored['ticket_work'])
-        self.assertEqual(stored['stage'], 'ticket_publication_pending')
-        self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
-        read.assert_called_once()
-        self.github.request.assert_not_called()
+    def test_ticket_control_admission(self):
+        baseline = copy.deepcopy(self.item)
+        template, batch, execution = self.ticket_work()
+        root = Path(self.database.execute('PRAGMA database_list').fetchone()[2]).parent
+        for boundary in ('claim', 'result', 'publication'):
+            with self.subTest(boundary=boundary):
+                self.database.close()
+                self.database = sqlite3.connect(root / ('ticket-' + boundary + '.sqlite'))
+                self.addCleanup(self.database.close)
+                self.database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+                self.item = copy.deepcopy(baseline); work = copy.deepcopy(template)
+                if boundary != 'claim': self.item['ticket_work'] = work
+                if boundary == 'publication':
+                    work.update(tickets=copy.deepcopy(batch), execution=copy.deepcopy(execution), status='publication_pending')
+                    self.item['repository_onboarding'] = {'api_base': 'https://api.github.com', 'metadata': {'id': 123}}
+                    self.item['execution_allowed'] = False
+                    self.item['stage'] = self.item['correlation']['stage'] = 'ticket_publication_pending'
+                self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
+                self.database.commit(); before = self.stored(); self.github.reset_mock()
+                request = {'assignment_id': work['assignment_id'], 'input_digest': work['input_digest'],
+                           'adaptation': tickets.ADAPTATION, 'execution': copy.deepcopy(execution), 'tickets': copy.deepcopy(batch)}
+                board = {'project_id': 'project-test'}
+                def read(*_):
+                    self.pause()
+                    return [] if boundary == 'publication' else work['inputs']
+                with patch.object(tickets, 'pinned_inputs', side_effect=read if boundary != 'publication' else None,
+                                  return_value=work['inputs']) as inputs, \
+                        patch.object(tickets, 'verified_board', return_value=board), \
+                        patch.object(tickets.gh, 'rest_pages', side_effect=read) as listed:
+                    if boundary == 'publication':
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            tickets.publish(self.database, self.item, self.github)
+                        self.assertEqual(caught.exception.code, 'iteration_paused')
+                        self.database.rollback(); stored = self.stored()
+                        self.assertEqual(stored['ticket_work']['status'], 'publication_pending')
+                        self.assertEqual(stored['ticket_work']['board'], board)
+                        self.assertNotIn('intents', stored['ticket_work']); self.assertNotIn('blocker', stored['ticket_work'])
+                        self.assertEqual(stored['stage'], 'ticket_publication_pending')
+                        self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
+                        listed.assert_called_once()
+                    else:
+                        with patch.object(tickets, 'publish') as publish:
+                            if boundary == 'claim':
+                                self.assert_refused(lambda: tickets.synthesize(self.database, self.item, work['request'], self.github), before)
+                                self.assertNotIn('ticket_work', self.stored())
+                            else:
+                                self.assert_refused(lambda: tickets.complete_synthesis(self.database, self.item, request, self.github), before)
+                            publish.assert_not_called()
+                        inputs.assert_called_once()
+                self.github.request.assert_not_called()

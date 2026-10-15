@@ -123,53 +123,77 @@ class SpendingCancellationTests(unittest.TestCase):
                 self.assertEqual(refused.exception.code, 'outcome_uncertain')
         adapter.call.assert_called_once_with(payload)
 
-    def test_stop_interrupts_idle_accept_and_unlinks_capability(self):
-        adapter = Mock(reservation=1, payload_fields={'input'})
-        def configure(component, mocks):
-            def accept():
-                component.stop.set()
-                component.targets[0]()
-                raise OSError('labeled cancelled accept')
-            component.server.accept.side_effect = accept
-        component = broker_component(self.state, self.scope, adapter, run=configure)
-        self.assert_cleanup(component)
-        adapter.call.assert_not_called()
-        adapter.cancel.assert_called_once()
-        self.assert_no_admission()
+    def test_broker_shutdown_without_admission(self):
+        for boundary in ('accept', 'partial-request', 'observer'):
+            with self.subTest(boundary=boundary):
+                adapter = Mock(reservation=1, payload_fields={'input'})
+                retained = []
+                def observer(*args):
+                    raise RuntimeError('labeled observer failure')
+                def configure(component, mocks):
+                    retained.append(component)
+                    if boundary == 'accept':
+                        def accept():
+                            component.stop.set(); component.targets[0]()
+                            raise OSError('labeled cancelled accept')
+                        component.server.accept.side_effect = accept
+                    elif boundary == 'partial-request':
+                        component.connection.recv.side_effect = [b'{"operation_id":', b'']
+                        def peer(*args):
+                            component.stop.set(); component.targets[0]()
+                            return struct.pack('3i', 123, os.getuid(), 123)
+                        component.connection.getsockopt.side_effect = peer
+                if boundary == 'observer':
+                    with self.assertRaisesRegex(RuntimeError, 'labeled observer failure'):
+                        broker_component(self.state, self.scope, adapter, observe=observer, run=configure)
+                else:
+                    broker_component(self.state, self.scope, adapter, run=configure)
+                component, = retained
+                self.assert_cleanup(component)
+                adapter.call.assert_not_called()
+                self.assert_no_admission()
+                if boundary == 'accept':
+                    adapter.cancel.assert_called_once()
+                if boundary == 'partial-request':
+                    self.assertEqual(json.loads(component.connection.sendall.call_args.args[0])['error'], 'invalid_request')
 
-    def test_stop_interrupts_partial_client_request_without_admission(self):
-        adapter = Mock(reservation=1, payload_fields={'input'})
-        def configure(component, mocks):
-            component.connection.recv.side_effect = [b'{"operation_id":', b'']
-            def peer(*args):
-                component.stop.set()
-                component.targets[0]()
-                return struct.pack('3i', 123, os.getuid(), 123)
-            component.connection.getsockopt.side_effect = peer
-        component = broker_component(self.state, self.scope, adapter, run=configure)
-        self.assert_cleanup(component)
-        self.assertEqual(json.loads(component.connection.sendall.call_args.args[0])['error'], 'invalid_request')
-        adapter.call.assert_not_called()
-        self.assert_no_admission()
 
-    def test_stop_interrupts_subscription_response_read(self):
-        self.cancellation()
 
-    def test_deadline_interrupts_active_subscription_body_and_joins_helper(self):
-        self.cancellation(deadline=True)
+    def test_active_transport_cancellation(self):
+        seed = self.state.read_bytes()
+        for label, deadline, fixture in (('subscription-stop', False, False), ('subscription-deadline', True, False), ('fixture-stop', False, True)):
+            with self.subTest(label=label):
+                self.state.write_bytes(seed)
+                self.scope = ('product', 'm1', *SUBSCRIPTION_SCOPE)
+                self.cancellation(deadline=deadline, fixture=fixture)
 
-    def test_stop_interrupts_labeled_fixture_transport_without_fabricated_completion(self):
-        self.cancellation(fixture=True)
 
-    def test_stop_during_authorization_refuses_reservation_and_outbound_io(self):
-        stop = threading.Event()
-        adapter = Mock(reservation=1, payload_fields={'input'})
-        component = broker_component(self.state, self.scope, adapter, stop=stop,
-                                     authorize=lambda db, request: stop.set())
-        self.assert_cleanup(component)
-        self.assertEqual(json.loads(component.connection.sendall.call_args.args[0])['error'], 'capability_exhausted')
-        adapter.call.assert_not_called()
-        self.assert_no_admission()
+
+
+    def test_admission_rechecks_stop_and_deadline(self):
+        lock = spending.state_lock
+        for boundary, deadline in (('authorization', False), ('lock', False), ('lock', True)):
+            with self.subTest(boundary=boundary, deadline=deadline):
+                adapter = Mock(reservation=1, payload_fields={'input'})
+                stop = threading.Event()
+                def configure(component, mocks):
+                    @contextmanager
+                    def after_wait(database):
+                        with lock(database):
+                            if deadline:
+                                component.clock[0] = 111
+                            else:
+                                stop.set()
+                            yield
+                    if boundary == 'lock':
+                        mocks.enter_context(patch.object(spending, 'state_lock', side_effect=after_wait))
+                component = broker_component(self.state, self.scope, adapter, stop=stop, run=configure,
+                    authorize=(lambda db, request: stop.set()) if boundary == 'authorization' else None)
+                self.assert_cleanup(component)
+                self.assertEqual(json.loads(component.connection.sendall.call_args.args[0])['error'], 'capability_exhausted')
+                adapter.call.assert_not_called()
+                self.assert_no_admission()
+
 
     def after_lock(self, deadline=False):
         adapter = Mock(reservation=1, payload_fields={'input'})
@@ -191,24 +215,8 @@ class SpendingCancellationTests(unittest.TestCase):
         adapter.call.assert_not_called()
         self.assert_no_admission()
 
-    def test_stop_is_rechecked_after_controller_lock_wait(self):
-        self.after_lock()
 
-    def test_deadline_is_rechecked_after_controller_lock_wait(self):
-        self.after_lock(deadline=True)
 
-    def test_request_observer_failure_joins_helper_and_unlinks_capability(self):
-        adapter = Mock(reservation=1, payload_fields={'input'})
-        retained = []
-        def configure(component, mocks):
-            retained.append(component)
-        def observer(*args):
-            raise RuntimeError('labeled observer failure')
-        with self.assertRaisesRegex(RuntimeError, 'labeled observer failure'):
-            broker_component(self.state, self.scope, adapter, observe=observer, run=configure)
-        self.assert_cleanup(retained[0])
-        adapter.call.assert_not_called()
-        self.assert_no_admission()
 
 
 if __name__ == '__main__':

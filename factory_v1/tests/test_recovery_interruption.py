@@ -21,7 +21,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
             function(*args)
         self.assertEqual(caught.exception.code, 'iteration_paused')
 
-    def test_registration_pause_after_final_issue_read_leaves_no_authority_or_parked_claim(self):
+    def test_registration_final_read_pause_matrix(self):
         original = self.stored()
         def read(*args):
             self.pause()
@@ -32,18 +32,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.assertEqual(assignments.rows(self.db), [])
         self.github.request.assert_not_called()
 
-    def test_pause_after_final_frontier_read_admits_no_repair_assignment(self):
-        self.seed_registered()
-        before = self.stored()
-        def read(*args):
-            self.pause()
-            return copy.deepcopy(self.issue)
-        self.reader.side_effect = read
-        self.refused(self.prepare)
-        self.assertEqual(self.stored(), before)
-        self.assertEqual(assignments.rows(self.db), [])
-
-    def test_pause_on_recovery_result_revalidation_admits_no_result(self):
+    def test_prepare_and_result_final_read_pause_matrix(self):
         prepared = self.seed_assignment()
         handoff = prepared['handoff']
         loads = {s['source']: s['sha256'] for s in handoff['skills']} | handoff['input_loads']
@@ -52,15 +41,47 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
                   'loads': [{'source': source, 'sha256': pin, 'tool_reference': 'SIMULATED read'} for source, pin in loads.items()],
                   'work': ['SIMULATED untrusted result'], 'artifacts': [simplification.artifact('stage-evidence', 'fixture')],
                   'tests': [{'command': 'SIMULATED command', 'result': 'SIMULATED no native execution'}]}
+        interruptions = []
         def read(*args):
             self.pause()
+            interruptions.append(True)
             return copy.deepcopy(self.issue)
         self.reader.side_effect = read
-        with self.preparation_seams():
-            self.refused(assignments.store_result, self.db, 'p', 'i', '42', prepared['assignment_id'], result, self.github)
-        self.assertNotIn('submitted_result', assignments.rows(self.db)[0])
+        baseline = self.stored()
+        with self.db:
+            self.db.execute('DELETE FROM role_assignments')
+        for label, seam, args in [
+            ('prepare', self.prepare, ()),
+            ('result', assignments.store_result, (self.db, 'p', 'i', '42', prepared['assignment_id'], result, self.github)),
+        ]:
+            with self.subTest(boundary=label):
+                _, control_path = controls.paths(self.db, 'p', 'i')
+                assert control_path is not None
+                control_path.unlink(missing_ok=True)
+                item = copy.deepcopy(baseline)
+                if label == 'prepare':
+                    record = recovery.active(item)
+                    assert record is not None
+                    record.update(status='registered', assignment=None)
+                    item['main_incident']['recovery_assignment'] = assignments.digest(self.authorization)
+                with self.db:
+                    self.db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+                    self.db.execute('UPDATE delivery_incidents SET payload=?', (json.dumps(item['main_incident']),))
+                    if label == 'result':
+                        self.db.execute('INSERT INTO role_assignments VALUES (?,?)', (prepared['assignment_id'], json.dumps(prepared)))
+                before = self.stored()
+                prior_interruptions = len(interruptions)
+                with self.preparation_seams():
+                    self.refused(seam, *args)
+                self.assertGreater(len(interruptions), prior_interruptions)
+                self.assertEqual(self.stored(), before)
+                rows = assignments.rows(self.db)
+                if label == 'prepare':
+                    self.assertEqual(rows, [])
+                else:
+                    self.assertNotIn('submitted_result', rows[0])
 
-    def test_pause_after_last_clearance_context_read_keeps_incident_and_parked_ownership(self):
+    def test_clearance_final_read_pause_matrix(self):
         self.seed_registered()
         config = {'recovery': {'incident_id': self.authorization['incident_id'], 'implementation_assignment': 'x'},
                   'head': 'b' * 40, 'api_base': self.github.base, 'required_checks': self.config['required_checks']}
@@ -89,7 +110,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.assertIsNotNone(self.stored()['main_incident'])
         self.assertEqual(recovery.active(self.stored())['status'], 'registered')
 
-    def test_pause_at_last_recovery_merge_boundary_prevents_intent_and_put(self):
+    def test_merge_final_boundary_pause_matrix(self):
         assignment, report, result, artifacts = self.completed_report()
         config = {'recovery': {'incident_id': self.authorization['incident_id'],
                   'implementation_assignment': assignment['assignment_id'], 'issue': 20, 'removed_assignments': []},
@@ -123,7 +144,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         api.request.assert_not_called()
         self.assertNotIn('merge', assignments.rows(self.db)[0])
 
-    def test_pause_and_emergency_stop_public_dispatch_ignore_controller_lock(self):
+    def test_public_stop_ignores_controller_lock_matrix(self):
         state = self.root / 'state.sqlite'
         for action in ('pause', 'emergency-stop'):
             argv = ['factory_v1', '--state', str(state), '--operator-id', '42', action,
@@ -135,7 +156,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
             self.assertNotIn('main_recoveries', self.stored())
         self.github.request.assert_not_called()
 
-    def test_pause_after_reopen_retains_receipt_but_admits_no_status_intent(self):
+    def test_reopen_posteffect_pause_matrix(self):
         prior, issue = self.delivered_ticket()
         self.seed_registered()
         field, member = self.tracker_for_removed(issue)
@@ -155,7 +176,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         field.assert_not_called()
         self.assertEqual(self.github.request.call_count, 1)
 
-    def test_pause_after_status_effect_keeps_membership_dependency_and_delivery_receipts(self):
+    def test_status_posteffect_pause_matrix(self):
         prior, issue = self.delivered_ticket()
         self.seed_registered()
         field, member = self.tracker_for_removed(issue)
@@ -174,7 +195,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.assertIsNotNone(self.stored()['main_incident'])
         self.assertEqual(field.call_count, 1)
 
-    def test_pause_during_membership_read_prevents_reopen_intent_and_write(self):
+    def test_membership_preintent_pause_matrix(self):
         prior, issue = self.delivered_ticket()
         self.seed_registered()
         def membership(*args):

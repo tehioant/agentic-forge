@@ -15,6 +15,9 @@ Instructions for any AI agent (Warp/Oz, Claude, or equivalent) working in this r
 
 ## Verification Policy
 
+- Keep routine tests simple, fast and deterministic: unit tests and small focused components with mocked external boundaries. Do not add or run E2E tests, full worker/controller journeys (including simulated chains), real services or containers unless Antoine explicitly changes this policy.
+- Preserve core behavior and distinct safety regressions. Remove genuinely duplicated coverage and repeated setup, not just test names; do not hide tests, weaken assertions, add sharding/retries or raise/remove timeouts to obtain green checks. Use `mise run test` for the complete policy-compliant suite and report unrun or incomplete checks honestly.
+- Keep the complete discovered suite at or below 500 test methods. Consolidate closely related cases into small, named matrices with isolated state and meaningful assertions, not wrapper tests or discovery filters. Report retained parameterized cases separately from discovered methods; a lower method count is not evidence of less execution work.
 - For ticket completion and test planning, follow the implementation-ticket verification policy in `docs/specs/fresh-agentic-factory.md`. Use meaningful automated tests, independent review and integrated CI; configure deployment requirements in the project specs rather than adding a live deployment/outage/recovery exercise to each ticket.
 
 ## Plan Mode

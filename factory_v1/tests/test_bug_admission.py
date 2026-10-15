@@ -129,166 +129,163 @@ class BugAdmissionTests(unittest.TestCase):
     def publish(self):
         return bugs.publish(self.database, self.item, {'assignment_id': self.work['assignment_id']}, self.github)
 
-    def test_final_duplicate_search_prevents_new_synthesis_claim(self):
-        self.item.pop('bug_work')
-        self.save()
-        self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
-        before = self.stored()
-        after = self.assert_paused(lambda: bugs.synthesize(self.database, self.item, {
-            'discovery_id': 'observer', 'skill': 'fixture:to-tickets', 'discovery': self.discovery}, self.github))
-        self.assertNotIn('bug_work', self.requested)
-        self.assertEqual(after, before)
-        self.assertNotIn('bug_discoveries', after)
+    def admission_case(self, label):
+        from contextlib import contextmanager
+        @contextmanager
+        def isolated():
+            names = ('item', 'work', 'bug', 'discovery', 'affected', 'issue', 'issues', 'dependencies', 'member')
+            original = {name: getattr(self, name) for name in names}
+            cloned = copy.deepcopy(original)
+            original_db = self.database
+            path = Path(tempfile.mkdtemp()) / 'row.sqlite'
+            self.addCleanup(__import__('shutil').rmtree, path.parent)
+            self.database = sqlite3.connect(path); original_db.backup(self.database)
+            mocks = (self.context, self.observations, self.read_issue, self.membership, self.read_dependencies,
+                     self.frontier, *self.mutations)
+            settings = [(mock, mock.side_effect, mock.return_value) for mock in mocks]
+            for name, value in cloned.items(): setattr(self, name, value)
+            self.observations.return_value = [*self.work['candidates'], {'issue': self.issue}]
+            for mock in mocks: mock.reset_mock()
+            try:
+                yield
+            finally:
+                self.database.close(); self.database = original_db
+                for name, value in original.items(): setattr(self, name, value)
+                for mock, effect, value in settings:
+                    mock.side_effect = effect; mock.return_value = value; mock.reset_mock()
+        return isolated()
 
-    def test_pinned_read_prevents_new_discovery_alias(self):
-        key = bugs.fingerprint(self.discovery, self.item)
-        self.item['bug_work'] = {key: self.work}
-        self.item['bug_discoveries'] = {'original-observer': {'key': key, 'request_digest': 'original-request'}}
-        self.save()
-        self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
-        before = self.stored()
-        after = self.assert_paused(lambda: bugs.synthesize(self.database, self.item, {
-            'discovery_id': 'new-observer', 'skill': 'fixture:to-tickets', 'discovery': self.discovery}, self.github))
-        self.assertEqual(after, before)
-        self.assertEqual(after['bug_discoveries'], before['bug_discoveries'])
-        self.observations.assert_not_called()
+    def test_bug_claim_control_admission(self):
+        for label in ('new-claim', 'existing-alias'):
+            with self.subTest(label=label), self.admission_case(label):
+                if label == 'new-claim':
+                    self.item.pop('bug_work')
+                    self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
+                else:
+                    key = bugs.fingerprint(self.discovery, self.item)
+                    self.item['bug_work'] = {key: self.work}
+                    self.item['bug_discoveries'] = {'original-observer': {'key': key, 'request_digest': 'original-request'}}
+                    self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
+                self.save(); before = self.stored()
+                after = self.assert_paused(lambda: bugs.synthesize(self.database, self.item, {
+                    'discovery_id': 'observer' if label == 'new-claim' else 'new-observer',
+                    'skill': 'fixture:to-tickets', 'discovery': self.discovery}, self.github))
+                self.assertEqual(after, before)
+                if label == 'new-claim':
+                    self.assertNotIn('bug_work', self.requested); self.assertNotIn('bug_discoveries', after)
+                else:
+                    self.assertEqual(after['bug_discoveries'], before['bug_discoveries']); self.observations.assert_not_called()
 
-    def test_pinned_read_prevents_result_admission(self):
-        self.work['status'] = 'synthesis_pending'
-        self.work.pop('bug')
-        evidence = self.work.pop('execution')
-        self.save()
-        self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
-        before = self.stored()
-        after = self.assert_paused(lambda: bugs.complete(self.database, self.item, {
-            'assignment_id': self.work['assignment_id'], 'input_digest': self.work['input_digest'],
-            'adaptation': bugs.ADAPTATION, 'execution': evidence, 'bug': self.bug}, self.github))
-        self.assertEqual(after, before)
-        self.assertNotIn('completion_digest', after['bug_work']['defect'])
-        self.observations.assert_not_called()
 
-    def test_final_duplicate_search_prevents_new_issue_intent(self):
-        evidence = copy.deepcopy(self.work['execution'])
-        request = {'assignment_id': self.work['assignment_id'], 'input_digest': self.work['input_digest'],
-                   'adaptation': bugs.ADAPTATION, 'execution': evidence, 'bug': self.bug}
-        self.work['completion_digest'] = tickets.digest(request)
-        self.save()
-        self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
-        after = self.assert_paused(self.publish)
-        work = after['bug_work']['defect']
-        self.assertEqual(work, self.requested['bug_work']['defect'])
-        self.assertEqual(work['status'], 'publication_pending')
-        self.assertEqual(work['execution'], evidence)
-        self.assertEqual(work['completion_digest'], tickets.digest(request))
-        self.assertNotIn('issue_intent', work)
 
-    def test_admitted_issue_response_retains_receipt_without_next_intent(self):
-        self.observations.return_value = self.work['candidates']
-        self.github.request.side_effect = lambda *args: self.pause(self.issue)
-        self.membership.return_value = None
-        self.membership.side_effect = None
-        after = self.assert_paused(self.publish)
-        self.assertIn('issue_intent', self.requested['bug_work']['defect'])
-        self.assertNotIn('identity', self.requested['bug_work']['defect'])
-        work = after['bug_work']['defect']
-        self.assertEqual(work['identity'], {'number': 13, 'id': 1013, 'node_id': 'I13'})
-        self.assertEqual(work['issue_intent']['body'], self.issue['body'])
-        self.assertNotIn('membership_intent', work)
-        self.github.request.assert_called_once()
-        self.add_item.assert_not_called()
+    def test_bug_result_and_issue_control_admission(self):
+        for boundary in ('result', 'issue-intent'):
+            with self.subTest(boundary=boundary), self.admission_case(boundary):
+                evidence = copy.deepcopy(self.work['execution'])
+                request = {'assignment_id': self.work['assignment_id'], 'input_digest': self.work['input_digest'],
+                           'adaptation': bugs.ADAPTATION, 'execution': evidence, 'bug': self.bug}
+                if boundary == 'result':
+                    self.work['status'] = 'synthesis_pending'; self.work.pop('bug'); self.work.pop('execution')
+                    self.context.side_effect = lambda *args, **kwargs: self.pause((self.inputs, self.board, {'10': self.inputs}))
+                else:
+                    self.work['completion_digest'] = tickets.digest(request)
+                    self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
+                self.save(); before = self.stored()
+                operation = (lambda: bugs.complete(self.database, self.item, request, self.github)) if boundary == 'result' else self.publish
+                after = self.assert_paused(operation)
+                if boundary == 'result':
+                    self.assertEqual(after, before); self.assertNotIn('completion_digest', after['bug_work']['defect'])
+                    self.observations.assert_not_called()
+                else:
+                    work = after['bug_work']['defect']
+                    self.assertEqual(work, self.requested['bug_work']['defect'])
+                    self.assertEqual(work['status'], 'publication_pending'); self.assertEqual(work['execution'], evidence)
+                    self.assertEqual(work['completion_digest'], tickets.digest(request)); self.assertNotIn('issue_intent', work)
 
-    def test_native_blocker_read_prevents_new_edge_intent(self):
-        self.bug['blockers'] = [12]
-        self.work['candidates'].append({'issue': {'number': 12, 'id': 1012, 'node_id': 'I12'}})
-        self.issue['body'] = bugs.render(self.item, self.work)
-        self.save()
-        self.read_dependencies.side_effect = lambda *args: self.pause([])
-        after = self.assert_paused(self.publish)
-        work = after['bug_work']['defect']
-        self.assertEqual(work['identity']['number'], 13)
-        self.assertNotIn('edge_intents', work)
-        self.add_dependency.assert_not_called()
 
-    def test_membership_read_prevents_new_membership_intent(self):
-        self.membership.side_effect = lambda *args: self.pause(None)
-        after = self.assert_paused(self.publish)
-        self.assertNotIn('membership_intent', after['bug_work']['defect'])
-        self.add_item.assert_not_called()
 
-    def test_membership_read_prevents_new_field_intent(self):
-        self.member['status'] = None
-        reads = 0
+    def test_bug_issue_and_membership_control_admission(self):
+        for boundary in ('issue-response', 'membership', 'field'):
+            with self.subTest(boundary=boundary), self.admission_case(boundary):
+                if boundary == 'issue-response':
+                    self.observations.return_value = self.work['candidates']
+                    self.github.request.side_effect = lambda *args: self.pause(self.issue)
+                    self.membership.return_value = None; self.membership.side_effect = None
+                elif boundary == 'membership':
+                    self.membership.side_effect = lambda *args: self.pause(None)
+                else:
+                    self.member['status'] = None; reads = []
+                    def membership(*args):
+                        reads.append(True)
+                        return None if len(reads) == 1 else self.pause(self.member)
+                    self.membership.side_effect = membership; self.add_item.side_effect = None
+                after = self.assert_paused(self.publish); work = after['bug_work']['defect']
+                if boundary == 'issue-response':
+                    self.assertIn('issue_intent', self.requested['bug_work']['defect'])
+                    self.assertNotIn('identity', self.requested['bug_work']['defect'])
+                    self.assertEqual(work['identity'], {'number': 13, 'id': 1013, 'node_id': 'I13'})
+                    self.assertEqual(work['issue_intent']['body'], self.issue['body']); self.github.request.assert_called_once()
+                if boundary != 'field':
+                    self.assertNotIn('membership_intent', work); self.add_item.assert_not_called()
+                else:
+                    self.assertTrue(work['membership_intent']); self.assertNotIn('field_intents', work)
+                    self.add_item.assert_called_once_with(self.github, 'P1', 'I13'); self.set_field.assert_not_called()
+                    self.assertIsNone(self.member['status'])
 
-        def membership(*args):
-            nonlocal reads
-            reads += 1
-            return None if reads == 1 else self.pause(self.member)
 
-        self.membership.side_effect = membership
-        self.add_item.side_effect = None
-        after = self.assert_paused(self.publish)
-        self.assertTrue(after['bug_work']['defect']['membership_intent'])
-        self.assertNotIn('field_intents', after['bug_work']['defect'])
-        self.add_item.assert_called_once_with(self.github, 'P1', 'I13')
-        self.set_field.assert_not_called()
-        self.assertIsNone(self.member['status'])
+    def test_bug_edge_control_admission(self):
+        for boundary in ('bug-blocker', 'affected-blocker'):
+            with self.subTest(boundary=boundary), self.admission_case(boundary):
+                body = self.affected['body']; target = body.replace('None (can start immediately).', '- #13')
+                if boundary == 'bug-blocker':
+                    self.bug['blockers'] = [12]
+                    self.work['candidates'].append({'issue': {'number': 12, 'id': 1012, 'node_id': 'I12'}})
+                    self.issue['body'] = bugs.render(self.item, self.work); self.save()
+                    self.read_dependencies.side_effect = lambda *args: self.pause([])
+                else:
+                    self.github.request.side_effect = lambda path, payload, method: self.affected.update(payload)
+                    self.read_dependencies.side_effect = lambda gh, repo, number: self.pause([]) if number == 10 else []
+                after = self.assert_paused(self.publish); work = after['bug_work']['defect']
+                self.add_dependency.assert_not_called()
+                if boundary == 'bug-blocker':
+                    self.assertEqual(work['identity']['number'], 13); self.assertNotIn('edge_intents', work)
+                else:
+                    self.assertEqual(work['affected_intents']['10'], {'before': body, 'body': target})
+                    self.assertEqual(work.get('edge_intents', []), []); self.assertEqual(self.affected['body'], target)
+                    self.github.request.assert_called_once_with('/repos/example/product/issues/10', {'body': target}, method='PATCH')
 
-    def test_affected_issue_read_prevents_new_body_intent(self):
-        body = self.affected['body']
 
-        def read_issue(gh, repo, number):
-            return self.pause(self.affected) if number == 10 else copy.deepcopy(self.issue)
 
-        self.read_issue.side_effect = read_issue
-        after = self.assert_paused(self.publish)
-        self.assertNotIn('affected_intents', after['bug_work']['defect'])
-        self.assertEqual(self.affected['body'], body)
-        self.github.request.assert_not_called()
 
-    def test_affected_native_read_prevents_new_edge_intent(self):
-        body = self.affected['body']
-        target = body.replace('None (can start immediately).', '- #13')
-        self.github.request.side_effect = lambda path, payload, method: self.affected.update(payload)
+    def test_bug_affected_observation_control_admission(self):
+        for boundary in ('body-intent', 'final-observation'):
+            with self.subTest(boundary=boundary), self.admission_case(boundary):
+                body = self.affected['body']; target = body.replace('None (can start immediately).', '- #13')
+                if boundary == 'body-intent':
+                    self.read_issue.side_effect = lambda gh, repo, number: self.pause(self.affected) if number == 10 else copy.deepcopy(self.issue)
+                else:
+                    self.work['affected_intents'] = {'10': {'before': body, 'body': target}}; self.affected['body'] = target
+                    self.dependencies[10] = [{'number': 13, 'id': 1013, 'node_id': 'I13'}]; self.save()
+                    reads = []
+                    def dependencies(gh, repo, number):
+                        if number == 10:
+                            reads.append(True)
+                            if len(reads) == 3: return self.pause(self.dependencies[10])
+                        return copy.deepcopy(self.dependencies[number])
+                    self.read_dependencies.side_effect = dependencies
+                after = self.assert_paused(self.publish); work = after['bug_work']['defect']
+                self.github.request.assert_not_called()
+                if boundary == 'body-intent':
+                    self.assertNotIn('affected_intents', work); self.assertEqual(self.affected['body'], body)
+                else:
+                    self.assertEqual(work['status'], 'publication_pending'); self.assertNotIn('publication_complete', work)
+                    self.assertNotIn('observation', self.requested['bug_work']['defect'])
+                    self.assertEqual(work['observation']['issue'], self.issue); self.assertEqual(work['observation']['membership']['status'], 'todo')
+                    self.assertEqual(self.affected['body'], target)
+                    self.assertEqual(self.dependencies[10], [{'number': 13, 'id': 1013, 'node_id': 'I13'}])
 
-        def dependencies(gh, repo, number):
-            return self.pause([]) if number == 10 else []
 
-        self.read_dependencies.side_effect = dependencies
-        after = self.assert_paused(self.publish)
-        self.assertEqual(after['bug_work']['defect']['affected_intents']['10'], {'before': body, 'body': target})
-        self.assertEqual(after['bug_work']['defect'].get('edge_intents', []), [])
-        self.assertEqual(self.affected['body'], target)
-        self.github.request.assert_called_once_with('/repos/example/product/issues/10', {'body': target}, method='PATCH')
-        self.add_dependency.assert_not_called()
 
-    def test_final_affected_read_retains_observation_without_advancement(self):
-        body = self.affected['body']
-        target = body.replace('None (can start immediately).', '- #13')
-        self.work['affected_intents'] = {'10': {'before': body, 'body': target}}
-        self.affected['body'] = target
-        self.dependencies[10] = [{'number': 13, 'id': 1013, 'node_id': 'I13'}]
-        self.save()
-        reads = 0
-
-        def dependencies(gh, repo, number):
-            nonlocal reads
-            if number == 10:
-                reads += 1
-                if reads == 3:  # Two edge readbacks, then the final affected observation.
-                    return self.pause(self.dependencies[10])
-            return copy.deepcopy(self.dependencies[number])
-
-        self.read_dependencies.side_effect = dependencies
-        after = self.assert_paused(self.publish)
-        work = after['bug_work']['defect']
-        self.assertEqual(work['status'], 'publication_pending')
-        self.assertNotIn('publication_complete', work)
-        self.assertNotIn('observation', self.requested['bug_work']['defect'])
-        self.assertEqual(work['observation']['issue'], self.issue)
-        self.assertEqual(work['observation']['membership']['status'], 'todo')
-        self.assertEqual(self.affected['body'], target)
-        self.assertEqual(self.dependencies[10], [{'number': 13, 'id': 1013, 'node_id': 'I13'}])
-        self.github.request.assert_not_called()
 
     def test_explicit_resume_reopens_only_admission_and_reuses_publication(self):
         body = self.affected['body']
