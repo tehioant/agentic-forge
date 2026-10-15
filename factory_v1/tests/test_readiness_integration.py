@@ -7,16 +7,15 @@ from unittest.mock import Mock
 
 from factory_v1 import assignments, controls, effect_resolution, merge, planning, readiness_gate, tickets
 from factory_v1.repositories import RepositoryError
-from factory_v1.tests.test_readiness_effects import OperationIntegrationTests
-from factory_v1.tests.test_readiness import CoreReadinessTests, SupervisedFixture
+from factory_v1.tests import test_readiness as readiness_fixtures, test_readiness_effects as effect_fixtures
 
 
-class CombinedReadinessTests(SupervisedFixture, unittest.TestCase):
-    setUp = OperationIntegrationTests.setUp
-    file = CoreReadinessTests.file
-    save = CoreReadinessTests.save
-    read = CoreReadinessTests.read
-    record = CoreReadinessTests.record
+class CombinedReadinessTests(readiness_fixtures.SupervisedFixture, unittest.TestCase):
+    setUp = effect_fixtures.OperationIntegrationTests.setUp
+    file = readiness_fixtures.CoreReadinessTests.file
+    save = readiness_fixtures.CoreReadinessTests.save
+    read = readiness_fixtures.CoreReadinessTests.read
+    record = readiness_fixtures.CoreReadinessTests.record
 
     def test_real_nested_checkpoint_with_terminal_slots_and_zero_allowance(self):
         for slot in self.config['slots']:
