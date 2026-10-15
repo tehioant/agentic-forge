@@ -155,7 +155,7 @@ def supervise(database, item, path, github, *, stop_event=None):
             fresh['handoff'] == fresh_handoff and fresh['planning'].get('native_wakeup') == request,
             'Fresh immutable publication/native completion changed.', 'execution_required')
     fresh['planning']['native_wakeup'].update(status='consumed', receipt=expected)
-    planning.checkpoint(database, fresh)
+    planning.checkpoint(database, fresh, operation='effect')
     return 'consumed'
 
 

@@ -128,9 +128,9 @@ def validate_documents(docs):
                 for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
 
 
-def checkpoint(database, item, *, resolution=None):
+def checkpoint(database, item, *, resolution=None, operation='work'):
     from .controls import admission
-    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution):
+    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation=operation):
         require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
         save_iteration(database, item)
         database.commit()
@@ -224,7 +224,7 @@ def complete(database, item, request, github, *, native_execution=None, native_g
         planning['pending_questions'] = pending
         planning['judgment'] = {key: request[key] for key in ('sufficient', 'rationale', 'reference')}
         transition(item, 'planning_pending')
-        checkpoint(database, item)
+        checkpoint(database, item, operation='effect')
         return item
     require(not pending, 'Missing answers cannot be replaced by an agent sufficiency assertion.')
     docs = request['documents']
@@ -249,7 +249,7 @@ def complete(database, item, request, github, *, native_execution=None, native_g
     planning['completion_digest'] = digest
     item['handoff'] = handoff
     transition(item, 'planning_complete')
-    checkpoint(database, item)
+    checkpoint(database, item, operation='effect')
     return item
 
 

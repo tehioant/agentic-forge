@@ -275,7 +275,11 @@ def local_check(database, project, iteration, observation, resolution, selection
         excluded.add('delivery')
     if resolution is not None:
         from .effect_resolution import permitted
-        if permitted(database, project, iteration, resolution):
+        allowed = permitted(database, project, iteration, resolution)
+        if resolution.kind == 'merge-reopen':
+            require(operation == 'effect' and selection == {'merge_reopen': resolution.target},
+                    'Corrective authority permits only exact reopening.', 'scope_mismatch')
+        if allowed:
             excluded |= {'capacity', 'spending', 'delivery'}
     require(all(v['state'] == 'ready' for k, v in report['checks'].items() if k not in excluded),
             'Current operation capabilities unavailable.', 'readiness_blocked')
@@ -318,7 +322,11 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
         excluded.add('delivery')
     if resolution is not None:
         from .effect_resolution import permitted
-        if permitted(database, project, iteration, resolution):
+        allowed = permitted(database, project, iteration, resolution)
+        if resolution.kind == 'merge-reopen':
+            require(operation == 'effect' and selection == {'merge_reopen': resolution.target},
+                    'Corrective authority permits only exact reopening.', 'scope_mismatch')
+        if allowed:
             # Exact previously-authorized effect resolution needs no NEW worker
             # allowance, unused slot or healthy deployment. All other gates stay.
             excluded |= {'capacity', 'spending', 'delivery'}
@@ -330,6 +338,10 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
 
 def validate_selection(database, config, selected, selection, *, operation='work'):
     if selection is None:
+        return
+    if 'merge_reopen' in selection:
+        require(operation == 'effect' and set(selection) == {'merge_reopen'},
+                'Only corrective reopening may use this selection.', 'scope_mismatch')
         return
     if 'native_config' in selection:
         from . import planning_wakeup

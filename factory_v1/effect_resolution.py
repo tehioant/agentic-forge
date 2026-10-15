@@ -17,6 +17,25 @@ class EffectResolution:
 
 
 def authority(item, rows, kind, target):
+    if kind == 'merge-reopen':
+        row = next((a for a in rows if a['assignment_id'] == target), None)
+        journal = row.get('merge', {}) if row else {}
+        config = journal.get('authority', {})
+        require(row is not None and journal.get('status') in {'pending', 'merged', 'incomplete'} and
+                journal.get('close_allowed') is False and
+                row['ticket_scope']['project'] == item['project_id'] and
+                row['ticket_scope']['iteration'] == item['iteration_id'] and
+                config.get('candidate_assignment') == target and
+                config.get('operator_id') == item['approval']['operator_id'] and
+                config.get('repository') == item['repository'] == row['handoff']['repository'] and
+                config.get('repository_id') == item['repository_onboarding']['metadata']['id'] == row['handoff']['repository_id'] and
+                config.get('api_base') == item['repository_onboarding']['api_base'] and
+                config.get('issue') == row['ticket_scope']['issue_number'] == row['handoff']['issue']['number'] and
+                assignments.commit(config.get('head')) and assignments.commit(config.get('baseline')) and
+                type(config.get('pr_number')) is int and config['pr_number'] > 0,
+                'Exact incomplete merge authority required for corrective reopening.', 'scope_mismatch')
+        assert row is not None
+        return [row['handoff'], row['revision'], journal]
     if kind == 'delivered-retirement':
         row = next((a for a in rows if a['assignment_id'] == target), None)
         require(row is not None and row.get('merge', {}).get('status') == 'delivered' and
@@ -80,6 +99,8 @@ def permitted(database, project, iteration, resolution):
     require(item['status'] == 'active', 'Paused/out-of-iteration effects remain held.', 'iteration_paused')
     require(resolution.authority == pinned_authority(database, item, resolution.kind, resolution.target),
             'Persisted effect authority changed.', 'stale_admission')
+    if resolution.kind == 'merge-reopen':
+        return {('delivery', 'corrective_reopen')}
     if not resolution.resolving:
         return set()
     if resolution.kind == 'delivered-retirement':

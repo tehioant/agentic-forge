@@ -272,7 +272,7 @@ def complete(database, item, request, github):
     work.update(bug=request['bug'], execution=evidence, completion_digest=completion_digest, duplicate_number=duplicate)
     if work['status'] == 'synthesis_pending':
         work['status'] = 'publication_pending'
-    tickets.admitted_checkpoint(database, item)
+    tickets.effect_checkpoint(database, item)
     return publish_locked(database, item, work, github)
 
 

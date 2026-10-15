@@ -258,8 +258,25 @@ def issue(api, assignment, config):
 def reopen(api, assignment, config, observed, *, database):
     if observed['state'] != 'closed':
         return
+    from .effect_resolution import bound
+    project, iteration = (assignment['ticket_scope'][k] for k in ('project', 'iteration'))
+    item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
+    resolution = bound(database, item, 'merge-reopen', assignment['assignment_id'])
+    saved = next(a for a in assignments.rows(database) if a['assignment_id'] == assignment['assignment_id'])
+    require(saved['merge']['authority'] == {k: v for k, v in config.items() if k != 'bearer'},
+            'Corrective reopen authority changed.', 'scope_mismatch')
+    repo = api.read('')
+    require(repo.get('id') == config['repository_id'] and repo.get('full_name') == config['repository'] and
+            repo.get('default_branch') == config['base'], 'Corrective repository changed.', 'scope_mismatch')
+    pr = target(api, config)
+    require(pr.get('merged') is True and pr.get('state') == 'closed' and assignments.commit(pr.get('merge_commit_sha')),
+            'Corrective reopening requires the exact integrated PR.', 'not_integrated')
     from .readiness_gate import check
-    check(database, assignment['ticket_scope']['project'], assignment['ticket_scope']['iteration'], operation='effect')
+    check(database, project, iteration, operation='effect', resolution=resolution,
+          selection={'merge_reopen': assignment['assignment_id']})
+    require(issue(api, saved, config) == observed, 'Corrective issue changed before reopening.', 'scope_mismatch')
+    from .controls import require_active
+    require_active(database, project, iteration, resolution=resolution)
     try:
         api.issue_state('open', observed)
     except RepositoryError:

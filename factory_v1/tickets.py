@@ -268,7 +268,7 @@ def complete_synthesis(database, item, request, github):
     if not already_completed:
         work['status'] = 'publication_pending'
     transition(item, 'ticket_publication_pending')
-    admitted_checkpoint(database, item)
+    effect_checkpoint(database, item)
     return publish(database, item, github)
 
 
@@ -326,8 +326,8 @@ def effect_checkpoint(database, item, *, resolution=None):
     with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation='effect'):
         require_active(database, item['project_id'], item['iteration_id'], resolution=resolution)
         require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
-        save_iteration(database, item)
-        database.commit()
+        from .planning import checkpoint as planning_checkpoint
+        planning_checkpoint(database, item, resolution=resolution, operation='effect')
 
 
 def publication_blocked(database, item, error, *, resolution, bug=None):
@@ -337,7 +337,7 @@ def publication_blocked(database, item, error, *, resolution, bug=None):
     work = fresh['ticket_work'] if bug is None else fresh['bug_work'][bug]
     work.update(status='blocked', blocker={'code': error.code, 'message': str(error)})
     transition(fresh, 'ticket_publication_blocked' if bug is None else 'bug_tracking_blocked')
-    checkpoint(database, fresh)
+    effect_checkpoint(database, fresh, resolution=resolution)
     original = item['ticket_work'] if bug is None else item['bug_work'][bug]
     original.update(status=work['status'], blocker=work['blocker'])
     return fresh
@@ -483,7 +483,7 @@ def frontier(database, item, github, *, resolution=None):
     if resolution is None:
         checkpoint(database, item)  # Finish reconciliation before scoped read-only copies.
     else:
-        admitted_checkpoint(database, item, resolution=resolution)
+        effect_checkpoint(database, item, resolution=resolution)
     board = verified_board(work, github, item['repository'], item['iteration_id'])
     status_options = {board['status']['options'][name]: role for role, name in work['request']['tracker']['statuses'].items()}
     rows = {}
