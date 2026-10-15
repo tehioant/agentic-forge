@@ -245,7 +245,9 @@ class SynthesisAdmissionTests(unittest.TestCase):
         self.complete.assert_not_called()
 
     def test_revision_spawn_uses_existing_checkpoint_hold_semantics(self):
-        record = {'status': 'resolved', 'affected': [10], 'requirements': {'10': 'changed'}}
+        self.item['execution_allowed'] = False
+        record = {'request': {'change_id': 'change'}, 'status': 'resolved',
+                  'affected': [10], 'requirements': {'10': 'changed'}}
         self.item['requirement_changes'] = {'change': record}
         observed = []
         def approved(_config, _work, *, cancelled, admission):
