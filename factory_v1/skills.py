@@ -49,3 +49,13 @@ def resolve(configuration, *, pins=None, installed=False):
 
 def resolve_installed(configuration):
     return resolve(configuration, pins=INSTALLED_PINS, installed=True)
+
+
+def resolve_planning(configuration):
+    """Admit installed reviewed sources; retain explicit historical snapshots."""
+    if isinstance(configuration, list) and any(isinstance(row, dict) and
+            isinstance(row.get('name'), str) and
+            row.get('path') == str(INSTALLED_ROOT / row['name'] / 'SKILL.md')
+            for row in configuration):
+        return resolve_installed(configuration)
+    return resolve(configuration)

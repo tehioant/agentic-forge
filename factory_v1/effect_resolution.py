@@ -17,6 +17,14 @@ class EffectResolution:
 
 
 def authority(item, rows, kind, target):
+    if kind == 'delivered-retirement':
+        row = next((a for a in rows if a['assignment_id'] == target), None)
+        require(row is not None and row.get('merge', {}).get('status') == 'delivered' and
+                row['merge'].get('close_allowed') is True and row['merge'].get('failure') is None and
+                (item.get('reservation', {}).get('issue_number') == row['handoff']['issue']['number'] or
+                 target in item.get('delivered_ticket_retirements', {})) and
+                not item.get('main_incident'), 'Exact delivered reservation required.', 'invalid_retirement')
+        return [item.get('reservation'), item.get('delivered_ticket_retirements', {}).get(target), row]
     if kind == 'ticket-publication':
         work = item.get('ticket_work')
         require(work is not None and work['assignment_id'] == target and work.get('tickets') and work.get('execution'),
@@ -74,6 +82,8 @@ def permitted(database, project, iteration, resolution):
             'Persisted effect authority changed.', 'stale_admission')
     if not resolution.resolving:
         return set()
+    if resolution.kind == 'delivered-retirement':
+        return {('tracker', 'reservation_conflict'), ('ownership', 'claim_conflict')}
     if resolution.kind == 'ticket-publication':
         return {('tracker', 'publication_uncertain')}
     if resolution.kind == 'candidate-publication':

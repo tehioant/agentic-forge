@@ -292,7 +292,7 @@ class RequirementChangeTests(unittest.TestCase):
 
     def test_late_pause_keeps_truthful_stage_receipt_but_never_admits_result(self):
         record, work, produced = self.stage()
-        def invoke(*_): self.fixture.pause(); return produced
+        def invoke(*_, **kwargs): self.fixture.pause(); return produced
         with patch.object(requirement_execution, 'invoke', side_effect=invoke):
             with self.assertRaises(repositories.RepositoryError) as caught:
                 requirement_execution.run_stage(self.database, self.item, record, 'to-spec', {'execution_reference': 'fixture'}, work)
@@ -316,7 +316,7 @@ class RequirementChangeTests(unittest.TestCase):
         database = sqlite3.connect(self.fixture.state, factory=FaultConnection)
         self.fixture.database = self.database = database
         record, work, produced = self.stage()
-        def invoke(_config, _work):
+        def invoke(_config, _work, **kwargs):
             database.fail_control_read = True
             return produced
         with patch.object(requirement_execution, 'invoke', side_effect=invoke) as external:

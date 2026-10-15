@@ -56,7 +56,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
     def test_pause_blocks_planning_until_explicit_resume(self):
         before = self.stored()
         self.pause()
-        with patch.object(planning, 'resolve', return_value={}) as load:
+        with patch.object(planning, 'resolve_planning', return_value={}) as load:
             self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
             load.assert_not_called()
             self.resume()
@@ -70,7 +70,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
         def load(_):
             self.pause()
             return {}
-        with patch.object(planning, 'resolve', side_effect=load) as selected:
+        with patch.object(planning, 'resolve_planning', side_effect=load) as selected:
             self.assert_refused(lambda: planning.plan(self.database, self.item, self.request), before)
         selected.assert_called_once_with(self.request['skills'])
         self.assertNotIn('planning', self.stored())
@@ -80,7 +80,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
         self.persist()
         self.pause()
         self.resume()
-        with patch.object(planning, 'resolve', return_value={}):
+        with patch.object(planning, 'resolve_planning', return_value={}):
             with self.assertRaises(repositories.RepositoryError) as caught:
                 planning.plan(self.database, self.item, self.request)
         self.assertEqual(caught.exception.code, 'requirements_held')
@@ -115,7 +115,7 @@ class AdmissionBoundaryTests(unittest.TestCase):
                     'repository_url': 'https://api.github.com/repos/example/product', 'state': 'open',
                     'body': documents['milestone.md'], 'labels': [{'name': 'ready-for-agent'}]}
         self.github.request.side_effect = read
-        with patch.object(planning, 'resolve', return_value={}), patch.object(planning, 'reconcile'):
+        with patch.object(planning, 'resolve_planning', return_value={}), patch.object(planning, 'reconcile'):
             self.assert_refused(lambda: planning.complete(self.database, self.item, request, self.github), before)
         self.assertEqual(self.github.request.call_count, 5)
         self.assertNotIn('handoff', self.stored())

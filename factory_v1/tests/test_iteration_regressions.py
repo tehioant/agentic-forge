@@ -193,7 +193,7 @@ class RevisionPublicationRegressions(unittest.TestCase):
              patch.object(requirement_publication, 'spec_issue', return_value=9), \
              patch.object(tickets, 'pinned_inputs', side_effect=lambda db, shadow, api: {'handoff': shadow['handoff'], 'documents': {}}), \
              patch.object(requirement_publication, 'verify_publication'), patch.object(requirements, 'sync_blocks'), \
-             patch.object(planning, 'resolve', return_value={}), patch.object(planning, 'reconcile'):
+             patch.object(planning, 'resolve_planning', return_value={}), patch.object(planning, 'reconcile'):
             result = requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
             revised = result['requirement_changes']['revision1']
             self.assertEqual(revised['status'], 'published')

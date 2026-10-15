@@ -6,9 +6,11 @@ import signal
 import stat
 import subprocess
 import tempfile
+import time
+from contextlib import nullcontext
 from pathlib import Path
 
-from . import planning, requirements, tickets
+from . import controls, planning, requirements, tickets
 from .planning import require, text
 from .publication import read_json
 from .repositories import RepositoryError
@@ -45,17 +47,47 @@ def configuration(database, path, operator):
     return config
 
 
-def invoke(config, payload):
+def stop_process(process):
+    failure = None
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError as error:
+        failure = error
+    try:
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        failure = error
+    if failure is not None:
+        raise RepositoryError('execution_uncertain', 'Synthesis cleanup unconfirmed; reconcile before further execution.') from failure
+
+
+def invoke(config, payload, *, cancelled=None, admission=None):
     """The admitted adapter owns actual conversational execution/approved model access."""
+    require(cancelled is None or not cancelled(), 'Interrupted before host execution.', 'iteration_paused')
+    pending = json.dumps(payload, sort_keys=True).encode()
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        process = subprocess.Popen(config['argv'], stdin=subprocess.PIPE, stdout=output, stderr=errors,
-                                   start_new_session=True, env={'PATH': os.environ.get('PATH', ''), 'LANG': 'C.UTF-8'})
+        with admission() if admission is not None else nullcontext():
+            try:
+                process = subprocess.Popen(config['argv'], stdin=subprocess.PIPE, stdout=output, stderr=errors,
+                                           start_new_session=True, env={'PATH': os.environ.get('PATH', ''), 'LANG': 'C.UTF-8'})
+            except OSError as error:
+                raise RepositoryError('execution_uncertain', 'Synthesis startup failed; reconcile before retry.') from error
+        deadline = time.monotonic() + config['timeout']
         try:
-            process.communicate(json.dumps(payload, sort_keys=True).encode(), timeout=config['timeout'])
-        except subprocess.TimeoutExpired as error:
-            os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise RepositoryError('execution_uncertain', 'Synthesis timed out; reconcile the admitted attempt, never automatically retry.') from error
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (cancelled is not None and cancelled()):
+                    raise subprocess.TimeoutExpired(config['argv'][0], config['timeout'])
+                try:
+                    process.communicate(pending, timeout=min(0.1, remaining) if cancelled is not None else remaining)
+                    break
+                except subprocess.TimeoutExpired:
+                    pending = None
+        except BaseException as error:
+            stop_process(process)
+            if isinstance(error, (OSError, subprocess.TimeoutExpired)):
+                raise RepositoryError('execution_uncertain', 'Synthesis interrupted/timed out; reconcile the admitted attempt, never automatically retry.') from error
+            raise
         require(process.returncode == 0, 'Host synthesis failed; retain the unresolved attempt without fallback.', 'execution_uncertain')
         output.seek(0)
         raw = output.read(8 * 1024 * 1024 + 1)
@@ -76,7 +108,9 @@ def run_stage(database, item, record, stage, config, work):
     require(stage not in record.get('attempts', {}), 'Uncertain synthesis must reconcile; no automatic repeated usage.', 'execution_uncertain')
     record.setdefault('attempts', {})[stage] = {'input_digest': tickets.digest(work), 'capability': config}
     requirements.checkpoint(database, item)
-    produced = invoke(config, work)
+    produced = invoke(config, work,
+        cancelled=lambda: controls.blocked(database, item['project_id'], item['iteration_id']),
+        admission=lambda: controls.admission(database, item['project_id'], item['iteration_id']))
     record.setdefault('execution_receipts', {})[stage] = produced
     requirements.checkpoint(database, item, receipt=True)
     evidence = tickets.validate_execution(work, produced['execution'], produced['result'])

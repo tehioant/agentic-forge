@@ -1,0 +1,66 @@
+{
+  "spawn": {
+    "path": "hermes_cli/plugin_host_child.py",
+    "qualname": "HostRuntime.spawn",
+    "first_line": 213,
+    "last_line": 216,
+    "sha256": "acc9f3f5ae50d29ec7f99c6f3d347b9976a5f67a7074dd3687e91bd47a981150",
+    "source_sha256": "d97b6355c7fd6c62a48e376f1c629125186f496a116447807bc202470b923b70"
+  },
+  "inject_plugin_message": {
+    "path": "hermes_cli/plugins_injection.py",
+    "qualname": "inject_plugin_message",
+    "first_line": 12,
+    "last_line": 62,
+    "sha256": "c76a6e9bc516323ab375393499558c136c881f730db5d4a143b48fa260afe468",
+    "source_sha256": "ee162e06bef52f0cbacb5b234ee72498fb85399f34e0d050a8cda59ebdf5f0c6"
+  },
+  "inject_message": {
+    "path": "hermes_cli/plugins.py",
+    "qualname": "PluginContext.inject_message",
+    "first_line": 603,
+    "last_line": 620,
+    "sha256": "40cffcf32ced4028bb41380c9882e11fbdb2d47f6e78e501f4e53d898bb5ad36",
+    "source_sha256": "a618a69581355e5fe56cb3d2250fc02647315359aae7fa0e6bd4dccc4ed3d3ad"
+  },
+  "_dispatch_plugin_origin_injection": {
+    "path": "gateway/run_plugin_injection.py",
+    "qualname": "GatewayPluginInjectionMixin._dispatch_plugin_origin_injection",
+    "first_line": 218,
+    "last_line": 244,
+    "sha256": "6fb1102cb1bed0df80b97287f3b6be34976e4be1db66cb1cfd2ba0f02f7c834d",
+    "source_sha256": "fbac49a8dead1c3f1e665d89345ba2366ead90525ca16ae3d6f02ba441315bed"
+  },
+  "_prefix_inbound_sender_context": {
+    "path": "gateway/run_inbound.py",
+    "qualname": "GatewayInboundMixin._prefix_inbound_sender_context",
+    "first_line": 1426,
+    "last_line": 1445,
+    "sha256": "8fb3f5fab046ecf9ddec6a58ea309aa248ec823466abdd0643c74e6d45822391",
+    "source_sha256": "57f9bf1973231b1ba2d5b87afd7f6460be824f7d66bd5b299a783e8800ab3f0b"
+  },
+  "_hmwa_apply_message_timestamp": {
+    "path": "gateway/run_turn.py",
+    "qualname": "GatewayTurnMixin._hmwa_apply_message_timestamp",
+    "first_line": 1460,
+    "last_line": 1489,
+    "sha256": "071626bfaafc77f6c38a0b9ffd43ebf5222ec0373fdac539759c7a69dc56d8a0",
+    "source_sha256": "1ba529d5dcd4279a40aa75bbccc6c225a8563b6a89667a69f48e651fb5e146fa"
+  },
+  "_collect_pre_llm_call_context": {
+    "path": "agent/turn_context.py",
+    "qualname": "_collect_pre_llm_call_context",
+    "first_line": 787,
+    "last_line": 841,
+    "sha256": "c669c66b4cc4945a0cbe7d1c7fcf6374e1b67263cb4acec1fc00c5d11327f412",
+    "source_sha256": "ff9e1fc6de94b3c890b54a28b3133c473d5f9c905ecff04fcc5449877821095a"
+  },
+  "original_user_message": {
+    "path": "agent/turn_context.py",
+    "qualname": "build_turn_context.original_user_message",
+    "first_line": 1117,
+    "last_line": 1117,
+    "sha256": "01d1321adf6bf5f9ddc9ba250ab6e7893000f83c75f78eea7ff91badc165dc1e",
+    "source_sha256": "ff9e1fc6de94b3c890b54a28b3133c473d5f9c905ecff04fcc5449877821095a"
+  }
+}

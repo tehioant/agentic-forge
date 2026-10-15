@@ -6,7 +6,7 @@ import re
 import uuid
 
 from .repositories import RepositoryError, reconcile, save_iteration
-from .skills import resolve
+from .skills import resolve_planning
 
 INSTRUCTIONS = """Carry out this assignment in the same originating conversation, not in a
 noninteractive worker. Load and follow the attached pinned grill-me instructions,
@@ -92,7 +92,7 @@ def plan(database, item, request):
     require(request['origin'] == item['origin'], 'Use the exact originating conversation.')
     require(type(request['expected_revision']) is int and request['expected_revision'] >= 0,
             'Use a nonnegative integer planning revision.')
-    skills = resolve(request['skills'])
+    skills = resolve_planning(request['skills'])
     previous = item.get('planning')
     from .requirements import held_numbers
     require(not held_numbers(item) and not item.get('requirement_authority'),
@@ -179,7 +179,7 @@ def continuation_evidence(planning, request, skills):
     return evidence
 
 
-def complete(database, item, request, github):
+def complete(database, item, request, github, *, native_execution=None, native_guard=None):
     from .controls import require_active
     item = reload_locked(database, item)
     require_active(database, item['project_id'], item['iteration_id'])
@@ -187,6 +187,18 @@ def complete(database, item, request, github):
             'Completed/paused work cannot restart planning.', 'iteration_wait_required')
     planning = item.get('planning')
     require(planning is not None, 'Start a same-conversation planning assignment first.', 'planning_required')
+    if planning.get('native_binding') or planning.get('native_execution'):
+        require(planning.get('native_execution') is not None, 'Native host execution required.', 'execution_required')
+        require(callable(native_guard), 'Native HOST execution guard required.', 'execution_required')
+        native_guard()
+        publication = planning.get('host_publication', {})
+        require(native_execution is not None and publication.get('status') == 'verified' and
+                publication.get('execution') == native_execution and
+                native_execution.get('native') == planning['native_execution'] and
+                request.get('documents') == publication.get('documents') and
+                request.get('commit') == publication.get('commit') and
+                request.get('issue_number') == publication.get('issue', {}).get('number'),
+                'Native-bound completion requires actual HOST publication/execution.', 'execution_required')
     common = {'assignment_id', 'origin', 'sufficient', 'rationale', 'reference', 'pending_questions'}
     if planning.get('continuation'):
         common.add('execution')
@@ -206,7 +218,7 @@ def complete(database, item, request, github):
         evidence = continuation_evidence(planning, request, selected)
         planning['execution'] = evidence
     else:
-        resolve(planning['request']['skills'])  # Revalidate even on restart/retry.
+        resolve_planning(planning['request']['skills'])  # Revalidate even on restart/retry.
     if not request['sufficient']:
         require(planning['status'] != 'complete', 'Reassign explicitly before changing a completed milestone.', 'planning_conflict')
         planning['pending_questions'] = pending
@@ -229,6 +241,8 @@ def complete(database, item, request, github):
     previous = item.get('handoff')
     require(previous is None or previous['issue']['id'] == handoff['issue']['id'],
             'Specification issue identity changed.', 'publication_mismatch')
+    if planning.get('native_execution'):
+        native_guard()
     planning['status'] = 'complete'
     planning['pending_questions'] = []
     planning['judgment'] = {key: request[key] for key in ('sufficient', 'rationale', 'reference')}

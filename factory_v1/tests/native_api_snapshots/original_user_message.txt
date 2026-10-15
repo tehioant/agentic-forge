@@ -1,0 +1,1 @@
+    original_user_message = persist_user_message if persist_user_message is not None else user_message

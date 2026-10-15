@@ -1,6 +1,19 @@
 # Fresh factory v1 — intake, execution, review, merge and delivery
 
-Standard-library Python 3.14 controller, outside Hermes core. Run from the repository root; no installation is needed. The CLI records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, controls ticket publication/frontier/reservation, and exposes bounded role launch, simplification, independent review, candidate publication, gated merge and integrated delivery verification. Automatic scheduling remains separate from these explicit trusted-host operations.
+Standard-library Python 3.14 controller, outside Hermes core. Run from the repository root; no installation is needed for the CLI. It records approved intake, reconciles repository onboarding, verifies a same-conversation planning handoff, controls ticket publication/frontier/reservation, and exposes bounded role launch, simplification, independent review, candidate publication, gated merge and integrated delivery verification.
+
+## Supervised deterministic service (#25)
+
+`python -m factory_v1.service` supplies isolated systemd-user install/start/status/
+stop/restart and the existing pause/emergency-stop/explicit-resume controls. Every
+startup persists a hold before reconciliation; starting the process never enables
+workers. Optional host-owned configurations connect deterministic observation and
+one admitted stage per tick to the existing synthesis/assignment/launch/simplify/
+two-axis-review/publication/merge seams. No agent polls, shell plugin registry or
+replacement backlog is introduced. The initial same-conversation native executor,
+changed installed source pins and real service/native qualification remain explicit
+gaps, not readiness claims. See [commands, configuration and limitations](SERVICE.md)
+and [focused verification scope](../docs/issue25-focused-verification.md).
 
 ## Trust and safety boundary
 

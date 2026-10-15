@@ -34,7 +34,7 @@ def scoped(database, project, iteration):
             (a['ticket_scope']['project'], a['ticket_scope']['iteration']) == (project, iteration)]
 
 
-def require_reconciled(database, project, iteration, *, resolution=None):
+def require_reconciled(database, project, iteration, *, resolution=None, allow_recovery=False):
     row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
                            (project, iteration)).fetchone()
     if row:
@@ -45,6 +45,14 @@ def require_reconciled(database, project, iteration, *, resolution=None):
                 isinstance(record['blockers'], list) and (record['status'] == 'ready') == (not record['blockers'])),
                 'Malformed restart evidence cannot grant admission.', 'invalid_restart')
         allowed = set()
+        if allow_recovery:
+            from . import recovery
+            item = json.loads(row[0])
+            registered = recovery.active(item)
+            require(registered is not None and registered['status'] != 'cleared' and
+                    not controls.blocked(database, project, iteration),
+                    'Only registered recovery can resolve health admission.', 'recovery_held')
+            allowed.add(('delivery', 'main_frozen'))
         if resolution is not None:
             from .effect_resolution import permitted
             allowed = permitted(database, project, iteration, resolution)
@@ -265,7 +273,11 @@ def tracker(database, item, api):
                         reservation.get('status') in {'pending', 'reserved'},
                         'Stale reservation authority.', 'reservation_conflict')
                 row = next((r for r in frontier['items'] if r['number'] == reservation['issue_number']), None)
-                require(row is not None and row['admissible'] and
+                delivered = delivered_repair(database, item) if repair == reservation['issue_number'] else None
+                completed_repair = bool(delivered is not None and row is not None and
+                    row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and
+                    row['id'] == delivered['handoff']['issue']['id'] and row['status'] == 'done')
+                require(row is not None and (row['admissible'] or completed_repair) and
                         (row['number'] == repair or set(frontier['active']) <= {row['number']}),
                         'Reservation is no longer in exact eligible scope.', 'reservation_conflict')
                 assert row is not None
@@ -288,7 +300,8 @@ def ownership(database, item):
     from .diagnosis import released_claim as directed
     from .recovery import released_claim as repaired
     active = [a for a in assignments.rows(database) if not revised(database, a) and not directed(database, a) and
-              not released_claim(a) and not assignments.completed_iteration_claim(database, a) and not repaired(database, a)]
+              not released_claim(a) and not assignments.completed_iteration_claim(database, a) and
+              not assignments.delivered_ticket_claim(database, a) and not repaired(database, a)]
     profiles, homes, ticket_scopes = set(), set(), set()
     for a in active:
         p = a['handoff']['profile']
@@ -321,6 +334,20 @@ def released_claim(assignment):
     return True
 
 
+def delivered_repair(database, item):
+    from . import recovery
+    record = recovery.active(item)
+    if record is None:
+        return None
+    candidates = [a for a in scoped(database, item['project_id'], item['iteration_id']) if
+                  a['handoff'].get('recovery') == recovery.contract(record) and
+                  a.get('merge', {}).get('status') == 'delivered' and
+                  a['merge'].get('close_allowed') is True and not a['merge'].get('failure') and
+                  a.get('runtime', {}).get('container_removed') is True]
+    require(len(candidates) <= 1, 'Ambiguous delivered repair.', 'recovery_held')
+    return candidates[0] if candidates else None
+
+
 def registered_recovery(database, item, api):
     """Read back host registration; readiness is not clearance or ordinary admission."""
     from . import recovery, requirements
@@ -338,7 +365,12 @@ def registered_recovery(database, item, api):
             record['evidence'] == delivery.persisted_evidence(database, item['project_id'], item['iteration_id'],
                 config['evidence_id'], saved['config']), 'Registered incident authority changed.', 'recovery_held')
     issue = recovery.exact_issue(api, item['repository'], recovery.observed_issue_pin(item, record))
-    require(issue['state'] == 'open', 'Repair issue is no longer open.', 'recovery_held')
+    delivered = delivered_repair(database, item)
+    require(issue['state'] == 'open' or (delivered is not None and
+            issue.get('state_reason') == 'completed' and issue['state'] == 'closed'),
+            'Repair issue is neither open nor exactly delivered.', 'recovery_held')
+    if issue['state'] == 'closed':
+        integration(delivered, api)  # Read back integration; not freeze clearance.
     requirements.revalidate_inputs(database, item, api, config['issue']['number'])
     return recovery.contract(record)
 
@@ -489,8 +521,9 @@ def reconcile(database, project, iteration, operator, github, *, recover=None):
                 item['status'] == 'active' and not controls.blocked(database, project, iteration)}
 
 
-def before_dispatch(database, project, iteration, operator, github, *, force=False, request=None, assignment_id=None):
+def before_dispatch(database, project, iteration, operator, github, *, force=False, request=None, assignment_id=None, verify_recovery=False):
     item = assignments.current(database, project, iteration, operator, require_active=False)
+    require(not controls.blocked(database, project, iteration), 'Explicit resume required.', 'iteration_paused')
     from . import recovery
     # Initial admission already reads the exact tracker/requirements at its own
     # seam. Broader restart inventory is needed once an attempt or observer exists.
@@ -503,6 +536,12 @@ def before_dispatch(database, project, iteration, operator, github, *, force=Fal
     controls.require_active(database, project, iteration)
     item = assignments.current(database, project, iteration, operator)
     if item.get('main_incident') or recovery.pending_registration(item):
+        if verify_recovery:
+            delivered = delivered_repair(database, item)
+            require(delivered is not None and delivered['assignment_id'] == assignment_id and
+                    report['observations']['delivery']['evidence']['main'] == delivered['merge']['integrated_evidence']['integrated'],
+                    'Exact delivered repair and observed integrated main required.', 'recovery_held')
+            return report  # Only the existing recovery verifier is called next.
         if assignment_id is not None:
             assignment = assignments.inspect(database, project, iteration, operator, assignment_id)
             assignments.require_result_active(assignment)

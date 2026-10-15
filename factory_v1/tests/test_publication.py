@@ -853,7 +853,7 @@ class PublicationComponentTests(unittest.TestCase):
         self.assertEqual(next(e for e in self.plan['changes'] if e['path'] == 'new_behavior.py')['mode'], '100644')
 
     def test_adapter_denies_arbitrary_operation_and_nonapproved_payload(self):
-        github = mock.Mock(spec=GitHub)
+        github = mock.Mock(spec=GitHub, base=self.config['api_base'])
         api = publication.PublicationGitHub(github, self.config)
         for method, path, body in (('POST', '/repos/other/product/pulls', {}),
                                    ('PATCH', '/repos/example/product/git/refs/heads/main', {'force': True}),

@@ -70,7 +70,8 @@ class IterationControlTests(unittest.TestCase):
                 f = fixture(self, fixtures.IterationComponents)
                 f.stack.close()  # Exercise the real copy wrapper, not completion's mocked frontier.
                 before = f.stored()
-                def read(db, item, api):
+                def read(db, item, api, *, resolution=None):
+                    self.assertIsNone(resolution)
                     self.assertNotEqual(db.execute('PRAGMA database_list').fetchone()[2],
                                         f.db.execute('PRAGMA database_list').fetchone()[2])
                     interrupt(f)

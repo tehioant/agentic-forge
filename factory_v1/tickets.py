@@ -580,6 +580,56 @@ def frontier(database, item, github, *, resolution=None):
     return item
 
 
+def advance_delivered(database, item, github, merge_config_path):
+    """Caller holds state_lock: verify one delivery, atomically retire its ownership."""
+    from . import assignments, controls, iteration, merge, publication, requirements
+    project, iteration_id = item['project_id'], item['iteration_id']
+    operator = item['approval']['operator_id']
+    item = assignments.current(database, project, iteration_id, operator, require_active=False)
+    require(item['status'] == 'active', 'Retirement requires active iteration.', 'iteration_paused')
+    config = merge.load_config(merge_config_path, operator)
+    from .effect_resolution import bound
+    resolution = bound(database, item, 'delivered-retirement', config['candidate_assignment'])
+    authority = {k: v for k, v in config.items() if k != 'bearer'}
+    number = config['issue']
+    observed = iteration.frontier(database, item, github, resolution=resolution)
+    row = next((r for r in observed['items'] if r['number'] == number), None)
+    require(row is not None and row['status'] == 'done' and row['issue_state'] == 'closed' and
+            row['state_reason'] == 'completed' and row['contract_valid'] and not row['held'] and
+            not observed['foreign_active'], 'Exact unheld delivered frontier required.', 'delivery_held')
+    assert row is not None
+    api = merge.MergeGitHub(config)
+    main = publication.ref_sha(api.read('/git/ref/heads/' + config['base']), config['base'])
+    delivered = iteration.delivered_item(database, item, row, merge_config_path, operator, github, main)
+    proof = assignments.delivered_ticket_proof(database, item, delivered, authority)
+    receipt = {'receipt_id': assignments.digest(proof), 'proof': proof}
+    requirements.revalidate_inputs(database, item, github, number)
+    require(iteration.frontier(database, item, github, resolution=resolution) == observed,
+            'Frontier changed during delivery verification.', 'delivery_race')
+    with controls.admission(database, project, iteration_id, resolution=resolution), database:
+        database.execute('BEGIN IMMEDIATE')
+        latest = assignments.current(database, project, iteration_id, operator, require_active=False)
+        require(latest == item and assignments.delivered_ticket_proof(database, latest, delivered, authority) == proof,
+                'Ownership or independent holds changed during verification.', 'delivery_race')
+        receipts = latest.setdefault('delivered_ticket_retirements', {})
+        identity = delivered['assignment_id']
+        require(receipts.get(identity, receipt) == receipt,
+                'Retirement cannot be rebound to different delivery authority.', 'invalid_retirement')
+        reservation = latest.get('reservation')
+        if reservation and reservation['issue_number'] == number:
+            work = latest['ticket_work']
+            require(reservation.get('status') == 'reserved' and
+                    reservation.get('assignment_id') == work['assignment_id'] and
+                    reservation.get('input_digest') == work['input_digest'],
+                    'Reservation authority changed.', 'reservation_conflict')
+            latest.setdefault('reservation_history', []).append(latest.pop('reservation'))
+        else:
+            require(identity in receipts, 'First retirement must own its exact reservation.', 'reservation_conflict')
+        receipts[identity] = receipt
+        save_iteration(database, latest)
+    return latest
+
+
 def reserve(database, item, github, number):
     from .assignments import ticket_claims
     from .restart import before_dispatch
