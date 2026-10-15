@@ -16,7 +16,35 @@ class EffectResolution:
     resolving: bool
 
 
+def branch_reopen_binding(row):
+    return assignments.digest({k: v for k, v in row.items() if k != 'merge_refusal'})
+
+
 def authority(item, rows, kind, target):
+    if kind == 'branch-reopen':
+        from . import requirements
+        row = next((a for a in rows if a['assignment_id'] == target), None)
+        refusal = row.get('merge_refusal', {}) if row else {}
+        correction = refusal.get('correction', {})
+        config = correction.get('authority', {})
+        require(row is not None and not row.get('merge') and refusal.get('code') == 'not_integrated' and
+                row['handoff']['stage'] == 'simplify' and
+                row['ticket_scope']['project'] == item['project_id'] and
+                row['ticket_scope']['iteration'] == item['iteration_id'] and
+                config.get('candidate_assignment') == target and
+                config.get('operator_id') == item['approval']['operator_id'] and
+                config.get('repository') == item['repository'] == row['handoff']['repository'] and
+                config.get('repository_id') == item['repository_onboarding']['metadata']['id'] == row['handoff']['repository_id'] and
+                config.get('api_base') == item['repository_onboarding']['api_base'] and
+                config.get('issue') == row['ticket_scope']['issue_number'] == row['handoff']['issue']['number'] and
+                refusal.get('candidate') == config.get('head') and refusal.get('revision') == row['revision'] and
+                row['revision'] == requirements.authority(item, config['issue']) and
+                config['issue'] not in requirements.held_numbers(item) and
+                assignments.digest(row['handoff']) == row['handoff_digest'] and
+                correction.get('binding') == branch_reopen_binding(row),
+                'Exact current branch-only refusal authority required.', 'scope_mismatch')
+        assignments.require_result_active(row)
+        return [row, correction]
     if kind == 'merge-reopen':
         row = next((a for a in rows if a['assignment_id'] == target), None)
         journal = row.get('merge', {}) if row else {}

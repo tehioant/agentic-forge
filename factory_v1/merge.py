@@ -261,22 +261,41 @@ def reopen(api, assignment, config, observed, *, database):
     from .effect_resolution import bound
     project, iteration = (assignment['ticket_scope'][k] for k in ('project', 'iteration'))
     item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
-    resolution = bound(database, item, 'merge-reopen', assignment['assignment_id'])
     saved = next(a for a in assignments.rows(database) if a['assignment_id'] == assignment['assignment_id'])
-    require(saved['merge']['authority'] == {k: v for k, v in config.items() if k != 'bearer'},
+    branch_only = not saved.get('merge')
+    resolution = bound(database, item, 'branch-reopen' if branch_only else 'merge-reopen', assignment['assignment_id'])
+    correction = saved.get('merge_refusal', {}).get('correction', {}) if branch_only else saved['merge']
+    require(correction.get('authority') == {k: v for k, v in config.items() if k != 'bearer'},
             'Corrective reopen authority changed.', 'scope_mismatch')
     repo = api.read('')
     require(repo.get('id') == config['repository_id'] and repo.get('full_name') == config['repository'] and
             repo.get('default_branch') == config['base'], 'Corrective repository changed.', 'scope_mismatch')
     pr = target(api, config)
-    require(pr.get('merged') is True and pr.get('state') == 'closed' and assignments.commit(pr.get('merge_commit_sha')),
-            'Corrective reopening requires the exact integrated PR.', 'not_integrated')
+    if branch_only:
+        require(pr.get('merged') is False and pr.get('state') in {'open', 'closed'} and
+                not pr.get('merge_commit_sha') and pr == correction.get('pr') and
+                observed == correction.get('issue') and
+                hashlib.sha256(observed['body'].encode()).hexdigest() == saved['handoff']['issue']['body_sha256'],
+                'Branch-only corrective target changed.', 'scope_mismatch')
+    else:
+        require(pr.get('merged') is True and pr.get('state') == 'closed' and assignments.commit(pr.get('merge_commit_sha')),
+                'Corrective reopening requires the exact integrated PR.', 'not_integrated')
     from . import readiness_gate, controls
     selection = {'merge_reopen': assignment['assignment_id']}
     observation = readiness_gate.observe(database, project, iteration, operation='effect',
                                          resolution=resolution, selection=selection)
+    if branch_only:
+        require(target(api, config) == pr and
+                publication.ref_sha(api.read('/git/ref/heads/' + config['branch']), config['branch']) == config['head'],
+                'Branch-only publication changed before reopening.', 'scope_mismatch')
     require(issue(api, saved, config) == observed, 'Corrective issue changed before reopening.', 'scope_mismatch')
     with controls.lane(database, project, iteration):
+        if branch_only:
+            from .effect_resolution import permitted
+            permitted(database, project, iteration, resolution)
+            controller_paths(database, correction['config_path'])
+            require(load_config(correction['config_path'], config['operator_id']) == config,
+                    'Branch-only host configuration changed.', 'scope_mismatch')
         readiness_gate.compare(database, project, iteration, observation, resolution=resolution)
         readiness_gate.local_check(database, project, iteration, observation, resolution, selection, 'effect')
         controls.require_active(database, project, iteration, resolution=resolution)
@@ -392,6 +411,7 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             action = 'verify-delivery'
     previous_delivery = (json.loads(json.dumps(journal)) if journal and
                          journal['status'] in {'delivered', 'revalidation-required'} else None)
+    correction = None
     try:
         prior, builder, root = chain(database, project, iteration, operator, config, config_path)
         require_publication(database, item, api, config['issue'])
@@ -491,6 +511,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                 pass
             pr = target(api, config)
         if not journal:
+            if isinstance(pr, dict) and pr.get('merged') is False and pr.get('state') in {'open', 'closed'} and not pr.get('merge_commit_sha'):
+                from .effect_resolution import branch_reopen_binding
+                correction = {'authority': authority, 'config_path': str(config_path),
+                              'binding': branch_reopen_binding(prior), 'issue': observed_issue, 'pr': pr}
             require(False, 'No trusted merge intent; branch-only work cannot be delivered.', 'not_integrated')
         require(pr.get('merged') is True, 'Pending outcome not proven; reconcile before any retry, never resend blindly.', 'merge_uncertain')
         evidence = merged_evidence(api, config, pr, plan)
@@ -560,8 +584,12 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                            close_allowed=False, failure=failure)
             save(database, assignment, journal)
         else:
-            assignment['merge_refusal'] = {'candidate': config['head'], 'revision': assignment['revision'], **failure}
-            publication.save(database, assignment)
+            fresh = next(a for a in assignments.rows(database) if a['assignment_id'] == assignment['assignment_id'])
+            refusal = {'candidate': config['head'], 'revision': assignment['revision'], **failure}
+            if correction is not None:
+                refusal['correction'] = correction
+            fresh['merge_refusal'] = refusal
+            publication.save(database, fresh)
         current_issue = issue(api, assignment, config)
         reopen(api, assignment, config, current_issue, database=database)
         raise error

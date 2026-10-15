@@ -276,7 +276,7 @@ def local_check(database, project, iteration, observation, resolution, selection
     if resolution is not None:
         from .effect_resolution import permitted
         allowed = permitted(database, project, iteration, resolution)
-        if resolution.kind == 'merge-reopen':
+        if resolution.kind in {'merge-reopen', 'branch-reopen'}:
             require(operation == 'effect' and selection == {'merge_reopen': resolution.target},
                     'Corrective authority permits only exact reopening.', 'scope_mismatch')
         if allowed:
@@ -324,7 +324,7 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
     if resolution is not None:
         from .effect_resolution import permitted
         allowed = permitted(database, project, iteration, resolution)
-        if resolution.kind == 'merge-reopen':
+        if resolution.kind in {'merge-reopen', 'branch-reopen'}:
             require(operation == 'effect' and selection == {'merge_reopen': resolution.target},
                     'Corrective authority permits only exact reopening.', 'scope_mismatch')
         if allowed:

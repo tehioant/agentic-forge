@@ -108,3 +108,90 @@ class CombinedReadinessTests(readiness_fixtures.SupervisedFixture, unittest.Test
             api.issue_state.assert_not_called()
         finally:
             source.write_bytes(raw)
+
+
+class BranchReopenReadinessTests(readiness_fixtures.SupervisedFixture, unittest.TestCase):
+    setUp = effect_fixtures.OperationIntegrationTests.setUp
+    file = readiness_fixtures.CoreReadinessTests.file
+    save = readiness_fixtures.CoreReadinessTests.save
+    read = readiness_fixtures.CoreReadinessTests.read
+    record = readiness_fixtures.CoreReadinessTests.record
+
+    def branch_fixture(self):
+        import hashlib
+        row, config, observed, records, api = CombinedReadinessTests.reopen_fixture(self)
+        self.health['sha'] = 'a' * 40
+        row.pop('merge')
+        row['handoff']['stage'] = 'simplify'
+        row['handoff']['issue']['body_sha256'] = hashlib.sha256(observed['body'].encode()).hexdigest()
+        row['handoff_digest'] = assignments.digest(row['handoff'])
+        config.update(execution_reference='LOCAL qualified prerequisites, not live execution',
+            executions=[{'local': n} for n in range(4)], standards_assignment='1' * 64,
+            spec_assignment='2' * 64, required_checks=[{'context': 'quality', 'app_id': 99}],
+            protection_sha256='f' * 64, recovery=None, bearer='LOCAL-NONSECRET')
+        path = self.file('branch-merge.json', config)
+        records['/pulls/2'].update(merged=False, state='open')
+        records['/pulls/2'].pop('merge_commit_sha')
+        records['/git/ref/heads/candidate'] = {'ref': 'refs/heads/candidate',
+                                             'object': {'type': 'commit', 'sha': config['head']}}
+        row['merge_refusal'] = {'code': 'not_integrated', 'candidate': config['head'], 'revision': row['revision'],
+            'correction': {'authority': {k: v for k, v in config.items() if k != 'bearer'},
+                'config_path': str(path), 'binding': effect_resolution.branch_reopen_binding(row),
+                'issue': deepcopy(observed), 'pr': deepcopy(records['/pulls/2'])}}
+        self.db.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
+                        (json.dumps(row), row['assignment_id'])); self.db.commit()
+        return row, config, observed, records, api
+
+    def test_branch_public_reopen_real_nested_readiness_grants_no_other_operation(self):
+        row, config, observed, records, api = self.branch_fixture()
+        resolution = effect_resolution.bound(self.db, self.item, 'branch-reopen', row['assignment_id'])
+        self.assertEqual(effect_resolution.permitted(self.db, 'p', 'i', resolution), set())
+        selection = {'merge_reopen': row['assignment_id']}
+        with readiness_gate.admission(self.db, 'p', 'i', operation='effect', resolution=resolution, selection=selection):
+            readiness_gate.check(self.db, 'p', 'i', operation='effect', resolution=resolution, selection=selection)
+        merge.reopen(api, row, config, observed, database=self.db)
+        api.issue_state.assert_called_once_with('open', observed)
+        for operation, chosen in (('work', selection), ('effect', None), ('effect', {'merge_reopen': 'other'})):
+            with self.subTest(operation=operation, selection=chosen), self.assertRaises(RepositoryError):
+                readiness_gate.check(self.db, 'p', 'i', operation=operation, selection=chosen, resolution=resolution)
+        self.assertNotIn('merge', assignments.rows(self.db)[0])
+
+    def test_branch_public_reopen_never_bypasses_health_permission_or_ownership(self):
+        row, config, observed, records, api = self.branch_fixture()
+        original = self.readers.execution_support.side_effect
+        for fault in ('health', 'permission', 'ownership'):
+            with self.subTest(fault=fault):
+                if fault == 'health': self.health['sha'] = 'b' * 40
+                elif fault == 'permission': self.write_authority['operations'].remove('projects')
+                else:
+                    changed = deepcopy(row)
+                    changed['runtime']['status'] = 'running'
+                    changed['merge_refusal']['correction']['binding'] = effect_resolution.branch_reopen_binding(changed)
+                    self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(changed),)); self.db.commit()
+                with self.assertRaises(RepositoryError): merge.reopen(api, row, config, observed, database=self.db)
+                api.issue_state.assert_not_called()
+                self.health['sha'] = 'a' * 40
+                if fault == 'permission': self.write_authority['operations'].append('projects')
+        self.readers.execution_support.side_effect = original
+
+    def test_branch_final_tracker_read_keeps_current_local_policy_and_independent_holds(self):
+        row, config, observed, records, api = self.branch_fixture()
+        source = Path(self.config['slots'][0]['skills'][0]['path'])
+        raw = source.read_bytes()
+        for fault in ('policy', 'hold'):
+            def read(path):
+                result = deepcopy(records[path])
+                if path == '/issues/1':
+                    if fault == 'policy': source.write_bytes(raw + b'changed at final read')
+                    else:
+                        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                            'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
+                        self.save()
+                return result
+            api.read.side_effect = read
+            try:
+                with self.subTest(fault=fault), self.assertRaises(RepositoryError):
+                    merge.reopen(api, row, config, observed, database=self.db)
+                api.issue_state.assert_not_called()
+            finally:
+                source.write_bytes(raw)
