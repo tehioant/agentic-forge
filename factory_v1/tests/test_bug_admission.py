@@ -168,14 +168,13 @@ class BugAdmissionTests(unittest.TestCase):
         self.observations.assert_not_called()
 
     def test_final_duplicate_search_prevents_new_issue_intent(self):
-        self.work['status'] = 'synthesis_pending'
-        evidence = self.work.pop('execution')
-        self.work.pop('bug')
-        self.save()
-        self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
+        evidence = copy.deepcopy(self.work['execution'])
         request = {'assignment_id': self.work['assignment_id'], 'input_digest': self.work['input_digest'],
                    'adaptation': bugs.ADAPTATION, 'execution': evidence, 'bug': self.bug}
-        after = self.assert_paused(lambda: bugs.complete(self.database, self.item, request, self.github))
+        self.work['completion_digest'] = tickets.digest(request)
+        self.save()
+        self.observations.side_effect = lambda *args: self.pause(self.work['candidates'])
+        after = self.assert_paused(self.publish)
         work = after['bug_work']['defect']
         self.assertEqual(work, self.requested['bug_work']['defect'])
         self.assertEqual(work['status'], 'publication_pending')

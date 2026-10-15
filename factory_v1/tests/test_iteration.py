@@ -178,7 +178,8 @@ class IterationComponents(unittest.TestCase):
         self.assertNotIn('completion', self.stored())
 
     def test_plain_plan_and_intake_cannot_bypass_wait(self):
-        self.complete()
+        self.item.update(status='waiting-for-operator', completion={'report_id': 'fixture-report'})
+        self.store()
         item = self.stored()
         with self.db, self.assertRaises(RepositoryError):
             planning.plan(self.db, item, {'origin': ORIGIN, 'expected_revision': 0, 'skills': []})
@@ -347,6 +348,33 @@ class ContinuationComponents(unittest.TestCase):
         with self.db:
             return iteration.next_iteration(self.db, 'product', 'm1', '42', request or self.request)
 
+    def pending_interview(self, continuation=None):
+        """Direct persisted successor input, not a prior continuation execution."""
+        selected = {}
+        for descriptor in self.request['skills']:
+            selected[descriptor['name']] = {**descriptor, 'instructions': Path(descriptor['path']).read_text()}
+        previous = self.item
+        result = {k: copy.deepcopy(previous[k]) for k in ('project_id', 'repository', 'origin', 'repository_onboarding')}
+        result.update(iteration_id='m2', idea=self.request['input'], status='active', execution_allowed=False,
+            stage='planning_pending', approval={'operator_id': '42', 'reference': self.request['reference']},
+            previous_iteration={'iteration_id': 'm1', 'completion': previous['completion'], 'input': self.request},
+            correlation={**previous['correlation'], 'iteration_id': 'm2', 'stage': 'planning_pending',
+                         'worker_run_id': None, 'work_item': None, 'evidence_id': assignments.digest(self.request)})
+        source = continuation or {'previous_spec': previous['handoff'], 'previous_specs': {'1': previous['handoff']},
+                                  'input_loads': {'https://example.test/spec': 'b' * 64}}
+        result['planning'] = {'assignment_id': 'direct-interview', 'revision': 1,
+            'request': {'origin': ORIGIN, 'expected_revision': 0, 'skills': self.request['skills']},
+            'origin': ORIGIN, 'status': 'pending', 'skills': selected, 'instructions': planning.INSTRUCTIONS,
+            'docs_path': 'docs/factory/m2/direct-interview', 'pending_questions': [],
+            'continuation': {**copy.deepcopy(source), 'input': self.request, 'adaptation': planning.NEXT_ADAPTATION,
+                             'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}}}
+        with self.db:
+            self.db.execute('INSERT OR REPLACE INTO iterations VALUES (?,?,?)', ('product', 'm2', json.dumps(result)))
+            previous = copy.deepcopy(previous)
+            previous['next_iteration'] = {'iteration_id': 'm2', 'request': self.request}
+            save_iteration(self.db, previous)
+        return result
+
     def test_explicit_same_product_input_starts_only_pinned_pending_interview(self):
         result = self.start()
         self.assertEqual(result['project_id'], self.item['project_id'])
@@ -359,6 +387,7 @@ class ContinuationComponents(unittest.TestCase):
         self.assertNotIn('ticket_work', result)
         self.assertFalse(result['execution_allowed'])
         self.assertEqual(self.start(), result)
+        result = self.pending_interview()
         with self.db, self.assertRaises(RepositoryError):
             planning.plan(self.db, result, result['planning']['request'])
 
@@ -411,7 +440,7 @@ class ContinuationComponents(unittest.TestCase):
         return request
 
     def test_correlated_load_work_answers_and_round_gate_are_required(self):
-        item = self.start()
+        item = self.pending_interview()
         request = self.evidence(item)
         self.assertEqual(planning.continuation_evidence(item['planning'], request, item['planning']['skills']), request['execution'])
         for defect in ('assignment', 'origin', 'load', 'hash', 'work', 'answer', 'actor', 'gate', 'result', 'adaptation'):
@@ -431,7 +460,7 @@ class ContinuationComponents(unittest.TestCase):
                 planning.continuation_evidence(item['planning'], bad, item['planning']['skills'])
 
     def test_pending_interview_never_reads_publication_and_complete_updates_spec_pointers(self):
-        item = self.start()
+        item = self.pending_interview()
         request = self.evidence(item, sufficient=False)
         request.pop('documents')
         request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
@@ -446,6 +475,7 @@ class ContinuationComponents(unittest.TestCase):
         self.assertEqual(pending['planning']['pending_questions'], ['Which search?'])
         self.assertNotIn('handoff', pending)
         github.request.assert_not_called()
+        pending = self.pending_interview()
         request = self.evidence(item)
         request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
                        rationale='Answered current frontier', reference='agent-sufficient', commit='e' * 40, issue_number=8)
@@ -476,7 +506,7 @@ class ContinuationComponents(unittest.TestCase):
         self.assertFalse(completed['execution_allowed'])
 
     def test_stale_spec_pointer_catalog_only_and_conflicting_next_input_refuse(self):
-        item = self.start()
+        item = self.pending_interview()
         request = self.evidence(item)
         request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
                        rationale='Ready', reference='agent', commit=SHA, issue_number=7)

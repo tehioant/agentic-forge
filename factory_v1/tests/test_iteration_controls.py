@@ -118,6 +118,9 @@ class IterationControlTests(unittest.TestCase):
         self.assertEqual(report['blockers'], [])
         self.assertEqual(stored, dict(before, restart_reconciliation=report))
         self.assertFalse(controls.blocked(f.db, 'product', 'm1'))
+        # Independent completed-wait input for continuation admission.
+        with f.db:
+            f.db.execute('UPDATE iterations SET payload=?', (json.dumps(before),))
         with state_lock(f.db):
             started = f.start()
         self.assertEqual(started['iteration_id'], 'm2')
@@ -126,7 +129,7 @@ class IterationControlTests(unittest.TestCase):
 
     def test_continuation_pause_after_last_publication_read_keeps_interview_pending(self):
         f = fixture(self, fixtures.ContinuationComponents)
-        item = f.start()
+        item = f.pending_interview()
         request = f.evidence(item)
         request.update(assignment_id=item['planning']['assignment_id'], origin=fixtures.ORIGIN,
                        rationale='Actual answers', reference='agent-sufficient', commit='e' * 40, issue_number=8)

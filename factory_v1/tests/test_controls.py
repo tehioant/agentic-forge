@@ -314,8 +314,11 @@ class AdmissionControlTests(ControlFixture):
             self.assertTrue(self.prepare()['claim_persisted'])
 
     def test_pause_on_result_revalidation_prevents_accepting_stage_evidence(self):
-        with patch.object(tickets.gh, 'read_issue', return_value=self.issue):
-            prepared = self.prepare()
+        from factory_v1.tests.test_assignments import AssignmentComponentTests
+        # Same normalized claim constructor; only the explicit tracker input differs.
+        self.item['ticket_work']['board'] = {'id': 'BOARD'}
+        self.item['ticket_work'].setdefault('inputs', {'documents': {}})
+        prepared = AssignmentComponentTests.seed_assignment(self, issue=self.issue)
         result = self.result(prepared)
         def final_read(*args):
             self.pause()

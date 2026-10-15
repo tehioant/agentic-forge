@@ -18,6 +18,40 @@ def fixture(owner, cls):
     return value
 
 
+def seed_monitor(f, config, evidence, item=None, incident=None, notify=True):
+    """Write explicit persisted observer inputs; never sample or inherit a lifecycle."""
+    item = copy.deepcopy(f.item if item is None else item)
+    evidence_id = assignments.digest(evidence)
+    if incident is None and evidence['status'] != 'healthy':
+        incident = {'incident_id': 'direct-incident', 'status': 'active',
+            'monitor_sha256': assignments.digest(config), 'first_evidence': evidence_id,
+            'latest_evidence': evidence_id, 'recovery_assignment': None, 'recovery_issue': None}
+    item['delivery_monitor'] = {'config': config, 'config_sha256': assignments.digest(config),
+        'sequence': int(incident is not None), 'latest': {'evidence_id': evidence_id,
+        'status': evidence['status'], 'main': evidence['main']}}
+    if incident is not None:
+        item['main_incident'] = copy.deepcopy(incident)
+    for table in ('delivery_observations', 'delivery_incidents'):
+        f.db.execute('CREATE TABLE IF NOT EXISTS ' + table + ' (project TEXT, iteration TEXT, id TEXT, payload TEXT, PRIMARY KEY(project,iteration,id))')
+    f.db.execute('INSERT OR REPLACE INTO delivery_observations VALUES (?,?,?,?)',
+        ('product', item['iteration_id'], evidence_id, json.dumps(evidence)))
+    if incident is not None:
+        f.db.execute('INSERT OR REPLACE INTO delivery_incidents VALUES (?,?,?,?)',
+            ('product', item['iteration_id'], incident['incident_id'], json.dumps(incident)))
+        if notify:
+            event = {'event_id': incident['incident_id'], 'kind': 'incident', 'message': 'Direct incident fixture',
+                     'issue_number': config['issue'], 'run_id': incident['incident_id'], 'evidence_ids': [incident['first_evidence']]}
+            notification = {'project_id': 'product', 'iteration_id': item['iteration_id'], 'event': event,
+                'destination': item['origin'], 'state': 'pending', 'attempts': 0, 'receipt': None, 'decision_response': None,
+                'correlation': {**item['correlation'], 'work_item': {'repository': item['repository'], 'issue_number': config['issue']},
+                    'worker_run_id': incident['incident_id'], 'evidence_ids': [incident['first_evidence']]}}
+            f.db.execute('INSERT OR REPLACE INTO notifications VALUES (?,?,?,?)',
+                ('product', item['iteration_id'], incident['incident_id'], json.dumps(notification)))
+    save_iteration(f.db, item)
+    f.db.commit()
+    return item
+
+
 class CompletionRegressions(unittest.TestCase):
     def retired(self, kind, runtime):
         f = fixture(self, fixtures.IterationComponents)
@@ -79,22 +113,24 @@ class CompletionRegressions(unittest.TestCase):
 
 class DeliveryContinuationRegressions(unittest.TestCase):
     def test_failed_unknown_and_later_old_samples_reach_new_mutation_boundary(self):
-        from factory_v1.tests.test_delivery import configuration, DeliveryTarget
+        from factory_v1.tests.test_delivery import configuration
+        from factory_v1.tests.test_recovery import RecoveryFixture
         config = configuration('http://127.0.0.1:9876')
         for status in ('failed', 'unknown', 'healthy'):
             with self.subTest(status=status):
                 f = fixture(self, fixtures.ContinuationComponents)
-                target = DeliveryTarget(config)
-                with patch.object(delivery, 'http_json', side_effect=lambda url, timeout: target.value('/health')):
-                    healthy = delivery.observe(config, api=type('API', (), {'read': lambda self, suffix: target.value(suffix)})())
+                source = fixture(self, RecoveryFixture)
+                source.config = config
+                healthy = source.evidence(True)
                 self.assertEqual(healthy['status'], 'healthy')
                 failed = dict(healthy, status=status, failure=None if status == 'healthy' else 'delivery_unknown')
+                f.item = seed_monitor(f, config, failed)
                 with patch.object(delivery, 'observe', return_value=failed):
-                    delivery.sample(f.db, 'product', 'm1', '42', config)
                     before = delivery.context(f.db, 'product', 'm1', '42')
                     started = f.start()
                     self.assertEqual(started.get('delivery_monitor'), before['delivery_monitor'])
                     self.assertEqual(started.get('main_incident'), before.get('main_incident'))
+                    started = seed_monitor(f, config, failed, f.pending_interview(), before.get('main_incident'), notify=False)
                     boundary = delivery.mutation_boundary(f.db, 'product', 'm2', '42')
                     self.assertEqual(boundary.get('main_incident'), before.get('main_incident'))
                     self.assertEqual(attention.records(f.db, 'product', 'm2', started), [])
@@ -131,7 +167,7 @@ class ScopedInputRegressions(unittest.TestCase):
                 f.request['event_id'] = f.item['completion']['event_id']
                 save_iteration(f.db, f.item)
                 f.db.commit()
-                started = f.start()
+                started = f.pending_interview(iteration.continuation_inputs(f.item))
                 continuation = started['planning']['continuation']
                 self.assertIn(docs['milestone.md']['url'], continuation['input_loads'])
                 self.assertEqual(continuation['input_loads'][docs['milestone.md']['url']], 'e' * 64)

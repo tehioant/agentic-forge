@@ -97,11 +97,55 @@ class PlanningPublicationTests(unittest.TestCase):
     def publish(self):
         return json.loads(self.binding.publish(self.args, session_id='native-origin'))
 
+    def execution(self):
+        return {'session_id': 'native-origin', 'native': copy.deepcopy(self.native),
+                'answers': copy.deepcopy(self.args['answers']), 'model_work': copy.deepcopy(self.args['work']),
+                'reference': self.args['reference']}
+
+    def seed_verified_publication(self):
+        """Independent completion input; no publisher execution constructs it."""
+        path = self.item['planning']['docs_path']
+        commit = 'e' * 40
+        references = {}
+        for name, content in self.args['documents'].items():
+            raw = content.encode()
+            blob = publication.object_sha('blob', raw)
+            document_path = path + '/' + name
+            self.records['/contents/' + document_path + '?ref=' + commit] = {
+                'type': 'file', 'path': document_path, 'encoding': 'base64', 'sha': blob,
+                'content': base64.b64encode(raw).decode()}
+            references[name] = {'path': document_path, 'blob': blob,
+                'url': 'https://github.com/example/product/blob/' + commit + '/' + document_path}
+        self.records['/git/commits/' + commit] = {'sha': commit}
+        self.records['/issues/7'] = {'number': 7, 'id': 1007, 'state': 'open',
+            'title': 'Factory initial specification origin-assignment', 'body': self.args['documents']['milestone.md'],
+            'labels': [{'name': 'ready-for-agent'}], 'html_url': 'https://github.com/example/product/issues/7',
+            'repository_url': 'https://api.github.com/repos/example/product'}
+        handoff = {'repository': 'example/product', 'commit': commit,
+            'issue': {'number': 7, 'id': 1007, 'url': 'https://github.com/example/product/issues/7'},
+            'documents': references, 'api_base': self.github.base}
+        record = {'scope': {k: v for k, v in self.auth.items() if k != 'bearer'},
+            'execution': self.execution(), 'documents': copy.deepcopy(self.args['documents']),
+            'branch': 'factory/planning/m1/origin-assignment', 'path': path, 'effects': {},
+            'issue': {'number': 7, 'id': 1007}, 'commit': commit, 'handoff': handoff, 'status': 'verified'}
+        self.item['planning']['host_publication'] = record
+        self.fixture.persist()
+        return copy.deepcopy(record)
+
+    def publish_only(self):
+        # Completion is a separate component; do not feed real publisher output into it.
+        completed = {'planning': {'status': 'complete'}, 'stage': 'planning_complete', 'handoff': {'commit': 'e' * 40}}
+        with patch.object(planning, 'complete', return_value=completed):
+            return self.publish()
+
     def test_real_publisher_functions_complete_durable_exact_mock_readbacks(self):
-        output = self.publish()
+        self.publish_only()
+        record = self.fixture.stored()['planning']['host_publication']
+        independent = self.seed_verified_publication()
+        with patch.object(planning_publication, 'publish', return_value=independent):
+            output = self.publish()
         self.assertEqual(output['status'], 'complete')
         stored = self.fixture.stored()
-        record = stored['planning']['host_publication']
         self.assertEqual(record['status'], 'verified')
         self.assertEqual(stored['handoff']['commit'], 'e' * 40)
         self.assertEqual(record['documents'], self.args['documents'])
@@ -161,10 +205,11 @@ class PlanningPublicationTests(unittest.TestCase):
             with self.subTest(suffix=suffix):
                 # Independent minimal fixture for each single boundary.
                 self.fail_after = suffix
-                with self.assertRaises(repositories.RepositoryError): self.publish()
+                with self.assertRaises(repositories.RepositoryError): self.publish_only()
                 self.fail_after = None
-                output = self.publish()
+                output = self.publish_only()
                 self.assertEqual(output['status'], 'complete')
+                self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
                 self.assertEqual(sum(p == suffix for p, _ in self.writes), 1)
                 if suffix == '/git/refs':
                     # Next subcase reuses no admitted publication or native completion.
@@ -210,13 +255,15 @@ class PlanningPublicationTests(unittest.TestCase):
         self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
 
     def test_host_authority_revoked_during_final_completion_read_is_not_admitted(self):
+        record = self.seed_verified_publication()
         def drift(path, result):
             if path == '/issues/7' and self.fixture.stored()['planning']['host_publication'].get('status') == 'verified':
                 changed = {**self.auth, 'reference': 'changed-authority'}
                 self.auth_path.write_text(json.dumps(changed))
             return result
         self.drift = drift
-        with self.assertRaises(repositories.RepositoryError): self.publish()
+        with patch.object(planning_publication, 'publish', return_value=record):
+            with self.assertRaises(repositories.RepositoryError): self.publish()
         self.assertEqual(self.fixture.stored()['planning']['host_publication']['status'], 'verified')
         self.assertNotEqual(self.fixture.stored()['planning']['status'], 'complete')
         self.assertNotIn('handoff', self.fixture.stored())
