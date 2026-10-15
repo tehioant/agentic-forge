@@ -282,11 +282,37 @@ class PlanningWakeupTests(unittest.TestCase):
         self.assertEqual(result['stage'], 'planning-wakeup')
         self.assertEqual(result['status'], 'requested')
         self.ctx.inject_message.assert_not_called()
+        # Both optional routes coexist without making either mandatory for legacy
+        # fixed envelopes. Continuation schema has its own component matrix.
+        from factory_v1 import continuation_dispatch
+        with patch.object(continuation_dispatch, 'validate') as continuation_validate:
+            for extras in ({}, {'planning_config': str(self.path)}, {'continuation': {}},
+                           {'planning_config': str(self.path), 'continuation': {}}):
+                legacy = {k: v for k, v in config.items() if k in dispatch.FIELDS}
+                self.assertEqual(dispatch.validate({**legacy, **extras}, service), {**legacy, **extras})
+            self.assertEqual(continuation_validate.call_count, 2)
+        config['continuation'] = {}
+        saved = self.fixture.stored()
+        saved['planning']['status'] = 'complete'
+        saved['ticket_work'] = {'publication_complete': True}
+        repositories.save_iteration(self.fixture.database, saved)
+        self.fixture.database.commit()
+        with patch.object(dispatch.merge, 'controller_paths'), patch.object(dispatch.publication, 'read_json',
+                return_value=config), patch.object(continuation_dispatch, 'validate'), \
+                patch.object(wakeup, 'supervise', return_value='enqueued') as supervise, \
+                patch.object(dispatch, 'continuation_tick', return_value={'status': 'continued'}) as continued:
+            self.assertEqual(dispatch.tick(service, self.fixture.github)['stage'], 'planning-wakeup')
+            supervise.assert_called_once()
+            continued.assert_not_called()
+            saved['planning']['native_wakeup']['status'] = 'consumed'
+            repositories.save_iteration(self.fixture.database, saved)
+            self.fixture.database.commit()
+            self.assertEqual(dispatch.tick(service, self.fixture.github), {'status': 'continued'})
+            continued.assert_called_once()
 
 
     def test_pinned_gateway_input_slice_reaches_real_strict_hook(self):
         """Pure dispatch/preparation/hook slices; no adapter loop, provider or turn journey."""
-        import asyncio
         import logging
         from contextlib import asynccontextmanager
         logger = logging.getLogger('pinned-native-contract')
@@ -307,7 +333,12 @@ class PlanningWakeupTests(unittest.TestCase):
             'MessageType': SimpleNamespace(TEXT='text'), 'logger': logger})
         self.mailbox('enqueued')
         raw = wakeup.message(self.item['planning']['native_wakeup'])
-        self.assertTrue(asyncio.run(dispatch(host, source=source, content=raw, plugin_id='factory-planning')))
+        # All awaited seams are immediate fixtures; drive the exact coroutine
+        # without creating an event loop or its socketpair under confinement.
+        operation = dispatch(host, source=source, content=raw, plugin_id='factory-planning')
+        with self.assertRaises(StopIteration) as completed:
+            operation.send(None)
+        self.assertTrue(completed.exception.value)
         event, = events
         self.assertIs(event.source, source)
         self.assertEqual(event.source.user_id, '42')
