@@ -125,7 +125,8 @@ def inspect_readiness(config, *, running=None, github=None):
             if runnable:
                 try:
                     operation, selection, stage = readiness_gate.dispatch_selection(db, config, github or github_client(config))
-                    readiness_gate.check(db, config['project'], config['iteration'], operation=operation, selection=selection)
+                    readiness_gate.check(db, config['project'], config['iteration'], operation=operation, selection=selection,
+                                         resolution=readiness_gate.retirement_resolution(db, config) if stage == 'retire-delivered' else None)
                     result.update(selected_operation=operation, selected_stage=stage)
                     result['checks']['admission'] = {'state': 'ready', 'code': 'verified', 'remediation': None}
                 except Exception:

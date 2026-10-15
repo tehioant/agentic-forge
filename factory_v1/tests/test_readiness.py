@@ -862,6 +862,22 @@ class CoreReadinessTests(SupervisedFixture, unittest.TestCase):
         adapter.call.assert_not_called()
         self.assertEqual(self.db.execute('SELECT status,actual_units FROM model_operations').fetchone(), ('failed', 0))
 
+    def test_exact_retirement_resolution_keeps_unrelated_restart_holds(self):
+        slot = self.config['slots'][0]
+        row = self.record(slot, 'complete')
+        row['merge'] = dict(status='delivered', close_allowed=True, failure=None)
+        self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(row),)); self.db.commit()
+        self.item.update(reservation={'issue_number': 1}, restart_reconciliation=dict(status='blocked', observations={},
+            blockers=[dict(boundary='tracker', code='reservation_conflict')]))
+        self.save()
+        self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
+        resolution = readiness_gate.retirement_resolution(self.db, self.service)
+        self.assertIsNotNone(resolution)
+        self.assertEqual(self.admit(operation='effect', resolution=resolution), 'admitted')
+        with self.assertRaises(repositories.RepositoryError): self.admit(operation='effect')
+        self.item['restart_reconciliation']['blockers'].append(dict(boundary='requirements', code='requirements_held')); self.save()
+        with self.assertRaises(repositories.RepositoryError): self.admit(operation='effect', resolution=resolution)
+
     def test_unknown_operation_cannot_be_a_bypass(self):
         for operation in ('repair', '', None, {}, []):
             with self.subTest(operation=operation), self.assertRaises(repositories.RepositoryError): self.admit(operation=operation)

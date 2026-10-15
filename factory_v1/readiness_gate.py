@@ -120,6 +120,14 @@ def dispatch_selection(database, service, github):
     config = service_dispatch.validate(readiness.load_config(service['dispatch_config']), service)
     item = assignments.current(database, service['project'], service['iteration'], service['operator_id'], require_active=False)
     rows = assignments.rows(database)
+    if config.get('planning_config') is not None and (item.get('planning', {}).get('status') != 'complete' or
+            item.get('planning', {}).get('native_wakeup', {}).get('status') != 'consumed'):
+        from . import planning_wakeup
+        native = planning_wakeup.configuration(config['planning_config'], new_execution=item.get('planning', {}).get('status') != 'complete')
+        return ('effect' if item.get('planning', {}).get('status') == 'complete' else 'work'), {
+            'native_config': config['planning_config'], 'identity': planning_wakeup.scope(item, native)}, 'planning-wakeup'
+    if 'continuation' in config and retirement_resolution(database, service) is not None:
+        return 'effect', None, 'retire-delivered'
     if 'continuation' in config and item.get('planning', {}).get('status') == 'complete' and item.get('ticket_work', {}).get('publication_complete'):
         chosen = continuation.choose(database, item, rows, continuation.observe(database, item, github))
         stage, target = chosen['stage'], chosen['target']
@@ -158,6 +166,19 @@ def dispatch_selection(database, service, github):
                                         axes[0]['handoff']['review']['pins']['candidate_assignment'])
         require(not candidate.get('review_holds'), 'Candidate rejection remains held.', 'review_held')
     return ('effect' if stage in {'publish-tickets', 'evaluate'} else 'work'), None, stage
+
+
+def retirement_resolution(database, service):
+    item = assignments.current(database, service['project'], service['iteration'], service['operator_id'], require_active=False)
+    candidates = [r for r in assignments.rows(database) if
+        (r['ticket_scope']['project'], r['ticket_scope']['iteration']) == (service['project'], service['iteration']) and
+        r['handoff']['issue']['number'] == item.get('reservation', {}).get('issue_number') and
+        r.get('merge', {}).get('status') == 'delivered' and r['merge'].get('close_allowed') is True and not r['merge'].get('failure')]
+    require(len(candidates) <= 1, 'Ambiguous delivered retirement.', 'claim_conflict')
+    if not candidates:
+        return None
+    from .effect_resolution import bound
+    return bound(database, item, 'delivered-retirement', candidates[0]['assignment_id'])
 
 
 def scope_identity(item):
@@ -312,8 +333,8 @@ def validate_selection(database, config, selected, selection, *, operation='work
         return
     if 'native_config' in selection:
         from . import planning_wakeup
-        native = planning_wakeup.configuration(selection['native_config'])
         item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+        native = planning_wakeup.configuration(selection['native_config'], new_execution=item.get('planning', {}).get('status') != 'complete')
         require(planning_wakeup.scope(item, native) == selection['identity'],
                 'Native wakeup selection changed.', 'slot_binding_changed')
         return

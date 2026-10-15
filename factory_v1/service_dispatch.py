@@ -227,9 +227,9 @@ def _launch_child(service, assignment_id, launcher, *, stop_event=None):
 
 def tick(service, github, *, stop_event=None):
     from .service import connect, scope
-    from .readiness_gate import check
+    from .readiness_gate import check, retirement_resolution
     with connect(service) as database:
-        check(database, *scope(service)[:2], operation='effect')
+        check(database, *scope(service)[:2], operation='effect', resolution=retirement_resolution(database, service))
     # Keep legacy fixed-envelope callers unchanged; continuation owns no second
     # executor and returns to the same public launcher/publication seams.
     with connect(service) as database:
@@ -355,9 +355,9 @@ def tick(service, github, *, stop_event=None):
 
 def continuation_tick(service, github, *, stop_event=None):
     from .service import connect, scope
-    from .readiness_gate import check
+    from .readiness_gate import check, retirement_resolution
     with connect(service) as database:
-        check(database, *scope(service)[:2], operation='effect')
+        check(database, *scope(service)[:2], operation='effect', resolution=retirement_resolution(database, service))
     from . import continuation_dispatch as continuation, recovery, restart
     if stop_event is not None and stop_event.is_set():
         return blocked('service_stopping')
