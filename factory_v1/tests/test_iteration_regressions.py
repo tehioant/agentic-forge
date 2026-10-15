@@ -68,29 +68,26 @@ class CompletionRegressions(unittest.TestCase):
         f.store()
         return f, assignment
 
-    def test_retired_runtime_requires_verified_container_absence(self):
-        for kind in ('diagnosis', 'requirements'):
-            for status in ('stopped', 'failed', 'complete'):
-                for removed in (False, None):
-                    with self.subTest(kind=kind, status=status, removed=removed):
-                        f, assignment = self.retired(kind, {'status': status, 'container_removed': removed})
-                        release = diagnosis.released_claim if kind == 'diagnosis' else requirements.released_claim
-                        self.assertFalse(release(f.db, assignment))
-                        with patch.object(assignments, 'rows', return_value=[assignment]):
-                            with self.assertRaises(RepositoryError):
-                                f.complete()
-                        self.assertNotIn('completion', f.stored())
-                        self.assertEqual(attention.records(f.db, 'product', 'm1', f.item), [])
-
-    def test_retired_unlaunched_and_verified_terminal_workers_remain_admissible(self):
-        for kind in ('diagnosis', 'requirements'):
-            for runtime in (None, {'status': 'stopped', 'container_removed': True}):
-                with self.subTest(kind=kind, runtime=runtime):
-                    f, assignment = self.retired(kind, runtime)
-                    release = diagnosis.released_claim if kind == 'diagnosis' else requirements.released_claim
-                    self.assertTrue(release(f.db, assignment))
-                    with patch.object(assignments, 'rows', return_value=[assignment]):
+    def test_retired_worker_completion_eligibility_cases(self):
+        cases = [(kind, {'status': status, 'container_removed': removed}, False)
+            for kind in ('diagnosis', 'requirements') for status in ('stopped', 'failed', 'complete') for removed in (False, None)]
+        cases += [(kind, runtime, True) for kind in ('diagnosis', 'requirements')
+            for runtime in (None, {'status': 'stopped', 'container_removed': True})]
+        for kind, runtime, allowed in cases:
+            with self.subTest(kind=kind, runtime=runtime):
+                f, assignment = self.retired(kind, runtime)
+                release = diagnosis.released_claim if kind == 'diagnosis' else requirements.released_claim
+                self.assertEqual(bool(release(f.db, assignment)), allowed)
+                with patch.object(assignments, 'rows', return_value=[assignment]):
+                    if allowed:
                         self.assertEqual(f.complete()['report']['delivered'], [f.delivered])
+                    else:
+                        with self.assertRaises(RepositoryError):
+                            f.complete()
+                if not allowed:
+                    self.assertNotIn('completion', f.stored())
+                    self.assertEqual(attention.records(f.db, 'product', 'm1', f.item), [])
+
 
     def test_scope_and_raw_issue_drift_refuse_without_report_or_attention(self):
         for body in ('## Bug scope\ncurrent\n', '## Bug scope\nrecovery\n', '## Bug scope\ndeferred\n## Detail\nChanged\n'):
@@ -112,7 +109,36 @@ class CompletionRegressions(unittest.TestCase):
 
 
 class DeliveryContinuationRegressions(unittest.TestCase):
-    def test_failed_unknown_and_later_old_samples_reach_new_mutation_boundary(self):
+    def test_inherited_monitor_observer_refresh_cases(self):
+            from factory_v1.tests.test_delivery import configuration
+            from factory_v1.tests.test_recovery import RecoveryFixture
+            config = configuration('http://127.0.0.1:9876')
+            for status in ('failed', 'unknown', 'healthy'):
+                with self.subTest(status=status):
+                    f = fixture(self, fixtures.ContinuationComponents)
+                    source = fixture(self, RecoveryFixture)
+                    source.config = config
+                    healthy = source.evidence(True)
+                    self.assertEqual(healthy['status'], 'healthy')
+                    failed = dict(healthy, status=status, failure=None if status == 'healthy' else 'delivery_unknown')
+                    f.item = seed_monitor(f, config, failed)
+                    with patch.object(delivery, 'observe', return_value=failed):
+                        before = delivery.context(f.db, 'product', 'm1', '42')
+                        started = seed_monitor(f, config, failed, f.pending_interview(), before.get('main_incident'), notify=False)
+                        boundary = delivery.mutation_boundary(f.db, 'product', 'm2', '42')
+                        self.assertEqual(boundary.get('main_incident'), before.get('main_incident'))
+                        self.assertEqual(attention.records(f.db, 'product', 'm2', started), [])
+                    later = dict(healthy, status='unknown', failure='delivery_unknown')
+                    with patch.object(delivery, 'observe', return_value=later):
+                        delivery.sample(f.db, 'product', 'm1', '42')
+                    current = delivery.inspect(f.db, 'product', 'm2', '42')
+                    self.assertEqual(current['monitor']['latest']['status'], 'unknown')
+                    self.assertIsNotNone(current['incident'])
+                    with patch.object(delivery, 'observe', return_value=healthy):
+                        delivery.sample(f.db, 'product', 'm1', '42')
+                    self.assertIsNone(delivery.inspect(f.db, 'product', 'm2', '42')['incident'])
+
+    def test_continuation_inherits_exact_monitor_cases(self):
         from factory_v1.tests.test_delivery import configuration
         from factory_v1.tests.test_recovery import RecoveryFixture
         config = configuration('http://127.0.0.1:9876')
@@ -122,28 +148,20 @@ class DeliveryContinuationRegressions(unittest.TestCase):
                 source = fixture(self, RecoveryFixture)
                 source.config = config
                 healthy = source.evidence(True)
-                self.assertEqual(healthy['status'], 'healthy')
-                failed = dict(healthy, status=status, failure=None if status == 'healthy' else 'delivery_unknown')
-                f.item = seed_monitor(f, config, failed)
-                with patch.object(delivery, 'observe', return_value=failed):
-                    before = delivery.context(f.db, 'product', 'm1', '42')
-                    started = f.start()
-                    self.assertEqual(started.get('delivery_monitor'), before['delivery_monitor'])
-                    self.assertEqual(started.get('main_incident'), before.get('main_incident'))
-                    started = seed_monitor(f, config, failed, f.pending_interview(), before.get('main_incident'), notify=False)
-                    boundary = delivery.mutation_boundary(f.db, 'product', 'm2', '42')
-                    self.assertEqual(boundary.get('main_incident'), before.get('main_incident'))
-                    self.assertEqual(attention.records(f.db, 'product', 'm2', started), [])
-                later = dict(healthy, status='unknown', failure='delivery_unknown')
-                with patch.object(delivery, 'observe', return_value=later):
-                    delivery.sample(f.db, 'product', 'm1', '42')
-                current = delivery.inspect(f.db, 'product', 'm2', '42')
-                self.assertEqual(current['monitor']['latest']['status'], 'unknown')
-                self.assertIsNotNone(current['incident'])
-                with patch.object(delivery, 'observe', return_value=healthy):
-                    delivery.sample(f.db, 'product', 'm1', '42')
-                self.assertIsNone(delivery.inspect(f.db, 'product', 'm2', '42')['incident'])
-                self.assertEqual(f.start()['delivery_monitor']['latest']['status'], 'healthy')
+                evidence = dict(healthy, status=status, failure=None if status == 'healthy' else 'delivery_unknown')
+                f.item = seed_monitor(f, config, evidence)
+                before = delivery.context(f.db, 'product', 'm1', '42')
+                started = f.start()
+                self.assertEqual(started.get('delivery_monitor'), before['delivery_monitor'])
+                self.assertEqual(started.get('main_incident'), before.get('main_incident'))
+                self.assertEqual(started['planning']['status'], 'pending')
+        f = fixture(self, fixtures.ContinuationComponents)
+        source = fixture(self, RecoveryFixture)
+        source.config = config
+        healthy = source.evidence(True)
+        f.item = seed_monitor(f, config, healthy)
+        seed_monitor(f, config, healthy, f.pending_interview(), notify=False)
+        self.assertEqual(f.start()['delivery_monitor']['latest']['status'], 'healthy')
 
 
 class ScopedInputRegressions(unittest.TestCase):
@@ -197,53 +215,53 @@ class ScopedInputRegressions(unittest.TestCase):
 
 class RevisionPublicationRegressions(unittest.TestCase):
     def test_scoped_revision_readback_does_not_repeat_the_completed_interview(self):
-        f = fixture(self, fixtures.ContinuationComponents)
-        item = f.start()
-        item['handoff'] = copy.deepcopy(f.item['handoff'])
-        item['planning']['status'] = 'complete'
-        docs = {name: '# Agreed revised prose' for name in ('milestone.md', 'vision.md', 'provenance.md')}
-        docs['milestone.md'] = '\n'.join('## ' + s + '\nAgreed prose.\n' for s in planning.SECTIONS)
-        record = {'status': 'synthesized', 'request': {'change_id': 'revision1'}, 'documents': docs, 'tickets': [],
-                  'resolution': {'content': 'New agreed scope', 'reference': 'operator-direction'},
-                  'synthesis_request': {'skills': f.request['skills']}, 'affected': []}
-        item['requirement_changes'] = {'revision1': record}
-        save_iteration(f.db, item)
-        f.db.commit()
-        corrupt = {'value': False}
-        def read(path):
-            if '/git/commits/' in path:
-                return {'sha': 'e' * 40}
-            if '/contents/' in path:
-                name = path.split('/')[-1].split('?')[0]
-                raw = (docs[name] + ('drift' if corrupt['value'] else '')).encode()
-                return {'type': 'file', 'path': 'docs/revision1/' + name, 'encoding': 'base64',
-                        'content': base64.b64encode(raw).decode(),
-                        'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()}
-            return {'number': 9, 'id': 90, 'html_url': 'https://github.com/example/product/issues/9',
-                    'repository_url': 'https://api.github.com/repos/example/product', 'state': 'open',
-                    'body': docs['milestone.md'], 'labels': [{'name': 'ready-for-agent'}]}
-        github = Mock(base='http://127.0.0.1:9876')
-        github.request.side_effect = read
-        with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
-             patch.object(requirement_publication, 'version_documents', return_value={'path': 'docs/revision1', 'commit': 'e' * 40}), \
-             patch.object(requirement_publication, 'spec_issue', return_value=9), \
-             patch.object(tickets, 'pinned_inputs', side_effect=lambda db, shadow, api: {'handoff': shadow['handoff'], 'documents': {}}), \
-             patch.object(requirement_publication, 'verify_publication'), patch.object(requirements, 'sync_blocks'), \
-             patch.object(planning, 'resolve_planning', return_value={}), patch.object(planning, 'reconcile'):
-            result = requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
-            revised = result['requirement_changes']['revision1']
-            self.assertEqual(revised['status'], 'published')
-            self.assertEqual(revised['new_revision']['spec']['commit'], 'e' * 40)
-            self.assertEqual(revised['new_revision']['spec']['issue']['number'], 9)
-            self.assertEqual(result['planning'], item['planning'])
-            self.assertEqual(result['handoff'], item['handoff'])
-            revised['status'] = 'synthesized'
-            save_iteration(f.db, result)
+            f = fixture(self, fixtures.ContinuationComponents)
+            item = f.pending_interview()
+            item['handoff'] = copy.deepcopy(f.item['handoff'])
+            item['planning']['status'] = 'complete'
+            docs = {name: '# Agreed revised prose' for name in ('milestone.md', 'vision.md', 'provenance.md')}
+            docs['milestone.md'] = '\n'.join('## ' + s + '\nAgreed prose.\n' for s in planning.SECTIONS)
+            record = {'status': 'synthesized', 'request': {'change_id': 'revision1'}, 'documents': docs, 'tickets': [],
+                      'resolution': {'content': 'New agreed scope', 'reference': 'operator-direction'},
+                      'synthesis_request': {'skills': f.request['skills']}, 'affected': []}
+            item['requirement_changes'] = {'revision1': record}
+            save_iteration(f.db, item)
             f.db.commit()
-            corrupt['value'] = True
-            with self.assertRaisesRegex(RepositoryError, 'Published docs differ'):
-                requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
-        # Versioned readback is not a substitute for actual selected resynthesis.
-        with patch('factory_v1.skills.resolve', return_value={}):
-            with self.assertRaisesRegex(RepositoryError, 'Actual selected synthesis required'):
-                requirement_publication.verify_synthesis(item, record)
+            corrupt = {'value': False}
+            def read(path):
+                if '/git/commits/' in path:
+                    return {'sha': 'e' * 40}
+                if '/contents/' in path:
+                    name = path.split('/')[-1].split('?')[0]
+                    raw = (docs[name] + ('drift' if corrupt['value'] else '')).encode()
+                    return {'type': 'file', 'path': 'docs/revision1/' + name, 'encoding': 'base64',
+                            'content': base64.b64encode(raw).decode(),
+                            'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()}
+                return {'number': 9, 'id': 90, 'html_url': 'https://github.com/example/product/issues/9',
+                        'repository_url': 'https://api.github.com/repos/example/product', 'state': 'open',
+                        'body': docs['milestone.md'], 'labels': [{'name': 'ready-for-agent'}]}
+            github = Mock(base='http://127.0.0.1:9876')
+            github.request.side_effect = read
+            with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
+                 patch.object(requirement_publication, 'version_documents', return_value={'path': 'docs/revision1', 'commit': 'e' * 40}), \
+                 patch.object(requirement_publication, 'spec_issue', return_value=9), \
+                 patch.object(tickets, 'pinned_inputs', side_effect=lambda db, shadow, api: {'handoff': shadow['handoff'], 'documents': {}}), \
+                 patch.object(requirement_publication, 'verify_publication'), patch.object(requirements, 'sync_blocks'), \
+                 patch.object(planning, 'resolve_planning', return_value={}), patch.object(planning, 'reconcile'):
+                result = requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
+                revised = result['requirement_changes']['revision1']
+                self.assertEqual(revised['status'], 'published')
+                self.assertEqual(revised['new_revision']['spec']['commit'], 'e' * 40)
+                self.assertEqual(revised['new_revision']['spec']['issue']['number'], 9)
+                self.assertEqual(result['planning'], item['planning'])
+                self.assertEqual(result['handoff'], item['handoff'])
+                revised['status'] = 'synthesized'
+                save_iteration(f.db, result)
+                f.db.commit()
+                corrupt['value'] = True
+                with self.assertRaisesRegex(RepositoryError, 'Published docs differ'):
+                    requirement_publication.publish(f.db, 'product', 'm2', '42', {'change_id': 'revision1'}, github)
+            # Versioned readback is not a substitute for actual selected resynthesis.
+            with patch('factory_v1.skills.resolve', return_value={}):
+                with self.assertRaisesRegex(RepositoryError, 'Actual selected synthesis required'):
+                    requirement_publication.verify_synthesis(item, record)

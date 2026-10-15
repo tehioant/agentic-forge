@@ -271,73 +271,94 @@ class SandboxComponentTests(unittest.TestCase):
             action()
         self.assertEqual(refusal.exception.code, code)
 
-    def test_untrusted_launcher_fields_are_refused_without_creating_attempt(self):
-        config = launcher_config(self.root)
-        config['command'] = ['sh', '-c', 'unrestricted']
-        self.fixture.config.write_text(json.dumps(config))
-        self.refusal('invalid_launcher', lambda: load_config(self.fixture.config))
-        self.assertEqual(list(self.fixture.artifacts.iterdir()), [])
-        self.assertNotIn('runtime', self.fixture.stored())
+    def test_launcher_configuration_admission_cases(self):
+        rows = (
+            ('valid', None), ('extra', 'invalid_launcher'), ('config-dotdot', 'unsafe_path'),
+            ('config-symlink', 'unsafe_path'), ('artifacts-dotdot', 'unsafe_path'),
+            ('private', 'invalid_launcher'), ('uid', 'invalid_launcher'), ('socket', 'invalid_launcher'),
+            ('seconds', 'invalid_launcher'),
+            *((('checks', value), 'invalid_launcher') for value in
+              ('echo unsafe', [None], [''], ['x\0y'], ['x' * 1025], ['echo ok'] * 9)),
+        )
+        for index, (defect, code) in enumerate(rows):
+            with self.subTest(defect=defect):
+                root = self.root / ('configuration-' + str(index))
+                root.mkdir()
+                artifacts = root / 'artifacts'
+                artifacts.mkdir(mode=0o700)
+                config = launcher_config(root)
+                path = root / 'launcher.json'
+                selected = path
+                untouched = self.fixture.state.read_bytes()
+                if isinstance(defect, tuple):
+                    config['verification_commands'] = defect[1]
+                elif defect == 'extra':
+                    config['command'] = ['sh', '-c', 'unrestricted']
+                elif defect == 'uid':
+                    config['uid'] = 0
+                elif defect == 'seconds':
+                    config['limits']['seconds'] = 0
+                elif defect == 'socket':
+                    alias = root / 'socket-alias'
+                    alias.symlink_to(root / 'absent.sock')
+                    config['subscription_socket'] = str(alias)
+                elif defect in {'config-dotdot', 'artifacts-dotdot'}:
+                    outside = root / 'outside'
+                    outside.mkdir()
+                    if defect == 'config-dotdot':
+                        selected = outside / '..' / path.name
+                    else:
+                        config['artifacts_root'] = str(outside / '..' / 'artifacts')
+                elif defect == 'config-symlink':
+                    selected = root / 'alias'
+                    selected.symlink_to(path)
+                path.write_text(json.dumps(config))
+                path.chmod(0o644 if defect == 'private' else 0o600)
+                if code:
+                    self.refusal(code, lambda: load_config(selected))
+                else:
+                    self.assertEqual(load_config(selected), config)
+                self.assertEqual(list(artifacts.iterdir()), [])
+                self.assertNotIn('runtime', self.fixture.stored())
+                self.assertEqual(self.fixture.state.read_bytes(), untouched)
 
-    def test_launcher_path_aliases_and_symlinks_refused_before_attempt(self):
-        outside = self.root / 'outside'
-        outside.mkdir()
-        alias = self.root / 'alias'
-        alias.symlink_to(self.fixture.config)
-        for path in (outside / '..' / self.fixture.config.name, alias):
-            self.refusal('unsafe_path', lambda: load_config(path))
-        config = launcher_config(self.root)
-        config['artifacts_root'] = str(outside / '..' / 'artifacts')
-        self.fixture.config.write_text(json.dumps(config))
-        self.refusal('unsafe_path', lambda: load_config(self.fixture.config))
-        self.assertEqual(list(self.fixture.artifacts.iterdir()), [])
 
-    def test_disjoint_controller_scopes_refused_before_runtime_mutation(self):
-        fixture = self.fixture
-        original = fixture.config.read_text()
-        for target in ('config', 'artifacts', 'state'):
+    def test_controller_scope_admission_cases(self):
+        for target in ('config', 'artifacts', 'state', 'state-alias'):
             with self.subTest(target=target):
-                fixture.config.write_text(original)
+                fixture = self.fixture if target == 'config' else LauncherFixture(self)
+                original = fixture.config.read_text()
                 if target == 'config':
-                    nested = fixture.source / 'launcher.json'
-                    nested.write_text(original)
-                    nested.chmod(0o600)
-                    fixture.config = nested
+                    fixture.config = fixture.source / 'launcher.json'
+                    fixture.config.write_text(original)
+                    fixture.config.chmod(0o600)
                 elif target == 'artifacts':
                     nested = fixture.source / 'artifacts'
                     nested.mkdir(mode=0o700)
                     config = json.loads(original)
                     config['artifacts_root'] = str(nested)
                     fixture.config.write_text(json.dumps(config))
-                else:
-                    # A source ancestor containing controller state is also disjointness failure.
+                elif target == 'state':
                     assignment = fixture.stored()
-                    assignment['handoff']['workspace'] = str(self.root)
+                    assignment['handoff']['workspace'] = str(fixture.root)
                     with fixture.db:
                         fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
-                self.refusal('unsafe_path', fixture.launch)
+                else:
+                    alias = fixture.root / 'existing-parent'
+                    alias.mkdir()
+                    fixture.state = alias / '..' / 'state.sqlite'
+                model, result_store = Mock(), Mock(wraps=assignments.store_result)
+                def setup(mocks):
+                    mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
+                    mocks.enter_context(patch.object(assignments, 'store_result', result_store))
+                self.refusal('unsafe_path', lambda: fixture.launch(setup=setup))
                 self.assertNotIn('runtime', fixture.stored())
                 self.assertEqual(list(fixture.artifacts.iterdir()), [])
-                fixture.config = self.root / 'launcher.json'
-        fixture.docker.call.assert_not_called()
+                fixture.docker.call.assert_not_called()
+                fixture.helper.start.assert_not_called()
+                model.assert_not_called()
+                result_store.assert_not_called()
 
-    def test_noncanonical_state_alias_refuses_before_attempt(self):
-        fixture = self.fixture
-        alias = self.root / 'existing-parent'
-        alias.mkdir()
-        fixture.state = alias / '..' / 'state.sqlite'
-        model = Mock()
-        result_store = Mock(wraps=assignments.store_result)
-        def setup(mocks):
-            mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
-            mocks.enter_context(patch.object(assignments, 'store_result', result_store))
-        self.refusal('unsafe_path', lambda: fixture.launch(setup=setup))
-        self.assertNotIn('runtime', fixture.stored())
-        self.assertEqual(list(fixture.artifacts.iterdir()), [])
-        fixture.docker.call.assert_not_called()
-        fixture.helper.start.assert_not_called()
-        model.assert_not_called()
-        result_store.assert_not_called()
 
     def test_running_pause_observed_in_wait_loop_retains_scratch_and_retires_capability(self):
         from factory_v1 import controls
@@ -371,49 +392,86 @@ class SandboxComponentTests(unittest.TestCase):
             self.assertTrue(controls.blocked(fresh, 'product', 'm1'))
         fixture.docker.inspect.assert_called_once()
 
-    def test_launch_anonymous_mount_calls_real_verifier_before_any_model_or_start(self):
-        fixture = self.fixture
-        def inspect(name):
-            observed = fixture.docker_inspect(name)
-            observed['Mounts'].append({'Destination': '/anonymous', 'Type': 'volume'})
-            return observed
-        fixture.docker.inspect.side_effect = inspect
-        verifier = Mock(wraps=sandbox.verify)
-        model = Mock()
-        stored_result = Mock(wraps=assignments.store_result)
-        def setup(mocks):
-            mocks.enter_context(patch.object(sandbox, 'verify', verifier))
-            mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
-            mocks.enter_context(patch.object(assignments, 'store_result', stored_result))
-        result = fixture.launch(setup=setup)
-        verifier.assert_called_once()
-        self.assertEqual(result['runtime']['error'], 'isolation_unavailable')
-        self.assertEqual(result['runtime']['status'], 'failed')
-        self.assertTrue(result['runtime']['container_removed'])
-        self.assertTrue(result['runtime']['recoverable'])
-        self.assertEqual(fixture.stored(), result)
-        self.assertEqual([call.args[0] for call in fixture.docker.call.call_args_list], ['create'])
-        fixture.docker.remove.assert_called_once_with(result['runtime']['container'])
-        fixture.helper.join.assert_called_once_with(timeout=1)
-        self.assertFalse(Path(json.loads((fixture.attempt_root() / 'capability-path.json').read_text())).exists())
-        model.assert_not_called()
-        self.assertEqual(list((fixture.attempt_root() / 'model-evidence').iterdir()), [])
-        stored_result.assert_not_called()
-        self.assertNotIn('submitted_result', result)
+    def test_prestart_failure_retirement_cases(self):
+        for defect, code in (('mount', 'isolation_unavailable'), ('pin', 'source_blocked')):
+            with self.subTest(defect=defect):
+                fixture = self.fixture if defect == 'mount' else LauncherFixture(self)
+                def inspect(name):
+                    observed = fixture.docker_inspect(name)
+                    observed['Mounts'].append({'Destination': '/anonymous', 'Type': 'volume'})
+                    return observed
+                if defect == 'mount':
+                    fixture.docker.inspect.side_effect = inspect
+                verifier = Mock(wraps=sandbox.verify)
+                model, stored_result = Mock(), Mock(wraps=assignments.store_result)
+                def setup(mocks):
+                    mocks.enter_context(patch.object(sandbox, 'verify', verifier))
+                    mocks.enter_context(patch.object(sandbox.spending, 'serve_unix_socket', model))
+                    mocks.enter_context(patch.object(assignments, 'store_result', stored_result))
+                    if defect == 'pin':
+                        mocks.enter_context(patch.object(sandbox, 'snapshot', side_effect=RepositoryError('source_blocked', 'labeled absent pin')))
+                result = fixture.launch(setup=setup)
+                self.assertEqual(result['runtime']['error'], code)
+                self.assertEqual(result['runtime']['status'], 'failed')
+                self.assertTrue(result['runtime']['recoverable'])
+                self.assertEqual(fixture.stored(), result)
+                self.assertNotIn('submitted_result', result)
+                self.assertFalse(any(call.args[0] == 'start' for call in fixture.docker.call.call_args_list))
+                model.assert_not_called()
+                stored_result.assert_not_called()
+                if defect == 'mount':
+                    verifier.assert_called_once()
+                    self.assertTrue(result['runtime']['container_removed'])
+                    self.assertEqual([call.args[0] for call in fixture.docker.call.call_args_list], ['create'])
+                    fixture.docker.remove.assert_called_once_with(result['runtime']['container'])
+                    fixture.helper.join.assert_called_once_with(timeout=1)
+                    self.assertFalse(Path(json.loads((fixture.attempt_root() / 'capability-path.json').read_text())).exists())
+                    self.assertEqual(list((fixture.attempt_root() / 'model-evidence').iterdir()), [])
+                else:
+                    fixture.helper.start.assert_not_called()
+                    verifier.assert_not_called()
 
-    def test_launch_retains_scoped_artifacts_and_never_promotes_worker_claims(self):
-        fixture = self.fixture
-        component = FinalizationFixture(self, fixture)
-        result = component.finalize()
-        self.assertEqual(fixture.stored(), result)
-        self.assertTrue(result['result_disposition']['isolated_execution'])
-        for flag in ('trusted_execution', 'checks_verified', 'advance_allowed', 'close_allowed'):
-            self.assertFalse(result['result_disposition'][flag])
-        self.assertEqual((fixture.source / 'hello.py').read_text(), 'print("baseline")\n')
-        self.assertFalse((fixture.attempt_root() / 'workspace/.git').exists())
-        self.assertEqual(result['runtime']['candidate_sha256'], assignments.digest(component.pins['workspace']))
-        self.assertEqual(result['runtime']['baseline_sha256'], assignments.digest(component.pins['baseline']))
-        self.assertEqual(result['submitted_result'], component.result)
+    def test_result_evidence_admission_cases(self):
+        rows = (('writable', True, None), ('loads', True, 'invalid_result'),
+                ('readonly', False, None), ('bytes', False, 'invalid_result'),
+                ('run', False, 'stale_assignment'), ('transcript', True, None))
+        for defect, writable, code in rows:
+            with self.subTest(defect=defect):
+                fixture = self.fixture if defect == 'writable' else LauncherFixture(self)
+                component = FinalizationFixture(self, fixture)
+                report = component.result
+                if defect == 'loads':
+                    (component.root / 'scratch/loads.json').write_text('[{"source":"forged"}]')
+                elif defect == 'bytes':
+                    (component.root / 'workspace/hello.py').write_text('changed read-only source')
+                elif defect == 'run':
+                    assignment = fixture.stored()
+                    assignment['runtime']['run_id'] = 'other-run'
+                    with fixture.db:
+                        fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+                elif defect == 'transcript':
+                    report['tests'][0]['result'] = 'FORGED: 99 tests OK'
+                    (component.root / 'scratch/result.json').write_text(json.dumps(report))
+                    path = component.root / 'scratch/conversation.json'
+                    conversation = json.loads(path.read_text())
+                    conversation['messages'][1]['content'] = report['tests'][0]['result']
+                    path.write_text(json.dumps(conversation))
+                if code:
+                    self.refusal(code, lambda: component.finalize(writable=writable))
+                    self.assertNotIn('submitted_result', fixture.stored())
+                else:
+                    result = component.finalize(writable=writable)
+                    self.assertEqual(fixture.stored(), result)
+                    self.assertTrue(result['result_disposition']['isolated_execution'])
+                    for flag in ('trusted_execution', 'checks_verified', 'advance_allowed', 'close_allowed'):
+                        self.assertFalse(result['result_disposition'][flag])
+                    self.assertEqual(result['submitted_result'], report)
+                    self.assertEqual(result['runtime']['candidate_sha256'], assignments.digest(component.pins['workspace']))
+                    self.assertEqual(result['runtime']['baseline_sha256'], assignments.digest(component.pins['baseline']))
+                    self.assertFalse((component.root / 'workspace/.git').exists())
+                    self.assertEqual((fixture.source / 'hello.py').read_text(), 'print("baseline")\n')
+                    self.assertFalse((component.root / 'verified-tests.json').exists())
+                self.assertTrue(component.root.is_dir())
 
     def test_role_mount_files_are_readable_by_different_nonroot_identity(self):
         component = FinalizationFixture(self, self.fixture)
@@ -427,17 +485,6 @@ class SandboxComponentTests(unittest.TestCase):
         sandbox.project_mount_permissions(root, root / 'inputs', False)
         self.assertEqual((root / 'workspace/hello.py').stat().st_mode & 0o022, 0)
 
-    def test_bad_physical_pin_is_recoverable_and_never_starts_worker(self):
-        fixture = self.fixture
-        def setup(mocks):
-            mocks.enter_context(patch.object(sandbox, 'snapshot', side_effect=RepositoryError('source_blocked', 'labeled absent pin')))
-        result = fixture.launch(setup=setup)
-        self.assertEqual(result['runtime']['status'], 'failed')
-        self.assertEqual(result['runtime']['error'], 'source_blocked')
-        self.assertTrue(result['runtime']['recoverable'])
-        self.assertNotIn('submitted_result', result)
-        fixture.helper.start.assert_not_called()
-        self.assertFalse(any(call.args[0] == 'start' for call in fixture.docker.call.call_args_list))
 
     def test_anonymous_mount_and_credential_propagation_refused(self):
         cfg = launcher_config(self.root)
@@ -458,33 +505,31 @@ class SandboxComponentTests(unittest.TestCase):
                 self.refusal('isolation_unavailable', lambda: verify(observed, cfg, 'fixture', 'fixture-image-id', mounts))
         verify(container_inspection(cfg, 'fixture', mounts), cfg, 'fixture', 'fixture-image-id', mounts)
 
-    def test_forged_loads_never_advance_and_retain_artifacts(self):
-        fixture = self.fixture
-        component = FinalizationFixture(self, fixture)
-        (component.root / 'scratch/loads.json').write_text('[{"source":"forged"}]')
-        with self.assertRaises(RepositoryError) as error:
-            component.finalize()
-        self.assertEqual(error.exception.code, 'invalid_result')
-        self.assertNotIn('submitted_result', fixture.stored())
-        self.assertTrue(fixture.attempt_root().is_dir())
 
-    def test_pause_and_changed_ticket_refuse_before_any_attempt(self):
-        fixture = self.fixture
-        for code in ('scope_mismatch', 'iteration_paused'):
-            def revalidate(db):
-                if code == 'iteration_paused':
-                    item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
-                    item['status'] = 'paused'
-                    with db:
-                        db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-                    assignments.current(db, 'product', 'm1', '42')
-                raise RepositoryError(code, 'labeled scope readback refusal')
-            fixture.preparing = revalidate
-            self.refusal(code, fixture.launch)
-            self.assertNotIn('runtime', fixture.stored())
-            self.assertEqual(list(fixture.artifacts.iterdir()), [])
-        fixture.helper.start.assert_not_called()
-        fixture.docker.call.assert_not_called()
+    def test_fresh_attempt_admission_cases(self):
+        for code in ('scope_mismatch', 'iteration_paused', 'run_conflict'):
+            with self.subTest(code=code):
+                fixture = self.fixture if code == 'scope_mismatch' else LauncherFixture(self)
+                if code == 'run_conflict':
+                    FinalizationFixture(self, fixture)
+                else:
+                    def revalidate(db):
+                        if code == 'iteration_paused':
+                            item = json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+                            item['status'] = 'paused'
+                            with db:
+                                db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
+                            assignments.current(db, 'product', 'm1', '42')
+                        raise RepositoryError(code, 'labeled scope readback refusal')
+                    fixture.preparing = revalidate
+                self.refusal(code, lambda: fixture.launch(setup=lambda mocks: mocks.enter_context(
+                    patch('factory_v1.restart.process_identity', return_value='declared-controller'))))
+                fixture.docker.call.assert_not_called()
+                fixture.helper.start.assert_not_called()
+                fixture.guard.wait.assert_not_called()
+                if code != 'run_conflict':
+                    self.assertNotIn('runtime', fixture.stored())
+                    self.assertEqual(list(fixture.artifacts.iterdir()), [])
 
     def test_unlinked_diagnostic_assignment_cannot_inject_failure_prose(self):
         from factory_v1 import diagnosis
@@ -494,19 +539,6 @@ class SandboxComponentTests(unittest.TestCase):
         self.assertEqual(self.fixture.state.read_bytes(), before)
         self.assertEqual(list(self.fixture.artifacts.iterdir()), [])
 
-    def test_launcher_privacy_limits_and_subscription_aliases_are_refused(self):
-        fixture = self.fixture
-        fixture.config.chmod(0o644)
-        self.refusal('invalid_launcher', lambda: load_config(fixture.config))
-        fixture.config.chmod(0o600)
-        socket_alias = self.root / 'socket-alias'
-        socket_alias.symlink_to(self.root / 'absent.sock')
-        for change in ({'uid': 0}, {'subscription_socket': str(socket_alias)},
-                       {'limits': {**launcher_config(self.root)['limits'], 'seconds': 0}}):
-            fixture.config.write_text(json.dumps({**launcher_config(self.root), **change}))
-            self.refusal('invalid_launcher', lambda: load_config(fixture.config))
-        self.assertNotIn('runtime', fixture.stored())
-        self.assertEqual(list(fixture.artifacts.iterdir()), [])
 
     def test_worker_loader_correlations_and_physical_evidence_fail_closed(self):
         fixture = self.fixture
@@ -620,11 +652,19 @@ class SandboxComponentTests(unittest.TestCase):
         self.assertEqual(fixture.docker.remove.call_count, 4)
 
 
-    def test_direct_cleanup_preserves_pause_failure_and_uncertainty_precedence(self):
+    def test_cleanup_ownership_precedence_cases(self):
         from factory_v1 import controls
-        for reason in ('complete', 'pause', 'verification_failed', 'invalid_result', 'remove', 'guard', 'broker'):
+        rows = (('complete', 'complete', None, False), ('pause', 'stopped', 'iteration_paused', False),
+                ('verification_failed', 'failed', 'verification_failed', False),
+                ('invalid_result', 'failed', 'invalid_result', False),
+                ('remove', 'unconfirmed', 'stop_unconfirmed', False),
+                ('guard', 'unconfirmed', 'stop_unconfirmed', False),
+                ('broker', 'unconfirmed', 'stop_unconfirmed', False),
+                ('signal-remove', 'stopped', 'cancelled', False),
+                ('alive-broker', 'unconfirmed', 'stop_unconfirmed', True))
+        for reason, expected, expected_error, capability_exists in rows:
             with self.subTest(reason=reason):
-                fixture = LauncherFixture(self)
+                fixture = self.fixture if reason == 'complete' else LauncherFixture(self)
                 component = FinalizationFixture(self, fixture)
                 status, error = 'complete', None
                 if reason == 'pause':
@@ -633,47 +673,40 @@ class SandboxComponentTests(unittest.TestCase):
                     status, error = 'failed', reason
                 elif reason == 'remove':
                     fixture.docker.remove.side_effect = OSError('declared removal uncertainty')
-                    component.cancel(signal.SIGTERM, None)
                 elif reason == 'guard':
                     fixture.guard.wait.side_effect = subprocess.TimeoutExpired('declared guard', 35)
-                    component.cancel(signal.SIGTERM, None)
                 elif reason == 'broker':
                     component.broker_errors.append('DeclaredBrokerFailure')
+                elif reason == 'alive-broker':
+                    fixture.helper.is_alive.side_effect = None
+                    fixture.helper.is_alive.return_value = True
+                elif reason == 'signal-remove':
+                    assignment = fixture.stored()
+                    assignment['submitted_result'] = component.result
+                    assignment['result_disposition'] = {'trusted_execution': False, 'advance_allowed': False, 'close_allowed': False}
+                    with fixture.db:
+                        fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+                    fixture.docker.remove.side_effect = lambda name: component.cancel(signal.SIGTERM, None)
+                if reason in {'remove', 'guard', 'broker', 'alive-broker'}:
                     component.cancel(signal.SIGTERM, None)
                 result = component.cleanup(status=status, error=error)
-                uncertain = reason in {'remove', 'guard', 'broker'}
-                expected = 'unconfirmed' if uncertain else 'stopped' if reason == 'pause' else status
                 self.assertEqual(result['runtime']['status'], expected)
-                self.assertEqual(result['runtime']['error'], 'stop_unconfirmed' if uncertain else 'iteration_paused' if reason == 'pause' else error)
-                self.assertEqual(result['runtime']['container_removed'], not uncertain)
+                self.assertEqual(result['runtime']['error'], expected_error)
+                self.assertEqual(result['runtime']['container_removed'], expected != 'unconfirmed')
                 self.assertEqual(result['runtime']['recoverable'], expected != 'complete')
                 self.assertEqual(fixture.stored(), result)
-                self.assertFalse(component.capability.exists())
+                self.assertEqual(component.capability.exists(), capability_exists)
                 self.assertEqual((component.root / 'scratch/result.json').read_text(), json.dumps(component.result))
                 fixture.docker.remove.assert_called_once_with(component.runtime['container'])
                 fixture.guard.wait.assert_called_once_with(timeout=35)
                 fixture.guard.kill.assert_not_called()
                 fixture.helper.join.assert_called_once_with(timeout=1)
+                if reason == 'signal-remove':
+                    self.assertTrue((component.root / 'stop').exists())
+                    self.assertEqual(result['submitted_result'], component.result)
+                    for flag in ('trusted_execution', 'advance_allowed', 'close_allowed'):
+                        self.assertFalse(result['result_disposition'][flag])
 
-    def test_direct_result_read_only_source_and_run_correlation(self):
-        for defect in ('unchanged', 'bytes', 'run'):
-            with self.subTest(defect=defect):
-                fixture = LauncherFixture(self)
-                component = FinalizationFixture(self, fixture)
-                if defect == 'bytes':
-                    (component.root / 'workspace/hello.py').write_text('changed read-only source')
-                elif defect == 'run':
-                    assignment = fixture.stored()
-                    assignment['runtime']['run_id'] = 'other-run'
-                    with fixture.db:
-                        fixture.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
-                if defect == 'unchanged':
-                    self.assertTrue(component.finalize(writable=False)['result_disposition']['isolated_execution'])
-                else:
-                    with self.assertRaises(RepositoryError) as error:
-                        component.finalize(writable=False)
-                    self.assertEqual(error.exception.code, 'invalid_result' if defect == 'bytes' else 'stale_assignment')
-                    self.assertNotIn('submitted_result', fixture.stored())
 
     def test_direct_pause_at_result_revalidation_and_after_commit(self):
         from factory_v1 import controls
@@ -705,14 +738,6 @@ class SandboxComponentTests(unittest.TestCase):
                 self.assertNotEqual(result['runtime']['status'], 'complete')
                 self.assertTrue(controls.blocked(fixture.db, 'product', 'm1'))
 
-    def test_direct_existing_attempt_refuses_relaunch_before_worker_start(self):
-        fixture = self.fixture
-        FinalizationFixture(self, fixture)
-        self.refusal('run_conflict', lambda: fixture.launch(setup=lambda mocks: mocks.enter_context(
-            patch('factory_v1.restart.process_identity', return_value='declared-controller'))))
-        fixture.docker.call.assert_not_called()
-        fixture.guard.wait.assert_not_called()
-        fixture.helper.start.assert_not_called()
 
 
 class SourceSnapshotTests(unittest.TestCase):
@@ -762,40 +787,40 @@ class SourceSnapshotTests(unittest.TestCase):
         with patch.object(sandbox_source.subprocess, 'run', side_effect=self.git_boundary):
             return sandbox_source.snapshot(self.source, {'baseline': self.revision}, self.destination)
 
-    def test_packed_source_ignores_configuration_and_untracked_secrets(self):
-        manifests = self.snapshot()
-        self.assertEqual(manifests['baseline'], {'hello.py': {'sha256': hashlib.sha256(self.content).hexdigest(),
-                                                             'bytes': len(self.content), 'executable': False}})
-        self.assertEqual((self.destination / 'baseline/hello.py').read_bytes(), self.content)
-        self.assertFalse((self.destination / 'baseline/.env').exists())
-        self.assertFalse((self.destination / 'baseline/.git').exists())
-        self.assertFalse((self.destination / 'git-reader').exists())
-        for argv, kwargs in self.calls:
-            self.assertEqual(argv[0], '/usr/bin/git')
-            self.assertNotEqual(kwargs['cwd'], self.source)
-            self.assertEqual(kwargs['env']['GIT_CONFIG_GLOBAL'], '/dev/null')
-            self.assertEqual(kwargs['env']['GIT_CONFIG_NOSYSTEM'], '1')
-            self.assertEqual(kwargs['env']['GIT_NO_REPLACE_OBJECTS'], '1')
-
-    def test_physical_pin_drift_is_refused_and_reader_removed(self):
-        self.revision = 'a' * 40
-        with patch.object(sandbox_source.subprocess, 'run', side_effect=self.git_boundary):
-            with self.assertRaises(RepositoryError) as caught:
-                sandbox_source.snapshot(self.source, {'baseline': 'b' * 40}, self.destination)
-        self.assertEqual(caught.exception.code, 'source_blocked')
-        self.assertFalse((self.destination / 'git-reader').exists())
-
-    def test_symlink_submodule_and_escape_source_entries_are_refused(self):
-        for entry in (b'120000 blob ', b'160000 commit ', b'100644 blob '):
-            self.entry = entry + b'c' * 40 + (b'\t../escape\0' if entry == b'100644 blob ' else b'\tlink\0')
-            with self.subTest(entry=entry):
-                try:
+    def test_pinned_source_snapshot_cases(self):
+        rows = (('packed', 'b' * 40, b'100644 blob ', b'hello.py'),
+                ('pin', 'a' * 40, b'100644 blob ', b'hello.py'),
+                ('symlink', 'b' * 40, b'120000 blob ', b'link'),
+                ('submodule', 'b' * 40, b'160000 commit ', b'link'),
+                ('escape', 'b' * 40, b'100644 blob ', b'../escape'))
+        for label, revision, mode, name in rows:
+            with self.subTest(label=label):
+                self.destination = self.root / label
+                self.destination.mkdir()
+                self.revision = revision
+                self.entry = mode + b'c' * 40 + b'\t' + name + b'\0'
+                self.calls = []
+                if label == 'packed':
+                    manifests = self.snapshot()
+                    self.assertEqual(manifests['baseline'], {'hello.py': {'sha256': hashlib.sha256(self.content).hexdigest(),
+                                                                         'bytes': len(self.content), 'executable': False}})
+                    self.assertEqual((self.destination / 'baseline/hello.py').read_bytes(), self.content)
+                    self.assertFalse((self.destination / 'baseline/.env').exists())
+                    self.assertFalse((self.destination / 'baseline/.git').exists())
+                else:
                     with self.assertRaises(RepositoryError) as caught:
-                        self.snapshot()
+                        with patch.object(sandbox_source.subprocess, 'run', side_effect=self.git_boundary):
+                            sandbox_source.snapshot(self.source, {'baseline': 'b' * 40}, self.destination)
                     self.assertEqual(caught.exception.code, 'source_blocked')
-                    self.assertFalse((self.destination / 'git-reader').exists())
-                finally:
-                    shutil.rmtree(self.destination / 'baseline', ignore_errors=True)
+                self.assertFalse((self.destination / 'git-reader').exists())
+                for argv, kwargs in self.calls:
+                    self.assertEqual(argv[0], '/usr/bin/git')
+                    self.assertNotEqual(kwargs['cwd'], self.source)
+                    self.assertEqual(kwargs['env']['GIT_CONFIG_GLOBAL'], '/dev/null')
+                    self.assertEqual(kwargs['env']['GIT_CONFIG_NOSYSTEM'], '1')
+                    self.assertEqual(kwargs['env']['GIT_NO_REPLACE_OBJECTS'], '1')
+
+
 
     def test_manifest_refuses_worker_created_symlinks_and_git_metadata(self):
         artifact = self.root / 'artifact'
@@ -903,17 +928,24 @@ class DockerRemovalTests(unittest.TestCase):
     def response(self, args, code=0, stdout=b'', stderr=b''):
         return subprocess.CompletedProcess(['/fixture/docker', *args], code, stdout, stderr)
 
-    def test_conflicting_remove_waits_for_verified_absence(self):
-        responses = [
-            self.response(['rm', '-f', self.name], 1, stderr=b'removal is already in progress'),
-            self.response(['inspect', self.name], stdout=b'[{"State": {"Status": "removing"}}]'),
-            self.response(['inspect', self.name], 1, stderr=b'Error: No such object'),
-        ]
-        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run, \
-                patch('time.sleep'):
-            self.docker.remove(self.name)
-        self.assertEqual([call.args[0][1:] for call in run.call_args_list],
-                         [['rm', '-f', self.name], ['inspect', self.name], ['inspect', self.name]])
+    def test_docker_removal_confirmed_absence_cases(self):
+        for conflict in (True, False):
+            with self.subTest(conflict=conflict):
+                responses = [self.response(['rm', '-f', self.name], 1,
+                             stderr=b'removal is already in progress' if conflict else b'No such container')]
+                if conflict:
+                    responses.append(self.response(['inspect', self.name], stdout=b'[{"State":{"Status":"removing"}}]'))
+                responses.append(self.response(['inspect', self.name], 1, stderr=b'Error: No such object' if conflict else b'Error: No such container'))
+                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run, \
+                        patch('time.sleep') as sleep:
+                    self.docker.remove(self.name)
+                self.assertEqual([call.args[0][1:] for call in run.call_args_list],
+                                 [['rm', '-f', self.name]] + [['inspect', self.name]] * (2 if conflict else 1))
+                self.assertEqual(run.call_count, 3 if conflict else 2)
+                if conflict:
+                    sleep.assert_called_once_with(.1)
+                else:
+                    sleep.assert_not_called()
 
     def test_stop_and_guard_competing_removal_keep_fresh_readback_consistent(self):
         fixture = LauncherFixture(self)
@@ -965,46 +997,33 @@ class DockerRemovalTests(unittest.TestCase):
         with sqlite3.connect(fixture.state) as fresh:
             self.assertEqual(json.loads(fresh.execute('SELECT payload FROM role_assignments').fetchone()[0]), stopped)
 
-    def test_already_removed_is_idempotent_but_still_inspected(self):
-        responses = [self.response(['rm', '-f', self.name], 1, stderr=b'No such container'),
-                     self.response(['inspect', self.name], 1, stderr=b'Error: No such container')]
-        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run:
-            self.docker.remove(self.name)
-        self.assertEqual(run.call_count, 2)
 
-    def test_remaining_container_never_counts_as_removed(self):
-        for state in ('running', 'removing'):
-            with self.subTest(state=state):
-                responses = [self.response(['rm', '-f', self.name], 1),
-                             self.response(['inspect', self.name], stdout=json.dumps([{'State': {'Status': state}}]).encode()),
-                             self.response(['inspect', self.name], stdout=json.dumps([{'State': {'Status': state}}]).encode())]
-                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses), \
-                        patch('time.monotonic', side_effect=[0, 0, 30]), \
-                        patch('time.sleep') as sleep, \
-                        self.assertRaises(RepositoryError) as caught:
+    def test_docker_removal_uncertainty_cases(self):
+        for defect in ('running', 'removing', 'rm-timeout', 'daemon', 'json', 'inspect-timeout'):
+            with self.subTest(defect=defect):
+                present = defect in {'running', 'removing'}
+                if present:
+                    observation = self.response(['inspect', self.name], stdout=json.dumps([{'State': {'Status': defect}}]).encode())
+                    responses = [self.response(['rm', '-f', self.name], 1), observation, observation]
+                elif defect == 'rm-timeout':
+                    responses = [subprocess.TimeoutExpired('docker rm', 30)]
+                else:
+                    failure = (self.response(['inspect', self.name], 1, stderr=b'Cannot connect to Docker daemon') if defect == 'daemon' else
+                               self.response(['inspect', self.name], stdout=b'not JSON') if defect == 'json' else
+                               subprocess.TimeoutExpired('docker inspect', 30))
+                    responses = [self.response(['rm', '-f', self.name]), failure]
+                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=responses) as run, \
+                        patch('time.monotonic', side_effect=[0, 0, 30] if present else None, return_value=0), \
+                        patch('time.sleep') as sleep, self.assertRaises(RepositoryError) as caught:
                     self.docker.remove(self.name)
-                self.assertEqual(caught.exception.code, 'stop_unconfirmed')
-                sleep.assert_called_once_with(.1)
+                self.assertEqual(caught.exception.code, 'stop_unconfirmed' if present else 'container_unavailable')
+                self.assertEqual(run.call_count, 3 if present else 1 if defect == 'rm-timeout' else 2)
+                if present:
+                    sleep.assert_called_once_with(.1)
+                else:
+                    sleep.assert_not_called()
 
-    def test_removal_timeout_is_not_hidden_by_optional_command(self):
-        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=
-                   subprocess.TimeoutExpired('docker rm', 30)) as run, \
-                self.assertRaises(RepositoryError) as caught:
-            self.docker.remove(self.name)
-        self.assertEqual(caught.exception.code, 'container_unavailable')
-        self.assertEqual(run.call_count, 1)
 
-    def test_inspection_failures_never_count_as_absence(self):
-        failures = [self.response(['inspect', self.name], 1, stderr=b'Cannot connect to Docker daemon'),
-                    self.response(['inspect', self.name], stdout=b'not JSON'),
-                    subprocess.TimeoutExpired('docker inspect', 30)]
-        for failure in failures:
-            with self.subTest(failure=failure):
-                with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=[
-                        self.response(['rm', '-f', self.name]), failure]), \
-                        self.assertRaises(RepositoryError) as caught:
-                    self.docker.remove(self.name)
-                self.assertEqual(caught.exception.code, 'container_unavailable')
 
 
 

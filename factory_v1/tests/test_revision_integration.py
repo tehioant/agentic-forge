@@ -1,6 +1,7 @@
 """Focused revision boundaries with simulated external reads/effects, not native acceptance."""
 import base64
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import sqlite3
@@ -34,6 +35,16 @@ def lean_body(inputs):
             '## Constraint\n\nNo unrelated changes.\n\n## Blocked by\n\nNone.\n\n'
             '<!-- factory-ticket:revision:notes -->\n')
 
+
+
+@contextmanager
+def component_case(cls):
+    case = cls(methodName='runTest')
+    try:
+        case.setUp()
+        yield case
+    finally:
+        case.doCleanups()
 
 class RevisionBodyTests(unittest.TestCase):
     def test_lean_update_family_keeps_unrelated_bytes_and_admits_only_new_pins(self):
@@ -239,36 +250,32 @@ class RevisionIntegrationTests(unittest.TestCase):
             {'change_id': 'durable-notes', 'direction': self.direction, 'new_revision': record['new_revision']}, self.github)
 
     def test_lean_revision_preserves_crlf_unrelated_sections_footer_and_lost_update(self):
-        record = self.prepare_publication()
-        original = lean_body(self.old_inputs).replace('## ', '## \t').replace('\n', '\r\n')
-        self.issues[10]['body'] = original
-        record['issues']['10'] = requirements.issue_pin(self.issues[10])
-        self.save(self.item)
-        def lost_update(path, payload=None, method=None):
-            assert payload is not None
-            self.issues[int(path.split('/')[-1])].update(payload)
-            raise RepositoryError('transport_error', 'SIMULATED lost update response')
-        self.github.request.side_effect = lost_update
-        published = self.publish_updates()
-        record = published['requirement_changes']['durable-notes']
-        self.assertEqual(record['status'], 'published')
-        body = self.issues[10]['body']
-        self.assertEqual(tickets.external_contract(self.issues[10], record['new_inputs']), 'contracted')
-        self.assertIn('agreed durable-note behavior', tickets.sections(body)['Change'])
-        self.assertIn('durability acceptance', tickets.sections(body)['Done'])
-        for name in ('Constraint', 'Blocked by'):
-            before, after = tickets.section_spans(original), tickets.section_spans(body)
-            assert before is not None and after is not None
-            self.assertEqual(original[slice(*before[name])], body[slice(*after[name])])
-        self.assertNotIn('\n', body.replace('\r\n', ''))
-        self.assertTrue(body.endswith(original[original.index('<!--'):]))
-        self.assertEqual(self.github.request.call_count, 2)
-        self.publish_updates()
-        self.assertEqual(self.github.request.call_count, 2, 'Readback recovery must not repeat either issue update')
-        self.prepare_resume()  # Independent published input, not the preceding component's output.
-        resumed = self.release()
-        self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
-        self.assertEqual(self.statuses, {10: 'Ready', 11: 'Ready'})
+            record = self.prepare_publication()
+            original = lean_body(self.old_inputs).replace('## ', '## \t').replace('\n', '\r\n')
+            self.issues[10]['body'] = original
+            record['issues']['10'] = requirements.issue_pin(self.issues[10])
+            self.save(self.item)
+            def lost_update(path, payload=None, method=None):
+                assert payload is not None
+                self.issues[int(path.split('/')[-1])].update(payload)
+                raise RepositoryError('transport_error', 'SIMULATED lost update response')
+            self.github.request.side_effect = lost_update
+            published = self.publish_updates()
+            record = published['requirement_changes']['durable-notes']
+            self.assertEqual(record['status'], 'published')
+            body = self.issues[10]['body']
+            self.assertEqual(tickets.external_contract(self.issues[10], record['new_inputs']), 'contracted')
+            self.assertIn('agreed durable-note behavior', tickets.sections(body)['Change'])
+            self.assertIn('durability acceptance', tickets.sections(body)['Done'])
+            for name in ('Constraint', 'Blocked by'):
+                before, after = tickets.section_spans(original), tickets.section_spans(body)
+                assert before is not None and after is not None
+                self.assertEqual(original[slice(*before[name])], body[slice(*after[name])])
+            self.assertNotIn('\n', body.replace('\r\n', ''))
+            self.assertTrue(body.endswith(original[original.index('<!--'):]))
+            self.assertEqual(self.github.request.call_count, 2)
+            self.publish_updates()
+            self.assertEqual(self.github.request.call_count, 2, 'Readback recovery must not repeat either issue update')
 
     def test_pause_after_final_record_read_prevents_revision_and_retirement(self):
         assignment = {'assignment_id': 'old-worker', 'revision': {'commit': 'a' * 40},
@@ -405,8 +412,33 @@ class RevisionIntegrationTests(unittest.TestCase):
             self.assertEqual([call.args[3] for call in stage.call_args_list], ['to-spec', 'to-tickets'])
             invoke.assert_not_called()
 
-    def test_pause_after_synthesis_input_read_prevents_capability_attempt(self):
-        self.refuse_synthesis_input()
+    def test_synthesis_last_input_interruption_cases(self):
+        for malformed, code in [(False, 'iteration_paused'), (True, 'invalid_control')]:
+            with self.subTest(malformed=malformed), component_case(RevisionIntegrationTests) as case:
+                case.install_record('resolved')
+                reads = 0
+                def final_input(*args):
+                    nonlocal reads
+                    reads += 1
+                    if reads == 2:
+                        case.interrupt(malformed=malformed)
+                    return case.old_inputs
+                case.pinned.side_effect = final_input
+                with patch.object(synthesis, 'invoke', side_effect=lambda config, work, *, cancelled, admission: case.produced(work)) as invoke:
+                    after = case.refused(case.execute, 'invalid_control' if malformed else 'iteration_paused')
+                    case.assertEqual(reads, 2)
+                    record = after['requirement_changes']['durable-notes']
+                    case.assertEqual(record['status'], 'resolved')
+                    case.assertNotIn('attempts', record)
+                    case.assertNotIn('executions', record)
+                    invoke.assert_not_called()
+                    case.resume(malformed=malformed)
+                    case.pinned.side_effect = None
+                    # Routing is independent of stage execution; do not perform two precursor stages.
+                    with patch.object(synthesis, 'run_stage', side_effect=lambda db, item, record, stage, config, work: case.produced(work)['result']) as stage:
+                        case.assertEqual(case.execute()['requirement_changes']['durable-notes']['status'], 'synthesized')
+                    case.assertEqual([call.args[3] for call in stage.call_args_list], ['to-spec', 'to-tickets'])
+                    invoke.assert_not_called()
 
     def test_pause_at_synthesis_return_retains_untrusted_receipt_not_admitted_result(self):
         self.install_record('resolved')
@@ -493,37 +525,40 @@ class RevisionIntegrationTests(unittest.TestCase):
         self.assertEqual(self.release()['requirement_changes']['durable-notes']['status'], 'resumed')
         self.assertEqual(self.statuses, {10: 'Ready', 11: 'Ready'})
 
-    def test_malformed_control_before_synthesis_attempt_never_invokes_adapter(self):
-        self.refuse_synthesis_input(malformed=True)
 
     def test_stop_after_final_ready_write_cannot_release_requirement_hold(self):
-        self.prepare_resume()
-        def final_write(*args):
-            self.change_status(*args)
-            if self.statuses == {10: 'Ready', 11: 'Ready'}:
-                self.interrupt('emergency-stop')
-        self.set_field.side_effect = final_write
-        after = self.refused(self.release)
-        self.assertEqual(after['requirement_changes']['durable-notes']['status'], 'resume-pending')
-        self.assertEqual(requirements.held_numbers(after), {10, 11})
-        self.assertEqual(self.statuses, {10: 'Ready', 11: 'Ready'}, 'Already applied effects stay truthful')
-        writes = self.set_field.call_count
-        self.resume()
-        self.assertEqual(self.release()['requirement_changes']['durable-notes']['status'], 'resumed')
-        self.assertEqual(self.set_field.call_count, writes, 'Ready effect reconciliation must not repeat writes')
-        # Requirement-only release must not clear independent holds or underlying deferred progress.
-        for previous, stuck, expected in [('blocked', False, 'Blocked'), ('deferred', False, 'Deferred'),
-                                           ('ready', True, 'Blocked')]:
-            with self.subTest(previous=previous, stuck=stuck):
-                self.item = self.read()
-                record = self.item['requirement_changes']['durable-notes']
-                record.update(status='published', previous_statuses={'10': previous, '11': 'ready'})
-                self.item['stuck_work'] = {'independent': {'status': 'held', 'affected': [10]}} if stuck else {}
-                self.statuses.update({10: 'Blocked', 11: 'Blocked'})
-                self.save(self.item)
-                self.set_field.side_effect = self.change_status
-                resumed = self.release()
+            self.prepare_resume()
+            def final_write(*args):
+                self.change_status(*args)
+                if self.statuses == {10: 'Ready', 11: 'Ready'}:
+                    self.interrupt('emergency-stop')
+            self.set_field.side_effect = final_write
+            after = self.refused(self.release)
+            self.assertEqual(after['requirement_changes']['durable-notes']['status'], 'resume-pending')
+            self.assertEqual(requirements.held_numbers(after), {10, 11})
+            self.assertEqual(self.statuses, {10: 'Ready', 11: 'Ready'}, 'Already applied effects stay truthful')
+            writes = self.set_field.call_count
+            self.resume()
+            self.assertEqual(self.release()['requirement_changes']['durable-notes']['status'], 'resumed')
+            self.assertEqual(self.set_field.call_count, writes, 'Ready effect reconciliation must not repeat writes')
+            # Requirement-only release must not clear independent holds or underlying deferred progress.
+            for previous, stuck, expected in [('blocked', False, 'Blocked'), ('deferred', False, 'Deferred'),
+                                               ('ready', True, 'Blocked')]:
+                with self.subTest(previous=previous, stuck=stuck):
+                    self.item = self.read()
+                    record = self.item['requirement_changes']['durable-notes']
+                    record.update(status='published', previous_statuses={'10': previous, '11': 'ready'})
+                    self.item['stuck_work'] = {'independent': {'status': 'held', 'affected': [10]}} if stuck else {}
+                    self.statuses.update({10: 'Blocked', 11: 'Blocked'})
+                    self.save(self.item)
+                    self.set_field.side_effect = self.change_status
+                    resumed = self.release()
+                    self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
+                    self.assertEqual(self.statuses, {10: expected, 11: 'Ready'})
+                    if stuck:
+                        self.assertEqual(resumed['stuck_work']['independent']['status'], 'held')
+            with component_case(RevisionIntegrationTests) as case:
+                case.prepare_resume()
+                resumed = case.release()
                 self.assertEqual(resumed['requirement_changes']['durable-notes']['status'], 'resumed')
-                self.assertEqual(self.statuses, {10: expected, 11: 'Ready'})
-                if stuck:
-                    self.assertEqual(resumed['stuck_work']['independent']['status'], 'held')
+                self.assertEqual(case.statuses, {10: 'Ready', 11: 'Ready'})
