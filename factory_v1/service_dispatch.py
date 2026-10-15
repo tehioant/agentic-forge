@@ -226,6 +226,8 @@ def _launch_child(service, assignment_id, launcher, *, stop_event=None):
 
 
 def tick(service, github, *, stop_event=None):
+    if stop_event is not None and stop_event.is_set():
+        return blocked('service_stopping')
     from .service import connect, scope
     from .readiness_gate import check, retirement_resolution
     with connect(service) as database:
