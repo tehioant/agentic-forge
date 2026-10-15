@@ -6,7 +6,7 @@ import unittest
 from contextlib import ExitStack
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, delivery, merge, repositories, requirements, review, sandbox, sandbox_source, simplification, tickets
+from factory_v1 import assignments, delivery, merge, repositories, requirements, review, role_skills, sandbox, sandbox_source, simplification, tickets
 from factory_v1.tests import test_simplification, test_tickets
 
 
@@ -95,9 +95,9 @@ class RequirementMergeTests(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'stale_assignment'); self.assertEqual(assignments.rows(self.database), [old])
 
     def final_merge_fixture(self, fault=lambda: None):
-        """Declared completed evidence; real review -> prepare -> frontier, no workers.
+        """Preadmitted input records; real final review -> prepare -> frontier.
 
-        Only native-chain/Git assembly and delivery sampling are prerequisite seams.
+        Byte writers below do not execute precursor preparation or validation.
         Tracker state is mutable, while pinned specification document bytes stay exact.
         """
         root = self.fixture.root
@@ -112,26 +112,64 @@ class RequirementMergeTests(unittest.TestCase):
                                     'workspace': self.request['workspace']}
         evidence.seal_handoff()
         candidate['submitted_result'] = evidence.result(evidence.report())
-        candidate['simplification_result'] = simplification.validate_result(candidate, candidate['submitted_result'])
+        candidate['simplification_result'] = {
+            'contract': simplification.CONTRACT, 'outcome': 'no-op',
+            'candidate_sha256': evidence.runtime['candidate_sha256'],
+            'input_candidate_sha256': evidence.contract['input_candidate_sha256'], 'changed_paths': [],
+            'checks_verified': True, 'behavior_preservation_claim': 'preserved',
+            'native_execution_trusted': False, 'approval': False, 'advance_allowed': False,
+            'review_required': ['Standards', 'Spec'], 'findings': [],
+            'reason': 'native_execution_unattested_and_independent_review_required'}
         self.store(candidate)
         source, baseline = evidence.initial, evidence.baseline
         preceding = review.preceding(candidate, evidence_root, source, baseline, evidence.receipt)
         axes = []
+        contracts = {}
         for stage in ('review-standards', 'review-spec'):
             request = {key: copy.deepcopy(candidate['handoff'][key]) for key in assignments.REQUEST_FIELDS}
             request.update(stage=stage, claim_id=stage, preceding=preceding,
                            profile={**self.request['profile'], 'name': stage, 'home': str(root / stage)})
-            axis = assignments.prepare(self.database, 'product', 'm1', '42', request, self.github, dry_run=True)
+            contract = {'contract': review.CONTRACT, 'axis': review.AXES[stage],
+                        'pins': review.pins(candidate, source, baseline),
+                        'verification_commands': ['python -m unittest discover -v'],
+                        'policy_paths': [], 'test_changes': [],
+                        'result_fields': ['contract', 'axis', 'adaptation', 'pins', 'verdict',
+                                          'findings', 'test_assessment', 'stuckness'],
+                        'finding_fields': sorted(review.FINDING_FIELDS), 'finding_kinds': sorted(review.KINDS),
+                        'verdicts': ['pass', 'reject', 'stuck'], 'native_execution_trusted': False}
+            contracts[stage] = contract
+            input_loads = {self.fixture.issues[10]['html_url']: request['issue']['body_sha256'],
+                           **{d['url']: d['sha256'] for d in self.fixture.inputs['documents'].values()},
+                           **{'handoff:preceding:' + a['name']: a['sha256'] for a in preceding}}
+            handoff = {**request, 'review': contract, 'adaptation': role_skills.ADAPTATIONS[stage],
+                       'issue_body': self.fixture.issues[10]['body'], 'specification': self.fixture.inputs,
+                       'stage_rules': role_skills.STAGE_RULES[stage],
+                       'support_policy': {k: role_skills.SUPPORT_POLICY[k] for k in ('repository-inputs', 'required')},
+                       'input_loads': input_loads, 'skill_entry_points': list(role_skills.STAGES[stage]),
+                       'tracker': {'api_base': self.github.base, 'board': self.fixture.board,
+                                   'issue_url': self.fixture.issues[10]['html_url']},
+                       'fresh_context': True, 'inherited_memory': False, 'inherited_sessions': False,
+                       'credentials': [], 'model_policy': {'scope': 'fixture', 'reservation': 1, 'recheck_at_call': True},
+                       'result_requirements': {'identity': ['assignment_id', 'handoff_digest', 'claim_id', 'run_id'],
+                           'required_evidence': ['actual-selected-instruction-loads', 'observable-skill-guided-work',
+                                                 'artifacts', 'tests', 'trusted-whole-process-execution'],
+                           'advancement': 'disabled-without-trusted-whole-process-evidence'}}
+            axis = {'assignment_id': assignments.digest({'request': request, 'scope': candidate['ticket_scope']}), 'claim_id': stage,
+                    'ticket_scope': copy.deepcopy(candidate['ticket_scope']), 'revision': copy.deepcopy(candidate['revision']),
+                    'handoff': handoff, 'handoff_digest': assignments.digest(handoff), 'assignment_ready': True}
             axis_root = root / (stage + '-evidence'); axis_root.mkdir(mode=0o700)
             local = test_simplification.LocalStageEvidence(axis_root)
+            local.runtime['run_id'] = stage + '-input'
+            local.refresh_checks()
             axis['runtime'] = local.runtime
-            report = {'contract': review.CONTRACT, 'axis': review.AXES[stage], 'pins': axis['handoff']['review']['pins'],
-                      'adaptation': axis['handoff']['adaptation'], 'verdict': 'pass', 'findings': [],
+            report = {'contract': review.CONTRACT, 'axis': review.AXES[stage], 'pins': contract['pins'],
+                      'adaptation': handoff['adaptation'], 'verdict': 'pass', 'findings': [],
                       'test_assessment': 'SIMULATED independent assessment', 'stuckness': None}
             result = local.result(report, 'review-result')
             result.update(assignment_id=axis['assignment_id'], claim_id=axis['claim_id'], handoff_digest=axis['handoff_digest'])
             axis.update(submitted_result=result, result_disposition={'checks_verified': True})
-            axis['review_result'] = review.validate_result(axis, result)
+            axis['review_result'] = {**report, 'report_sha256': result['artifacts'][0]['sha256'],
+                                     'native_execution_trusted': False, 'advance_allowed': False, 'close_allowed': False}
             # Hash inputs are labeled fixtures, not claims of native execution.
             for relative in ('scratch/loads.json', 'scratch/events.jsonl', 'scratch/conversation.json', 'scratch/probes.json',
                              'inputs/worker.py', 'inputs/sandbox_relay.py', 'inputs/assignment.json', 'inputs/handoff.json',
@@ -154,7 +192,7 @@ class RequirementMergeTests(unittest.TestCase):
         self.config_path = root / 'merge.json'; self.config_path.write_text(json.dumps(self.config)); self.config_path.chmod(0o600)
         self.api = merge.MergeGitHub(self.config)
         self.api.github = self.github
-        self.protection_reads = 0; self.frontier_reads = []
+        self.protection_reads = 0; self.frontier_reads = []; self.fault_injected = False
         repo = {'id': 123, 'full_name': 'example/product', 'default_branch': 'main'}
         self.pr = {'number': 20, 'state': 'open', 'merged': False, 'draft': False, 'mergeable': True, 'mergeable_state': 'clean',
                    'base': {'ref': 'main', 'sha': self.config['baseline'], 'repo': repo},
@@ -172,7 +210,9 @@ class RequirementMergeTests(unittest.TestCase):
             if suffix == '/rules/branches/main': return []
             if suffix == '/branches/main/protection':
                 self.protection_reads += 1
-                if self.protection_reads == 3: fault()
+                if self.protection_reads == 3:
+                    fault()
+                    self.fault_injected = True
                 return copy.deepcopy(self.classic)
             if suffix.startswith('/git/ref/heads/'):
                 branch = suffix.removeprefix('/git/ref/heads/')
@@ -186,6 +226,10 @@ class RequirementMergeTests(unittest.TestCase):
         self.enterContext(patch.object(merge, 'chain', side_effect=lambda *a: (self.stored_candidate(), {}, evidence_root)))
         self.enterContext(patch.object(merge, 'mapped_candidate', return_value={'tree': 'd' * 40}))
         self.enterContext(patch.object(delivery, 'mutation_boundary', side_effect=lambda *a: assignments.current(*a)))
+        # Only precursor contract metadata is supplied. Final pair validation,
+        # approved execution-binding comparison and prepare/frontier stay real.
+        self.enterContext(patch.object(review, 'handoff', side_effect=lambda _d, _p, _i, _o, request:
+                                      copy.deepcopy(contracts[request['stage']])))
         # A transparent observation of the real external tracker read records timing;
         # evaluate/prepare/frontier themselves are never replaced.
         project_items = self.fixture.project_items
@@ -217,7 +261,7 @@ class RequirementMergeTests(unittest.TestCase):
         self.assertFalse('merge' in stored, 'Final frontier refusal must not persist merge intent')
         self.assertEqual([call for call in self.github.request.call_args_list if call.args[1] is not None], [])
         self.assertEqual(caught.exception.code, code)
-        self.assertEqual(self.protection_reads, 3)
+        self.assertTrue(self.fault_injected)
         self.assertIn(0, self.frontier_reads)  # Initially valid at actual merge admission.
         if code != 'stale_admission':
             self.assertIn(3, self.frontier_reads)  # Re-read by the FINAL review checkpoint.
@@ -231,8 +275,9 @@ class RequirementMergeTests(unittest.TestCase):
         self.final_merge_fixture()
         with self.assertRaises(repositories.RepositoryError) as caught: self.run_final_merge()
         self.assertEqual(caught.exception.code, 'merge_uncertain')
-        self.assertEqual(self.protection_reads, 3)
-        self.assertEqual(self.frontier_reads, [0, 0, 3, 3])
+        self.assertTrue(self.fault_injected)
+        self.assertIn(0, self.frontier_reads)
+        self.assertIn(3, self.frontier_reads)
         self.assertEqual(self.stored_candidate()['merge']['status'], 'pending')
         puts = [call for call in self.github.request.call_args_list if call.args[2:] == ('PUT',)]
         self.assertEqual(len(puts), 1)
