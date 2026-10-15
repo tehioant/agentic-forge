@@ -1,6 +1,7 @@
 """Combined public checkpoints from explicit records; no worker/stage journeys."""
 from copy import deepcopy
 import json
+from pathlib import Path
 import unittest
 from unittest.mock import Mock
 
@@ -90,3 +91,21 @@ class CombinedReadinessTests(SupervisedFixture, unittest.TestCase):
             merge.reopen(api, row, config, observed, database=self.db)
         api.issue_state.assert_not_called()
         self.assertEqual(assignments.current(self.db, 'p', 'i', 'operator', require_active=False)['restart_reconciliation']['blockers'][0]['boundary'], 'model')
+
+    def test_public_corrective_reopen_final_tracker_read_rechecks_policy(self):
+        row, config, observed, records, api = self.reopen_fixture()
+        source = Path(self.config['slots'][0]['skills'][0]['path'])
+        raw = source.read_bytes()
+        def read(path):
+            result = deepcopy(records[path])
+            if path == '/issues/1':
+                source.write_bytes(raw + b'changed at final issue read')
+            return result
+        api.read.side_effect = read
+        try:
+            with self.assertRaises(RepositoryError) as caught:
+                merge.reopen(api, row, config, observed, database=self.db)
+            self.assertEqual(caught.exception.code, 'readiness_inputs_changed')
+            api.issue_state.assert_not_called()
+        finally:
+            source.write_bytes(raw)

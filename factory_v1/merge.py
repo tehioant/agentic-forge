@@ -271,12 +271,15 @@ def reopen(api, assignment, config, observed, *, database):
     pr = target(api, config)
     require(pr.get('merged') is True and pr.get('state') == 'closed' and assignments.commit(pr.get('merge_commit_sha')),
             'Corrective reopening requires the exact integrated PR.', 'not_integrated')
-    from .readiness_gate import check
-    check(database, project, iteration, operation='effect', resolution=resolution,
-          selection={'merge_reopen': assignment['assignment_id']})
+    from . import readiness_gate, controls
+    selection = {'merge_reopen': assignment['assignment_id']}
+    observation = readiness_gate.observe(database, project, iteration, operation='effect',
+                                         resolution=resolution, selection=selection)
     require(issue(api, saved, config) == observed, 'Corrective issue changed before reopening.', 'scope_mismatch')
-    from .controls import require_active
-    require_active(database, project, iteration, resolution=resolution)
+    with controls.lane(database, project, iteration):
+        readiness_gate.compare(database, project, iteration, observation, resolution=resolution)
+        readiness_gate.local_check(database, project, iteration, observation, resolution, selection, 'effect')
+        controls.require_active(database, project, iteration, resolution=resolution)
     try:
         api.issue_state('open', observed)
     except RepositoryError:
