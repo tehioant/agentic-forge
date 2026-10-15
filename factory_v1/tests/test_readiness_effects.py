@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import patch
 
 from factory_v1 import assignments, attention, effect_resolution, merge, messaging, recovery, requirements, tickets
+from factory_v1 import readiness_gate, service_dispatch
 from factory_v1.errors import IntakeError
 from factory_v1.repositories import RepositoryError
 from factory_v1.tests import test_readiness as fixtures
@@ -98,6 +99,139 @@ class ReceiptTests(unittest.TestCase):
                 transport.send({'destination': {'chat_id': '1', 'thread_id': '3'}})
         self.assertEqual(caught.exception.code, 'invalid_origin')
         run.assert_not_called()
+
+
+class NotificationAdmissionTests(fixtures.SupervisedFixture, unittest.TestCase):
+    """Reconstructed SPEC26-01 regression; original retained probe has no script."""
+    file = fixtures.ReadinessTests.file
+    save = fixtures.ReadinessTests.save
+    read = fixtures.ReadinessTests.read
+
+    def setUp(self):
+        fixtures.EnforcedReadinessTests.setUp(self)
+        self.db.execute('CREATE TABLE notifications(project TEXT, iteration TEXT, event_id TEXT, payload TEXT, '
+                        'PRIMARY KEY(project, iteration, event_id))')
+        self.pending = dict(project_id='p', iteration_id='i', destination=deepcopy(self.origin),
+            event=dict(event_id='incident', kind='incident', message='Engineering capability unavailable',
+                       issue_number=1, run_id='observer', evidence_ids=['proof']),
+            state='pending', attempts=0, receipt=None, decision_response=None,
+            correlation=dict(project_id='p', iteration_id='i', control_run_id='control', evidence_id='evidence',
+                stage='incident', work_item=dict(repository='owner/product', issue_number=1),
+                worker_run_id='observer', evidence_ids=['proof']))
+        self.reset_pending()
+
+    def reset_pending(self):
+        attention.save(self.db, deepcopy(self.pending))
+        self.db.commit()
+
+    def deliver(self, public=False):
+        if public:
+            return attention.lifecycle(self.db, 'p', 'i', 'operator', 'deliver',
+                event_id='incident', config_path=self.service['transport_config'])
+        return attention.deliver(self.db, self.item, 'incident', self.service['transport_config'])
+
+    def test_incident_reports_unrelated_capability_failures_without_admitting_engineering(self):
+        original = self.github.request.side_effect
+        for fault in ('projects', 'repository', 'board', 'stages'):
+            for route in ('direct', 'lifecycle', 'nested'):
+                with self.subTest(fault=fault, route=route):
+                    self.reset_pending()
+                    def metadata(path, *args, **kwargs):
+                        if fault == 'repository' or (fault == 'board' and path == '/graphql'):
+                            raise ValueError('independent metadata inaccessible')
+                        return original(path, *args, **kwargs)
+                    self.github.request.side_effect = metadata
+                    if fault == 'projects': self.write_authority['operations'].remove('projects')
+                    try:
+                        with patch.object(service_dispatch, 'installed', side_effect=ValueError('stage unavailable')) if fault == 'stages' else patch.object(service_dispatch, 'installed', wraps=service_dispatch.installed):
+                            for operation in ('work', 'effect'):
+                                with self.assertRaises(RepositoryError) as caught:
+                                    readiness_gate.check(self.db, 'p', 'i', operation=operation)
+                                self.assertEqual(caught.exception.code, 'readiness_blocked')
+                            with patch.object(attention.HermesTransport, 'send', return_value='accepted') as send:
+                                if route == 'nested':
+                                    with readiness_gate.admission(self.db, 'p', 'i', operation='notification'):
+                                        result = self.deliver()
+                                else:
+                                    result = self.deliver(public=route == 'lifecycle')
+                            self.assertEqual(result['state'], 'accepted')
+                            send.assert_called_once()
+                            self.assertEqual(send.call_args.args[0]['destination'], self.origin)
+                            self.assertEqual(attention.get_record(self.db, self.item, 'incident')['attempts'], 1)
+                    finally:
+                        self.github.request.side_effect = original
+                        if fault == 'projects': self.write_authority['operations'].append('projects')
+
+    def test_origin_transport_and_host_policy_drift_refuse_before_send_at_both_checks(self):
+        original = self.github.request.side_effect
+        baseline = deepcopy(self.item)
+        paths = [Path(self.service_path), Path(self.service['readiness_config']),
+                 Path(self.service['transport_config']), self.root / 'host-adapter']
+        saved = [(p, p.read_bytes(), p.stat().st_mode) for p in paths]
+        for phase in (1, 2):
+            for fault in ('origin', 'transport', 'private-config', 'executable', 'policy'):
+                with self.subTest(phase=phase, fault=fault):
+                    self.reset_pending()
+                    injected = False
+                    def metadata(path, *args, **kwargs):
+                        nonlocal injected
+                        result = original(path, *args, **kwargs)
+                        state = json.loads(self.db.execute('SELECT payload FROM notifications').fetchone()[0])['state']
+                        if path == '/repos/owner/product':
+                            if not injected and state == ('pending' if phase == 1 else 'uncertain'):
+                                injected = True
+                                if fault == 'origin':
+                                    self.item['origin'] = {**self.origin, 'thread_id': '999'}
+                                    self.save()
+                                elif fault == 'transport':
+                                    self.file('transport.json', {'command': [str(self.root / 'host-adapter')],
+                                                               'approved_destinations': []})
+                                elif fault == 'private-config': paths[0].chmod(0o666)
+                                elif fault == 'executable': paths[3].chmod(0o777)
+                                else:
+                                    self.file('readiness.json', {**self.config, 'reference': 'changed'})
+                        return result
+                    self.github.request.side_effect = metadata
+                    try:
+                        with patch.object(attention.HermesTransport, 'send', return_value='accepted') as send:
+                            with self.assertRaises((RepositoryError, IntakeError)):
+                                self.deliver(public=True)
+                            send.assert_not_called()
+                        stored = attention.records(self.db, 'p', 'i')[0]
+                        self.assertEqual((stored['state'], stored['attempts']),
+                                         ('pending', 0) if phase == 1 else ('uncertain', 1))
+                    finally:
+                        for path, raw, mode in saved:
+                            path.write_bytes(raw); path.chmod(mode)
+                        self.item = deepcopy(baseline); self.save()
+                        self.github.request.side_effect = original
+                    if phase == 2:
+                        # A refused final check leaves intent uncertain, never auto-resends.
+                        with patch.object(attention.HermesTransport, 'send') as send:
+                            self.assertEqual(self.deliver()['state'], 'uncertain')
+                            send.assert_not_called()
+
+    def test_incident_reports_during_restart_hold_and_without_a_hold(self):
+        for held in (False, True):
+            with self.subTest(held=held):
+                self.reset_pending()
+                if held:
+                    self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                        'blockers': [{'boundary': 'tracker', 'code': 'publication_uncertain'}]}
+                    self.save()
+                with patch.object(attention.HermesTransport, 'send', return_value='accepted') as send:
+                    result = self.deliver(public=True)
+                self.assertEqual((result['state'], result['attempts']), ('accepted', 1))
+                send.assert_called_once()
+
+    def test_changed_record_destination_cannot_be_routed_elsewhere(self):
+        record = deepcopy(self.pending)
+        record['destination']['thread_id'] = '999'
+        attention.save(self.db, record); self.db.commit()
+        with patch.object(attention.HermesTransport, 'send') as send:
+            with self.assertRaises(IntakeError): self.deliver(public=True)
+            send.assert_not_called()
+        self.assertEqual(json.loads(self.db.execute('SELECT payload FROM notifications').fetchone()[0])['attempts'], 0)
 
 
 class OperationIntegrationTests(fixtures.SupervisedFixture, unittest.TestCase):

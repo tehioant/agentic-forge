@@ -182,9 +182,16 @@ slots for a final effect.
 `operation='work'` remains the default. `effect` exempts new-worker capacity and a
 second allowance for already-prepared publication/delivery/completion; it does not
 waive exact downstream effect authority, current policy, permission, revision,
-ownership or controls. `notification` validates the exact sealed origin and route
-without fresh worker capacity/allowance/executor/healthy-delivery prerequisites,
-including waiting/completed incident reports. Unknown operation values refuse.
+ownership or controls. `notification` requires only the current scope and
+notification-route capability checks in both fresh observation and nested local
+admission: an inaccessible repository/board, denied GitHub/Projects authority or
+unavailable engineering stage cannot suppress an already-recorded incident.
+It still requires the exact sealed operator/project/iteration/repository identity,
+origin, private host configuration, code integrity and approved executable route;
+changed reviewed local inputs fail closed. It needs no fresh worker capacity,
+allowance, executor or healthy delivery, including waiting/completed incident
+reports. Ordinary work/effects retain their engineering capability requirements.
+Unknown operation values refuse.
 Exact existing EffectResolution tokens retain only their existing lane-specific
 restart/ownership exceptions. Registered repair health admission reuses durable
 incident/evidence/host authority and fresh registered-recovery readback; ordinary

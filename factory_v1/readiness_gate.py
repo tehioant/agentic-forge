@@ -281,7 +281,8 @@ def local_check(database, project, iteration, observation, resolution, selection
                     'Corrective authority permits only exact reopening.', 'scope_mismatch')
         if allowed:
             excluded |= {'capacity', 'spending', 'delivery'}
-    require(all(v['state'] == 'ready' for k, v in report['checks'].items() if k not in excluded),
+    required_checks = {'scope', 'notification'} if operation == 'notification' else set(report['checks']) - excluded
+    require(all(report['checks'].get(name, {}).get('state') == 'ready' for name in required_checks),
             'Current operation capabilities unavailable.', 'readiness_blocked')
     validate_selection(database, latest, latest_selected, selection, operation=operation)
     if operation == 'work':
@@ -330,7 +331,8 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
             # Exact previously-authorized effect resolution needs no NEW worker
             # allowance, unused slot or healthy deployment. All other gates stay.
             excluded |= {'capacity', 'spending', 'delivery'}
-    require(all(v['state'] == 'ready' for k, v in report['checks'].items() if k not in excluded),
+    required_checks = {'scope', 'notification'} if operation == 'notification' else set(report['checks']) - excluded
+    require(all(report['checks'].get(name, {}).get('state') == 'ready' for name in required_checks),
             'Current scoped capabilities unavailable; inspect readiness.', 'readiness_blocked')
     validate_selection(database, config, selected, selection, operation=operation)
     return config, selected, local, before, report, repair, scope_identity(assignments.current(database, project, iteration, config['operator_id'], require_active=False))
