@@ -53,9 +53,15 @@ class OverlappingHoldTests(unittest.TestCase):
                     with patch.object(tickets, 'frontier', side_effect=frontier), patch.object(diagnosis, 'source', side_effect=source), \
                             patch.object(tickets.gh, 'read_issue', side_effect=lambda github, repository, n: {'body': bodies[n]}), \
                             patch.object(tickets.gh, 'set_field', side_effect=set_field):
-                        for number in (10, 12):
-                            with closing(sqlite3.connect(state)) as database:
-                                diagnosis.declare(database, 'p', 'i', '42', {'stuck_assignment': identities[number]}, None)
+                        item['stuck_work'] = {identities[n]: {'status': 'diagnosis', 'sequence': index + 1,
+                            'pins': source(None, None, None, None, identities[n])[-1], 'affected': [n, 11],
+                            'issues': {str(k): {'id': 1000+k, 'node_id': f'I{k}',
+                                'body_sha256': hashlib.sha256(bodies[k].encode()).hexdigest()} for k in (n, 11)},
+                            'previous_statuses': {str(n): 'ready', '11': underlying},
+                            'retired_assignments': [], 'blocks_verified': True} for index, n in enumerate((10, 12))}
+                        statuses.update({n: 'blocked' for n in statuses})
+                        with closing(sqlite3.connect(state)) as database:
+                            tickets.checkpoint(database, item)
                         self.assertEqual(statuses[11], 'blocked')
                         for index, number in enumerate(order):
                             with closing(sqlite3.connect(state)) as database:

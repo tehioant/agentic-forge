@@ -27,7 +27,31 @@ class RecoveryComponentFixture(RecoveryFixture):
         self.db = db
         self.addCleanup(db.close)
         (self.root / 'state.sqlite').chmod(0o600)
-        self.sample(False)
+        evidence = self.evidence(False)
+        evidence_id = assignments.digest(evidence)
+        incident_id = 'main-' + assignments.digest({'project': 'p', 'iteration': 'i',
+            'config': assignments.digest(self.config), 'sequence': 1})
+        item = self.stored()
+        incident = {'incident_id': incident_id, 'status': 'active',
+            'monitor_sha256': assignments.digest(self.config), 'first_evidence': evidence_id,
+            'latest_evidence': evidence_id, 'recovery_assignment': None, 'recovery_issue': None}
+        item.update(main_incident=incident, delivery_monitor={'config': self.config,
+            'config_sha256': assignments.digest(self.config), 'sequence': 1,
+            'latest': {'evidence_id': evidence_id, 'status': 'failed', 'main': evidence['main']}})
+        event = {'event_id': incident_id, 'kind': 'incident', 'message': 'Preadmitted failed-health incident',
+            'issue_number': self.config['issue'], 'run_id': incident_id, 'evidence_ids': [evidence_id]}
+        notification = {'project_id': 'p', 'iteration_id': 'i', 'event': event,
+            'destination': item['origin'], 'state': 'pending', 'attempts': 0,
+            'receipt': None, 'decision_response': None, 'correlation': {**item['correlation'],
+                'work_item': {'repository': item['repository'], 'issue_number': event['issue_number']},
+                'worker_run_id': incident_id, 'evidence_ids': [evidence_id]}}
+        with self.db:
+            for table, key in [('delivery_observations', 'id'), ('delivery_incidents', 'id'), ('notifications', 'event_id')]:
+                self.db.execute(f'CREATE TABLE {table} (project TEXT, iteration TEXT, {key} TEXT, payload TEXT, PRIMARY KEY(project,iteration,{key}))')
+            self.db.execute('INSERT INTO delivery_observations VALUES (?,?,?,?)', ('p', 'i', evidence_id, json.dumps(evidence)))
+            self.db.execute('INSERT INTO delivery_incidents VALUES (?,?,?,?)', ('p', 'i', incident_id, json.dumps(incident)))
+            self.db.execute('INSERT INTO notifications VALUES (?,?,?,?)', ('p', 'i', incident_id, json.dumps(notification)))
+            save_iteration(self.db, item)
         self.issue = {'number': 20, 'id': 200, 'node_id': 'I20', 'body': 'repair requirements', 'state': 'open',
                       'html_url': 'https://github.com/example/product/issues/20'}
         self.pin = {k: self.issue[k] for k in ('number', 'id', 'node_id')} | {
@@ -93,9 +117,72 @@ class RecoveryComponentFixture(RecoveryFixture):
         with self.preparation_seams():
             return recovery.prepare(self.db, 'p', 'i', '42', self.request(claim), self.github, dry_run)
 
+    def seed_registered(self):
+        """Declare admitted authority; registration tests use register instead."""
+        item = self.stored()
+        related = assignments.rows(self.db)
+        removable = {a['assignment_id']: {'issue': a['handoff']['issue'], 'delivery': a['merge']}
+                     for a in related if a['assignment_id'] in self.authorization['removable_assignments']}
+        record = {'status': 'registered', 'config': copy.deepcopy(self.authorization),
+            'evidence': self.evidence(False), 'assignment': None,
+            'parked': [a['assignment_id'] for a in related], 'reservation': item.pop('reservation', None),
+            'removable': removable, 'removed': {}, 'clearance': None}
+        item['main_recoveries'] = {self.authorization['incident_id']: record}
+        item['main_incident'].update(recovery_issue=20, recovery_assignment=assignments.digest(self.authorization))
+        with self.db:
+            for a in related:
+                a['recovery_disposition'] = self.authorization['incident_id']
+                self.db.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(a), a['assignment_id']))
+            save_iteration(self.db, item)
+            self.db.execute('UPDATE delivery_incidents SET payload=? WHERE id=?',
+                (json.dumps(item['main_incident']), self.authorization['incident_id']))
+        return record
+
+    def seed_assignment(self):
+        """Preadmitted repair input with the same identity/projections as preparation."""
+        record = self.seed_registered()
+        item = self.stored()
+        request = self.request() | {'preceding': recovery.preceding(record)}
+        selected = [{'name': name, 'source': role_skills.SELECTED[name][0], 'path': '/fixture/' + name,
+            'sha256': hashlib.sha256(name.encode()).hexdigest(), 'instructions': name, 'dependencies': []}
+            for name in ('diagnosing-bugs', 'implement')]
+        request['skills'] = [{k: v for k, v in s.items() if k != 'instructions'} for s in selected]
+        scope = {'project': 'p', 'iteration': 'i', 'repository': item['repository'], 'repository_id': 7,
+            'issue_number': 20, 'issue_id': 200, 'workspace': request['workspace']}
+        loads = {self.issue['html_url']: self.pin['body_sha256']}
+        for group in ('standards', 'preceding'):
+            loads.update({'handoff:' + group + ':' + a['name']: a['sha256'] for a in request[group]})
+        handoff = {**request, 'skills': selected, 'issue_body': self.issue['body'],
+            'specification': item['ticket_work']['inputs'], 'adaptation': role_skills.ADAPTATIONS['repair'],
+            'stage_rules': role_skills.STAGE_RULES['repair'],
+            'support_policy': {k: role_skills.SUPPORT_POLICY[k] for k in sorted({'required', 'repository-inputs', 'diagnosing-bugs', 'implement-review'})},
+            'input_loads': loads, 'skill_entry_points': ['diagnosing-bugs', 'implement'],
+            'tracker': {'api_base': self.github.base, 'board': item['ticket_work']['board'], 'issue_url': self.issue['html_url']},
+            'fresh_context': True, 'inherited_memory': False, 'inherited_sessions': False, 'credentials': [],
+            'model_policy': {'scope': 'test', 'reservation': 1, 'recheck_at_call': True},
+            'result_requirements': {'identity': ['assignment_id', 'handoff_digest', 'claim_id', 'run_id'],
+                'required_evidence': ['actual-selected-instruction-loads', 'observable-skill-guided-work', 'artifacts', 'tests', 'trusted-whole-process-execution'],
+                'advancement': 'disabled-without-trusted-whole-process-evidence'},
+            'recovery': recovery.contract(record)}
+        assignment = {'assignment_id': assignments.digest({'request': request, 'scope': scope}),
+            'claim_id': request['claim_id'], 'ticket_scope': scope, 'handoff': handoff,
+            'handoff_digest': assignments.digest(handoff), 'assignment_ready': True, 'launchable': False,
+            'execution_allowed': False, 'status': 'prepared', 'refusal': 'whole_process_isolation_unavailable',
+            'revision': {'spec': item['handoff'], 'ticket_assignment': 'tickets', 'ticket_inputs': 'd' * 64}}
+        record = recovery.active(item)
+        assert record is not None
+        record.update(status='repair', assignment=assignment['assignment_id'])
+        item['main_incident']['recovery_assignment'] = assignment['assignment_id']
+        with self.db:
+            self.db.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
+            self.db.execute('INSERT INTO role_assignments VALUES (?,?)', (assignment['assignment_id'], json.dumps(assignment)))
+            save_iteration(self.db, item)
+            self.db.execute('UPDATE delivery_incidents SET payload=? WHERE id=?',
+                (json.dumps(item['main_incident']), self.authorization['incident_id']))
+        return assignment
+
     def completed_report(self):
-        self.register()
-        assignment = self.prepare()
+        assignment = self.seed_assignment()
         artifacts = self.root / 'artifacts'
         (artifacts / 'workspace').mkdir(parents=True)
         (artifacts / 'inputs/baseline').mkdir(parents=True)
@@ -191,7 +278,7 @@ class RecoveryComponents(RecoveryComponentFixture):
             self.register()
 
     def test_fresh_repair_handoff_and_claim_replay_with_feature_priority(self):
-        self.register()
+        self.seed_registered()
         before = self.db.total_changes
         preview = self.prepare(dry_run=True)
         self.assertEqual(self.db.total_changes, before)
@@ -211,8 +298,7 @@ class RecoveryComponents(RecoveryComponentFixture):
             recovery.handoff(self.db, self.stored(), self.request() | {'preceding': [simplification.artifact('incident-evidence', 'worker assertion')]})
 
     def test_parked_claim_does_not_admit_feature_results_or_reuse_profile(self):
-        self.register()
-        assignment = self.prepare()
+        assignment = self.seed_assignment()
         item = self.stored()
         record = recovery.active(item)
         assert record is not None
@@ -227,8 +313,7 @@ class RecoveryComponents(RecoveryComponentFixture):
             assignments.claims(self.db, self.request(), assignment['ticket_scope'], 'other')
 
     def test_stuck_retry_waits_for_explicit_separate_debug_direction(self):
-        self.register()
-        assignment = self.prepare()
+        assignment = self.seed_assignment()
         for status, response in [('diagnosis', None), ('awaiting-direction', None), ('release-pending', {'id': 'response'})]:
             item = self.stored()
             item['stuck_work'] = {'stuck': {'status': status, 'direction': {'action': 'retry'},
@@ -406,7 +491,7 @@ class RecoveryComponents(RecoveryComponentFixture):
         item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
         with self.db:
             save_iteration(self.db, item)
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(old_issue)
         member['status'] = 'B'
         item = self.stored()
@@ -524,7 +609,7 @@ class RecoveryComponents(RecoveryComponentFixture):
             before = tickets.frontier(self.db, self.stored(), self.github)['ticket_work']['frontier']
             self.assertEqual(before['eligible'], [])
             self.assertEqual([r['number'] for r in before['items']], [10])
-            self.register()
+            self.seed_registered()
             admitted = tickets.frontier(self.db, self.stored(), self.github)['ticket_work']['frontier']
             self.assertEqual(admitted['eligible'], [20])
             self.assertTrue(any(len(call.args) == 3 and call.args[0]['number'] == 20 and

@@ -11,8 +11,7 @@ from factory_v1.tests.test_recovery_components import RecoveryComponentFixture
 
 class RecoveryContinuationTests(RecoveryComponentFixture):
     def failed_root(self):
-        self.register()
-        prior = self.prepare()
+        prior = self.seed_assignment()
         prior['runtime'] = {'status': 'stopped', 'container_removed': True, 'error': 'controller_lost',
                             'recoverable': True, 'run_id': 'lost-run', 'artifacts': str(self.root / 'failed'),
                             'controller_pid': -1, 'controller_start': 'SIMULATED absent controller'}
@@ -201,7 +200,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
         with self.db:
             save_iteration(self.db, item)
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         write = self.github.request.side_effect
         def block(*args):
@@ -342,7 +341,7 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         item['ticket_work']['board']['scope'] = {'id': 'S', 'options': {'i': 'I'}}
         with self.db:
             save_iteration(self.db, item)
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         member['scope'] = 'I'
         calls = []

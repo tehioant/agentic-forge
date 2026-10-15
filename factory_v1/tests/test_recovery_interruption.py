@@ -33,7 +33,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.github.request.assert_not_called()
 
     def test_pause_after_final_frontier_read_admits_no_repair_assignment(self):
-        self.register()
+        self.seed_registered()
         before = self.stored()
         def read(*args):
             self.pause()
@@ -44,8 +44,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.assertEqual(assignments.rows(self.db), [])
 
     def test_pause_on_recovery_result_revalidation_admits_no_result(self):
-        self.register()
-        prepared = self.prepare()
+        prepared = self.seed_assignment()
         handoff = prepared['handoff']
         loads = {s['source']: s['sha256'] for s in handoff['skills']} | handoff['input_loads']
         result = {'assignment_id': prepared['assignment_id'], 'handoff_digest': prepared['handoff_digest'],
@@ -62,7 +61,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
         self.assertNotIn('submitted_result', assignments.rows(self.db)[0])
 
     def test_pause_after_last_clearance_context_read_keeps_incident_and_parked_ownership(self):
-        self.register()
+        self.seed_registered()
         config = {'recovery': {'incident_id': self.authorization['incident_id'], 'implementation_assignment': 'x'},
                   'head': 'b' * 40, 'api_base': self.github.base, 'required_checks': self.config['required_checks']}
         journal = {'status': 'delivered', 'integrated_evidence': {'integrated': 'a' * 40, 'candidate': 'b' * 40}, 'delivery_checks': ['bound-pass']}
@@ -138,7 +137,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
 
     def test_pause_after_reopen_retains_receipt_but_admits_no_status_intent(self):
         prior, issue = self.delivered_ticket()
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         write = self.github.request.side_effect
         def reopen(*args):
@@ -158,7 +157,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
 
     def test_pause_after_status_effect_keeps_membership_dependency_and_delivery_receipts(self):
         prior, issue = self.delivered_ticket()
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(issue)
         effect = field.side_effect
         def status(*args):
@@ -177,7 +176,7 @@ class RecoveryInterruptionTests(RecoveryComponentFixture):
 
     def test_pause_during_membership_read_prevents_reopen_intent_and_write(self):
         prior, issue = self.delivered_ticket()
-        self.register()
+        self.seed_registered()
         def membership(*args):
             self.pause()
             return {'id': 'MEM10', 'status': 'D'}

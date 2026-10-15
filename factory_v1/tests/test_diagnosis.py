@@ -342,6 +342,33 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.store(self.prior)
         return diagnosis.declare(self.database, 'product', 'm1', '42', {'stuck_assignment': self.prior['assignment_id']}, self.github)
 
+    def seed_declaration(self):
+        self.prior['handoff']['issue']['body_sha256'] = diagnosis.hashlib.sha256(b'Local issue 10').hexdigest()
+        self.prior['handoff_digest'] = diagnosis.assignments.digest(self.prior['handoff'])
+        result = self.prior['submitted_result']
+        artifact = result['artifacts'][0]
+        pins = {'stuck_assignment': self.prior['assignment_id'], 'stuck_run': self.prior['runtime']['run_id'],
+            'handoff_digest': self.prior['handoff_digest'], 'result_sha256': diagnosis.assignments.digest(result),
+            'declaration_sha256': artifact['sha256'], 'tree_sha256': diagnosis.assignments.digest(self.e.initial),
+            'baseline_sha256': diagnosis.assignments.digest(self.e.baseline),
+            'issue_sha256': self.prior['handoff']['issue']['body_sha256'], 'spec_commit': self.prior['handoff']['spec_commit']}
+        record = {'status': 'diagnosis', 'sequence': 1, 'pins': pins,
+            'declaration': json.loads(artifact['content']), 'affected': [10, 11, 13],
+            'issues': {str(n): {'id': 100+n, 'node_id': 'ISSUE'+str(n),
+                'body_sha256': diagnosis.hashlib.sha256(('Local issue '+str(n)).encode()).hexdigest()} for n in (10, 11, 13)},
+            'previous_statuses': {str(n): 'ready' for n in (10, 11, 13)},
+            'retired_assignments': [self.prior['assignment_id']], 'blocks_verified': True,
+            'diagnosis_assignment': None, 'event_id': None, 'applied_response': None}
+        self.prior['stuck_disposition'] = 'held'
+        self.store(self.prior)
+        for row in self.rows:
+            if row['number'] in record['affected']:
+                row['status'] = 'blocked'
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        item['stuck_work'] = {self.prior['assignment_id']: record}
+        diagnosis.tickets.checkpoint(self.database, item)
+        return record
+
     def test_responsible_stuck_source_retains_attempts_and_refuses_crash_or_forgery(self):
         good = copy.deepcopy(self.prior)
         diagnosis.source(self.database, 'product', 'm1', '42', good['assignment_id'])
@@ -377,7 +404,7 @@ class DiagnosisComponentTests(unittest.TestCase):
             self.assertEqual(diagnosis.assignments.current(restarted, 'product', 'm1', '42')['stuck_work'][held['assignment_id']], record)
 
     def test_exact_independent_handoff_and_real_staging(self):
-        record = self.declare()
+        record = self.seed_declaration()
         request = copy.deepcopy(self.prior['handoff'])
         request['preceding'] = diagnosis.preceding(record, record['declaration'], self.prior)
         contract = diagnosis.handoff(self.database, 'product', 'm1', '42', request)
@@ -395,7 +422,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertEqual(refusal.exception.code, 'scope_mismatch')
 
     def test_overlapping_release_preserves_other_hold_and_exact_issue_body(self):
-        record = self.declare()
+        record = self.seed_declaration()
         item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
         item['stuck_work']['other'] = {'pins': {'other': True}, 'status': 'awaiting-direction', 'affected': [11]}
         released = diagnosis.sync_blocks(self.database, item, record, self.github, release=True)
@@ -409,7 +436,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertEqual(self.set_field.call_count, writes)
 
     def direction_inputs(self, action='retry'):
-        record = self.declare()
+        record = self.seed_declaration()
         root = self.root / 'independent-debug'
         root.mkdir(mode=0o700)
         e = test_simplification.LocalStageEvidence(root)
@@ -485,7 +512,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertIsNotNone(saved['applied_response'])
         released = diagnosis.apply_direction(self.database, 'product', 'm1', '42', request, self.github)
         self.assertEqual(released['status'], 'released')
-        self.assertEqual(self.set_field.call_count, 6)  # Three Blocked writes, then three distinct Ready writes.
+        self.assertEqual(self.set_field.call_count, 3)  # Only three distinct Ready effects; Blocked rows are inputs.
         self.assertEqual({r['status'] for r in self.rows}, {'ready'})
         for row in diagnosis.assignments.rows(self.database):
             self.assertEqual(row['stuck_disposition'], 'superseded')
@@ -504,7 +531,7 @@ class DiagnosisComponentTests(unittest.TestCase):
 
     def completed_inputs(self):
         """Direct local records/artifacts, not a native worker or stage execution."""
-        record = self.declare()
+        record = self.seed_declaration()
         root = self.root / 'completed-debug'
         root.mkdir(mode=0o700)
         e = test_simplification.LocalStageEvidence(root)
@@ -544,7 +571,8 @@ class DiagnosisComponentTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(content))
         axis['submitted_result'] = result
-        axis['diagnosis_result'] = diagnosis.validate_result(axis, result)
+        axis['diagnosis_result'] = {**report, 'report_sha256': result['artifacts'][0]['sha256'],
+            'native_execution_trusted': False, 'advance_allowed': False, 'close_allowed': False}
         self.store(axis)
         item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
         record = item['stuck_work'][self.prior['assignment_id']]
@@ -601,7 +629,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertEqual(diagnosis.completed(self.database, 'product', 'm1', '42', {**record, 'status': 'release-pending'}, self.github), good)
         self.assertEqual(self.eligibility.call_args.kwargs['diagnosis_revalidation'], good['assignment_id'])
         self.assertEqual(self.durable_snapshot(), before)
-        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual(self.set_field.call_count, 0)
 
     def test_authorization_reader_requires_private_exact_host_grant_outside_every_worker_scope(self):
         _, axis = self.completed_inputs()
@@ -654,7 +682,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         evidence.write_bytes(original)
         self.assertEqual(diagnosis.authorization(self.database, path, '42', axis), config)
         self.assertEqual(self.durable_snapshot(), before)
-        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual(self.set_field.call_count, 0)
 
     def test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay(self):
         _, axis = self.completed_inputs()
@@ -697,14 +725,26 @@ class DiagnosisComponentTests(unittest.TestCase):
             diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github)
         self.assertEqual(refusal.exception.code, 'execution_required')
         self.assertEqual(self.durable_snapshot(), before)
-        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual(self.set_field.call_count, 0)
 
     def test_unrelated_direction_event_refuses_before_response_read_or_release_effect(self):
         _, axis = self.completed_inputs()
         path, _ = self.host_grant(axis)
         request = {'stuck_assignment': self.prior['assignment_id']}
-        result = diagnosis.request_direction(self.database, 'product', 'm1', '42', request, self.github, path)
-        notification = result['attention']
+        item = diagnosis.assignments.current(self.database, 'product', 'm1', '42')
+        record = item['stuck_work'][self.prior['assignment_id']]
+        event_id = 'stuck-' + self.prior['assignment_id']
+        record.update(status='awaiting-direction', event_id=event_id, authorization=json.loads(path.read_text()))
+        diagnosis.tickets.checkpoint(self.database, item)
+        self.database.execute('CREATE TABLE notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project,iteration,event_id))')
+        event = {'event_id': event_id, 'decision_id': event_id, 'kind': 'decision',
+            'message': 'Preadmitted independent direction request', 'issue_number': 10,
+            'run_id': axis['runtime']['run_id'], 'evidence_ids': [self.prior['assignment_id'], axis['assignment_id']]}
+        notification = {'project_id': 'product', 'iteration_id': 'm1', 'event': event,
+            'destination': item['origin'], 'state': 'pending', 'attempts': 0, 'receipt': None,
+            'decision_response': None, 'correlation': {**item['correlation'],
+                'work_item': {'repository': item['repository'], 'issue_number': 10},
+                'worker_run_id': event['run_id'], 'evidence_ids': event['evidence_ids']}}
         notification['decision_response'] = {'event_id': notification['event']['event_id'],
             'decision_id': notification['event']['decision_id'], 'operator_id': '42', 'origin': notification['destination'],
             'reference': 'LABELED local authenticated operator input',
@@ -724,12 +764,12 @@ class DiagnosisComponentTests(unittest.TestCase):
             self.assertEqual(refusal.exception.code, 'invalid_decision')
             read.assert_not_called()
         self.assertEqual(self.durable_snapshot(), before)
-        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual(self.set_field.call_count, 0)
         revised = diagnosis.apply_direction(self.database, 'product', 'm1', '42',
                                            {**request, 'event_id': notification['event']['event_id']}, self.github)
         self.assertEqual(revised['status'], 'revision-required')
         self.assertEqual(revised['applied_response'], notification['decision_response'])
-        self.assertEqual(self.set_field.call_count, 3)
+        self.assertEqual(self.set_field.call_count, 0)
         self.assertEqual([r['status'] for r in self.rows], ['blocked', 'blocked', 'ready', 'blocked'])
 
     def test_declaration_ack_without_block_readback_keeps_durable_claim_owned_until_reconciliation(self):

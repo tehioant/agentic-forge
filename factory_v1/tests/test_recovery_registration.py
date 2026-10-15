@@ -82,9 +82,11 @@ class RecoveryRegistrationTests(unittest.TestCase):
         return recovery.register(self.db, 'p', 'i', 'operator', self.config_file, self.github)
 
     def blocked_health(self):
-        result = self.reconcile()
-        self.assertEqual(result['blockers'], [{'boundary': 'delivery', 'code': 'main_frozen'}])
-        self.assertEqual(result['status'], 'blocked')
+        item = self.stored()
+        item['restart_reconciliation'] = {'status': 'blocked',
+            'observations': {'tracker': None, 'attention': [], 'ownership': None},
+            'blockers': [{'boundary': 'delivery', 'code': 'main_frozen'}]}
+        self.save(item)
         return self.stored()
 
     def refused(self, code):
