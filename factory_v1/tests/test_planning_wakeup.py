@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 from typing import Mapping, Any
 
-from factory_v1 import assignments, planning, planning_wakeup as wakeup, repositories
+from factory_v1 import assignments, controls, planning, planning_wakeup as wakeup, repositories
 from factory_v1.tests import test_conversation_binding as binding_tests
 
 
@@ -74,6 +74,173 @@ class PlanningWakeupTests(unittest.TestCase):
         work['host_publication'] = {'status': 'verified', 'execution': {'native': copy.deepcopy(work['native_execution'])},
                                     'commit': 'a' * 40, 'issue': issue, 'documents': {'fixture': 'actual-documents'}}
         self.fixture.persist()
+
+    def original_completion(self):
+        """Explicit completed original-turn record, no wakeup or stage execution."""
+        work = self.item['planning']
+        work.pop('native_wakeup', None)
+        work['native_execution'].update(sufficient=True, loads=['grill-me', 'grilling', 'to-spec'])
+        work['native_execution']['rationale'] = 'Genuine choices settled.'
+        issue = {'number': 7, 'id': 700, 'url': 'https://github.com/example/product/issues/7'}
+        self.item['handoff'] = {'repository': self.item['repository'], 'commit': 'a' * 40,
+                                'issue': issue, 'documents': {'fixture': 'immutable-docs'}}
+        work.update(status='complete', pending_questions=[],
+            judgment={'sufficient': True, 'rationale': 'Genuine choices settled.', 'reference': 'original-output'},
+            host_publication={'status': 'verified', 'execution': {'native': copy.deepcopy(work['native_execution']), 'reference': 'original-output'},
+                              'commit': 'a' * 40, 'issue': issue, 'documents': {'fixture': 'actual-documents'}})
+        completed = {'assignment_id': work['assignment_id'], 'origin': self.item['origin'], **work['judgment'],
+            'pending_questions': [], 'documents': work['host_publication']['documents'], 'commit': 'a' * 40, 'issue_number': 7}
+        work['completion_digest'] = hashlib.sha256(json.dumps(completed, sort_keys=True,
+            ensure_ascii=False, allow_nan=False).encode()).hexdigest()
+        self.fixture.persist()
+
+    def approve_sender(self, platform='discord', user_id='42'):
+        self.item['origin']['platform'] = platform
+        self.config['origin']['platform'] = platform
+        self.item['planning']['origin']['platform'] = platform
+        self.item['planning']['native_execution']['origin']['platform'] = platform
+        self.config['operator_id'] = user_id
+        self.binding.config = copy.deepcopy(self.config)
+        self.item['approval']['operator_id'] = user_id
+        self.item['planning']['native_execution']['operator_id'] = user_id
+        self.approval['binding'] = copy.deepcopy(self.config)
+        self.approval['input_envelope'] = {'kind': 'sender_attribution', 'platform': platform,
+                                          'user_id': user_id, 'user_name': 'Operator'}
+        self.write_approval()
+
+    def test_original_completion_adopted_without_request_enqueue_or_execution_turn(self):
+        self.original_completion()
+        # Adoption is read-only execution accounting, not a new allowance use.
+        self.approval['allowance']['expires_at'] = 1
+        self.write_approval()
+        original = copy.deepcopy(self.item)
+        with patch.object(planning, 'read_publication', return_value=copy.deepcopy(self.item['handoff'])) as read:
+            self.assertEqual(self.supervise(), 'consumed')
+            self.assertEqual(self.supervise(), 'consumed')
+        record = self.fixture.stored()['planning'].pop('native_wakeup')
+        self.assertEqual(record['mode'], 'origin_turn')
+        self.assertEqual(record['receipt']['task_id'], 'original-task')
+        self.assertEqual(record['receipt']['turn_id'], 'original-turn')
+        self.assertEqual(record['receipt']['run_id'], 'actual-host-run-fixture')
+        self.assertNotIn('request_id', record)
+        self.assertNotIn('execution_turn', record)
+        stored = self.fixture.stored(); stored['planning'].pop('native_wakeup')
+        self.assertEqual(stored, original)
+        self.assertGreaterEqual(read.call_count, 2)
+        self.ctx.inject_message.assert_not_called()
+
+    def test_original_completion_refuses_missing_or_changed_native_authority(self):
+        self.original_completion()
+        original = copy.deepcopy(self.item)
+        mutations = [lambda w: w['native_execution'].update(origin={'platform': 'other'}),
+            lambda w: w['native_execution'].update(assignment_id='wrong'),
+            lambda w: w['native_execution'].update(sources={}),
+            lambda w: w['native_execution'].update(sufficient=False),
+            lambda w: w['native_execution'].pop('turn_id'),
+            lambda w: w['host_publication'].update(status='revoked'),
+            lambda w: w.update(completion_digest='changed-before-entry'),
+            lambda w: w.pop('completion_digest')]
+        for mutate in mutations:
+            self.item = copy.deepcopy(original); self.fixture.item = self.item
+            mutate(self.item['planning']); self.fixture.persist()
+            with self.subTest(mutate=mutate), self.assertRaises(repositories.RepositoryError): self.supervise()
+            self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
+        self.ctx.inject_message.assert_not_called()
+
+    def test_original_completion_final_read_return_revocation_and_pause_refuse(self):
+        self.original_completion()
+        original = copy.deepcopy(self.item)
+        for boundary in (1, 2):
+            for change in ('publication', 'completion', 'approval', 'pause', 'handoff'):
+                self.item = copy.deepcopy(original); self.fixture.item = self.item; self.fixture.persist()
+                self.approval['profile_name'] = 'approved-profile'; self.write_approval()
+                calls = []
+                def read(*args):
+                    calls.append(True)
+                    if len(calls) == boundary:
+                        if change == 'publication': self.item['planning']['host_publication']['status'] = 'revoked'
+                        elif change == 'completion': self.item['planning']['completion_digest'] = 'changed'
+                        elif change == 'approval':
+                            self.approval['profile_name'] = 'changed'; self.write_approval()
+                        elif change == 'pause': self.item['status'] = 'paused'
+                        else: self.item['handoff']['commit'] = 'b' * 40
+                        self.fixture.persist()
+                    return copy.deepcopy(original['handoff'])
+                with self.subTest(boundary=boundary, change=change), patch.object(planning, 'read_publication', side_effect=read), self.assertRaises(repositories.RepositoryError):
+                    self.supervise()
+                self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
+        self.ctx.inject_message.assert_not_called()
+
+    def test_original_completion_real_pause_after_final_publication_read_refuses(self):
+        self.original_completion()
+        handoff = copy.deepcopy(self.item['handoff'])
+        calls = []
+        def read(*args):
+            calls.append(True)
+            if len(calls) == 2:
+                controls.request(self.fixture.database, 'product', 'm1', '42', 'pause', 'final-read-pause')
+            return handoff
+        with patch.object(planning, 'read_publication', side_effect=read), self.assertRaises(repositories.RepositoryError):
+            self.supervise()
+        self.assertTrue(controls.blocked(self.fixture.database, 'product', 'm1'))
+        self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
+        self.ctx.inject_message.assert_not_called()
+
+    def test_sender_envelope_cannot_supply_unapproved_slack_rendering(self):
+        self.approve_sender('slack', 'U123ABC')
+        original = copy.deepcopy(self.approval)
+        for sender in ('42', '<@U123ABC>', 'Ubad', 'U12\nABC'):
+            self.approval = copy.deepcopy(original)
+            self.approval['binding']['operator_id'] = sender
+            self.approval['input_envelope']['user_id'] = sender
+            self.write_approval()
+            with self.subTest(sender=sender), self.assertRaises(repositories.RepositoryError):
+                wakeup.configuration(str(self.path))
+
+    def test_approved_sender_envelope_exact_rendering_only_preserves_answers(self):
+        for platform, sender in (('discord', '42'), ('slack', 'U123ABC')):
+            self.approve_sender(platform, sender); self.mailbox('enqueued')
+            original = copy.deepcopy(self.item['planning']['native_execution'])
+            prefix = native_contract('_prefix_inbound_sender_context', {
+                'MessageEvent': Any, 'SessionSource': Any, 'Platform': SimpleNamespace(SLACK='slack'),
+                'is_shared_multi_user_session': lambda *a, **kw: True,
+                'neutralize_untrusted_inline_text': lambda name: name})
+            raw = wakeup.message(self.item['planning']['native_wakeup'])
+            rendered = prefix(SimpleNamespace(config=SimpleNamespace()), SimpleNamespace(),
+                SimpleNamespace(platform=platform, user_id=sender, user_name='Operator'), raw)
+            args = {'session_id': 'native-origin', 'task_id': 'wake-task', 'turn_id': 'wake-turn',
+                'sender_id': sender, 'model': 'fixture-model', 'user_message': rendered,
+                'conversation_history': [{'role': 'user', 'content': 'Use Python.'}]}
+            for change in ({'sender_id': 'wrong'}, {'user_message': '[Other] ' + raw},
+                           {'user_message': '[Operator] ' + rendered}, {'user_message': rendered + ' extra'},
+                           {'user_message': 'backfill\n' + rendered}, {'conversation_history': []},
+                           {'model': 'other'}, {'user_message': raw}):
+                with self.subTest(platform=platform, change=change), self.assertRaises(repositories.RepositoryError):
+                    self.binding.context(**{**args, **change})
+            self.binding.context(**args)
+            with self.assertRaises(repositories.RepositoryError): self.binding.context(**{**args, 'turn_id': 'replayed'})
+            self.ctx.profile_name = 'wrong-profile'
+            with self.assertRaises(repositories.RepositoryError): self.binding.context(**args)
+            self.ctx.profile_name = 'approved-profile'
+            self.assertEqual(self.fixture.stored()['planning']['native_execution'], original)
+            self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
+
+    def test_sender_envelope_approval_validation_expiry_and_change_refuse(self):
+        self.approve_sender(); self.mailbox('enqueued')
+        original = copy.deepcopy(self.approval)
+        for change in ({'user_name': 'bad\nname'}, {'user_name': 'bad\x00name'}, {'user_name': '[nested]'},
+                       {'platform': 'slack'}, {'user_id': 'wrong'}, {'prefix': '[Operator] '}, {'kind': 'arbitrary'}):
+            self.approval = copy.deepcopy(original)
+            self.approval['input_envelope'].update(change); self.write_approval()
+            with self.subTest(change=change), self.assertRaises(repositories.RepositoryError): wakeup.configuration(str(self.path))
+        for change in ({'profile_name': 'other'}, {'allowance': {**original['allowance'], 'expires_at': 1}},
+                       {'input_envelope': {**original['input_envelope'], 'user_name': 'Other'}}):
+            self.approval = {**copy.deepcopy(original), **change}; self.write_approval()
+            with self.subTest(change=change), self.assertRaises(repositories.RepositoryError):
+                self.binding.context('native-origin', task_id='task', turn_id='turn', sender_id='42', model='fixture-model',
+                    user_message='[Operator] ' + wakeup.message(self.item['planning']['native_wakeup']),
+                    conversation_history=[{'role': 'user', 'content': 'Use Python.'}])
+        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'enqueued')
 
     def test_supervisor_commits_one_request_and_deduplicates_before_transport(self):
         self.assertEqual(self.supervise(), 'requested')

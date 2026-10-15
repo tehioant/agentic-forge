@@ -67,6 +67,22 @@ supply the **same** private absolute path as `wakeup_config`. Its exact JSON fie
 and `allowance`. The allowance has only `reference`, explicitly approved
 `provider_route`, native `model`, integer Unix `expires_at`, and `max_wakeups: 1`.
 Plugin setting `provider_route` must independently match that approved route.
+An optional private `input_envelope` explicitly approves the native hook rendering:
+omit it (or use `{"kind":"plain"}`) for the unchanged exact plain-input route;
+shared sessions use `{"kind":"sender_attribution","platform":"discord",
+"user_id":"42","user_name":"Operator"}`. Platform must equal the bound
+origin, user_id must equal the bound operator, and the name is a conservative
+1–80-character ASCII canonical name (starts alphanumeric; remaining characters
+are alphanumerics, spaces, `.`, `_`, `'`, `(`, `)`, `-`). No control characters,
+line breaks, brackets, arbitrary wrappers or backfill are admitted. The hook
+requires byte-for-byte `[Operator] ` plus the exact durable request message;
+Slack instead requires `[Operator | Slack user <@U123ABC>] `, with the exact
+bound typed ID (`U`/`W` followed by 2–31 uppercase letters/digits).
+This grants only one explicitly selected rendering, not normalization, identity
+or execution authority. Actual callback sender/session/model/task/turn/history,
+native profile/route and durable request/source correlation remain mandatory.
+The name/prefix never comes from model/tool arguments, never becomes an answer,
+and carries no invented plugin metadata or native-internal provenance claim.
 These are authorization inputs, not discovered personal credentials or permission
 to install/enable a profile. The separately approved HOST publisher is unchanged.
 
@@ -95,6 +111,18 @@ supervisor consumes only an exact native run with verified HOST publication and
 completed immutable handoff, freshly reads that publication, then rereads the
 SQLite completion before retaining its receipt. Consumption occupies one tick;
 only a later tick can select synthesis. Unknown/changed scopes stay held.
+
+If the genuine original active native turn already completed HOST publication
+before any scheduler request, the supervisor instead adopts that existing
+completion. A `mode: origin_turn`, `status: consumed` receipt retains its exact
+original task/turn/run, native/publication/completion/handoff digests and current
+exact private binding approval. It invents no request ID, enqueue, running state
+or execution turn, and performs no model call or allowance consumption. Entry
+and final immutable publication readbacks plus fresh durable reads and real
+control admission must agree; source, approval, completion or publication drift,
+pause and stop refuse. The future wakeup expiry need not still be live for this
+accounting-only adoption; its schema/scope must remain valid, and every actual
+wakeup or tool-publication admission still requires an unexpired allowance.
 
 Initial publication and wakeup are implemented here; continuation/revision use
 their existing separate contracts. S2/frontier progression is not changed.

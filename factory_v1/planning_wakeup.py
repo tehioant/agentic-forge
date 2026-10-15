@@ -5,6 +5,9 @@ import fcntl
 import concurrent.futures
 import threading
 import time
+import re
+import hashlib
+import json
 from contextlib import contextmanager
 
 from . import assignments, controls, planning, publication, skills
@@ -16,20 +19,46 @@ TAG = '[factory-planning-wakeup:'
 FIELDS = {'binding', 'assignment_id', 'profile_name', 'source_digest', 'allowance'}
 
 
-def configuration(path):
+def configuration(path, *, new_execution=True):
     source = publication.physical(path)
     controls.private(source)
     config = publication.read_json(source)
-    require(isinstance(config, dict) and set(config) == FIELDS and
+    require(isinstance(config, dict) and FIELDS <= set(config) <= FIELDS | {'input_envelope'} and
             all(text(config[k]) for k in FIELDS - {'binding', 'allowance'}) and
             isinstance(config['binding'], dict), 'Exact private native wakeup approval required.', 'approval_required')
     grant = config['allowance']
     require(isinstance(grant, dict) and set(grant) == {'reference', 'provider_route', 'model', 'expires_at', 'max_wakeups'} and
             text(grant['reference']) and text(grant['provider_route']) and text(grant['model']) and
-            type(grant['expires_at']) is int and grant['expires_at'] > time.time() and
+            type(grant['expires_at']) is int and grant['expires_at'] > 0 and
+            (not new_execution or grant['expires_at'] > time.time()) and
             type(grant['max_wakeups']) is int and grant['max_wakeups'] == 1,
             'Explicit unexpired native route and single-wakeup allowance required.', 'approval_required')
+    sender_prefix(config)
     return config
+
+
+def sender_prefix(config):
+    """Exact HOST-approved rendering only; never normalize arbitrary input."""
+    envelope = config.get('input_envelope', {'kind': 'plain'})
+    require(isinstance(envelope, dict), 'Exact HOST input envelope required.', 'approval_required')
+    if envelope == {'kind': 'plain'}:
+        return ''
+    binding = config['binding']
+    require(set(envelope) == {'kind', 'platform', 'user_id', 'user_name'} and
+            envelope.get('kind') == 'sender_attribution' and
+            isinstance(envelope.get('platform'), str) and
+            envelope.get('platform') in {'discord', 'telegram', 'slack', 'matrix', 'teams', 'signal', 'whatsapp'} and
+            envelope['platform'] == binding.get('origin', {}).get('platform') and
+            envelope.get('user_id') == binding.get('operator_id') and
+            isinstance(envelope.get('user_name'), str) and
+            re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._'()-]{0,79}", envelope['user_name']) is not None,
+            'Only exact bounded canonical HOST sender attribution is supported.', 'approval_required')
+    name = envelope['user_name']
+    if envelope['platform'] == 'slack':
+        require(isinstance(envelope['user_id'], str) and re.fullmatch(r'[UW][A-Z0-9]{2,31}', envelope['user_id']) is not None,
+                'Exact typed Slack sender ID required.', 'approval_required')
+        name += ' | Slack user <@' + envelope['user_id'] + '>'
+    return '[' + name + '] '
 
 
 def scope(item, config):
@@ -39,6 +68,7 @@ def scope(item, config):
     selected = skills.resolve_installed(work['request']['skills'])
     require(binding.get('project') == item['project_id'] and binding.get('iteration') == item['iteration_id'] and
             binding.get('origin') == item['origin'] == work.get('origin') and
+            native.get('origin') == item['origin'] and
             config['assignment_id'] == work.get('assignment_id') == native.get('assignment_id') and
             binding.get('session_id') == native.get('session_id') and
             binding.get('operator_id') == native.get('operator_id') and
@@ -46,7 +76,8 @@ def scope(item, config):
             native.get('sources') == selected == work['skills'] and
             native.get('adaptation') == work['instructions'] == planning.INSTRUCTIONS and
             config['source_digest'] == assignments.digest({'skills': selected, 'adaptation': work['instructions']}) and
-            native.get('observations') and text(native.get('run_id')),
+            native.get('observations') and text(native.get('run_id')) and
+            text(native.get('task_id')) and text(native.get('turn_id')),
             'Exact original native observations, assignment, source and session required.', 'scope_mismatch')
     return {'approval': copy.deepcopy(config), 'run_id': native['run_id'],
             'observations_digest': assignments.digest(native['observations'])}
@@ -86,7 +117,9 @@ def mailbox_lock(database):
 
 def supervise(database, item, path, github, *, stop_event=None):
     """One tick requests or consumes one exact receipt; never sends or retries a native turn."""
-    config = configuration(path)
+    existing = item.get('planning', {}).get('native_wakeup')
+    origin_turn = (existing is None and item.get('planning', {}).get('status') == 'complete') or (existing or {}).get('mode') == 'origin_turn'
+    config = configuration(path, new_execution=not origin_turn)
     binding = config['binding']
     require(binding.get('state') == database.execute('PRAGMA database_list').fetchone()[2],
             'Physical durable state required.', 'approval_required')
@@ -95,6 +128,8 @@ def supervise(database, item, path, github, *, stop_event=None):
     require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
     work = item['planning']
     request = work.get('native_wakeup')
+    if origin_turn:
+        return adopt_original(database, item, path, github, config, identity, stop_event)
     if request is None:
         require(work['status'] == 'pending' and not work.get('host_publication'),
                 'Wakeup requires unpublished pending native work.', 'execution_required')
@@ -121,6 +156,66 @@ def supervise(database, item, path, github, *, stop_event=None):
             'Fresh immutable publication/native completion changed.', 'execution_required')
     fresh['planning']['native_wakeup'].update(status='consumed', receipt=expected)
     planning.checkpoint(database, fresh)
+    return 'consumed'
+
+
+def original_receipt(item):
+    """Account for existing host-observed execution; never invent a scheduler turn."""
+    work = item['planning']
+    native = work.get('native_execution', {})
+    published = work.get('host_publication', {})
+    handoff = item.get('handoff', {})
+    judgment = work.get('judgment', {})
+    require(work.get('status') == 'complete' and text(work.get('completion_digest')) and
+            judgment.get('sufficient') is True and judgment.get('rationale') == native.get('rationale') and
+            text(judgment.get('rationale')) and text(judgment.get('reference')) and
+            judgment['reference'] == published.get('execution', {}).get('reference') and work.get('pending_questions') == [] and
+            native.get('sufficient') is True and native.get('loads') == ['grill-me', 'grilling', 'to-spec'] and
+            text(native.get('task_id')) and text(native.get('turn_id')) and
+            any(isinstance(m, dict) and m.get('role') == 'user' for m in native.get('observations', [])) and
+            all(isinstance(m, dict) and text(m.get('content')) and TAG not in m['content']
+                for m in native.get('observations', [])) and
+            published.get('status') == 'verified' and published.get('execution', {}).get('native') == native and
+            published.get('documents') and handoff.get('commit') == published.get('commit') and
+            handoff.get('issue') == published.get('issue') and handoff.get('repository') == item['repository'],
+            'Completed actual original native execution and HOST publication required.', 'execution_required')
+    completed = {'assignment_id': work['assignment_id'], 'origin': item['origin'], **judgment,
+                 'pending_questions': [], 'documents': published['documents'], 'commit': published['commit'],
+                 'issue_number': published['issue']['number']}
+    require(work['completion_digest'] == hashlib.sha256(json.dumps(completed, sort_keys=True,
+                ensure_ascii=False, allow_nan=False).encode()).hexdigest(),
+            'Original native completion digest changed.', 'execution_required')
+    return {'run_id': native['run_id'], 'task_id': native['task_id'], 'turn_id': native['turn_id'],
+            'native_digest': assignments.digest(native), 'publication_digest': assignments.digest(published),
+            'completion_digest': work['completion_digest'], 'handoff_digest': assignments.digest(handoff),
+            'commit': handoff['commit'], 'issue_number': handoff['issue']['number']}
+
+
+def adopt_original(database, item, path, github, config, identity, stop_event):
+    expected = original_receipt(item)
+    retained = item['planning'].get('native_wakeup')
+    adopted = {**identity, 'mode': 'origin_turn', 'status': 'consumed', 'config_path': path, 'receipt': expected}
+    require(retained is None or retained == adopted, 'Original completion receipt changed.', 'execution_required')
+
+    def current():
+        fresh = assignments.current(database, *(config['binding'][k] for k in ('project', 'iteration', 'operator_id')))
+        require(configuration(path, new_execution=False) == config and scope(fresh, config) == identity and
+                original_receipt(fresh) == expected and fresh['planning'].get('native_wakeup') == retained and
+                fresh['status'] == 'active' and (stop_event is None or not stop_event.is_set()),
+                'Original completion authority changed or stopped.', 'execution_required')
+        controls.require_active(database, fresh['project_id'], fresh['iteration_id'])
+        return fresh
+
+    # Entry/final immutable observations stay outside the short durable admission.
+    for _ in range(2):
+        fresh = current()
+        handoff = planning.read_publication(database, fresh, fresh['planning']['docs_path'],
+            fresh['planning']['host_publication']['documents'], expected['commit'], expected['issue_number'], github)
+        require(current()['handoff'] == handoff, 'Original immutable publication changed.', 'execution_required')
+    with controls.admission(database, item['project_id'], item['iteration_id']):
+        fresh = current()
+        fresh['planning']['native_wakeup'] = adopted
+        save(database, fresh)
     return 'consumed'
 
 
@@ -254,7 +349,7 @@ def observe_wakeup(work, config, user_message, task_id, turn_id, sender_id, hist
     require(isinstance(request, dict), 'No approved synthetic turn.', 'scope_mismatch')
     approval = configuration(work['native_wakeup']['config_path'])
     require(not request.get('cancelled') and approval == request['approval'] and
-            model == approval['allowance']['model'] and user_message == message(request) and
+            model == approval['allowance']['model'] and user_message == sender_prefix(approval) + message(request) and
             request['status'] in {'enqueue_unknown', 'enqueued', 'running'} and
             request['approval']['binding'] == config and text(task_id) and text(turn_id) and
             sender_id == config['operator_id'] and work['native_execution']['run_id'] == request['run_id'],

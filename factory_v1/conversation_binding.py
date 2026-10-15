@@ -60,9 +60,18 @@ class ConversationBinding:
             if work['status'] == 'complete':
                 return None
             native = work.get('native_execution')
-            from .planning_wakeup import TAG, observe_wakeup
+            from .planning_wakeup import TAG, observe_wakeup, configuration, scope
             wakeup = isinstance(user_message, str) and TAG in user_message
             if wakeup:
+                require(isinstance(work.get('native_wakeup'), dict), 'No approved synthetic turn.', 'scope_mismatch')
+                approval = configuration(work.get('native_wakeup', {}).get('config_path'))
+                identity = scope(item, approval)
+                request = work['native_wakeup']
+                require(all(request.get(k) == v for k, v in identity.items()) and
+                        request.get('request_id') == assignments.digest(identity) and
+                        self.ctx.profile_name == approval['profile_name'] and
+                        self.ctx.get_config('provider_route') == approval['allowance']['provider_route'],
+                        'Actual native profile and durable wakeup scope required.', 'scope_mismatch')
                 observe_wakeup(work, self.config, user_message, task_id, turn_id, sender_id, conversation_history,
                                kwargs.get('model'))
             if not wakeup and (task_id or turn_id):
