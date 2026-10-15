@@ -1154,7 +1154,12 @@ class ChainAdmissionTests(unittest.TestCase):
             'scope': ['hello.py'], 'result_fields': list(report)}
         self.candidate['submitted_result']['artifacts'] = [simplification.artifact('simplification-result', json.dumps(report))]
         self.seal(self.candidate)
-        self.candidate['simplification_result'] = simplification.validate_result(self.candidate, self.candidate['submitted_result'])
+        self.candidate['simplification_result'] = {
+            'contract': simplification.CONTRACT, 'outcome': 'no-op', 'candidate_sha256': digest,
+            'input_candidate_sha256': digest, 'changed_paths': [], 'checks_verified': True,
+            'behavior_preservation_claim': 'preserved', 'native_execution_trusted': False,
+            'approval': False, 'advance_allowed': False, 'review_required': ['Standards', 'Spec'],
+            'findings': [], 'reason': 'native_execution_unattested_and_independent_review_required'}
         root = Path(self.candidate['runtime']['artifacts'])
         self.pins = merge.review.pins(self.candidate, manifest(root / 'workspace'), manifest(root / 'inputs/baseline'))
         for axis in self.axes:
@@ -1169,7 +1174,7 @@ class ChainAdmissionTests(unittest.TestCase):
                 'verdicts': ['pass', 'reject', 'stuck']}
             axis['submitted_result']['artifacts'] = [simplification.artifact('review-result', json.dumps(report))]
             self.seal(axis)
-            axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+            axis['review_result'] = self.admitted_review(axis)
         saved = {'operator_id': '42', 'execution_reference': 'LOCAL declared approved prerequisites, NOT attestation',
             'axes': [merge.review.execution_binding(a) for a in self.axes], 'policy_decision': None}
         for axis in self.axes:
@@ -1186,6 +1191,11 @@ class ChainAdmissionTests(unittest.TestCase):
         # Adverse-candidate holds have their own component tests. Do not let that
         # earlier scan mask the immutable chain-pins comparison being tested here.
         self.enterContext(patch.object(merge.review, 'adverse_reviews', return_value=[]))
+
+    def admitted_review(self, axis):
+        artifact = axis['submitted_result']['artifacts'][0]
+        return {**json.loads(artifact['content']), 'report_sha256': artifact['sha256'],
+                'native_execution_trusted': False, 'advance_allowed': False, 'close_allowed': False}
 
     def seal(self, row):
         row['handoff_digest'] = assignments.digest(row['handoff'])
@@ -1368,7 +1378,7 @@ class ChainAdmissionTests(unittest.TestCase):
                     axis['submitted_result']['artifacts'][0] = merge.simplification.artifact('review-result', json.dumps(report))
                     self.seal(axis)
                     try:
-                        axis['review_result'] = merge.review.validate_result(axis, axis['submitted_result'])
+                        axis['review_result'] = self.admitted_review(axis)
                         self.reseal_axis_authority(axes)
                         self.assert_refused('stale_review')
                     finally:
@@ -1389,7 +1399,7 @@ class ChainAdmissionTests(unittest.TestCase):
             'correction': 'Correct the greeting and obtain both fresh axes'}])
         spec['submitted_result']['artifacts'] = [merge.simplification.artifact('review-result', json.dumps(report))]
         self.seal(spec)
-        spec['review_result'] = merge.review.validate_result(spec, spec['submitted_result'])
+        spec['review_result'] = self.admitted_review(spec)
         self.reseal_axis_authority(axes)
         before = list(self.db.iterdump())
         with self.assertRaises(RepositoryError) as refusal:
@@ -1455,7 +1465,7 @@ class MappedCandidateTests(unittest.TestCase):
         self.calls = []
         self.api = merge.MergeGitHub(self.config)
         self.api.github.request = Mock(side_effect=self.external)
-        self.plan, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+        self.plan = self.input_plan()
         self.config['head'] = self.plan['candidate']
         self.commits[self.config['head']] = {'sha': self.config['head'], 'tree': {'sha': self.plan['tree']},
             'parents': [{'sha': self.config['baseline']}], 'message': self.plan['message']}
@@ -1466,6 +1476,21 @@ class MappedCandidateTests(unittest.TestCase):
     def reseal_source(self):
         self.approval['manifest'] = manifest(self.source)
         (self.root / 'source-artifacts.json').write_text(json.dumps(self.approval['manifest']))
+
+    def input_plan(self):
+        from factory_v1.tests.test_publication import git_object, git_tree
+        entries = [{'path': name, 'type': 'blob',
+                    'mode': '100755' if value['executable'] else '100644',
+                    'sha': git_object('blob', (self.source / name).read_bytes())}
+                   for name, value in self.approval['manifest'].items()]
+        tree = git_tree(entries)
+        message = 'Factory candidate: Refs #10'
+        raw = (f"tree {tree}\nparent {'a' * 40}\n"
+               'author Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               'committer Factory Controller <factory-controller@users.noreply.github.com> 1767225600 +0000\n'
+               f'\n{message}\n').encode()
+        return {'candidate': git_object('commit', raw), 'tree': tree, 'base_tree': self.base_tree,
+                'changes': [e for e in entries if e['path'] == 'hello.py'], 'message': message}
 
     def external(self, path, body=None, method=None):
         self.assertIsNone(body)
@@ -1499,7 +1524,7 @@ class MappedCandidateTests(unittest.TestCase):
                 self.assertEqual(refusal.exception.code, 'manifest_mismatch')
                 # Reseal manifest comparisons to reach actual content/mode -> Git HEAD equality.
                 self.reseal_source()
-                changed, _ = publication.assemble(self.api, self.approval, self.assignment, self.root)
+                changed = self.input_plan()
                 self.commits[changed['candidate']] = {'sha': changed['candidate'], 'tree': {'sha': changed['tree']},
                     'parents': [{'sha': self.config['baseline']}], 'message': changed['message']}
                 self.assertNotEqual(changed['tree'], self.plan['tree'])

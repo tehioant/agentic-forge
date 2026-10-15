@@ -243,7 +243,8 @@ class SimplificationValidatorTests(unittest.TestCase):
         request['preceding'] = simplification.preceding(prior, root, source, baseline, receipt)
         empty = simplification.handoff(database, 'product', 'm1', '42', request)
         self.assertEqual(empty['scope'], [])
-        e.assignment['handoff']['simplification'] = e.contract = empty
+        e.assignment['handoff']['simplification'] = e.contract = {
+            **e.contract, 'input_candidate_sha256': assignments.digest(e.initial), 'scope': []}
         self.assertEqual(simplification.validate_result(e.assignment, e.result(e.report()))['changed_paths'], [])
         (e.root / 'stop').touch()
         with self.assertRaises(RepositoryError) as raised:
@@ -278,10 +279,8 @@ class SimplificationComponentTests(unittest.TestCase):
 
     def test_real_staging_copies_verified_candidate_and_keeps_baseline(self):
         e = self.e
-        prior, root, source, baseline, receipt = simplification.implementation(self.db, 'product', 'm1', '42', e.assignment['assignment_id'])
-        request = copy.deepcopy(prior['handoff'])
-        request['preceding'] = simplification.preceding(prior, root, source, baseline, receipt)
-        contract = simplification.handoff(self.db, 'product', 'm1', '42', request)
+        root, source, baseline = e.root, e.initial, e.baseline
+        contract = {**e.contract, 'implementation_assignment': e.assignment['assignment_id']}
         destination = self.root / 'staged'
         destination.mkdir()
         (destination / 'workspace').mkdir()

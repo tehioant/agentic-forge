@@ -158,7 +158,14 @@ class ReviewComponentTests(unittest.TestCase):
         root.mkdir(mode=0o700)
         self.e = test_simplification.LocalStageEvidence(root)
         self.candidate = self.e.assignment
-        self.candidate['simplification_result'] = simplification.validate_result(self.candidate, self.e.result(self.e.report()))
+        self.candidate['simplification_result'] = {
+            'contract': simplification.CONTRACT, 'outcome': 'no-op',
+            'candidate_sha256': self.e.runtime['candidate_sha256'],
+            'input_candidate_sha256': self.e.contract['input_candidate_sha256'], 'changed_paths': [],
+            'checks_verified': True, 'behavior_preservation_claim': 'preserved',
+            'native_execution_trusted': False, 'approval': False, 'advance_allowed': False,
+            'review_required': ['Standards', 'Spec'], 'findings': [],
+            'reason': 'native_execution_unattested_and_independent_review_required'}
         self.candidate['submitted_result'] = self.e.result(self.e.report())
         self.candidate['handoff'].update(repository='example/product', repository_id=123,
             workspace=str(self.root / 'workspace'), standards=[], profile={'name': 'candidate', 'home': str(self.root / 'candidate-home')})
@@ -199,7 +206,7 @@ class ReviewComponentTests(unittest.TestCase):
         result = e.result(report, 'review-result')
         result.update(assignment_id=row['assignment_id'], claim_id=row['claim_id'], handoff_digest=row['handoff_digest'])
         row['submitted_result'] = result
-        row['review_result'] = review.validate_result(row, result)
+        row['review_result'] = self.admitted_review(row)
         for group, names in (('scratch', ['loads.json', 'events.jsonl', 'conversation.json', 'probes.json']),
                             ('inputs', ['worker.py', 'sandbox_relay.py', 'assignment.json', 'handoff.json']),
                             ('', ['container-inspection.json', 'launch-command.json', 'source-artifacts.json'])):
@@ -222,12 +229,17 @@ class ReviewComponentTests(unittest.TestCase):
             report.update(verdict='reject', findings=[{'id': 'R1', 'kind': kind, 'path': 'hello.py',
                 'requirement': 'Greeting required', 'evidence': 'Local omission', 'correction': 'Restore greeting'}])
         axis['submitted_result']['artifacts'] = [simplification.artifact('review-result', json.dumps(report))]
-        axis['review_result'] = review.validate_result(axis, axis['submitted_result'])
+        axis['review_result'] = self.admitted_review(axis)
         (Path(axis['runtime']['artifacts']) / 'scratch/result.json').write_text(json.dumps(axis['submitted_result']))
         self.store(axis)
         with self.database:
             review.record_hold(self.database, axis)
         return axis
+
+    def admitted_review(self, axis):
+        artifact = axis['submitted_result']['artifacts'][0]
+        return {**json.loads(artifact['content']), 'report_sha256': artifact['sha256'],
+                'native_execution_trusted': False, 'advance_allowed': False, 'close_allowed': False}
 
     def authorization(self, decision=None):
         path = self.root / 'authorization.json'
@@ -486,7 +498,7 @@ class ReviewComponentTests(unittest.TestCase):
         report['pins'] = axis['handoff']['review']['pins']
         axis['submitted_result'].update(handoff_digest=axis['handoff_digest'])
         axis['submitted_result']['artifacts'] = [simplification.artifact('review-result', json.dumps(report))]
-        axis['review_result'] = review.validate_result(axis, axis['submitted_result'])
+        axis['review_result'] = self.admitted_review(axis)
         self.store(axis)
         with self.assertRaises(RepositoryError) as refusal:
             self.evaluate()
