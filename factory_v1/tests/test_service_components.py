@@ -48,6 +48,49 @@ class DispatchComponentTests(unittest.TestCase):
             db.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT NOT NULL)')
             db.execute('INSERT OR REPLACE INTO role_assignments VALUES (?, ?)', (self.seed['assignment_id'], json.dumps(self.seed)))
 
+    def test_initial_planning_routes_only_the_selected_public_operation(self):
+        original = deepcopy(self.item)
+        request = {'reference': 'fixture:ticket-synthesis-request'}
+        self.config['tickets'] = request
+        for stage, work in (('synthesize', None),
+                            ('execute-synthesis', {'status': 'synthesis_pending'}),
+                            ('publish-tickets', {'status': 'synthesized', 'publication_complete': False})):
+            with self.subTest(stage=stage):
+                self.item = deepcopy(original)
+                self.item.pop('ticket_work')
+                if work is not None:
+                    self.item['ticket_work'] = deepcopy(work)
+                self.persist()
+                github, event = Mock(), threading.Event()
+                with patch.object(restart, 'before_dispatch') as before, \
+                     patch.object(dispatch.tickets, 'synthesize') as prepare, \
+                     patch.object(dispatch, 'synthesize') as execute, \
+                     patch.object(dispatch.tickets, 'publish') as publish, \
+                     patch.object(dispatch, 'run_assignment') as launch, \
+                     patch.object(dispatch, 'continuation_tick') as continuation:
+                    result = dispatch.tick(self.service, github, stop_event=event)
+                self.assertEqual(result, {'status': 'progress', 'stage': stage,
+                                         'dispatch_allowed': False, 'blockers': []})
+                operations = {'synthesize': prepare, 'execute-synthesis': execute, 'publish-tickets': publish}
+                chosen = operations[stage]
+                chosen.assert_called_once()
+                database = chosen.call_args.args[0]
+                self.assertIsInstance(database, sqlite3.Connection)
+                if stage == 'synthesize':
+                    chosen.assert_called_once_with(database, self.item, request, github)
+                elif stage == 'execute-synthesis':
+                    chosen.assert_called_once_with(database, self.item, self.config, github, stop_event=event)
+                else:
+                    chosen.assert_called_once_with(database, self.item, github)
+                before.assert_called_once_with(database, 'p', 'i', 'operator', github, force=True)
+                for other, operation in operations.items():
+                    if other != stage:
+                        operation.assert_not_called()
+                launch.assert_not_called()
+                continuation.assert_not_called()
+                with service.connect(self.service) as stored:
+                    self.assertEqual(json.loads(stored.execute('SELECT payload FROM iterations').fetchone()[0]), self.item)
+
     def test_paused_scope_never_reaches_dispatch_or_precursor_reads(self):
         with service.connect(self.service) as db:
             controls.request(db, 'p', 'i', 'operator', 'pause', 'pause:1')
