@@ -1,0 +1,215 @@
+{
+  "issue": 28,
+  "kind": "STATIC_COMPONENT_COVERAGE_MAP_NOT_TEST_RESULT",
+  "inspected_integrated_base": {
+    "head": "7382dc9493c404cc11064d74f14158235e147817",
+    "tree": "2c695a1f9f21c460a591bfc8228d7f14f1dee989"
+  },
+  "amendment": "docs/specs/no-live-verification-amendment.md",
+  "amendment_comment": "https://github.com/tehioant/agentic-forge/issues/28#issuecomment-6187444149",
+  "policy_hashes": {
+    "AGENTS.md": "214e4272135eab3174068c86c8f47aa6d2040588fdd13c1841c5a077067ac5bc",
+    "docs/specs/fresh-agentic-factory.md": "5c340368aa0d01c22c05834bf40500c2d88b1d393713530cc75334899717a774",
+    "docs/specs/no-live-verification-amendment.md": "1b2786398ed9f95a097e3f8883ddc4488740da5c4b8665cff7994459a7c4810e",
+    "scripts/run_factory_tests.py": "b55fb12e3badf7a5329dcc8c378e57973cfb680e5b2ec53c2d27616e24ced668",
+    ".github/workflows/fresh-factory-v1.yml": "ae1ca9c55953c766a8877a30a69e61352312a164373d985026a924e1fdb3f3ec"
+  },
+  "criteria": [
+    {
+      "number": 1,
+      "criterion": "Independent adverse review despite narrow green checks; stale approvals cannot merge",
+      "sources": [
+        "factory_v1/review.py:validate_result",
+        "factory_v1/review.py:record_hold",
+        "factory_v1/review.py:adverse_reviews",
+        "factory_v1/review.py:evaluate",
+        "factory_v1/merge.py:chain"
+      ],
+      "tests": [
+        "test_review.ReviewValidatorTests.test_exact_axis_pin_schema_findings_stuckness_and_readonly_evidence",
+        "test_review.ReviewComponentTests.test_lone_adverse_axis_holds_old_and_later_passing_pairs",
+        "test_merge.ChainAdmissionTests.test_rejected_spec_with_valid_resealed_authority_cannot_pass_real_chain"
+      ],
+      "behavior": "Real review schema and candidate-wide adverse predicates refuse promotion; the chain rejects a resealed Spec rejection even with passing declared checks.",
+      "limitations": [
+        "No installed reviewer/model executed or actual omission discovered. Rejection reports are explicit local input, not review success evidence.",
+        "ChainAdmissionTests mocks adverse_reviews to expose the independent exact-pass predicate; ReviewComponentTests separately exercises actual adverse scanning and persistent holds."
+      ]
+    },
+    {
+      "number": 2,
+      "criterion": "Unmerged green branch incomplete; changed head needs fresh evidence",
+      "sources": [
+        "factory_v1/merge.py:checks",
+        "factory_v1/merge.py:mapped_candidate",
+        "factory_v1/merge.py:merged_evidence",
+        "factory_v1/merge.py:lifecycle"
+      ],
+      "tests": [
+        "test_merge.MergeComponentTests.test_actual_merge_capability_denies_unscoped_write_and_branch_only_closure",
+        "test_merge.MergeComponentTests.test_real_integrated_tree_parents_and_membership_are_not_branch_proof",
+        "test_merge.MergeComponentTests.test_final_branch_main_and_check_drift_never_admit_intent",
+        "test_merge.MappedCandidateTests.test_reviewed_bytes_and_modes_cannot_map_to_the_old_git_head"
+      ],
+      "behavior": "Real integrated commit/tree/membership and exact-head checks, plus byte/mode mapping, distinguish delivery from branch checks and reject late head drift.",
+      "limitations": [
+        "MergeComponentTests patches chain, mapped_candidate, review.evaluate and delivery.mutation_boundary; MappedCandidateTests independently exercises actual mapping with metadata-only GitHub mock.",
+        "No product merge, closure or deployment is established by these component checks."
+      ]
+    },
+    {
+      "number": 3,
+      "criterion": "Source/secret/Docker/GitHub/repository/egress denials with admitted model contract",
+      "sources": [
+        "factory_v1/sandbox_policy.py:command",
+        "factory_v1/sandbox_policy.py:verify",
+        "factory_v1/sandbox_source.py:snapshot",
+        "factory_v1/sandbox_source.py:manifest",
+        "factory_v1/sandbox.py:authorize",
+        "factory_v1/sandbox.py:finalize_result",
+        "factory_v1/merge.py:MergeGitHub.request",
+        "factory_v1/sandbox_relay.py:Handler.do_POST"
+      ],
+      "tests": [
+        "test_sandbox.SandboxComponentTests.test_anonymous_mount_and_credential_propagation_refused",
+        "test_sandbox.SandboxComponentTests.test_provider_network_tools_are_denied_by_real_authorization_guard",
+        "test_sandbox.SandboxComponentTests.test_direct_result_read_only_source_and_run_correlation",
+        "test_sandbox.SourceSnapshotTests.test_packed_source_ignores_configuration_and_untracked_secrets",
+        "test_sandbox.SourceSnapshotTests.test_symlink_submodule_and_escape_source_entries_are_refused",
+        "test_sandbox.SourceSnapshotTests.test_manifest_refuses_worker_created_symlinks_and_git_metadata",
+        "test_merge.MergeComponentTests.test_wrong_repo_missing_branch_checks_and_unbound_recovery_refuse_without_intent",
+        "test_sandbox_relay.RelayTests.test_wrong_model_arbitrary_route_and_extra_provider_fields_never_reach_socket",
+        "test_sandbox_relay.RelayTests.test_socket_protocol_uses_fixed_reservation_and_exact_completed_response"
+      ],
+      "behavior": "Exact mount allowlist/read-only bindings and network-none inspection reject unexpected mounts (including an unadmitted Docker socket by the same predicate), writable source, propagated credential variable and bridge network; trusted object snapshot excludes untracked secret fixtures/config. Real broker/relay validation admits only fixed model/function-tool routes. Exact merge capability scopes writes.",
+      "limitations": [
+        "No shell/file/network escape probes. Docker inspection is an independent input fixture, not measured isolation. Generic unexpected-mount coverage is not a live Docker-socket denial receipt.",
+        "Host-service, cloud metadata and direct API egress are constrained by network-none policy only; no packet-level denial or working native inference proved.",
+        "Source snapshots exclude untracked fixture secrets; this does not prove arbitrary tracked source cannot contain secrets. No real credential files read.",
+        "Reviewer source mutation is detected by read-only result validation; actual OS write denial is unexecuted."
+      ]
+    },
+    {
+      "number": 4,
+      "criterion": "Required-check/security/protection weakening refused",
+      "sources": [
+        "factory_v1/merge.py:protection",
+        "factory_v1/merge.py:checks",
+        "factory_v1/review.py:evaluate",
+        "factory_v1/merge.py:chain"
+      ],
+      "tests": [
+        "test_merge.MergeComponentTests.test_checks_and_resealed_protection_semantic_matrix",
+        "test_merge.MergeComponentTests.test_changed_or_resealed_weak_protection_and_malformed_check_counts_refuse",
+        "test_review.ReviewComponentTests.test_security_weakening_requires_exact_scoped_policy_grant_and_still_corrections",
+        "test_merge.MappedCandidateTests.test_unchanged_policy_is_preserved_and_changed_policy_needs_explicit_authority"
+      ],
+      "behavior": "Resealed weak policy cannot bypass semantic strict-check/authoritative-app guards. Security findings require exact scoped policy decision and remain corrections, never automatic merge.",
+      "limitations": [
+        "No real protection/security settings changed. Readback fixtures and declared findings exercise actual predicates, not GitHub enforcement.",
+        "Unsupported effective rules intentionally fail closed; not a source defect or permission-expansion task."
+      ]
+    },
+    {
+      "number": 5,
+      "criterion": "Existing allowance admitted; quota/unapproved charge/paid fallback refused",
+      "sources": [
+        "factory_v1/spending.py:_preview",
+        "factory_v1/spending.py:_prepare",
+        "factory_v1/spending.py:execute_controlled",
+        "factory_v1/model_access.py:SubscriptionTransport",
+        "factory_v1/model_access.py:transport"
+      ],
+      "tests": [
+        "test_spending.ModelSpendingTests.test_allowance_reaches_controlled_operation_boundary_and_replay_is_idempotent",
+        "test_spending.ModelSpendingTests.test_unapproved_and_exhausted_spending_is_refused_and_persistently_blocks",
+        "test_spending.ModelSpendingTests.test_scoped_approval_ceiling_and_fixed_adapter_reservation",
+        "test_spending.ModelSpendingTests.test_paid_approval_does_not_authorize_subscription_or_any_paid_fallback",
+        "test_spending.ModelSpendingTests.test_quota_refusal_requires_billing_receipt_then_explicit_resume"
+      ],
+      "behavior": "Real SQLite admission/accounting enforces exact-scope grants, fixed reservation, allowance-only subscription and uncertain/quota holds. Unapproved charge refuses before mock upstream call; exhausted ceiling refuses additional calls.",
+      "limitations": [
+        "Adapter is Mock; allowance success is controlled-boundary contract evidence only, not live account capacity or billing evidence.",
+        "No real model request, quota exhaustion or billable operation initiated."
+      ]
+    },
+    {
+      "number": 6,
+      "criterion": "Required-skill/source/execution/verifier/missing-axis refusals",
+      "sources": [
+        "factory_v1/role_skills.py:closure",
+        "factory_v1/role_skills.py:snapshots",
+        "factory_v1/assignments.py:validate",
+        "factory_v1/review.py:pair",
+        "factory_v1/review.py:execution_binding",
+        "factory_v1/merge.py:chain"
+      ],
+      "tests": [
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_admit_reviewed_bytes_and_refuse_drift_or_caller_repins",
+        "test_role_skills.ReviewedImplementTests.test_both_review_axes_refuse_dependency_omission_without_hiding_the_graph_guard",
+        "test_role_skills.ReviewedImplementTests.test_review_dependency_omission_refuses_before_tracker_or_claim",
+        "test_assignments.AssignmentComponentTests.test_real_skill_closure_and_stage_bindings",
+        "test_assignments.AssignmentComponentTests.test_result_identity_loads_artifacts_and_tests_matrix",
+        "test_merge.ChainAdmissionTests.test_forged_execution_declarations_never_qualify",
+        "test_merge.ChainAdmissionTests.test_reused_review_axis_cannot_supply_two_independent_passes",
+        "test_merge.ChainAdmissionTests.test_both_review_authorizations_freeze_source_response_loads_and_work",
+        "test_merge.ChainAdmissionTests.test_changed_selected_source_bytes_do_not_qualify",
+        "test_review.ReviewComponentTests.test_pair_independence_checks_and_resealed_pin_matrix"
+      ],
+      "behavior": "Actual snapshot graph and source hash checks reject missing/changed selected inputs before tracker/claim; result schema requires actual load/work declarations; exact verifier binding and independent-stage requirements refuse generic/reused axes.",
+      "limitations": [
+        "Snapshot files are repository fixtures, not installed current skill-byte validation or evidence they were used by a native worker.",
+        "Chain setup builds explicit four-stage records using local pure preceding/validation helpers, not execution of implementation/simplify/review stages; its host authority is explicitly declared input.",
+        "No pin refresh or host permission repair; unsupported App/fine-grained/proxy readiness stays fail closed; classic OAuth support only."
+      ]
+    },
+    {
+      "number": 7,
+      "criterion": "Truthful negative evidence and no external success claims",
+      "sources": [
+        "factory_v1/review.py:validate_result",
+        "factory_v1/review.py:evaluate",
+        "factory_v1/merge.py:chain",
+        "factory_v1/merge.py:lifecycle",
+        "scripts/run_factory_tests.py:no_external_execution"
+      ],
+      "tests": [
+        "test_review.ReviewComponentTests.test_pair_authority_replay_and_private_exact_binding",
+        "test_merge.ChainAdmissionTests.test_forged_execution_declarations_never_qualify",
+        "test_merge.ChainAdmissionTests.test_rejected_spec_with_valid_resealed_authority_cannot_pass_real_chain",
+        "test_merge.MergeComponentTests.test_final_branch_main_and_check_drift_never_admit_intent",
+        "test_spending.ModelSpendingTests.test_unapproved_and_exhausted_spending_is_refused_and_persistently_blocks"
+      ],
+      "behavior": "Real validators mark structured worker reports untrusted and disallow merge/closure; negative tests assert unchanged SQLite or no mock mutations/no upstream call at their exact seam. This static map preserves those limits.",
+      "limitations": [
+        "No attempted live targets and no live target readbacks exist. Absence of preflight execution is not proof an attempted attack was denied.",
+        "Source-delivery CI is separate from product live evidence. No unauthorized-mutation, deployment or issue-closure enforcement campaign is claimed."
+      ]
+    }
+  ],
+  "unique_mapped_active_test_ids": 36,
+  "class_setup_helper_limits": {
+    "ReviewValidatorTests": "No class setup. LocalStageEvidence writes explicit local manifests/check declarations; actual review.validate_result called; no launcher.",
+    "ReviewComponentTests": "Temporary SQLite plus LocalStageEvidence; explicit independent axis artifacts and declared reports; assignments.prepare patched. Real pair/report/hold/evaluate checks execute. No legacy ReviewTests.setUp.",
+    "MergeComponentTests": "Temporary SQLite and exact mock GitHub metadata; actual MergeGitHub route/protection/check/lifecycle predicates. chain, mapped_candidate, review.evaluate and delivery.mutation_boundary patched; separate chain/mapping tests cover those guards.",
+    "ChainAdmissionTests": "Temporary SQLite and repository role_skill_snapshots (via SOURCE_ROOT) copied into fixture paths. Explicit already-completed four-stage records, pure manifest/preceding/validation helpers. Actual merge.chain and authorization comparisons; adverse_reviews patched to avoid masking targeted predicate. No worker/HTTP server.",
+    "MappedCandidateTests": "Explicit local byte/mode manifests and mocked GitHub commit/tree metadata; real deterministic mapping. No Git subprocess.",
+    "SandboxComponentTests": "LauncherFixture only creates explicit source/config/SQLite and Docker/helper/process mocks; listed direct verify/authorize/finalization checks do not execute legacy SandboxTests setup or worker journey. FinalizationFixture builds explicit result boundary input.",
+    "SourceSnapshotTests": "Local packed-object/untracked-secret placeholders; git subprocess boundary mocked; real snapshot/manifest validation. No real secret reads.",
+    "RelayTests": "Handler built without server startup; BytesIO plus scheduled thread/event mocks; Unix socket mocked. Real handler/protocol validation only.",
+    "ModelSpendingTests": "Temporary SQLite and Mock upstream adapter; real grants/accounting/refusal; no subscription HTTP.",
+    "ReviewedImplementTests": "Repository snapshot descriptors in temporary directory; actual snapshots/prepare/validation; no installed skill execution.",
+    "AssignmentComponentTests": "Direct assignment component fixture, not dormant AssignmentTests HTTP setup; selected checks are schema/loads/source predicates. This map is not a new repository-wide transitive-fixture audit."
+  },
+  "interpretation": "Static entrypoint/test map only. Passing results require separate exact-candidate receipts and CI; mock reports and declared host authority are not native execution provenance. No confirmed source defect or missing focused predicate coverage was found in the inspected scope.",
+  "product_live_evidence": {
+    "status": "NOT_EXECUTED",
+    "waived_for_delivery": true,
+    "handles": null,
+    "attempted_targets": null,
+    "denial_readbacks": null,
+    "model_requests": null,
+    "worker_runs": null,
+    "deployments": null
+  }
+}
