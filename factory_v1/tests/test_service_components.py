@@ -18,13 +18,19 @@ class DispatchComponentTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name) / 'controller'
-        self.service = service.initialize(self.root, 'operator', 'p', 'i', 'https://api.github.com')
+        self.root.mkdir(mode=0o700)
+        # Direct scheduler state, not a registered supervised-service envelope.
+        self.service = {'state': str(self.root / 'controller.sqlite'), 'operator_id': 'operator',
+                        'project': 'p', 'iteration': 'i', 'api_base': 'https://api.github.com'}
+        with closing(sqlite3.connect(self.service['state'])) as db, db:
+            db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
+        Path(self.service['state']).chmod(0o600)
         self.item = {'project_id': 'p', 'iteration_id': 'i', 'repository': 'owner/repo', 'status': 'active',
                      'execution_allowed': False, 'approval': {'operator_id': 'operator', 'reference': 'intake:1'},
                      'planning': {'status': 'complete'}, 'ticket_work': {'publication_complete': True, 'status': 'published'}}
         self.seed = {'assignment_id': 'a' * 64, 'claim_id': 'seed',
                      'ticket_scope': {'project': 'p', 'iteration': 'i'},
-                     'handoff': {'stage': 'implementation', 'skills': [],
+                     'handoff': {'stage': 'implementation', 'skills': [], 'issue': {'number': 1},
                                  'workspace': str(Path(self.temp.name) / 'workspace'),
                                  'profile': {'home': str(Path(self.temp.name) / 'dedicated-role')},
                                  'adaptation': dispatch.role_skills.ADAPTATIONS['implementation']}}

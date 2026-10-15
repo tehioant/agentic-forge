@@ -136,7 +136,12 @@ class OwnedLauncherTests(unittest.TestCase):
         self.launch = self.enterContext(patch.object(dispatch.subprocess, 'Popen', return_value=self.process))
         self.kill = self.enterContext(patch.object(dispatch.os, 'killpg'))
         self.enterContext(patch('factory_v1.service.connect', side_effect=lambda _: nullcontext(Mock())))
-        self.enterContext(patch.object(dispatch.controls, 'admission', side_effect=lambda *a: nullcontext()))
+        def admission(database, project, iteration, *, selection):
+            self.assertEqual((project, iteration), ('p', 'i'))
+            self.assertEqual(selection, {'assignment_id': 'a' * 64, 'run_id': None,
+                                         'launcher': '/private/launcher.json'})
+            return nullcontext()
+        self.enterContext(patch.object(dispatch.controls, 'admission', side_effect=admission))
         self.active = self.enterContext(patch.object(dispatch.controls, 'require_active'))
         self.hold = self.enterContext(patch.object(dispatch.controls, 'request'))
 
