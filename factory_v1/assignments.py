@@ -149,6 +149,92 @@ def completed_iteration_claim(database, assignment):
                     for work in report.get('delivered', [])))
 
 
+def delivered_ticket_proof(database, item, delivered, authority, lineage=None):
+    """Correlate retained delivery and absent workers without external reads."""
+    from . import bugs, diagnosis, recovery, requirements
+    number = delivered['issue']['number']
+    held = (requirements.held_numbers(item) | diagnosis.held_numbers(item) |
+            bugs.held_numbers(item) | recovery.held_numbers(item))
+    require(number not in held and not item.get('main_incident') and not recovery.pending_registration(item),
+            'Delivery ownership remains held.', 'delivery_held')
+    records = {a['assignment_id']: a for a in rows(database)}
+    candidate = records.get(delivered['assignment_id'])
+    require(candidate is not None, 'Delivered candidate is missing.', 'invalid_retirement')
+    assert candidate is not None
+    scope = candidate['ticket_scope']
+    issue = candidate['handoff']['issue']
+    require(scope['project'] == item['project_id'] and scope['iteration'] == item['iteration_id'] and
+            scope['repository'] == item['repository'] == authority['repository'] and
+            scope['repository_id'] == item['repository_onboarding']['metadata']['id'] == authority['repository_id'] and
+            scope['issue_number'] == number == authority['issue'] == issue['number'] and
+            scope['issue_id'] == delivered['issue']['id'] == issue['id'] and
+            candidate['revision'] == delivered['requirements'] == requirements.authority(item, number) and
+            authority['candidate_assignment'] == candidate['assignment_id'] and
+            authority['head'] == delivered['integration']['candidate'] and
+            delivered['reviews'] == [authority['standards_assignment'], authority['spec_assignment']],
+            'Exact delivered ticket/revision/candidate authority required.', 'invalid_retirement')
+    journal = candidate.get('merge', {})
+    require(journal.get('status') == 'delivered' and journal.get('failure') is None and
+            journal.get('close_allowed') is True and journal.get('authority') == authority and
+            all(journal.get('integrated_evidence', {}).get(k) == delivered['integration'][k]
+                for k in ('candidate', 'integrated', 'tree', 'parents')) and
+            journal.get('delivery_checks') == delivered['checks'],
+            'Correlated integrated delivery proof required.', 'invalid_retirement')
+    if lineage is None:
+        lineage = sorted(a['assignment_id'] for a in records.values() if a['ticket_scope'] == scope)
+    require(candidate['assignment_id'] in lineage and set(delivered['reviews']) <= set(lineage),
+            'Delivery lineage is incomplete.', 'invalid_retirement')
+    pins = {}
+    for identity in lineage:
+        a = records.get(identity)
+        require(a is not None and a['ticket_scope'] == scope and digest(a['handoff']) == a['handoff_digest'],
+                'Retired assignment/handoff identity changed.', 'invalid_retirement')
+        assert a is not None
+        runtime = a.get('runtime')
+        require((runtime is None and not a.get('submitted_result') and
+                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a))) or
+                (isinstance(runtime, dict) and runtime.get('status') in {'complete', 'stopped', 'failed'} and
+                 runtime.get('container_removed') is True and runtime.get('error') != 'stop_unconfirmed'),
+                'Every launched lineage worker needs verified terminal cleanup.', 'cleanup_required')
+        pins[identity] = {'handoff_digest': a['handoff_digest'], 'claim_id': a['claim_id'],
+                          'revision': a['revision'], 'run_id': (runtime or {}).get('run_id'),
+                          'record_sha256': digest(a)}
+    work = item['ticket_work']
+    reservations = [*item.get('reservation_history', []), item.get('reservation', {})]
+    reservation = next((r for r in reversed(reservations) if r.get('issue_number') == number and
+                        r.get('status') == 'reserved' and r.get('assignment_id') == work['assignment_id'] and
+                        r.get('input_digest') == work['input_digest']), None)
+    require(reservation is not None, 'Exact retained reservation required.', 'invalid_retirement')
+    return {'reservation': reservation, 'scope': scope, 'issue': issue, 'revision': candidate['revision'],
+            'candidate': candidate['assignment_id'], 'merge_authority': authority,
+            'delivered': delivered, 'lineage': pins}
+
+
+def delivered_ticket_receipt(database, assignment):
+    """Retained history forbids reuse even after its release authority becomes obsolete."""
+    scope = assignment['ticket_scope']
+    row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
+                           (scope['project'], scope['iteration'])).fetchone()
+    item = json.loads(row[0]) if row else {}
+    return item, next((r for r in item.get('delivered_ticket_retirements', {}).values()
+                       if assignment['assignment_id'] in r.get('proof', {}).get('lineage', {})), None)
+
+
+def delivered_ticket_claim(database, assignment):
+    """Only a correlated per-ticket receipt retires ownership; never perform I/O."""
+    item, receipt = delivered_ticket_receipt(database, assignment)
+    if receipt is None:
+        return False
+    try:
+        proof = receipt['proof']
+        return bool(proof['lineage'][assignment['assignment_id']]['record_sha256'] == digest(assignment) and
+                    receipt.get('receipt_id') == digest(proof) and
+                    proof == delivered_ticket_proof(database, item, proof['delivered'],
+                                                   proof['merge_authority'], proof['lineage']))
+    except (RepositoryError, KeyError, TypeError, ValueError):
+        return False
+
+
 def ticket_claims(database, scope):
     """Check durable role ownership for every supplied ticket identity field."""
     from .diagnosis import released_claim
@@ -157,7 +243,8 @@ def ticket_claims(database, scope):
     from .restart import released_claim as recovered_claim
     existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
                 not released_claim(database, old) and not revised_claim(database, old) and
-                not completed_iteration_claim(database, old) and not recovery_claim(database, old) and
+                not completed_iteration_claim(database, old) and not delivered_ticket_claim(database, old) and
+                not recovery_claim(database, old) and
                 not recovered_claim(old)]
     for old in existing:
         require(all(old['ticket_scope'].get(key) == value for key, value in scope.items()),
@@ -174,6 +261,14 @@ def claims(database, request, scope, assignment_id):
     from .recovery import released_claim as recovery_claim
     from .diagnosis import released_claim as directed_claim
     for old in existing:
+        if delivered_ticket_receipt(database, old)[1] is not None:
+            require(old['assignment_id'] != assignment_id and old['claim_id'] != request['claim_id'],
+                    'Delivered attempts require fresh claims and assignments.', 'claim_conflict')
+            require(old['handoff']['profile']['name'] != request['profile']['name'] and
+                    old['handoff']['profile']['home'] != request['profile']['home'],
+                    'Delivered profiles are historical, never reusable.', 'profile_claim_conflict')
+            if delivered_ticket_claim(database, old):
+                continue
         if recovered_claim(old):
             require(old['assignment_id'] == assignment_id or old['claim_id'] != request['claim_id'],
                     'Infrastructure recovery requires a fresh claim identity.', 'claim_conflict')
@@ -414,6 +509,8 @@ def require_result_active(assignment):
 def store_result(database, project, iteration, operator, assignment_id, request, github, *, sandbox_run_id=None):
     assignment = inspect(database, project, iteration, operator, assignment_id)
     assert assignment is not None
+    require(delivered_ticket_receipt(database, assignment)[1] is None,
+            'Delivered results are historical, never resubmittable.', 'stale_assignment')
     keys = {'assignment_id', 'handoff_digest', 'claim_id', 'run_id', 'status', 'loads', 'work', 'artifacts', 'tests'}
     require(isinstance(request, dict) and set(request) == keys and request['assignment_id'] == assignment_id and
             request['handoff_digest'] == assignment['handoff_digest'] and request['claim_id'] == assignment['claim_id'] and

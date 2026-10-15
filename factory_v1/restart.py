@@ -288,7 +288,8 @@ def ownership(database, item):
     from .diagnosis import released_claim as directed
     from .recovery import released_claim as repaired
     active = [a for a in assignments.rows(database) if not revised(database, a) and not directed(database, a) and
-              not released_claim(a) and not assignments.completed_iteration_claim(database, a) and not repaired(database, a)]
+              not released_claim(a) and not assignments.completed_iteration_claim(database, a) and
+              not assignments.delivered_ticket_claim(database, a) and not repaired(database, a)]
     profiles, homes, ticket_scopes = set(), set(), set()
     for a in active:
         p = a['handoff']['profile']
