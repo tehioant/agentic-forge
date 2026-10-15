@@ -91,7 +91,7 @@ class ReadinessTests(unittest.TestCase):
             path = self.root / 'engineering' / name
             if '/' not in name:
                 path = path / 'SKILL.md'
-            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw)
+            path.parent.mkdir(parents=True, exist_ok=True); path.write_bytes(raw); path.chmod(0o644)
             selected[name] = (str(path), sha(raw))
         self.stack.enter_context(patch.object(role_skills, 'SELECTED', selected))
         self.stack.enter_context(patch.object(skills, 'INSTALLED_ROOT', self.root / 'planning'))
