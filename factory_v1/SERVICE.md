@@ -153,6 +153,50 @@ delivery checks remain authoritative. Missing host authority returns its specifi
 capability name; it does not invoke a fallback agent or fabricate a ready result.
 A reviewed merge authority is still required by the existing human-approved seam.
 
+## Optional finite continuation capacity
+
+Add `continuation` to the legacy dispatch object, with exactly:
+
+- `reference`: explicit host approval to select the current frontier within this
+  project/iteration and implementation envelope's repository/workspace. It permits
+  rebinding only the selected full issue pin, current scoped specification commit,
+  authoritative current-main baseline, and literal unused execution slot. The
+  envelope must explicitly permit a fresh candidate (`candidate: null`).
+- `slots`: a nonempty finite list (maximum 1000) of objects containing exactly
+  `stage`, `profile`, `skills`, `claim_id`, `launcher`. Stage is one of
+  `implementation`, `corrections`, `simplify`, `review-standards`, `review-spec`,
+  `diagnosis`, `repair`. Profiles are complete existing dedicated role profiles;
+  claims, names and homes are unique and never reused, including failed/retired
+  history. Skills must be the actual reviewed installed stage closure. Launchers
+  are explicit existing private configs, with all limits supplied and validated by
+  `sandbox_policy.load_config`; inherited checks must match exactly. Slot order is
+  capacity preference, not ticket order. Exhaustion holds, never declares stuck.
+- `authorities`: exactly `review`, `diagnosis`, `publication`, `merge`, each a finite
+  explicit list of existing private host-authority paths (maximum 1000 each).
+  Selectors bind actual runs, candidate ancestry, skill/check identities and scope;
+  existing consumers revalidate full independent approval immediately before use.
+  Missing, stale or ambiguous authority holds. No approval is manufactured from a
+  worker report, no path is discovered by glob, and no model grant is created.
+
+Each tick chooses current eligible work from GitHub, not the old implementation
+claim. Corrective modifiers restart simplification and both review axes. Genuine
+responsible-worker stuck declarations use the existing separate diagnosis and
+stored authenticated attention response; silence grants nothing. A revise
+response leaves publication to the existing versioned requirement lifecycle, not
+an automatic required/deferred choice. Infrastructure failures need the existing
+exact-attempt host retry/recovery authority; no synthetic stuck result is created.
+
+Ordinary verified delivery is retired before fresh health/restart admission.
+Retirement can resolve only its exact retained old-reservation/ownership blocker,
+leaves the restart report intact, and requires fresh reconciliation afterward.
+Nonhealthy delivery reaches dispatch only for an existing registered repair;
+ordinary work and unrelated holds remain frozen. Exact integrated repair delivery
+uses the existing recovery verifier, including removed-requirement reopening and
+fresh configured health, before ownership retirement. Neither a healthy sample
+nor a delivered journal alone clears the incident. Completion revalidates every
+required delivered authority and persists the immutable report/outbox/wait state;
+`await_next_interview` never invokes `next_iteration`.
+
 ## Explicit remaining gaps (not a #25 Done claim)
 
 1. **Origin conversation binding:** `integrations/hermes-planning` provides an
@@ -160,19 +204,25 @@ A reviewed merge authority is still required by the existing human-approved seam
    session. It loads the reviewed installed interview sources into actual origin
    turns. Sufficient clarification returns the installed `to-spec` instructions
    directly to that same native tool loop, without another operator advancement.
-   The native `factory_planning_publish` tool now accepts actual same-origin
-   synthesis and uses a separately approved HOST capability for controlled
-   initial docs/issue publication and exact durable readback. Native-bound
-   completion cannot substitute loader receipts or supplied GitHub pointers.
-   The service still waits at `origin_conversation_pending`: supervisor wakeup
-   and correlated asynchronous receipt consumption remain the S1 wiring gap.
-   The plugin has not been installed/enabled or exercised with a model. See
-   its README for authorization fields and the tested source/runtime boundary.
-2. **Bounded scope:** automation drives one configured frontier ticket through
-   existing gates. Corrections, diagnosis, repair, changed requirements, uncertain
-   effects and next-ticket/iteration enrollment still stop at the existing public
-   recovery/direction seams; it does not invent fresh profiles or retry budgets.
-   Rejection is held, not an automatic per-stage approval prompt.
+   The native `factory_planning_publish` tool accepts actual same-origin synthesis
+   and uses a separately approved HOST capability for controlled initial docs/issue
+   publication and exact durable readback. Native-bound completion cannot substitute
+   loader receipts or supplied GitHub pointers. Optional `planning_config` selects
+   the private approved native wakeup route; it may coexist with `continuation`.
+   Request, enqueue and verified asynchronous receipt consumption are separate
+   ticks; ticket synthesis and continuation wait until that receipt is consumed.
+   A load or enqueue is not completion. The plugin has not been installed/enabled
+   or exercised with a model. Only plain exact-origin hook input is qualified by
+   component probes: shared-session sender attribution remains unsupported because
+   trusted injection metadata is absent at the hook. No prefix normalization is
+   performed. See the integration README for authorization/runtime contracts.
+2. **Bounded scope:** the optional `continuation` configuration now drives the
+   authoritative frontier through finite approved fresh execution slots, corrective
+   descendants, separate diagnosis/operator direction, registered repair and
+   verified ticket retirement. Without it, legacy fixed-ticket envelopes retain
+   their prior behavior. Required completion uses `iteration.complete` and waits
+   for explicit next-interview input; no next iteration is auto-approved. Missing
+   slots, allowances or exact independent authorities remain runtime holds.
 3. **Unavailable installed source revisions:** read-only local preflight found
    installed `implement`, `code-review` and `to-tickets` bytes different from the
    repository's reviewed pins. They were not repinned or edited. Live dispatch

@@ -1,8 +1,8 @@
 """Deterministic admitted stage routing over existing controller lifecycle contracts.
 
 No shell plugin registry, agent polling, worker-authored authority or parallel claims.
-One configured ticket is driven from the authoritative frontier; a missing host
-capability is a hold, never a fabricated executor or permission to fall back.
+Legacy fixed envelopes and finite continuation use the authoritative frontier;
+a missing host capability is a hold, never permission to fabricate or fall back.
 """
 from pathlib import Path
 from contextlib import contextmanager
@@ -27,7 +27,7 @@ def blocked(reason):
 
 
 def validate(config, service):
-    require(isinstance(config, dict) and set(config) in (FIELDS, FIELDS | {'planning_config'}) and text(config['reference']) and
+    require(isinstance(config, dict) and FIELDS <= set(config) <= FIELDS | {'planning_config', 'continuation'} and text(config['reference']) and
             all(config[k] == service[k] for k in ('operator_id', 'project', 'iteration')) and
             isinstance(config['roles'], dict) and set(config['roles']) <= ROLES and
             isinstance(config['launchers'], dict) and set(config['launchers']) <= ROLES | {'implementation'},
@@ -45,6 +45,9 @@ def validate(config, service):
             'Use an explicit private native wakeup approval or null.', 'invalid_dispatch')
     require(all(assignments.absolute(p) for p in config['launchers'].values()),
             'Explicit private launcher paths required.', 'invalid_dispatch')
+    if 'continuation' in config:
+        from .continuation_dispatch import validate as validate_continuation
+        validate_continuation(config, service)
     return config
 
 
@@ -223,6 +226,20 @@ def _launch_child(service, assignment_id, launcher, *, stop_event=None):
 
 def tick(service, github, *, stop_event=None):
     from .service import connect, scope
+    # Keep legacy fixed-envelope callers unchanged; continuation owns no second
+    # executor and returns to the same public launcher/publication seams.
+    with connect(service) as database:
+        path = service['dispatch_config']
+        merge.controller_paths(database, path)
+        config = validate(publication.read_json(Path(path)), service)
+    if 'continuation' in config:
+        with connect(service) as database:
+            item = assignments.current(database, *scope(service), require_active=False)
+        planning_ready = (config.get('planning_config') is None or
+                          item.get('planning', {}).get('native_wakeup', {}).get('status') == 'consumed')
+        if planning_ready and (item.get('completion') or (item.get('planning', {}).get('status') == 'complete' and
+                                      item.get('ticket_work', {}).get('publication_complete'))):
+            return continuation_tick(service, github, stop_event=stop_event)
     if stop_event is not None and stop_event.is_set():
         return blocked('service_stopping')
     launch = None
@@ -330,3 +347,72 @@ def tick(service, github, *, stop_event=None):
             if runtime.get('status') != 'complete' or runtime.get('container_removed') is not True:
                 return {**blocked('attempt_requires_reconciliation'), 'stage': action}
     return {'status': 'progress', 'stage': action, 'dispatch_allowed': False, 'blockers': []}
+
+
+def continuation_tick(service, github, *, stop_event=None):
+    from .service import connect, scope
+    from . import continuation_dispatch as continuation, recovery, restart
+    if stop_event is not None and stop_event.is_set():
+        return blocked('service_stopping')
+    with connect(service) as database, state_lock(database):
+        path = service['dispatch_config']
+        merge.controller_paths(database, path)
+        config = validate(publication.read_json(Path(path)), service)
+        item = assignments.current(database, *scope(service), require_active=False)
+        require(not controls.blocked(database, *scope(service)[:2]), 'Explicit resume required.', 'iteration_paused')
+        if item.get('completion') and item['status'] == 'waiting-for-operator':
+            return {'status': 'await_next_interview', 'report_id': item['completion']['report_id'],
+                    'dispatch_allowed': False, 'blockers': []}
+        require(item['status'] == 'active', 'Iteration is not active.', 'iteration_paused')
+        rows = assignments.rows(database)
+        # Retire the exact delivered reservation BEFORE restart/health/frontier
+        # admission. Otherwise restart can persist the old reservation as a hold.
+        if continuation.retire_delivered(database, scope(service), config, item, rows, github):
+            return {'status': 'progress', 'stage': 'retire-delivered', 'dispatch_allowed': False, 'blockers': []}
+        # Planning remains the existing fixed public seam, not another backlog.
+        if item.get('planning', {}).get('status') != 'complete' or not item.get('ticket_work', {}).get('publication_complete'):
+            return blocked('planning_or_ticket_publication_pending')
+        observed = continuation.observe(database, item, github)
+        selected = continuation.choose(database, item, rows, observed)
+        if selected['stage'] == 'blocked':
+            return blocked(selected['target'])
+        stage, target = selected['stage'], selected['target']
+        if stage in {'implementation', 'repair'}:
+            slot = continuation.slot_for(config, rows, stage)
+            selected.update(slot=slot, request=continuation.request(config, item, target, slot, github))
+            context = {'request': selected['request']}
+        elif stage in {'complete', 'wait'}:
+            context = {}
+        else:
+            ancestor = next(r for r in rows if r['assignment_id'] == target)
+            context = {'assignment_id': target} if stage == 'launch' else {'request': {
+                **ancestor['handoff'], 'stage': 'diagnosis' if stage in {
+                    'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'} else stage}}
+        if recovery.active(item):
+            restart.require_reconciled(database, *scope(service)[:2], allow_recovery=True)
+        restart.before_dispatch(database, *scope(service), github, force=True, **context)
+        fresh = assignments.current(database, *scope(service))
+        fresh_rows = assignments.rows(database)
+        again = continuation.choose(database, fresh, fresh_rows, continuation.observe(database, fresh, github))
+        if stage in {'implementation', 'repair'} and again['stage'] == stage:
+            slot = continuation.slot_for(config, fresh_rows, stage)
+            again.update(slot=slot, request=continuation.request(config, fresh, again['target'], slot, github))
+        require(again == selected and validate(publication.read_json(Path(path)), service) == config,
+                'Continuation scope or capacity changed during reconciliation.', 'stale_admission')
+        require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+        effect = continuation.execute(database, scope(service), config, fresh, fresh_rows, selected, github)
+    if effect.get('result'):
+        return effect['result']
+    if effect.get('publish'):
+        require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+        with connect(service) as database:
+            publication.publish(database, *scope(service), *effect['publish'])
+    if effect.get('launch'):
+        require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
+        run_assignment(service, *effect['launch'], stop_event=stop_event)
+        with connect(service) as database:
+            row = assignments.inspect(database, *scope(service), effect['launch'][0])
+            require(row.get('runtime', {}).get('status') == 'complete' and
+                    row['runtime'].get('container_removed') is True,
+                    'Attempt completion/removal requires reconciliation.', 'execution_uncertain')
+    return {'status': 'progress', 'stage': stage, 'dispatch_allowed': False, 'blockers': []}

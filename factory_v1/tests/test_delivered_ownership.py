@@ -30,7 +30,8 @@ class DeliveredOwnershipComponents(unittest.TestCase):
                      'approval': {'operator_id': '42', 'reference': 'approved'},
                      'status': 'active', 'execution_allowed': False, 'correlation': {'stage': 'delivery'},
                      'handoff': {'commit': 'a' * 40},
-                     'repository_onboarding': {'status': 'verified', 'metadata': {'id': 7}},
+                     'repository_onboarding': {'status': 'verified', 'metadata': {'id': 7},
+                                               'api_base': 'https://api.github.com'},
                      'ticket_work': {'assignment_id': 'batch', 'input_digest': 'b' * 64,
                                      'publication_complete': True,
                                      'board': {'project_id': 'P', 'status': {'id': 'F', 'options': {'Active': 'A'}}},
@@ -296,6 +297,26 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.store()
         self.reserve_second()
         self.assertEqual(restart.ownership(self.db, self.stored())['assignments'], ['fresh'])
+
+    def test_restart_old_reservation_hold_can_only_resolve_exact_delivery(self):
+        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+            'blockers': [{'boundary': 'tracker', 'code': 'reservation_conflict'}]}
+        self.store()
+        result = self.advance()
+        self.assertNotIn('reservation', result)
+        self.assertEqual(result['restart_reconciliation']['status'], 'blocked')
+        with self.assertRaises(RepositoryError):
+            controls.require_active(self.db, 'product', 'm1')
+
+    def test_retirement_resolution_never_bypasses_unrelated_restart_hold(self):
+        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+            'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
+        self.store()
+        before = self.stored()
+        with self.assertRaises(RepositoryError) as refused:
+            self.advance()
+        self.assertEqual(refused.exception.code, 'reconciliation_required')
+        self.assertEqual(self.stored(), before)
 
     def test_without_receipt_second_ticket_conflicts_and_retired_results_cannot_be_reused(self):
         before, rows = self.stored(), self.rows()

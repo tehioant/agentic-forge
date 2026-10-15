@@ -124,6 +124,18 @@ def cycle(config, github, *, stop_event=None):
     with connect(config) as db:
         controls.owner(db, *scope(config))
         item = assignments.current(db, *scope(config), require_active=False)
+        # Delivery retires the exact reservation before a fresh watcher/restart
+        # can persist the just-closed ticket as an ownership contradiction.
+        if (config['dispatch_config'] is not None and item['status'] == 'active' and item.get('reservation') and
+                not item.get('main_incident') and not controls.blocked(db, *scope(config)[:2])):
+            with state_lock(db):
+                from . import continuation_dispatch as continuation, service_dispatch
+                from .merge import controller_paths
+                controller_paths(db, config['dispatch_config'])
+                dispatch_config = service_dispatch.validate(read_json(Path(config['dispatch_config'])), config)
+                if 'continuation' in dispatch_config:
+                    continuation.retire_delivered(db, scope(config), dispatch_config, item, assignments.rows(db), github)
+                    item = assignments.current(db, *scope(config), require_active=False)
         healthy = True
         if config['delivery_config'] is not None:
             with state_lock(db):
@@ -141,10 +153,14 @@ def cycle(config, github, *, stop_event=None):
                         attention.deliver(db, item, record['event']['event_id'], config['transport_config'])
         if controls.blocked(db, config['project'], config['iteration']):
             return {'status': 'paused', 'dispatch_allowed': False, 'blockers': ['explicit_resume_required']}
+        item = assignments.current(db, *scope(config), require_active=False)
         if not healthy:
-            return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['delivery_not_healthy']}
+            from . import recovery
+            if recovery.active(item) is None:
+                return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['delivery_not_healthy']}
         if item['status'] != 'active':
-            return {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['iteration_not_active']}
+            return {'status': 'await_next_interview' if item.get('completion') else 'waiting',
+                    'dispatch_allowed': False, 'blockers': ['iteration_not_active']}
     if config['dispatch_config'] is None:
         return {'status': 'blocked', 'dispatch_allowed': False, 'blockers': ['dispatch_capability_unavailable']}
     return dispatch(config, github, stop_event=stop_event)

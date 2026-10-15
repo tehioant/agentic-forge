@@ -10,13 +10,13 @@ from .planning import require, text, transition
 from .repositories import save_iteration
 
 
-def frontier(database, item, github):
+def frontier(database, item, github, *, resolution=None):
     """Observe tracker read-only, checking controls against the real durable state."""
-    controls.require_active(database, item['project_id'], item['iteration_id'])
+    controls.require_active(database, item['project_id'], item['iteration_id'], resolution=resolution)
     with closing(sqlite3.connect(':memory:')) as observation:
         database.backup(observation)
-        result = tickets.frontier(observation, item, assignments.ReadOnlyGitHub(github))['ticket_work']['frontier']
-    controls.require_active(database, item['project_id'], item['iteration_id'])
+        result = tickets.frontier(observation, item, assignments.ReadOnlyGitHub(github), resolution=resolution)['ticket_work']['frontier']
+    controls.require_active(database, item['project_id'], item['iteration_id'], resolution=resolution)
     return result
 
 
