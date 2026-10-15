@@ -461,7 +461,7 @@ class RecoveryComponents(RecoveryComponentFixture):
 
     def test_unknown_reopen_never_blindly_duplicates_and_changed_identity_never_writes(self):
         prior, old_issue = self.delivered_ticket()
-        self.register()
+        self.seed_registered()
         field, member = self.tracker_for_removed(old_issue, lost_before=True)
         report = {'removed_assignments': [prior['assignment_id']]}
         for _ in range(2):
@@ -559,6 +559,7 @@ class RecoveryComponents(RecoveryComponentFixture):
             payload = json.loads(stdout.getvalue())
             self.assertTrue(payload)
         self.assertEqual(payload['incident']['recovery_issue'], 20)
+        self.seed_registered()  # The preparation dispatch has its own preadmitted input.
         request_file = self.root / 'request.json'
         request_file.write_text(json.dumps(self.request()))
         for command, option, value in [('prepare-recovery', '--request', request_file), ('verify-recovery', '--merge-config', self.config_file)]:
