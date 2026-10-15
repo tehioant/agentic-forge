@@ -136,8 +136,20 @@ def checkpoint(database, item, *, receipt=False):
         fresh = assignments.current(database, item['project_id'], item['iteration_id'],
                                     item['approval']['operator_id'], require_active=False)
         for key, record in item.get('requirement_changes', {}).items():
-            target = fresh['requirement_changes'][key]
-            require(target.get('request') == record.get('request'), 'Revision receipt authority changed.', 'stale_admission')
+            target = fresh.get('requirement_changes', {}).get(key)
+            require(target is not None and target.get('request') == record.get('request'),
+                    'Revision receipt authority changed.', 'stale_admission')
+            assert target is not None
+            for stage, produced in record.get('execution_receipts', {}).items():
+                attempt = record.get('attempts', {}).get(stage)
+                require(isinstance(record.get('request'), dict) and isinstance(attempt, dict) and
+                        set(attempt) == {'input_digest', 'capability'} and
+                        attempt == target.get('attempts', {}).get(stage),
+                        'Revision receipt stage attempt changed.', 'stale_admission')
+                receipts = target.setdefault('execution_receipts', {})
+                require(stage not in receipts or receipts[stage] == produced,
+                        'Revision stage receipt conflicts with retained output.', 'stale_admission')
+                receipts[stage] = produced
             for field in ('tree', 'parent', 'commit', 'issue_identity', 'issue_number'):
                 if field in record.get('publication', {}):
                     target.setdefault('publication', {})[field] = record['publication'][field]

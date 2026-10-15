@@ -348,6 +348,91 @@ class RequirementChangeTests(unittest.TestCase):
             self.assertTrue(tickets.external_contract({**issue, 'body': body}, new))
 
 
+class RevisionReceiptCheckpointTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.database = sqlite3.connect(Path(directory.name) / 'state.sqlite')
+        self.addCleanup(self.database.close)
+        self.database.execute('CREATE TABLE iterations(project_id TEXT, iteration_id TEXT, payload TEXT)')
+        self.attempt = {'input_digest': tickets.digest({'direction': 'exact work input'}),
+                        'capability': {'execution_reference': 'fixture-host', 'argv': ['/never-executed']}}
+        self.produced = {'result': {'notes': 'raw output'}, 'execution': {'run_id': 'fixture-run'}}
+        self.item = {'project_id': 'p', 'iteration_id': 'i', 'status': 'active', 'execution_allowed': False,
+                     'approval': {'operator_id': 'operator', 'reference': 'fixture'},
+                     'requirement_changes': {'revision': {'request': {'change_id': 'revision', 'direction': 'exact'},
+                         'status': 'resolved', 'resolution': {'content': 'original'},
+                         'attempts': {'to-spec': copy.deepcopy(self.attempt)}, 'executions': {},
+                         'publication': {'path': 'docs/revision'}, 'updated_issues': {}}}}
+        self.persist(self.item)
+
+    def persist(self, item):
+        self.database.execute('DELETE FROM iterations')
+        self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('p', 'i', json.dumps(item)))
+        self.database.commit()
+
+    def stored(self):
+        return json.loads(self.database.execute('SELECT payload FROM iterations').fetchone()[0])
+
+    def producer(self):
+        item = copy.deepcopy(self.item)
+        record = item['requirement_changes']['revision']
+        record['execution_receipts'] = {'to-spec': copy.deepcopy(self.produced)}
+        record['executions']['to-spec'] = {'untrusted': 'must not be admitted'}
+        record['attempts']['to-tickets'] = copy.deepcopy(self.attempt)
+        record['status'] = 'synthesized'
+        record['publication']['ref_intent'] = True
+        return item
+
+    def test_receipt_preserves_full_fresh_state_and_identical_replay(self):
+        for status in ('active', 'paused'):
+            with self.subTest(status=status):
+                fresh = copy.deepcopy(self.item)
+                fresh.update(status=status, main_incident={'incident_id': 'independent'}, restart={'status': 'blocked'})
+                fresh['requirement_changes']['independent'] = {'status': 'held', 'affected': [9]}
+                target = fresh['requirement_changes']['revision']
+                target.update(status='held', resolution={'content': 'fresh resolution'}, independent_hold=True)
+                target['attempts']['other-stage'] = {'retained': True}
+                target['executions']['other-stage'] = {'accepted': 'retained'}
+                target['execution_receipts'] = {'other-stage': {'retained': 'raw truth'}}
+                self.persist(fresh)
+                expected = copy.deepcopy(fresh)
+                expected['requirement_changes']['revision']['execution_receipts']['to-spec'] = self.produced
+                producer = self.producer()
+                requirements.checkpoint(self.database, producer, receipt=True)
+                self.assertEqual(self.stored(), expected)
+                requirements.checkpoint(self.database, producer, receipt=True)
+                self.assertEqual(self.stored(), expected)
+
+    def test_stale_or_conflicting_receipts_refuse_without_any_durable_change(self):
+        faults = ('request', 'missing-record', 'missing-request', 'digest', 'capability',
+                  'missing-stage', 'missing-producer-stage', 'null-stage', 'incomplete-stage', 'conflict')
+        for fault in faults:
+            with self.subTest(fault=fault):
+                fresh, producer = copy.deepcopy(self.item), self.producer()
+                target = fresh['requirement_changes']['revision']
+                record = producer['requirement_changes']['revision']
+                if fault == 'request': target['request']['direction'] = 'changed'
+                if fault == 'missing-record': del fresh['requirement_changes']['revision']
+                if fault == 'missing-request': target.pop('request'); record.pop('request')
+                if fault == 'digest': target['attempts']['to-spec']['input_digest'] = 'different'
+                if fault == 'capability': target['attempts']['to-spec']['capability']['execution_reference'] = 'different'
+                if fault == 'missing-stage': target['attempts'].pop('to-spec')
+                if fault == 'missing-producer-stage': record['attempts'].pop('to-spec')
+                if fault == 'null-stage': target['attempts']['to-spec'] = record['attempts']['to-spec'] = None
+                if fault == 'incomplete-stage': target['attempts']['to-spec'] = record['attempts']['to-spec'] = {}
+                if fault == 'conflict': target['execution_receipts'] = {'to-spec': {'different': 'raw output'}}
+                record['publication']['commit'] = 'c' * 40
+                record['updated_issues']['10'] = {'number': 10, 'id': 100}
+                self.persist(fresh)
+                with self.assertRaises(repositories.RepositoryError) as caught:
+                    requirements.checkpoint(self.database, producer, receipt=True)
+                self.assertEqual(caught.exception.code, 'stale_admission')
+                self.assertEqual(self.stored(), fresh)
+                self.assertFalse(self.database.in_transaction)
+
+
 class StuckRequirementRevisionTests(unittest.TestCase):
     def test_correlated_resume_releases_only_linked_revise_hold(self):
         fixture = test_tickets.FrontierFixture(self); record = revision_record(fixture, (10,))
