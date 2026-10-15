@@ -64,11 +64,9 @@ def artifacts(values, required, code='invalid_assignment'):
     require(required <= names, 'Missing required preceding artifacts or standards.', code)
 
 
-def validate(request):
-    require(isinstance(request, dict) and set(request) == REQUEST_FIELDS, 'Provide only the bounded assignment fields.', 'invalid_assignment')
-    stage = request['stage']
+def validate_profile(stage, profile):
+    """Validate infrastructure identity without manufacturing assignment precursors."""
     role_skills.closure(stage)
-    profile = request['profile']
     require(isinstance(profile, dict) and set(profile) == {'name', 'home', 'role', 'provider', 'model', 'operation', 'reasoning'} and
             identifier(profile['name']) and profile['name'] not in {'default', 'personal'} and
             absolute(profile['home']) and profile['role'] == ROLES[stage],
@@ -76,6 +74,13 @@ def validate(request):
     require((profile['provider'], profile['model'], profile['operation']) == SUBSCRIPTION_SCOPE and
             profile['reasoning'] in ('low', 'medium', 'high', 'xhigh'),
             'Only the existing approved provider/model/operation with explicit reasoning is supported; no fallback.', 'model_blocked')
+    return profile
+
+
+def validate(request):
+    require(isinstance(request, dict) and set(request) == REQUEST_FIELDS, 'Provide only the bounded assignment fields.', 'invalid_assignment')
+    stage = request['stage']
+    profile = validate_profile(stage, request['profile'])
     issue = request['issue']
     require(isinstance(issue, dict) and set(issue) == {'number', 'id', 'node_id', 'body_sha256'} and
             type(issue['number']) is int and issue['number'] > 0 and type(issue['id']) is int and issue['id'] > 0 and

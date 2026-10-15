@@ -109,6 +109,17 @@ def block_creation(database, item, error):
     database.commit()
 
 
+def validate_metadata(metadata, repository):
+    """Check selected identity without onboarding persistence or resource creation."""
+    owner, name = repository.split('/')
+    if (not isinstance(metadata, dict) or metadata.get('full_name') != repository or
+            metadata.get('name') != name or not isinstance(metadata.get('owner'), dict) or
+            metadata['owner'].get('login') != owner or type(metadata.get('private')) is not bool or
+            type(metadata.get('id')) is not int or metadata['id'] <= 0):
+        raise RepositoryError('repository_mismatch', 'Exact selected repository identity/privacy could not be verified; no replacement is permitted.')
+    return metadata
+
+
 def reconcile(database, item, github, receipt=None):
     previous = item.get('repository_onboarding')
     if receipt is not None:
@@ -161,14 +172,7 @@ def reconcile(database, item, github, receipt=None):
                 metadata = github.request('/repos/' + item['repository'])
             except RepositoryError as error:
                 raise RepositoryError('creation_uncertain', 'Creation returned successfully but read-back is unavailable; restore metadata access and reconcile the exact target. ' + str(error)) from error
-    if (not isinstance(metadata, dict) or
-            metadata.get('full_name') != item['repository'] or
-            metadata.get('name') != name or
-            not isinstance(metadata.get('owner'), dict) or
-            metadata['owner'].get('login') != owner or
-            type(metadata.get('private')) is not bool or
-            type(metadata.get('id')) is not int or metadata['id'] <= 0):
-        raise RepositoryError('repository_mismatch', 'Exact selected repository identity/privacy could not be verified; no replacement is permitted.')
+    validate_metadata(metadata, item['repository'])
     previous = item.get('repository_onboarding')
     if previous and 'created_repository_id' in previous and metadata['id'] != previous['created_repository_id']:
         raise RepositoryError('repository_mismatch', 'Repository ID differs from the successful creation response; do not adopt the replacement.')
