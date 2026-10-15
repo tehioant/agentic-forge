@@ -184,7 +184,8 @@ class OperationIntegrationTests(fixtures.SupervisedFixture, unittest.TestCase):
         self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
         for slot in self.config['slots']: Path(slot['profile']['home']).mkdir()
         self.health['sha'] = 'b'*40
-        self.db.execute('CREATE TABLE notifications(project TEXT, iteration TEXT, event_id TEXT, payload TEXT)')
+        self.db.execute('CREATE TABLE notifications(project TEXT, iteration TEXT, event_id TEXT, payload TEXT, '
+                        'PRIMARY KEY(project, iteration, event_id))')
         attention.enqueue(self.db, self.item, {'event_id': 'done', 'kind': 'completion', 'message': 'Done',
             'issue_number': 1, 'run_id': 'completion', 'evidence_ids': ['proof']})
         self.db.commit()
