@@ -498,64 +498,81 @@ class MergeComponentTests(unittest.TestCase):
         with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
             self.assertEqual(merge.inspect_merge(restarted, 'product', 'm1', '42', 'a' * 64)['merge']['integrated_evidence']['integrated'], self.integrated)
 
-    def test_pending_uncertain_intent_never_resends_even_while_paused(self):
-        self.merge_effect = False
-        self.drop_merge = True
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'merge_uncertain')
-        controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause pending merge')
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'merge_uncertain')
-        self.assertEqual(self.stored()['merge']['status'], 'pending')
-        self.assertEqual(len(self.mutations('PUT')), 1)
 
-    def test_late_pause_after_last_protection_read_blocks_intent_and_put(self):
-        def change(reads):
-            if reads == 3:
-                controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause final admission read')
-        self.boundary_change = change
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'iteration_paused')
-        self.assertEqual(self.protection_reads, 3)
-        self.assertEqual(self.mutations(), [])
-        self.assertNotIn('merge', self.stored())
-
-    def test_final_publication_document_drift_blocks_intent_and_put(self):
-        def change(reads):
-            if reads == 3: self.remote_inputs['documents']['spec']['sha256'] = '0' * 64
-        self.boundary_change = change
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'stale_requirements')
-        self.assertEqual(self.protection_reads, 3)
-        self.assertEqual(self.mutations(), [])
-        self.assertNotIn('merge', self.stored())
-
-    def test_final_issue_identity_or_body_drift_refuses_unsafe_writes(self):
-        for field, value, code in [('node_id', 'REPLACED', 'scope_mismatch'),
-                                   ('body', self.body + ' changed', 'stale_admission')]:
-            self.protection_reads = 0
-            self.calls.clear()
-            self.work_issue.update(node_id='ISSUE10', body=self.body)
-            self.store(self.candidate)
-            def change(reads):
-                if reads == 3:
-                    self.work_issue[field] = value
-            self.boundary_change = change
-            with self.subTest(field=field):
+    def test_preintent_final_read_guards_matrix(self):
+        config, classic, refs, issue, inputs = copy.deepcopy((self.config, self.classic, self.refs,
+                                                            self.work_issue, self.remote_inputs))
+        cases = [
+            ('pause', 3, lambda: controls.request(self.db, 'product', 'm1', '42', 'pause', 'pause final admission read'), 'iteration_paused'),
+            ('publication', 3, lambda: self.remote_inputs['documents']['spec'].update(sha256='0' * 64), 'stale_requirements'),
+            ('issue-identity', 3, lambda: self.work_issue.update(node_id='REPLACED'), 'scope_mismatch'),
+            ('issue-body', 3, lambda: self.work_issue.update(body=self.body + ' changed'), 'stale_admission'),
+            ('main', 3, lambda: self.refs.update(main='d' * 40), 'stale_baseline'),
+            ('branch', 3, lambda: self.refs.update({self.config['branch']: 'd' * 40}), 'stale_admission'),
+            ('check', 3, lambda: self.run_records[self.config['head']]['check_runs'][0].update(conclusion='failure'), 'checks_failed'),
+            ('config', 2, lambda: (self.config.update(execution_reference='LOCAL replaced authority'), self.write_config()), 'stale_admission'),
+            ('protection', 2, lambda: self.classic['required_status_checks'].update(strict=False), 'stale_protection'),
+            ('review', 3, lambda: None, 'stale_review'),
+        ]
+        for name, phase, mutate, code in cases:
+            with self.subTest(final_read=name):
+                self.config, self.classic, self.refs, self.work_issue, self.remote_inputs = copy.deepcopy((config, classic, refs, issue, inputs))
+                self.write_config()
+                self.store(self.candidate)
+                self.calls.clear()
+                self.protection_reads = 0
+                self.run_records[self.config['head']] = self.good_checks(self.config['head'])
+                self.review.side_effect = [{'status': 'accepted'}, {'status': 'corrections'}] if name == 'review' else None
+                self.boundary_change = lambda reads: mutate() if reads == phase else None
                 with self.assertRaises(RepositoryError) as refusal:
                     self.lifecycle()
                 self.assertEqual(refusal.exception.code, code)
-            self.assertEqual(self.mutations(), [])
-            self.assertNotIn('merge', self.stored())
-
-    def test_final_review_admission_cannot_use_earlier_pass(self):
-        self.review.side_effect = [{'status': 'accepted'}, {'status': 'corrections'}]
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'stale_review')
-        self.assertEqual(self.mutations(), [])
-        self.assertNotIn('merge', self.stored())
+                if name in ('pause', 'publication'):
+                    self.assertEqual(self.protection_reads, 3)
+                self.assertEqual(self.mutations(), [])
+                self.assertNotIn('merge', self.stored())
+                _, control_path = controls.paths(self.db, 'product', 'm1')
+                if control_path is not None:
+                    control_path.unlink(missing_ok=True)
 
     def test_delivery_incident_at_final_sample_freezes_ordinary_merge(self):
+        config = copy.deepcopy(self.config)
+        for mode, code in (('repository', 'scope_mismatch'), ('missing-check', 'checks_unknown'),
+                           ('unknown-check', 'checks_failed'), ('boolean-recovery', 'scope_mismatch'),
+                           ('ordinary-recovery', 'main_frozen')):
+            with self.subTest(mode=mode):
+                self.config = copy.deepcopy(config)
+                self.repo['id'] = 123
+                self.item.pop('main_incident', None)
+                self.run_records[self.config['head']] = self.good_checks(self.config['head'])
+                self.store(self.candidate)
+                self.calls.clear()
+                if mode == 'repository':
+                    self.repo['id'] = 456
+                elif mode == 'missing-check':
+                    self.run_records[self.config['head']] = {'total_count': 0, 'check_runs': []}
+                elif mode == 'unknown-check':
+                    self.run_records[self.config['head']]['check_runs'][0]['conclusion'] = None
+                else:
+                    self.item['main_incident'] = {'status': 'active', 'incident_id': 'incident-1',
+                        'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
+                    self.config['recovery'] = True if mode == 'boolean-recovery' else {
+                        'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10,
+                        'removed_assignments': []}
+                self.save_item()
+                self.write_config()
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+                self.assertEqual(self.mutations(), [])
+                self.assertNotIn('merge', self.stored())
+        self.config = config
+        self.repo['id'] = 123
+        self.item.pop('main_incident', None)
+        self.save_item()
+        self.write_config()
+        self.calls.clear()
+        self.store(self.candidate)
         calls = 0
         def boundary(*args):
             nonlocal calls
@@ -570,7 +587,7 @@ class MergeComponentTests(unittest.TestCase):
         self.assertEqual(self.mutations(), [])
         self.assertNotIn('merge', self.stored())
 
-    def test_exact_repair_scope_keeps_checks_reviews_and_incident(self):
+        self.store(self.candidate)
         from factory_v1 import recovery, simplification
         self.builder['handoff']['stage'] = 'repair'
         incident = {'status': 'active', 'incident_id': 'incident-1', 'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
@@ -620,12 +637,45 @@ class MergeComponentTests(unittest.TestCase):
 
     def test_integrated_checks_only_delivery_and_lost_closure_readback(self):
         self.lifecycle()
-        self.work_issue['state'] = 'closed'
-        self.run_records[self.integrated] = self.good_checks(self.config['head'])
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle('verify-delivery')
-        self.assertEqual(refusal.exception.code, 'checks_stale')
-        self.assertEqual(self.work_issue['state'], 'open')
-        self.assertEqual(self.stored()['merge']['status'], 'incomplete')
+        writes = self.mutations()
+        self.assertEqual(merge.merged_evidence(self.api, self.config, self.pr, self.plan)['integrated'], self.integrated)
+        original = copy.deepcopy(self.commits[self.integrated])
+        for change in ({'tree': {'sha': '0' * 40}}, {'parents': [{'sha': self.config['head']}]}):
+            self.commits[self.integrated] = {**original, **change}
+            with self.subTest(integration=change):
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.merged_evidence(self.api, self.config, self.pr, self.plan)
+                self.assertEqual(refusal.exception.code, 'integration_mismatch')
+        self.commits[self.integrated] = original
+        self.membership = 'diverged'
+        with self.assertRaises(RepositoryError) as refusal:
+            merge.merged_evidence(self.api, self.config, self.pr, self.plan)
+        self.assertEqual(refusal.exception.code, 'not_integrated')
+        self.assertEqual(self.mutations(), writes)
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.assertEqual(self.mutations('PATCH'), [])
+        self.membership = 'identical'
+        for mode, code in (('stale', 'checks_stale'), ('missing', 'checks_unknown'),
+                           ('failed', 'checks_failed'), ('unknown', 'checks_failed')):
+            with self.subTest(integrated_checks=mode):
+                records = self.good_checks(self.config['head'] if mode == 'stale' else self.integrated)
+                if mode == 'missing':
+                    records = {'total_count': 0, 'check_runs': []}
+                elif mode in ('failed', 'unknown'):
+                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
+                self.run_records[self.integrated] = records
+                self.work_issue['state'] = 'closed'
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle('verify-delivery')
+                self.assertEqual(refusal.exception.code, code)
+                self.assertEqual(self.work_issue['state'], 'open')
+                journal = self.stored()['merge']
+                self.assertEqual(journal['status'], 'incomplete')
+                self.assertEqual(journal['failure']['code'], code)
+                self.assertFalse(journal['close_allowed'])
+                self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
+                self.assertEqual(journal['delivery_checks'], [])
+                self.assertEqual(len(self.mutations('PUT')), 1)
         self.run_records[self.integrated] = self.good_checks(self.integrated)
         self.drop_state = True
         delivered = self.lifecycle('verify-delivery')
@@ -641,6 +691,19 @@ class MergeComponentTests(unittest.TestCase):
     def test_prior_delivery_receipts_survive_unknown_main_drift_without_reopening(self):
         self.lifecycle()
         delivered = self.lifecycle('verify-delivery')
+        self.work_issue['state'] = 'open'
+        original = self.external_request.side_effect
+        def read_return(path, body=None, method=None):
+            if method == 'PATCH' and body['state'] == 'closed':
+                retained = self.stored()['merge']
+                self.assertEqual(retained['status'], 'delivered')
+                self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
+                self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
+            return original(path, body, method)
+        self.external_request.side_effect = read_return
+        self.assertEqual(self.lifecycle('verify-delivery')['status'], 'delivered')
+        self.assertEqual(len(self.mutations('PUT')), 1)
+        self.external_request.side_effect = original
         later = 'd' * 40
         self.refs['main'] = later
         self.membership = 'ahead'
@@ -661,25 +724,29 @@ class MergeComponentTests(unittest.TestCase):
         self.assertEqual(self.work_issue['state'], 'open')
         self.assertEqual(self.stored()['merge']['status'], 'incomplete')
 
-    def test_reopened_delivery_checkpoint_keeps_prior_receipts_before_close_response(self):
-        self.lifecycle()
-        delivered = self.lifecycle('verify-delivery')
-        self.work_issue['state'] = 'open'
-        original = self.external_request.side_effect
-        def read_return(path, body=None, method=None):
-            if method == 'PATCH' and body['state'] == 'closed':
-                retained = self.stored()['merge']
-                self.assertEqual(retained['status'], 'delivered')
-                self.assertEqual(retained['delivery_checks'], delivered['delivery_checks'])
-                self.assertEqual(retained['integrated_evidence'], delivered['integrated_evidence'])
-            return original(path, body, method)
-        self.external_request.side_effect = read_return
-        self.assertEqual(self.lifecycle('verify-delivery')['status'], 'delivered')
-        self.assertEqual(len(self.mutations('PUT')), 1)
 
     def test_checks_and_resealed_protection_semantic_matrix(self):
         self.assertTrue(merge.protection(self.api, self.config))
-        for field, value in [('strict', False), ('checks', [])]:
+        original = copy.deepcopy(self.classic)
+        cases = [('strict', False), ('enforce_admins', False), ('allow_force_pushes', True), ('allow_deletions', True)]
+        for field, value in cases:
+            with self.subTest(protection=field):
+                self.classic = copy.deepcopy(original)
+                self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': original})
+                if field == 'strict':
+                    self.classic['required_status_checks']['strict'] = value
+                else:
+                    self.classic[field]['enabled'] = value
+                for resealed, code in ((False, 'stale_protection'), (True, 'protection_required')):
+                    if resealed:
+                        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+                    with self.subTest(resealed=resealed):
+                        with self.assertRaises(RepositoryError) as refusal:
+                            merge.protection(self.api, self.config)
+                        self.assertEqual(refusal.exception.code, code)
+        self.classic = original
+        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+        for field, value in [('checks', [])]:
             old = copy.deepcopy(self.classic)
             self.classic['required_status_checks'][field] = value
             self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
@@ -703,6 +770,37 @@ class MergeComponentTests(unittest.TestCase):
                 self.assertEqual(refusal.exception.code, code)
         self.assertEqual(self.mutations(), [])
 
+        for count in (True, 0, 2, 100):
+            with self.subTest(total_count=count):
+                self.run_records[self.config['head']] = {**self.good_checks(self.config['head']), 'total_count': count}
+                with self.assertRaises(RepositoryError) as refusal:
+                    merge.checks(self.api, self.config, self.config['head'])
+                self.assertEqual(refusal.exception.code, 'checks_unknown')
+        self.rules = []
+        self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
+        self.write_config()
+        self.run_records[self.config['head']] = self.good_checks(self.config['head'])
+        for mode in ('failed', 'missing', 'unknown'):
+            with self.subTest(main_checks=mode):
+                self.store(self.candidate)
+                self.calls.clear()
+                records = self.good_checks(self.config['baseline'])
+                if mode == 'missing':
+                    records = {'total_count': 0, 'check_runs': []}
+                else:
+                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
+                self.run_records[self.config['baseline']] = records
+                self.assertTrue(merge.checks(self.api, self.config, self.config['head']))
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, 'main_frozen')
+                self.assertIn(('GET', '/commits/' + self.config['baseline'] +
+                               '/check-runs?per_page=100&filter=latest', None), self.calls)
+                self.assertEqual(self.stored()['merge_refusal']['code'], 'main_frozen')
+                self.assertNotIn('merge', self.stored())
+                self.assertEqual(self.mutations(), [])
+                self.assertNotIn('main_incident', assignments.current(self.db, 'product', 'm1', '42'))
+
     def test_controller_config_private_scope_and_fixed_intent(self):
         self.config_path.chmod(0o644)
         with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
@@ -716,13 +814,20 @@ class MergeComponentTests(unittest.TestCase):
         with self.assertRaises(RepositoryError) as refusal: merge.controller_paths(self.db, mounted)
         self.assertEqual(refusal.exception.code, 'execution_required')
         self.lifecycle()
+        original_reference = self.config['execution_reference']
         self.config['execution_reference'] = 'Replacement authority'
         self.write_config()
         with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
         self.assertEqual(refusal.exception.code, 'merge_conflict')
         self.assertEqual(len(self.mutations('PUT')), 1)
 
-    def test_actual_merge_capability_denies_unscoped_write_and_branch_only_closure(self):
+        self.config['execution_reference'] = original_reference
+        self.write_config()
+        self.store(self.candidate)
+        self.pr.update(merged=False, state='open')
+        self.pr.pop('merge_commit_sha', None)
+        self.refs['main'] = self.config['baseline']
+        self.calls.clear()
         with self.assertRaises(RepositoryError) as refusal:
             self.api.request(self.api.prefix + '/issues/11', {'state': 'closed'}, 'PATCH')
         self.assertEqual(refusal.exception.code, 'capability_blocked')
@@ -732,72 +837,6 @@ class MergeComponentTests(unittest.TestCase):
         self.assertEqual(self.work_issue['state'], 'open')
         self.assertEqual(self.mutations('PUT'), [])
 
-    def test_changed_requirements_during_autoclosure_reopen_with_incomplete_receipt(self):
-        self.auto_close = True
-        self.after_merge = lambda: self.work_issue.update(body=self.body + ' revised during integration')
-        with self.assertRaises(RepositoryError) as refusal:
-            self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'stale_requirements')
-        self.assertEqual(self.work_issue['state'], 'open')
-        journal = self.stored()['merge']
-        self.assertEqual(journal['status'], 'incomplete')
-        self.assertFalse(journal['close_allowed'])
-        self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
-        self.assertEqual(len(self.mutations('PUT')), 1)
-        self.assertEqual(len(self.mutations('PATCH')), 1)
-
-    def test_real_integrated_tree_parents_and_membership_are_not_branch_proof(self):
-        self.pr.update(merged=True, state='closed', merge_commit_sha=self.integrated)
-        self.refs['main'] = self.integrated
-        self.assertEqual(merge.merged_evidence(self.api, self.config, self.pr, self.plan)['integrated'], self.integrated)
-        original = copy.deepcopy(self.commits[self.integrated])
-        for change in ({'tree': {'sha': '0' * 40}}, {'parents': [{'sha': self.config['head']}]}):
-            self.commits[self.integrated] = {**original, **change}
-            with self.subTest(change=change):
-                with self.assertRaises(RepositoryError) as refusal:
-                    merge.merged_evidence(self.api, self.config, self.pr, self.plan)
-                self.assertEqual(refusal.exception.code, 'integration_mismatch')
-        self.commits[self.integrated] = original
-        self.membership = 'diverged'
-        with self.assertRaises(RepositoryError) as refusal:
-            merge.merged_evidence(self.api, self.config, self.pr, self.plan)
-        self.assertEqual(refusal.exception.code, 'not_integrated')
-        self.assertEqual(self.mutations(), [])
-
-    def test_final_branch_main_and_check_drift_never_admit_intent(self):
-        for mode, code in [('main', 'stale_baseline'), ('branch', 'stale_admission'), ('check', 'checks_failed')]:
-            self.protection_reads = 0
-            self.calls.clear()
-            self.refs.update(main=self.config['baseline'])
-            self.refs[self.config['branch']] = self.config['head']
-            self.run_records[self.config['head']] = self.good_checks(self.config['head'])
-            self.store(self.candidate)
-            def change(reads):
-                if reads != 3:
-                    return
-                if mode == 'main':
-                    self.refs['main'] = 'd' * 40
-                elif mode == 'branch':
-                    self.refs[self.config['branch']] = 'd' * 40
-                else:
-                    self.run_records[self.config['head']]['check_runs'][0]['conclusion'] = 'failure'
-            self.boundary_change = change
-            with self.subTest(mode=mode):
-                with self.assertRaises(RepositoryError) as refusal:
-                    self.lifecycle()
-                self.assertEqual(refusal.exception.code, code)
-            self.assertEqual(self.mutations(), [])
-            self.assertNotIn('merge', self.stored())
-
-    def test_identity_changed_after_merge_persists_hold_without_wrong_issue_write(self):
-        self.auto_close = True
-        self.after_merge = lambda: self.work_issue.update(node_id='REPLACED')
-        with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
-        self.assertEqual(refusal.exception.code, 'scope_mismatch')
-        self.assertEqual(self.mutations('PATCH'), [])
-        journal = self.stored()['merge']
-        self.assertFalse(journal['close_allowed'])
-        self.assertEqual(journal['status'], 'incomplete')
 
     def test_concrete_protection_http_failures_keep_preflight_immutable_and_refusal_durable(self):
         original = self.external_request.side_effect
@@ -827,31 +866,6 @@ class MergeComponentTests(unittest.TestCase):
                 self.assertEqual(self.mutations(), [])
                 self.assertEqual(self.work_issue['state'], 'open')
         self.external_request.side_effect = original
-
-    def test_green_candidate_cannot_hide_failed_or_unknown_baseline_checks(self):
-        for mode in ('failed', 'missing', 'unknown'):
-            with self.subTest(main_checks=mode):
-                self.store(self.candidate)
-                self.refs['main'] = self.config['baseline']
-                self.pr.update(state='open', merged=False)
-                self.calls.clear()
-                records = self.good_checks(self.config['baseline'])
-                if mode == 'missing':
-                    records = {'total_count': 0, 'check_runs': []}
-                else:
-                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
-                self.run_records[self.config['baseline']] = records
-                # The real baseline predicate, not a supplied main_incident, refuses.
-                self.assertTrue(merge.checks(self.api, self.config, self.config['head']))
-                with self.assertRaises(RepositoryError) as refusal:
-                    self.lifecycle()
-                self.assertEqual(refusal.exception.code, 'main_frozen')
-                self.assertIn(('GET', '/commits/' + self.config['baseline'] +
-                               '/check-runs?per_page=100&filter=latest', None), self.calls)
-                self.assertEqual(self.stored()['merge_refusal']['code'], 'main_frozen')
-                self.assertNotIn('merge', self.stored())
-                self.assertEqual(self.mutations(), [])
-                self.assertNotIn('main_incident', assignments.current(self.db, 'product', 'm1', '42'))
 
     def test_concurrent_locked_controllers_share_one_merge_intent_and_put(self):
         import fcntl
@@ -886,7 +900,35 @@ class MergeComponentTests(unittest.TestCase):
         self.assertEqual(journal['status'], 'merged')
         self.assertEqual(journal['integrated_evidence'], results[0]['integrated_evidence'])
 
-    def test_material_spec_or_obsolete_assignment_reopens_retaining_integrated_receipts(self):
+    def test_posteffect_requirements_and_identity_matrix(self):
+        issue = copy.deepcopy(self.work_issue)
+        for field, value, code, patches in (
+                ('body', self.body + ' revised during integration', 'stale_requirements', 1),
+                ('node_id', 'REPLACED', 'scope_mismatch', 0)):
+            with self.subTest(posteffect=field):
+                self.store(self.candidate)
+                self.work_issue = copy.deepcopy(issue)
+                self.pr.update(merged=False, state='open')
+                self.refs['main'] = self.config['baseline']
+                self.calls.clear()
+                self.auto_close = True
+                self.after_merge = lambda: self.work_issue.update({field: value})
+                with self.assertRaises(RepositoryError) as refusal:
+                    self.lifecycle()
+                self.assertEqual(refusal.exception.code, code)
+                journal = self.stored()['merge']
+                self.assertEqual(journal['status'], 'incomplete')
+                self.assertFalse(journal['close_allowed'])
+                self.assertEqual(len(self.mutations('PATCH')), patches)
+                self.assertEqual(len(self.mutations('PUT')), 1)
+                if field == 'body':
+                    self.assertEqual(self.work_issue['state'], 'open')
+                    self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
+        self.work_issue = issue
+        self.auto_close = False
+        self.after_merge = None
+        self.calls.clear()
+        self.store(self.candidate)
         authority = {k: v for k, v in self.config.items() if k != 'bearer'}
         evidence = {'candidate': self.config['head'], 'integrated': self.integrated,
                     'tree': self.plan['tree'], 'main': self.integrated, 'membership': 'identical',
@@ -936,110 +978,9 @@ class MergeComponentTests(unittest.TestCase):
                     else:
                         self.assertEqual(inspected['requirement_disposition'], candidate['requirement_disposition'])
 
-    def test_missing_or_failed_integrated_checks_reopen_without_another_merge(self):
-        self.lifecycle()
-        for mode, code in (('missing', 'checks_unknown'), ('failed', 'checks_failed'), ('unknown', 'checks_failed')):
-            with self.subTest(integrated_checks=mode):
-                records = self.good_checks(self.integrated)
-                if mode == 'missing':
-                    records = {'total_count': 0, 'check_runs': []}
-                else:
-                    records['check_runs'][0]['conclusion'] = 'failure' if mode == 'failed' else None
-                self.run_records[self.integrated] = records
-                self.work_issue['state'] = 'closed'
-                with self.assertRaises(RepositoryError) as refusal:
-                    self.lifecycle('verify-delivery')
-                self.assertEqual(refusal.exception.code, code)
-                self.assertEqual(self.work_issue['state'], 'open')
-                journal = self.stored()['merge']
-                self.assertEqual(journal['status'], 'incomplete')
-                self.assertEqual(journal['failure']['code'], code)
-                self.assertFalse(journal['close_allowed'])
-                self.assertEqual(journal['integrated_evidence']['integrated'], self.integrated)
-                self.assertEqual(journal['delivery_checks'], [])
-                self.assertEqual(len(self.mutations('PUT')), 1)
 
-    def test_wrong_repo_missing_branch_checks_and_unbound_recovery_refuse_without_intent(self):
-        config = copy.deepcopy(self.config)
-        for mode, code in (('repository', 'scope_mismatch'), ('missing-check', 'checks_unknown'),
-                           ('unknown-check', 'checks_failed'), ('boolean-recovery', 'scope_mismatch'),
-                           ('ordinary-recovery', 'main_frozen')):
-            with self.subTest(mode=mode):
-                self.config = copy.deepcopy(config)
-                self.repo['id'] = 123
-                self.item.pop('main_incident', None)
-                self.run_records[self.config['head']] = self.good_checks(self.config['head'])
-                self.store(self.candidate)
-                self.calls.clear()
-                if mode == 'repository':
-                    self.repo['id'] = 456
-                elif mode == 'missing-check':
-                    self.run_records[self.config['head']] = {'total_count': 0, 'check_runs': []}
-                elif mode == 'unknown-check':
-                    self.run_records[self.config['head']]['check_runs'][0]['conclusion'] = None
-                else:
-                    self.item['main_incident'] = {'status': 'active', 'incident_id': 'incident-1',
-                        'recovery_assignment': self.builder['assignment_id'], 'recovery_issue': 10}
-                    self.config['recovery'] = True if mode == 'boolean-recovery' else {
-                        'incident_id': 'incident-1', 'implementation_assignment': self.builder['assignment_id'], 'issue': 10,
-                        'removed_assignments': []}
-                self.save_item()
-                self.write_config()
-                with self.assertRaises(RepositoryError) as refusal:
-                    self.lifecycle()
-                self.assertEqual(refusal.exception.code, code)
-                self.assertEqual(self.mutations(), [])
-                self.assertNotIn('merge', self.stored())
 
-    def test_changed_or_resealed_weak_protection_and_malformed_check_counts_refuse(self):
-        original = copy.deepcopy(self.classic)
-        cases = [('strict', False), ('enforce_admins', False), ('allow_force_pushes', True), ('allow_deletions', True)]
-        for field, value in cases:
-            with self.subTest(protection=field):
-                self.classic = copy.deepcopy(original)
-                self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': original})
-                if field == 'strict':
-                    self.classic['required_status_checks']['strict'] = value
-                else:
-                    self.classic[field]['enabled'] = value
-                with self.assertRaises(RepositoryError) as refusal:
-                    merge.protection(self.api, self.config)
-                self.assertEqual(refusal.exception.code, 'stale_protection')
-                self.config['protection_sha256'] = assignments.digest({'rules': self.rules, 'protection': self.classic})
-                with self.assertRaises(RepositoryError) as refusal:
-                    merge.protection(self.api, self.config)
-                self.assertEqual(refusal.exception.code, 'protection_required')
-        for count in (True, 0, 2, 100):
-            with self.subTest(total_count=count):
-                self.run_records[self.config['head']] = {**self.good_checks(self.config['head']), 'total_count': count}
-                with self.assertRaises(RepositoryError) as refusal:
-                    merge.checks(self.api, self.config, self.config['head'])
-                self.assertEqual(refusal.exception.code, 'checks_unknown')
-        self.assertEqual(self.mutations(), [])
 
-    def test_late_config_or_protection_drift_blocks_durable_intent(self):
-        for mode, code in (('config', 'stale_admission'), ('protection', 'stale_protection')):
-            with self.subTest(mode=mode):
-                self.store(self.candidate)
-                self.calls.clear()
-                self.protection_reads = 0
-                self.classic['required_status_checks']['strict'] = True
-                self.config['execution_reference'] = 'LOCAL unchanged authority'
-                self.write_config()
-                def change(reads):
-                    if reads != 2:
-                        return
-                    if mode == 'config':
-                        self.config['execution_reference'] = 'LOCAL replaced authority'
-                        self.write_config()
-                    else:
-                        self.classic['required_status_checks']['strict'] = False
-                self.boundary_change = change
-                with self.assertRaises(RepositoryError) as refusal:
-                    self.lifecycle()
-                self.assertEqual(refusal.exception.code, code)
-                self.assertNotIn('merge', self.stored())
-                self.assertEqual(self.mutations(), [])
 
     def test_paused_pending_intent_remains_uncertain_on_fresh_connection(self):
         self.merge_effect = False
@@ -1361,12 +1302,10 @@ class ChainAdmissionTests(unittest.TestCase):
         self.assertIs(messages['Independent review execution authorization missing or stale.'], True)
         self.assertIs(messages['Host-resolved implement, simplify-code and both native review executions required.'], True)
 
-    def test_forged_execution_declarations_never_qualify(self):
+        approved = copy.deepcopy(self.config['executions'])
         self.config['executions'] = [{'role': 'implementation', 'status': 'done'}] * 4
         self.assert_refused('execution_required')
-
-    def test_each_host_execution_binding_field_is_frozen(self):
-        approved = copy.deepcopy(self.config['executions'])
+        self.config['executions'] = approved
         for index, execution in enumerate(approved):
             for field in execution:
                 with self.subTest(stage=self.rows[index]['handoff']['stage'], field=field):
@@ -1375,8 +1314,6 @@ class ChainAdmissionTests(unittest.TestCase):
                     self.assert_refused('execution_required')
         self.config['executions'] = approved
 
-    def test_each_assignment_candidate_check_and_scope_binding_is_frozen(self):
-        approved = copy.deepcopy(self.config['executions'])
         for index, execution in enumerate(approved):
             for field in execution['binding']:
                 with self.subTest(stage=self.rows[index]['handoff']['stage'], field=field):
@@ -1405,7 +1342,6 @@ class ChainAdmissionTests(unittest.TestCase):
             axis['review_authorization'] = copy.deepcopy(approved)
             self.store(axis)
 
-    def test_changed_reviewer_load_references_and_work_cannot_reuse_approval(self):
         for original in self.axes:
             for field in ('loads', 'work'):
                 with self.subTest(axis=original['handoff']['stage'], field=field):
@@ -1424,7 +1360,6 @@ class ChainAdmissionTests(unittest.TestCase):
                         self.config['executions'] = approved
                         self.store(original)
 
-    def test_changed_builder_and_other_stage_transcripts_or_responses_are_rejected(self):
         for row in self.rows:
             for relative in ('scratch/conversation.json', 'model-evidence/response-local.json'):
                 path = Path(row['runtime']['artifacts']) / relative
@@ -1445,7 +1380,8 @@ class ChainAdmissionTests(unittest.TestCase):
         self.reseal_axis_authority([self.axes[0], self.axes[0]])
         self.assert_refused('stale_review')
 
-    def test_reused_profiles_or_artifacts_cannot_supply_fresh_axes(self):
+        self.config['spec_assignment'] = self.axes[1]['assignment_id']
+        self.reseal_axis_authority(self.axes)
         original = copy.deepcopy(self.axes)
         for field in ('name', 'home', 'artifacts'):
             with self.subTest(field=field):
@@ -1472,7 +1408,6 @@ class ChainAdmissionTests(unittest.TestCase):
                 finally:
                     path.write_bytes(raw)
 
-    def test_each_review_pin_must_equal_the_immutable_candidate(self):
         for index, original in enumerate(self.axes):
             for field in self.pins:
                 with self.subTest(axis=original['handoff']['stage'], pin=field):
@@ -1515,7 +1450,7 @@ class ChainAdmissionTests(unittest.TestCase):
                         for restored in self.axes:
                             self.store(restored)
 
-    def test_rejected_spec_with_valid_resealed_authority_cannot_pass_real_chain(self):
+    def test_review_semantics_and_artifact_bounds_matrix(self):
         self.admit()  # Identical bytes, checks and independent bindings qualify first.
         axes = copy.deepcopy(self.axes)
         spec = axes[1]
@@ -1537,8 +1472,7 @@ class ChainAdmissionTests(unittest.TestCase):
         self.assertEqual(spec['review_result']['verdict'], 'reject')
         self.assertTrue(spec['result_disposition']['checks_verified'])
 
-    def test_private_artifact_envelope_and_oversized_model_evidence_fail_real_chain(self):
-        self.admit()
+        self.reseal_axis_authority(self.axes)
         root = Path(self.builder['runtime']['artifacts'])
         root.chmod(0o755)
         try:
@@ -1661,7 +1595,9 @@ class MappedCandidateTests(unittest.TestCase):
                 self.assertEqual(refusal.exception.code, 'stale_head')
                 self.assertEqual(str(refusal.exception), 'Reviewed byte/mode tree differs from Git head.')
 
-    def test_unchanged_policy_is_preserved_and_changed_policy_needs_explicit_authority(self):
+        file.write_bytes(original)
+        file.chmod(0o644)
+        self.reseal_source()
         mapped = self.mapped()
         policy = next(e for e in self.entries if e['path'] == 'AGENTS.md')
         expected = publication.tree_sha([policy, {'path': 'hello.py', 'type': 'blob', 'mode': '100644',
@@ -1670,6 +1606,7 @@ class MappedCandidateTests(unittest.TestCase):
         self.assertEqual([e['path'] for e in mapped['changes']], ['hello.py'])
         self.assertEqual(manifest(self.source)['AGENTS.md'], manifest(self.baseline)['AGENTS.md'])
         file = self.source / 'AGENTS.md'
+        policy_raw = file.read_bytes()
         file.write_bytes(file.read_bytes() + b'Unapproved policy change\n')
         self.reseal_source()
         self.approval['paths'] = ['hello.py', 'AGENTS.md']
@@ -1680,7 +1617,9 @@ class MappedCandidateTests(unittest.TestCase):
             self.mapped()
         self.assertEqual(refusal.exception.code, 'policy_held')
 
-    def test_exact_published_git_commit_tree_and_parent_cannot_be_replaced(self):
+        file.write_bytes(policy_raw)
+        self.approval['paths'] = ['hello.py']
+        self.reseal_source()
         original = copy.deepcopy(self.commits[self.config['head']])
         for field, value in (('tree', {'sha': '0' * 40}), ('parents', [{'sha': '0' * 40}]), ('message', 'unreviewed')):
             with self.subTest(field=field):

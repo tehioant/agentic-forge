@@ -6,6 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / 'factory_v1' / 'tests'
+MAX_TESTS = 500
 
 
 def test_ids(suite):
@@ -20,6 +21,9 @@ def inventory(suite):
     identities = list(test_ids(suite))
     if not identities or len(set(identities)) != len(identities):
         raise ValueError('Discovery must contain a nonempty, unique test inventory.')
+    if len(identities) > MAX_TESTS:
+        raise ValueError(f'Discovered {len(identities)} tests; the maximum is {MAX_TESTS}. '
+                         'Consolidate related coverage without excluding tests or dropping safety checks.')
     return identities
 
 

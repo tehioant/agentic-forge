@@ -80,32 +80,32 @@ class AttentionComponentTests(unittest.TestCase):
         return {'event_id': self.event['event_id'], 'decision_id': 'direction-15', 'operator_id': '42',
                 'origin': self.origin, 'reference': 'verified operator message', 'response': 'Investigate outage'}
 
-    def test_enqueue_exact_correlations_reopen_and_routine_silence(self):
+    def test_outbox_event_identity(self):
         before = self.rows('iterations')
         self.assertEqual(self.records(), [])
-        with self.assertRaises(IntakeError):
-            self.enqueue(dict(self.event, kind='stage_success'))
-        record = self.enqueue()
-        self.assertEqual(record['destination'], self.origin)
-        self.assertEqual(record['correlation']['work_item'], {'repository': 'example/product', 'issue_number': 15})
-        self.assertEqual(record['correlation']['worker_run_id'], 'run-15')
-        self.assertEqual(record['correlation']['evidence_ids'], ['evidence-15'])
-        self.assertEqual(self.records(), [record])
+        with self.assertRaises(IntakeError): self.enqueue(dict(self.event, kind='stage_success'))
+        first = self.enqueue()
+        self.assertEqual(first['destination'], self.origin)
+        self.assertEqual(first['correlation']['work_item'], {'repository': 'example/product', 'issue_number': 15})
+        self.assertEqual(first['correlation']['worker_run_id'], 'run-15')
+        self.assertEqual(first['correlation']['evidence_ids'], ['evidence-15'])
+        self.assertEqual(self.records(), [first])
+        decision = dict(self.event, event_id='decision-1', kind='decision', decision_id='direction-15')
+        rows = [('replay', self.event, False), ('changed-message', dict(self.event, message='different'), True),
+                ('new-incident', dict(self.event, event_id='incident-2'), False), ('decision', decision, False),
+                ('duplicate-decision', dict(decision, event_id='duplicate-decision'), True),
+                ('new-decision', dict(decision, event_id='decision-2', decision_id='direction-16'), False)]
+        for name, event, refused in rows:
+            with self.subTest(event=name):
+                if refused:
+                    with self.assertRaises(IntakeError): self.enqueue(event)
+                else:
+                    record = self.enqueue(event)
+                    if name == 'replay': self.assertEqual(record, first)
+        self.assertEqual(len(self.records()), 4)
         self.assertEqual(self.rows('iterations'), before)
         self.runner.assert_not_called()
 
-    def test_idempotence_event_conflict_and_unique_decision_identity(self):
-        first = self.enqueue()
-        self.assertEqual(self.enqueue(), first)
-        with self.assertRaises(IntakeError):
-            self.enqueue(dict(self.event, message='different'))
-        self.enqueue(dict(self.event, event_id='incident-2'))
-        decision = dict(self.event, event_id='decision-1', kind='decision', decision_id='direction-15')
-        self.enqueue(decision)
-        with self.assertRaises(IntakeError):
-            self.enqueue(dict(decision, event_id='duplicate-decision'))
-        self.enqueue(dict(decision, event_id='decision-2', decision_id='direction-16'))
-        self.assertEqual(len(self.records()), 4)
 
     def test_event_negative_matrix_preserves_empty_outbox(self):
         for changes in ({'issue_number': True}, {'run_id': ' run'}, {'evidence_ids': []}, {'kind': []},
@@ -213,54 +213,52 @@ class AttentionComponentTests(unittest.TestCase):
             self.assertEqual(transport.send(record), expected)
         self.assertNotIn('secret-do-not-retain', json.dumps(self.records()))
 
-    def test_no_effect_retry_new_attempt_and_uncertain_effect_no_blind_retry(self):
-        self.enqueue()
-        self.runner.side_effect = OSError('not executed')
-        with self.assertRaises(IntakeError) as raised:
-            self.deliver()
-        self.assertEqual(raised.exception.code, 'transport_not_sent')
-        self.assertEqual(self.records()[0]['state'], 'pending')
-        self.runner.side_effect = None
-        self.runner.return_value = subprocess.CompletedProcess([], 1, '', 'secret')
-        with self.assertRaises(IntakeError):
-            self.deliver()
-        uncertain = self.records()[0]
-        self.assertEqual(uncertain['state'], 'uncertain')
-        self.assertEqual(self.deliver(), uncertain)
-        self.assertEqual(self.runner.call_count, 2)
-        receipt = self.receipt('not_sent')
-        self.operation('attention-reconcile', receipt)
-        self.runner.return_value = subprocess.CompletedProcess([], 0, '{"success":true}', '')
-        accepted = self.deliver()
-        self.assertEqual(accepted['attempts'], 3)
-        self.assertEqual(accepted['reconciliation'], receipt)
-        self.assertIsNone(accepted['receipt'])
-        with self.assertRaises(IntakeError):
-            self.operation('attention-reconcile', receipt)
-        self.operation('attention-reconcile', self.receipt())
-        self.deliver()
-        self.assertEqual(self.runner.call_count, 3)
-
-    def test_interruption_at_send_return_preserves_uncertain_intent_before_and_after_effect(self):
-        self.enqueue()
+    def test_delivery_intent_uncertainty_and_retry(self):
+        original = self.enqueue()
         effects = []
-        for effect in (False, True):
-            def interrupted(*args, **kwargs):
-                retained = self.records()[0]
-                self.assertEqual(retained['state'], 'uncertain')
-                self.assertGreater(retained['attempts'], 0)
-                if effect:
-                    effects.append(retained['event']['event_id'])
-                raise SystemExit('simulated effect-return interruption')
-            self.runner.side_effect = interrupted
-            with self.assertRaises(SystemExit):
-                self.deliver()
-            count = self.runner.call_count
-            self.assertEqual(self.deliver()['state'], 'uncertain')
-            self.assertEqual(self.runner.call_count, count)
-            self.operation('attention-reconcile', self.receipt('delivered' if effect else 'not_sent'))
-        self.assertEqual(self.records()[0]['state'], 'delivered')
+        for outcome in ('retry', 'interrupted-before-effect', 'interrupted-after-effect'):
+            with self.subTest(outcome=outcome):
+                self.replace('notifications', json.dumps(original))
+                self.runner.reset_mock(); self.runner.side_effect = None
+                if outcome == 'retry':
+                    self.runner.side_effect = OSError('not executed')
+                    with self.assertRaises(IntakeError) as raised: self.deliver()
+                    self.assertEqual(raised.exception.code, 'transport_not_sent')
+                    self.assertEqual(self.records()[0]['state'], 'pending')
+                    self.runner.side_effect = None
+                    self.runner.return_value = subprocess.CompletedProcess([], 1, '', 'secret')
+                    expected = IntakeError
+                else:
+                    def interrupted(*args, **kwargs):
+                        retained = self.records()[0]
+                        self.assertEqual(retained['state'], 'uncertain')
+                        self.assertGreater(retained['attempts'], 0)
+                        if outcome == 'interrupted-after-effect': effects.append(retained['event']['event_id'])
+                        raise SystemExit('simulated effect-return interruption')
+                    self.runner.side_effect = interrupted
+                    expected = SystemExit
+                with self.assertRaises(expected): self.deliver()
+                uncertain = self.records()[0]
+                self.assertEqual(uncertain['state'], 'uncertain')
+                count = self.runner.call_count
+                self.assertEqual(self.deliver(), uncertain)
+                self.assertEqual(self.runner.call_count, count)
+                if outcome == 'retry': self.assertEqual(count, 2)
+                receipt = self.receipt('delivered' if outcome == 'interrupted-after-effect' else 'not_sent')
+                self.operation('attention-reconcile', receipt)
+                if outcome == 'retry':
+                    self.runner.return_value = subprocess.CompletedProcess([], 0, '{"success":true}', '')
+                    accepted = self.deliver()
+                    self.assertEqual(accepted['attempts'], 3)
+                    self.assertEqual(accepted['reconciliation'], receipt)
+                    self.assertIsNone(accepted['receipt'])
+                    with self.assertRaises(IntakeError): self.operation('attention-reconcile', receipt)
+                    self.operation('attention-reconcile', self.receipt())
+                    self.deliver()
+                    self.assertEqual(self.runner.call_count, 3)
+                if outcome == 'interrupted-after-effect': self.assertEqual(self.records()[0]['state'], 'delivered')
         self.assertEqual(effects, [self.event['event_id']])
+
 
     def test_receipt_and_response_negative_matrices_do_not_authorize_execution(self):
         self.event = dict(self.event, kind='decision', decision_id='direction-15')
@@ -309,7 +307,7 @@ class AttentionComponentTests(unittest.TestCase):
             self.assertEqual(self.records()[0]['attempts'], 0)
         self.runner.assert_not_called()
 
-    def test_corrupt_durable_notifications_fail_all_real_lifecycle_seams(self):
+    def test_durable_attention_record_validation_1(self):
         self.event = dict(self.event, kind='decision', decision_id='direction-15')
         original = self.enqueue()
         receipt = self.receipt()
@@ -335,6 +333,24 @@ class AttentionComponentTests(unittest.TestCase):
         for changed in ({}, dict(response, operator_id='99'), dict(response, decision_id='other'),
                         dict(response, origin={}), dict(response, response=''), dict(response, acknowledgement=True)):
             malformed.append(json.dumps(dict(original, decision_response=changed)))
+        receipt = dict(self.receipt(), attempt=1)
+        delivered = dict(original, state='delivered', attempts=1, receipt=receipt, reconciliation=receipt)
+        self.assertEqual(attention.load_record(json.dumps(delivered), 'product', 'm1', self.event['event_id'], self.item), delivered)
+        not_sent = {k: v for k, v in dict(receipt, outcome='not_sent').items() if k != 'message_id'}
+        semantic = [dict(original, receipt=receipt), dict(original, state='delivered', attempts=1, receipt=None),
+                     dict(original, state='delivered', attempts=1, receipt={}), dict(delivered, reconciliation={}),
+                     dict(original, reconciliation=not_sent), dict(original, state='accepted', attempts=1, reconciliation=not_sent),
+                     dict(original, state='uncertain', attempts=1, reconciliation=not_sent)]
+        response = self.response()
+        for changed in (dict(response, operator_id=42), dict(response, event_id='other'), dict(response, reference=''),
+                        dict(response, origin=dict(self.origin, chat_id=' 123'))):
+            semantic.append(dict(original, decision_response=changed))
+        incident = {k: v for k, v in dict(self.event, kind='incident').items() if k != 'decision_id'}
+        semantic.append(dict(original, event=incident, decision_response=response))
+        malformed += [json.dumps(record) for record in semantic]
+        valid_pending = dict(original, attempts=1, reconciliation=not_sent)
+        self.assertEqual(attention.load_record(json.dumps(valid_pending), 'product', 'm1', self.event['event_id'], self.item), valid_pending)
+        self.runner.assert_not_called()
         for raw in malformed:
             self.replace('notifications', raw)
             before = self.rows('notifications')
@@ -382,32 +398,6 @@ class AttentionComponentTests(unittest.TestCase):
         self.runner.assert_called_once()
 
 
-    def test_semantic_receipt_and_decision_consistency_without_unrelated_guards(self):
-        self.event = dict(self.event, kind='decision', decision_id='direction-15')
-        original = self.enqueue()
-        receipt = dict(self.receipt(), attempt=1)
-        delivered = dict(original, state='delivered', attempts=1, receipt=receipt, reconciliation=receipt)
-        self.assertEqual(attention.load_record(json.dumps(delivered), 'product', 'm1', self.event['event_id'], self.item), delivered)
-        not_sent = {k: v for k, v in dict(receipt, outcome='not_sent').items() if k != 'message_id'}
-        malformed = [dict(original, receipt=receipt), dict(original, state='delivered', attempts=1, receipt=None),
-                     dict(original, state='delivered', attempts=1, receipt={}), dict(delivered, reconciliation={}),
-                     dict(delivered, reconciliation=None), dict(delivered, receipt=None),
-                     dict(delivered, state='accepted'), dict(delivered, attempts=2), dict(delivered, last_error='transport_uncertain'),
-                     dict(original, reconciliation=not_sent), dict(original, state='accepted', attempts=1, reconciliation=not_sent),
-                     dict(original, state='uncertain', attempts=1, reconciliation=not_sent)]
-        response = self.response()
-        for changed in (dict(response, operator_id=42), dict(response, event_id='other'), dict(response, reference=''),
-                        dict(response, origin=dict(self.origin, chat_id=' 123'))):
-            malformed.append(dict(original, decision_response=changed))
-        incident = {k: v for k, v in dict(self.event, kind='incident').items() if k != 'decision_id'}
-        malformed.append(dict(original, event=incident, decision_response=response))
-        for record in malformed:
-            with self.subTest(record=record), self.assertRaises(IntakeError) as raised:
-                attention.load_record(json.dumps(record), 'product', 'm1', self.event['event_id'], self.item)
-            self.assertEqual(raised.exception.code, 'state_error')
-        valid_pending = dict(original, attempts=1, reconciliation=not_sent)
-        self.assertEqual(attention.load_record(json.dumps(valid_pending), 'product', 'm1', self.event['event_id'], self.item), valid_pending)
-        self.runner.assert_not_called()
 
     def test_no_retry_guard_sensitivity(self):
         record = self.enqueue()

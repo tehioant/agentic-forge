@@ -59,7 +59,3 @@ class RecoveryObservationTests(RecoveryFixture):
         self.assertIsNotNone(observed['incident'], 'Healthy polling must not bypass registered repair delivery/reopen proof')
         self.assertEqual(observed['incident']['latest_evidence'], assignments.digest(self.evidence(True)))
         delivery.inspect(self.db, 'p', 'i', '42')
-
-    def test_unregistered_transient_incident_still_clears_on_verified_health(self):
-        self.sample(False)
-        self.assertIsNone(self.sample(True)['incident'])

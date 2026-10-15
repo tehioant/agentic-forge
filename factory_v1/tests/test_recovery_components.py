@@ -1,5 +1,6 @@
 """Small, deterministic recovery fixtures; no worker, HTTP server or model is started."""
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import sqlite3
@@ -14,6 +15,16 @@ from factory_v1.model_access import SUBSCRIPTION_SCOPE
 from factory_v1.repositories import RepositoryError, save_iteration
 from factory_v1.tests.test_recovery import RecoveryFixture
 
+
+
+@contextmanager
+def component_case(cls):
+    case = cls(methodName='runTest')
+    try:
+        case.setUp()
+        yield case
+    finally:
+        case.doCleanups()
 
 class RecoveryComponentFixture(RecoveryFixture):
     def setUp(self):
@@ -253,29 +264,35 @@ class RecoveryComponentFixture(RecoveryFixture):
 
 
 class RecoveryComponents(RecoveryComponentFixture):
-    def test_private_registration_is_durable_idempotent_and_pins_real_observation(self):
-        record = self.register()
-        self.assertEqual(record, self.register())
-        self.assertEqual(record['evidence'], self.evidence(False))
-        self.assertEqual(self.stored()['main_incident']['recovery_issue'], 20)
-        self.assertIsNotNone(self.sample(True)['incident'])
-        for mutation in ({'paths': ['other.py']}, {'evidence_id': '0' * 64}):
-            self.config_file.write_text(json.dumps(self.authorization | mutation))
-            with self.assertRaises(RepositoryError):
-                self.register()
-        self.github.request.assert_not_called()
+    def test_registered_recovery_authority_cases(self):
+        for mode in ('valid', 'public', 'worker-mounted', 'changed-paths', 'changed-evidence'):
+            with self.subTest(mode=mode), component_case(RecoveryComponentFixture) as case:
+                error = None
+                if mode == 'public':
+                    case.config_file.chmod(0o644)
+                    error = 'Private'
+                elif mode == 'worker-mounted':
+                    case.db.execute('CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
+                    case.db.execute('INSERT INTO role_assignments VALUES (?,?)', ('x', json.dumps({
+                        'handoff': {'workspace': str(case.root), 'profile': {'home': '/fixture-home'}}})))
+                    case.db.commit()
+                    error = 'outside'
+                elif mode.startswith('changed-'):
+                    case.seed_registered()
+                    mutation = {'paths': ['other.py']} if mode == 'changed-paths' else {'evidence_id': '0' * 64}
+                    case.config_file.write_text(json.dumps(case.authorization | mutation))
+                    error = 'authority'
+                if error:
+                    with self.assertRaisesRegex(RepositoryError, error):
+                        case.register()
+                else:
+                    record = case.register()
+                    self.assertEqual(record, case.register())
+                    self.assertEqual(record['evidence'], case.evidence(False))
+                    self.assertEqual(case.stored()['main_incident']['recovery_issue'], 20)
+                    self.assertIsNotNone(case.sample(True)['incident'])
+                case.github.request.assert_not_called()
 
-    def test_worker_mount_or_public_config_cannot_grant_recovery(self):
-        self.config_file.chmod(0o644)
-        with self.assertRaisesRegex(RepositoryError, 'Private'):
-            self.register()
-        self.config_file.chmod(0o600)
-        self.db.execute('CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT)')
-        self.db.execute('INSERT INTO role_assignments VALUES (?,?)', ('x', json.dumps({
-            'handoff': {'workspace': str(self.root), 'profile': {'home': '/fixture-home'}}})))
-        self.db.commit()
-        with self.assertRaisesRegex(RepositoryError, 'outside'):
-            self.register()
 
     def test_fresh_repair_handoff_and_claim_replay_with_feature_priority(self):
         self.seed_registered()
@@ -344,25 +361,42 @@ class RecoveryComponents(RecoveryComponentFixture):
         with self.assertRaisesRegex(RepositoryError, 'unrelated'):
             recovery.validate_result(assignment, result)
 
-    def test_final_merge_boundary_checks_simplified_bytes_and_exact_host_scope(self):
-        assignment, report, result, artifacts = self.completed_report()
-        item = self.stored()
-        config = {'recovery': {'incident_id': item['main_incident']['incident_id'],
-                              'implementation_assignment': assignment['assignment_id'], 'issue': 20, 'removed_assignments': []},
-                  'baseline': 'a' * 40, 'issue': 20}
-        self.assertEqual(recovery.merge_boundary(self.db, item, config, assignment, artifacts), report)
-        config['recovery']['implementation_assignment'] = '0' * 64
-        with self.assertRaises(RepositoryError):
-            recovery.merge_boundary(self.db, item, config, assignment, artifacts)
-        config['recovery']['implementation_assignment'] = assignment['assignment_id']
-        simplified = self.root / 'simplified'
-        (simplified / 'workspace').mkdir(parents=True)
-        (simplified / 'inputs/baseline').mkdir(parents=True)
-        (simplified / 'workspace/app.py').write_text('fixed')
-        (simplified / 'workspace/unrelated.py').write_text('unrelated')
-        (simplified / 'inputs/baseline/app.py').write_text('broken')
-        with self.assertRaisesRegex(RepositoryError, 'authorized incident paths'):
-            recovery.merge_boundary(self.db, item, config, assignment, simplified)
+    def test_recovery_merge_authority_cases(self):
+        cases = [('valid', None), ('wrong-root', 'ancestry'), ('extra-path', 'authorized incident paths'),
+                 ('host-removals', 'host removal assessment'), ('safe-revert', None)]
+        for mode, error in cases:
+            with self.subTest(mode=mode), component_case(RecoveryComponentFixture) as case:
+                if mode == 'safe-revert':
+                    prior, _ = case.delivered_ticket()
+                assignment, report, result, artifacts = case.completed_report()
+                removed = [prior['assignment_id']] if mode == 'safe-revert' else []
+                if mode == 'safe-revert':
+                    report.update(mode='safe-revert', removed_assignments=removed,
+                        rationale='Red feedback identifies delivered regression; bounded revert restores main at cost of accepted behavior.')
+                    result['artifacts'] = [simplification.artifact('recovery-report', json.dumps(report))]
+                validated = recovery.validate_result(assignment, result)
+                self.assertEqual(validated['mode'], 'safe-revert' if mode == 'safe-revert' else 'roll-forward')
+                item = case.stored()
+                config = {'recovery': {'incident_id': case.authorization['incident_id'],
+                    'implementation_assignment': assignment['assignment_id'], 'issue': 20,
+                    'removed_assignments': ['f' * 64] if mode == 'host-removals' else removed},
+                    'baseline': 'a' * 40, 'issue': 20}
+                if mode == 'wrong-root':
+                    config['recovery']['implementation_assignment'] = '0' * 64
+                elif mode == 'extra-path':
+                    artifacts = case.root / 'simplified'
+                    (artifacts / 'workspace').mkdir(parents=True)
+                    (artifacts / 'inputs/baseline').mkdir(parents=True)
+                    (artifacts / 'workspace/app.py').write_text('fixed')
+                    (artifacts / 'workspace/unrelated.py').write_text('unrelated')
+                    (artifacts / 'inputs/baseline/app.py').write_text('broken')
+                if error:
+                    with self.assertRaisesRegex(RepositoryError, error) as refusal:
+                        recovery.merge_boundary(case.db, item, config, assignment, artifacts)
+                    if mode == 'wrong-root':
+                        self.assertEqual(refusal.exception.code, 'scope_mismatch')
+                else:
+                    self.assertEqual(recovery.merge_boundary(case.db, item, config, assignment, artifacts), report)
 
     def test_corrective_recovery_reassesses_final_choice_and_requires_original_native_binding(self):
         prior, _ = self.delivered_ticket()
@@ -433,71 +467,86 @@ class RecoveryComponents(RecoveryComponentFixture):
         with self.assertRaises(RepositoryError):
             recovery.merge_boundary(self.db, self.stored(), {'recovery': {'incident_id': 'asserted'}}, {}, self.root)
 
-    def test_safe_revert_reopens_exact_ticket_and_status_with_lost_response_reconciliation(self):
-        prior, old_issue = self.delivered_ticket()
-        assignment, report, result, artifacts = self.completed_report()
-        report.update(mode='safe-revert', removed_assignments=[prior['assignment_id']],
-                      rationale='Red feedback identifies delivered regression; bounded revert restores main at cost of accepted behavior.')
-        result['artifacts'] = [simplification.artifact('recovery-report', json.dumps(report))]
-        self.assertEqual(recovery.validate_result(assignment, result)['mode'], 'safe-revert')
-        config = {'recovery': {'incident_id': self.authorization['incident_id'], 'implementation_assignment': assignment['assignment_id'],
-                              'issue': 20, 'removed_assignments': [prior['assignment_id']]}, 'baseline': 'a' * 40, 'issue': 20}
-        self.assertEqual(recovery.merge_boundary(self.db, self.stored(), config, assignment, artifacts), report)
-        field, member = self.tracker_for_removed(old_issue, lost_after=True)
-        for _ in range(2):
-            item = self.stored()
-            record = recovery.active(item)
-            recovery.reopen_removed(self.db, item, record, report, self.github)
-        self.assertEqual(self.github.request.call_count, 1)
-        self.assertEqual(field.call_count, 1)
-        self.assertEqual((old_issue['state'], member['status']), ('open', 'T'))
-        saved = next(a for a in assignments.rows(self.db) if a['assignment_id'] == prior['assignment_id'])
-        self.assertEqual(saved['merge']['failure']['code'], 'delivery_removed')
-        record = recovery.active(self.stored())
-        assert record is not None
-        self.assertEqual(record['removed'][prior['assignment_id']]['dependencies'], [])
-        self.assertEqual(recovery.held_numbers(self.stored()), {10})
-        self.assertIsNotNone(self.sample(True)['incident'])
+    def test_removed_ticket_reopen_readback_cases(self):
+        modes = ('lost-after', 'lost-before', 'issue-identity', 'blocked-before', 'blocked-patch',
+                 'blocked-last-read', 'membership-id', 'membership-scope')
+        for mode in modes:
+            with self.subTest(mode=mode), component_case(RecoveryComponentFixture) as case:
+                prior, issue = case.delivered_ticket()
+                item = case.stored()
+                item['ticket_work']['request']['tracker']['statuses']['blocked'] = 'Blocked'
+                item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
+                item['ticket_work']['board']['scope'] = {'id': 'S', 'options': {'i': 'I'}}
+                with case.db:
+                    save_iteration(case.db, item)
+                case.seed_registered()
+                field, member = case.tracker_for_removed(issue, lost_after=mode == 'lost-after', lost_before=mode == 'lost-before')
+                member['scope'] = 'I'
+                if mode == 'blocked-before':
+                    member['status'] = 'B'
+                elif mode == 'issue-identity':
+                    issue['id'] = 999
+                elif mode == 'blocked-patch':
+                    write = case.github.request.side_effect
+                    def block(*args):
+                        write(*args)
+                        member['status'] = 'B'
+                    case.github.request.side_effect = block
+                reads, last_guard_injected = [], []
+                def read_member(*args):
+                    reads.append(True)
+                    observed = copy.deepcopy(member)
+                    if mode == 'blocked-last-read' and len(reads) == 3:
+                        member['status'] = observed['status'] = 'B'
+                        last_guard_injected.append(True)
+                    if len(reads) > 1:
+                        if mode == 'membership-id':
+                            observed['id'] = 'replaced'
+                        elif mode == 'membership-scope':
+                            observed['scope'] = 'foreign'
+                    return observed
+                report = {'removed_assignments': [prior['assignment_id']]}
+                error = mode in ('lost-before', 'issue-identity', 'membership-id', 'membership-scope')
+                with patch.object(tickets.gh, 'membership', side_effect=read_member):
+                    for _ in range(2 if mode in ('lost-after', 'lost-before') else 1):
+                        item = case.stored()
+                        if error:
+                            with self.assertRaises(RepositoryError) as refusal:
+                                recovery.reopen_removed(case.db, item, recovery.active(item), report, case.github)
+                            if mode == 'issue-identity':
+                                self.assertRegex(str(refusal.exception), 'identity|requirements')
+                        else:
+                            recovery.reopen_removed(case.db, item, recovery.active(item), report, case.github)
+                if mode == 'lost-after':
+                    self.assertEqual(case.github.request.call_count, 1)
+                    self.assertEqual(field.call_count, 1)
+                    self.assertEqual((issue['state'], member['status']), ('open', 'T'))
+                    saved = next(a for a in assignments.rows(case.db) if a['assignment_id'] == prior['assignment_id'])
+                    self.assertEqual(saved['merge']['failure']['code'], 'delivery_removed')
+                    self.assertEqual(recovery.active(case.stored())['removed'][prior['assignment_id']]['dependencies'], [])
+                    self.assertEqual(recovery.held_numbers(case.stored()), {10})
+                    self.assertIsNotNone(case.sample(True)['incident'])
+                else:
+                    field.assert_not_called()
+                    if mode == 'lost-before':
+                        self.assertEqual(case.github.request.call_count, 1)
+                    elif mode == 'issue-identity':
+                        case.github.request.assert_not_called()
+                    elif mode.startswith('blocked-'):
+                        self.assertEqual(member['status'], 'B')
+                        receipt = recovery.active(case.stored())['removed'][prior['assignment_id']]
+                        self.assertEqual(receipt['membership']['status'], 'B')
+                        if mode == 'blocked-patch':
+                            self.assertFalse(receipt['status_intent'])
+                        if mode == 'blocked-last-read':
+                            self.assertEqual(last_guard_injected, [True])
+                            self.assertTrue(receipt['status_intent'])
+                    else:
+                        self.assertEqual(len(reads), 2)
+                        self.assertEqual(member['status'], 'D')
 
-    def test_unknown_reopen_never_blindly_duplicates_and_changed_identity_never_writes(self):
-        prior, old_issue = self.delivered_ticket()
-        self.seed_registered()
-        field, member = self.tracker_for_removed(old_issue, lost_before=True)
-        report = {'removed_assignments': [prior['assignment_id']]}
-        for _ in range(2):
-            item = self.stored()
-            with self.assertRaises(RepositoryError):
-                recovery.reopen_removed(self.db, item, recovery.active(item), report, self.github)
-        self.assertEqual(self.github.request.call_count, 1)
-        field.assert_not_called()
-        old_issue['id'] = 999
-        item = self.stored()
-        with self.assertRaisesRegex(RepositoryError, 'identity|requirements'):
-            recovery.reopen_removed(self.db, item, recovery.active(item), report, self.github)
-        self.assertEqual(self.github.request.call_count, 1)
 
-    def test_worker_removal_list_cannot_override_host_merge_assessment(self):
-        assignment, report, result, artifacts = self.completed_report()
-        item = self.stored()
-        config = {'recovery': {'incident_id': self.authorization['incident_id'], 'implementation_assignment': assignment['assignment_id'],
-                              'issue': 20, 'removed_assignments': ['f' * 64]}, 'baseline': 'a' * 40, 'issue': 20}
-        with self.assertRaisesRegex(RepositoryError, 'host removal assessment'):
-            recovery.merge_boundary(self.db, item, config, assignment, artifacts)
 
-    def test_reopening_preserves_independently_blocked_progress(self):
-        prior, old_issue = self.delivered_ticket()
-        item = self.stored()
-        item['ticket_work']['request']['tracker']['statuses']['blocked'] = 'Blocked'
-        item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
-        with self.db:
-            save_iteration(self.db, item)
-        self.seed_registered()
-        field, member = self.tracker_for_removed(old_issue)
-        member['status'] = 'B'
-        item = self.stored()
-        recovery.reopen_removed(self.db, item, recovery.active(item), {'removed_assignments': [prior['assignment_id']]}, self.github)
-        field.assert_not_called()
-        self.assertEqual(member['status'], 'B')
 
     def test_clearance_requires_merge_integrated_checks_and_fresh_health_after_readbacks(self):
         assignment, report, result, artifacts = self.completed_report()
@@ -548,37 +597,37 @@ class RecoveryComponents(RecoveryComponentFixture):
         import io
         import sys
         from factory_v1 import __main__ as cli
-        state = self.root / 'state.sqlite'
-        Path(str(state) + '.onboarding.lock').touch(mode=0o600)
-        for command, extra in [('register-recovery', ['--recovery-config', str(self.config_file), '--api-base', self.github.base]),
-                               ('inspect-recovery', [])]:
-            stdout = io.StringIO()
-            argv = ['factory_v1', '--state', str(state), '--operator-id', '42', command, '--project', 'p', '--iteration', 'i', *extra]
-            with patch.object(sys, 'argv', argv), patch('factory_v1.repositories.GitHub', return_value=self.github), contextlib.redirect_stdout(stdout):
-                cli.main()
-            payload = json.loads(stdout.getvalue())
-            self.assertTrue(payload)
-        self.assertEqual(payload['incident']['recovery_issue'], 20)
-        self.seed_registered()  # The preparation dispatch has its own preadmitted input.
-        request_file = self.root / 'request.json'
-        request_file.write_text(json.dumps(self.request()))
-        for command, option, value in [('prepare-recovery', '--request', request_file), ('verify-recovery', '--merge-config', self.config_file)]:
-            stdout = io.StringIO()
-            argv = ['factory_v1', '--state', str(state), '--operator-id', '42', command, '--project', 'p', '--iteration', 'i',
-                    option, str(value), '--api-base', self.github.base]
-            with patch.object(sys, 'argv', argv), patch('factory_v1.repositories.GitHub', return_value=self.github), \
-                 self.preparation_seams(), patch.object(recovery, 'verify', return_value={'status': 'simulated-verifier-boundary'}) as verifier, \
-                 contextlib.redirect_stdout(stdout):
-                cli.main()
-            payload = json.loads(stdout.getvalue())
-            if command == 'prepare-recovery':
-                self.assertEqual(payload['handoff']['stage'], 'repair')
-                self.assertEqual(self.stored()['main_incident']['recovery_assignment'], payload['assignment_id'])
-                verifier.assert_not_called()
-            else:
-                self.assertEqual(payload['status'], 'simulated-verifier-boundary')
-                verifier.assert_called_once()
-        self.github.request.assert_not_called()
+        for command in ('register-recovery', 'inspect-recovery', 'prepare-recovery', 'verify-recovery'):
+            with self.subTest(command=command), component_case(RecoveryComponentFixture) as case:
+                state = case.root / 'state.sqlite'
+                Path(str(state) + '.onboarding.lock').touch(mode=0o600)
+                if command != 'register-recovery':
+                    case.seed_registered()
+                request_file = case.root / 'request.json'
+                request_file.write_text(json.dumps(case.request()))
+                extra = {'register-recovery': ['--recovery-config', str(case.config_file), '--api-base', case.github.base],
+                    'inspect-recovery': [],
+                    'prepare-recovery': ['--request', str(request_file), '--api-base', case.github.base],
+                    'verify-recovery': ['--merge-config', str(case.config_file), '--api-base', case.github.base]}[command]
+                stdout = io.StringIO()
+                argv = ['factory_v1', '--state', str(state), '--operator-id', '42', command, '--project', 'p', '--iteration', 'i', *extra]
+                with patch.object(sys, 'argv', argv), patch('factory_v1.repositories.GitHub', return_value=case.github), \
+                     case.preparation_seams(), patch.object(recovery, 'verify', return_value={'status': 'simulated-verifier-boundary'}) as verifier, \
+                     contextlib.redirect_stdout(stdout):
+                    cli.main()
+                payload = json.loads(stdout.getvalue())
+                self.assertTrue(payload)
+                if command == 'inspect-recovery':
+                    self.assertEqual(payload['incident']['recovery_issue'], 20)
+                elif command == 'prepare-recovery':
+                    self.assertEqual(payload['handoff']['stage'], 'repair')
+                    self.assertEqual(case.stored()['main_incident']['recovery_assignment'], payload['assignment_id'])
+                elif command == 'verify-recovery':
+                    self.assertEqual(payload['status'], 'simulated-verifier-boundary')
+                    verifier.assert_called_once()
+                if command != 'verify-recovery':
+                    verifier.assert_not_called()
+                case.github.request.assert_not_called()
 
     def test_authoritative_frontier_admits_only_registered_recovery_without_erasing_other_holds(self):
         item = self.stored()

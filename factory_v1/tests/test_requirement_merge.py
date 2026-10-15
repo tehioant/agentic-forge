@@ -26,15 +26,6 @@ def candidate_record(fixture):
             'assignment_ready': True, 'result_disposition': {'requirements_valid': True}}
 
 
-class RequirementReviewTests(unittest.TestCase):
-    def test_material_revision_before_review_refuses_old_candidate_on_durable_reload(self):
-        fixture = test_tickets.FrontierFixture(self); old = candidate_record(fixture)
-        fixture.database.execute('INSERT INTO role_assignments VALUES (?,?)', (old['assignment_id'], json.dumps(old))); fixture.database.commit()
-        fixture.item['requirement_changes'] = {'change': {'kind': 'material', 'status': 'held', 'affected': [10]}}; fixture.persist()
-        before = fixture.stored()
-        with self.assertRaises(repositories.RepositoryError) as caught: review.candidate(fixture.database, 'product', 'm1', '42', 'candidate')
-        self.assertEqual(caught.exception.code, 'requirements_held'); self.assertEqual(fixture.stored(), before)
-        fixture.github.request.assert_not_called(); self.assertEqual(assignments.rows(fixture.database), [old])
 
 
 class RequirementMergeTests(unittest.TestCase):
@@ -58,25 +49,41 @@ class RequirementMergeTests(unittest.TestCase):
                        'protection_sha256': assignments.digest({'rules': [], 'protection': classic})}
         self.api.read.side_effect = lambda path: [] if path == '/rules/branches/main' else copy.deepcopy(classic)
 
-    def test_material_revision_after_approval_refuses_result_and_merge_inspection_retains_history(self):
-        old = candidate_record(self.fixture); old['requirement_disposition'] = {'change_id': 'change', 'status': 'obsolete'}
-        old['assignment_ready'] = False; old['result_disposition']['requirements_valid'] = False
-        old['merge_refusal'] = {'code': 'requirements_held'}
-        self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('candidate', json.dumps(old))); self.database.commit()
-        for _ in range(2):
-            with self.assertRaises(repositories.RepositoryError) as caught: assignments.require_result_active(assignments.rows(self.database)[0])
-            self.assertEqual(caught.exception.code, 'requirements_held')
-            readback = merge.inspect_merge(self.database, 'product', 'm1', '42', 'candidate')
-            self.assertEqual(readback['requirement_disposition'], old['requirement_disposition']); self.assertEqual(readback['refusal']['code'], 'requirements_held')
-        self.assertEqual(assignments.rows(self.database), [old]); self.api.request.assert_not_called()
+    def test_candidate_revision_authority(self):
+        initial = copy.deepcopy(self.item)
+        for boundary in ('before-review', 'obsolete-result', 'independent'):
+            with self.subTest(boundary=boundary):
+                self.item.clear(); self.item.update(copy.deepcopy(initial))
+                old = candidate_record(self.fixture)
+                self.database.execute('DELETE FROM role_assignments')
+                if boundary == 'obsolete-result':
+                    old['requirement_disposition'] = {'change_id': 'change', 'status': 'obsolete'}
+                    old['assignment_ready'] = False; old['result_disposition']['requirements_valid'] = False
+                    old['merge_refusal'] = {'code': 'requirements_held'}
+                else:
+                    self.item['requirement_changes'] = {'change': {'kind': 'material', 'status': 'held',
+                        'affected': [10] if boundary == 'before-review' else [12]}}
+                self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('candidate', json.dumps(old)))
+                self.fixture.persist(); before = self.fixture.stored()
+                if boundary == 'before-review':
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        review.candidate(self.database, 'product', 'm1', '42', 'candidate')
+                    self.assertEqual(caught.exception.code, 'requirements_held'); self.assertEqual(self.fixture.stored(), before)
+                    self.github.request.assert_not_called()
+                elif boundary == 'obsolete-result':
+                    for _ in range(2):
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            assignments.require_result_active(assignments.rows(self.database)[0])
+                        self.assertEqual(caught.exception.code, 'requirements_held')
+                        readback = merge.inspect_merge(self.database, 'product', 'm1', '42', 'candidate')
+                        self.assertEqual(readback['requirement_disposition'], old['requirement_disposition'])
+                        self.assertEqual(readback['refusal']['code'], 'requirements_held')
+                else:
+                    self.assertEqual(assignments.inspect(self.database, 'product', 'm1', '42', 'candidate'), old)
+                    self.assertEqual(merge.inspect_merge(self.database, 'product', 'm1', '42', 'candidate')['current_revision'], old['revision'])
+                self.assertEqual(assignments.rows(self.database), [old]); self.api.request.assert_not_called()
 
-    def test_independent_candidate_retains_exact_revision_evidence_when_other_issue_held(self):
-        old = candidate_record(self.fixture)
-        self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('candidate', json.dumps(old))); self.database.commit()
-        self.item['requirement_changes'] = {'change': {'kind': 'material', 'status': 'held', 'affected': [12]}}; self.fixture.persist()
-        self.assertEqual(assignments.inspect(self.database, 'product', 'm1', '42', 'candidate'), old)
-        self.assertEqual(merge.inspect_merge(self.database, 'product', 'm1', '42', 'candidate')['current_revision'], old['revision'])
-        self.assertEqual(assignments.rows(self.database), [old]); self.api.request.assert_not_called()
+
 
     def test_minor_prose_cannot_revalidate_changed_controller_check_bytes(self):
         root = self.fixture.root / 'artifacts'; (root / 'workspace').mkdir(parents=True); (root / 'inputs/baseline').mkdir(parents=True); (root / 'scratch').mkdir()
@@ -94,12 +101,13 @@ class RequirementMergeTests(unittest.TestCase):
             with self.assertRaises(repositories.RepositoryError) as caught: requirements.validity(self.database, self.item, self.github, {10})
         self.assertEqual(caught.exception.code, 'stale_assignment'); self.assertEqual(assignments.rows(self.database), [old])
 
-    def final_merge_fixture(self, fault=lambda: None):
+    def final_merge_fixture(self, fault=lambda: None, *, context=None):
         """Preadmitted input records; real final review -> prepare -> frontier.
 
         Byte writers below do not execute precursor preparation or validation.
         Tracker state is mutable, while pinned specification document bytes stay exact.
         """
+        enter_context = self.enterContext if context is None else context.enter_context
         root = self.fixture.root
         evidence_root = root / 'candidate'; evidence_root.mkdir(mode=0o700)
         evidence = test_simplification.LocalStageEvidence(evidence_root)
@@ -222,13 +230,13 @@ class RequirementMergeTests(unittest.TestCase):
                         'head_sha': suffix.split('/')[2], 'status': 'completed', 'conclusion': 'success'}]}
             return tracker_request(path, body, method)
         self.github.request.side_effect = external
-        self.enterContext(patch.object(merge, 'MergeGitHub', return_value=self.api))
-        self.enterContext(patch.object(merge, 'chain', side_effect=lambda *a: (self.stored_candidate(), {}, evidence_root)))
-        self.enterContext(patch.object(merge, 'mapped_candidate', return_value={'tree': 'd' * 40}))
-        self.enterContext(patch.object(delivery, 'mutation_boundary', side_effect=lambda *a: assignments.current(*a)))
+        enter_context(patch.object(merge, 'MergeGitHub', return_value=self.api))
+        enter_context(patch.object(merge, 'chain', side_effect=lambda *a: (self.stored_candidate(), {}, evidence_root)))
+        enter_context(patch.object(merge, 'mapped_candidate', return_value={'tree': 'd' * 40}))
+        enter_context(patch.object(delivery, 'mutation_boundary', side_effect=lambda *a: assignments.current(*a)))
         # Only precursor contract metadata is supplied. Final pair validation,
         # approved execution-binding comparison and prepare/frontier stay real.
-        self.enterContext(patch.object(review, 'handoff', side_effect=lambda _d, _p, _i, _o, request:
+        enter_context(patch.object(review, 'handoff', side_effect=lambda _d, _p, _i, _o, request:
                                       copy.deepcopy(contracts[request['stage']])))
         # A transparent observation of the real external tracker read records timing;
         # evaluate/prepare/frontier themselves are never replaced.
@@ -236,7 +244,7 @@ class RequirementMergeTests(unittest.TestCase):
         def observe():
             self.frontier_reads.append(self.protection_reads)
             return project_items()
-        self.enterContext(patch.object(tickets.gh, 'project_items', side_effect=lambda *a: observe()))
+        enter_context(patch.object(tickets.gh, 'project_items', side_effect=lambda *a: observe()))
         self.candidate_id = candidate['assignment_id']
         self.github.request.reset_mock()
 
@@ -251,8 +259,8 @@ class RequirementMergeTests(unittest.TestCase):
     def run_final_merge(self):
         return merge.lifecycle(self.database, 'product', 'm1', '42', self.config_path, 'merge-candidate')
 
-    def assert_protection_read_drift_refused(self, fault, code):
-        self.final_merge_fixture(fault)
+    def assert_protection_read_drift_refused(self, fault, code, *, context=None):
+        self.final_merge_fixture(fault, context=context)
         before = self.fixture.stored(); rows = assignments.rows(self.database)
         documents = copy.deepcopy(self.fixture.inputs['documents'])
         body = self.fixture.issues[10]['body']
@@ -283,30 +291,56 @@ class RequirementMergeTests(unittest.TestCase):
         self.assertEqual(len(puts), 1)
         self.assertEqual(puts[0].args, ('/repos/example/product/pulls/20/merge', {'sha': self.config['head'], 'merge_method': 'merge'}, 'PUT'))
 
-    def test_native_blocker_drift_at_protection_read_refuses_merge(self):
-        self.assert_protection_read_drift_refused(lambda: self.fixture.deps.update({10: [12]}), 'github_mismatch')
+    def test_merge_last_frontier_admission(self):
+        import sqlite3
+        from contextlib import contextmanager
+        fixture = self.fixture
+        immutable = {name: getattr(fixture, name) for name in ('item', 'work', 'issues', 'members', 'deps')}
+        request, config, api = copy.deepcopy(self.request), copy.deepcopy(self.config), self.api
+        original_root, original_state, original_db = fixture.root, fixture.state, self.database
+        @contextmanager
+        def isolated(label):
+            data = copy.deepcopy(immutable)
+            patches = ExitStack()
+            fixture.root = original_root / label; fixture.root.mkdir()
+            fixture.state = fixture.root / 'state.sqlite'
+            self.database = fixture.database = sqlite3.connect(fixture.state); original_db.backup(self.database)
+            fixture.state.chmod(0o600)
+            for name, value in data.items(): setattr(fixture, name, value)
+            self.item = fixture.item; self.request = copy.deepcopy(request); self.config = copy.deepcopy(config); self.api = api
+            self.request['issue'] = requirements.issue_pin(fixture.issues[10])
+            try:
+                yield patches
+            finally:
+                patches.close()
+                self.database.close(); self.database = fixture.database = original_db
+                fixture.root, fixture.state = original_root, original_state
+                for name, value in immutable.items(): setattr(fixture, name, value)
+                self.item = fixture.item; self.request = request; self.config = config; self.api = api
+        for defect, code in (('native-blocker', 'github_mismatch'), ('reopened-blocker', 'ticket_ineligible'),
+                             ('scope', 'ticket_ineligible'), ('progress', 'ticket_ineligible'), ('body', 'stale_admission')):
+            with self.subTest(defect=defect), isolated(defect) as patches:
+                if defect == 'reopened-blocker':
+                    fixture.deps[10] = [12]
+                    fixture.issues[10]['body'] = fixture.issues[10]['body'].replace('None (can start immediately).', '- #12')
+                    self.request['issue'] = requirements.issue_pin(fixture.issues[10])
+                    fixture.issues[12].update(state='closed', state_reason='completed')
+                    fixture.members[12]['fields']['STATUS'] = 'Done'
+                def fault():
+                    if defect == 'native-blocker': fixture.deps[10] = [12]
+                    elif defect == 'reopened-blocker':
+                        fixture.issues[12].update(state='open', state_reason=None)
+                        fixture.members[12]['fields']['STATUS'] = 'Ready'
+                    elif defect == 'scope': fixture.members[10]['fields']['SCOPE'] = 'M2'
+                    elif defect == 'progress': fixture.members[10]['fields']['STATUS'] = 'Blocked'
+                    else: fixture.issues[10]['body'] += '\nNew requirement.'
+                self.assert_protection_read_drift_refused(fault, code, context=patches)
 
-    def test_completed_blocker_reopened_at_last_protection_read_refuses_merge(self):
-        # Declare the blocker before pinning the candidate. Only its completion
-        # changes late; no issue-10 byte drift can mask the frontier invariant.
-        self.fixture.deps[10] = [12]
-        self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #12')
-        self.request['issue'] = requirements.issue_pin(self.fixture.issues[10])
-        self.fixture.issues[12].update(state='closed', state_reason='completed')
-        self.fixture.members[12]['fields']['STATUS'] = 'Done'
-        def fault():
-            self.fixture.issues[12].update(state='open', state_reason=None)
-            self.fixture.members[12]['fields']['STATUS'] = 'Ready'
-        self.assert_protection_read_drift_refused(fault, 'ticket_ineligible')
 
-    def test_board_scope_drift_at_protection_read_refuses_admission(self):
-        self.assert_protection_read_drift_refused(lambda: self.fixture.members[10]['fields'].update(SCOPE='M2'), 'ticket_ineligible')
 
-    def test_board_progress_drift_at_last_protection_read_refuses_admission(self):
-        self.assert_protection_read_drift_refused(lambda: self.fixture.members[10]['fields'].update(STATUS='Blocked'), 'ticket_ineligible')
 
-    def test_exact_ticket_body_drift_at_protection_read_refuses_admission(self):
-        self.assert_protection_read_drift_refused(lambda: self.fixture.issues[10].update(body=self.fixture.issues[10]['body'] + '\nNew requirement.'), 'stale_admission')
+
+
 
     def test_last_publication_guard_rejects_remote_doc_drift_without_mutation(self):
         merge.require_publication(self.database, self.item, self.api, 10)

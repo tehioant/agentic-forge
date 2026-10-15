@@ -234,25 +234,51 @@ class TicketTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(repositories.RepositoryError):
                 tickets.validate_execution(work, {**request['execution'], field: value}, request['tickets'])
 
-    def test_stale_completion_and_changed_inputs_leave_durable_state_unchanged(self):
-        request = self.completion(); before = self.inspect()
-        for field, value in (('assignment_id', 'old'), ('input_digest', '0' * 64), ('adaptation', 'other')):
-            with self.subTest(field=field), patch.object(tickets, 'publish') as publish:
-                with self.assertRaises(repositories.RepositoryError):
-                    tickets.complete_synthesis(self.database, self.item, {**request, field: value}, self.github)
-                self.database.rollback(); self.assertEqual(self.inspect(), before); publish.assert_not_called()
-        with patch.object(tickets, 'pinned_inputs', return_value={}):
-            with self.assertRaises(repositories.RepositoryError):
-                tickets.complete_synthesis(self.database, self.item, request, self.github)
-        self.database.rollback(); self.assertEqual(self.inspect(), before)
+    def ticket_case(self, label):
+        from contextlib import contextmanager
+        @contextmanager
+        def isolated():
+            fixture = self.fixture
+            saved = {name: getattr(fixture, name) for name in ('item', 'work', 'issues', 'members', 'deps')}
+            original_db = self.database; original_state = fixture.state
+            data = copy.deepcopy(saved)
+            fixture.state = fixture.root / (label + '.sqlite')
+            self.database = fixture.database = sqlite3.connect(fixture.state); original_db.backup(self.database)
+            for name, value in data.items(): setattr(fixture, name, value)
+            self.item, self.issues, self.members, self.deps = fixture.item, fixture.issues, fixture.members, fixture.deps
+            mocks = (fixture.set_field, fixture.add_item, fixture.add_dependency, self.github.request)
+            settings = [(m, m.side_effect, m.return_value) for m in mocks]
+            for m in mocks: m.reset_mock()
+            try:
+                yield
+            finally:
+                self.database.close(); self.database = fixture.database = original_db; fixture.state = original_state
+                for name, value in saved.items(): setattr(fixture, name, value)
+                self.item, self.issues, self.members, self.deps = fixture.item, fixture.issues, fixture.members, fixture.deps
+                for m, effect, value in settings: m.side_effect = effect; m.return_value = value; m.reset_mock()
+        return isolated()
 
-    def test_repeat_completion_retains_publication_and_external_progress(self):
-        request = self.completion(); self.fixture.work['completion_digest'] = tickets.digest(request); self.fixture.persist()
-        with patch.object(tickets, 'publish', side_effect=lambda _d, i, _g: i):
-            item = tickets.complete_synthesis(self.database, self.item, request, self.github)
-        self.assertEqual(item['ticket_work']['status'], 'published')
-        self.assertTrue(item['ticket_work']['publication_complete'])
-        self.assertEqual(self.inspect(), item)
+    def test_synthesis_completion_replay(self):
+        request = self.completion()
+        for field, value in (('assignment_id', 'old'), ('input_digest', '0' * 64), ('adaptation', 'other'), ('inputs', None), ('replay', None)):
+            with self.subTest(field=field), self.ticket_case(field):
+                before = self.inspect()
+                if field == 'replay':
+                    self.fixture.work['completion_digest'] = tickets.digest(request); self.fixture.persist()
+                    with patch.object(tickets, 'publish', side_effect=lambda _d, i, _g: i):
+                        result = tickets.complete_synthesis(self.database, self.item, request, self.github)
+                    self.assertEqual(result['ticket_work']['status'], 'published'); self.assertTrue(result['ticket_work']['publication_complete'])
+                    self.assertEqual(self.inspect(), result)
+                else:
+                    with patch.object(tickets, 'publish') as publish:
+                        if field == 'inputs':
+                            with patch.object(tickets, 'pinned_inputs', return_value={}):
+                                with self.assertRaises(repositories.RepositoryError): tickets.complete_synthesis(self.database, self.item, request, self.github)
+                        else:
+                            with self.assertRaises(repositories.RepositoryError): tickets.complete_synthesis(self.database, self.item, {**request, field: value}, self.github)
+                        self.database.rollback(); self.assertEqual(self.inspect(), before); publish.assert_not_called()
+
+
 
     def test_external_contract_requires_substance_current_refs_and_unambiguous_sections(self):
         good = self.issues[10]
@@ -286,80 +312,116 @@ class TicketTests(unittest.TestCase):
         tickets.publish(self.database, result, self.github)
         self.assertEqual(self.github.request.call_count, writes)
 
-    def test_unknown_creation_is_never_retried_and_known_marker_is_adopted(self):
-        self.fixture.publication()
-        self.fixture.work['intents'] = {'note': {'issue': {'title': 'Retain a note'}}}; self.fixture.persist()
-        blocked = tickets.publish(self.database, self.item, self.github)
-        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'publication_uncertain')
-        self.github.request.assert_not_called()
-        self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
-        recovered = tickets.publish(self.database, blocked, self.github)
-        self.assertTrue(recovered['ticket_work']['publication_complete'])
-        self.github.request.assert_not_called(); self.assertEqual(self.inspect(), recovered)
+    def test_ticket_effect_intent_reconciliation(self):
+        for effect in ('unknown-issue', 'lost-issue', 'dependency', 'membership'):
+            with self.subTest(effect=effect), self.ticket_case(effect):
+                self.fixture.publication()
+                if effect in ('dependency', 'membership'):
+                    ticket = self.fixture.ticket(blockers=['blocker'])
+                    self.fixture.work.update(tickets=[ticket], published={'blocker': {'number': 10, 'id': 1010, 'node_id': 'I10'}})
+                    self.issues[10] = self.fixture.issue(10, 'external blocker')
+                    self.issues[11] = self.fixture.issue(11, tickets.body(self.item, ticket, {'blocker': 10}))
+                    self.fixture.work['intents'] = {'note': {'dependencies': [1010]} if effect == 'dependency' else {'membership': True}}
+                    self.deps[11] = [] if effect == 'dependency' else [10]
+                elif effect == 'unknown-issue': self.fixture.work['intents'] = {'note': {'issue': {'title': 'Retain a note'}}}
+                else:
+                    def create(path, body, method=None):
+                        self.assertIn('issue', self.inspect()['ticket_work']['intents']['note'])
+                        self.fixture.request(path, body, method)
+                        raise repositories.RepositoryError('github_unavailable', 'lost acknowledgement')
+                    self.github.request.side_effect = create
+                self.fixture.persist()
+                blocked = tickets.publish(self.database, self.item, self.github)
+                if effect == 'lost-issue':
+                    self.assertEqual(blocked['ticket_work']['status'], 'blocked'); self.assertEqual(len(self.issues), 1)
+                else:
+                    self.assertEqual(blocked['ticket_work']['blocker']['code'], 'publication_uncertain')
+                    self.github.request.assert_not_called()
+                if effect in ('dependency', 'membership'):
+                    self.assertFalse(blocked['ticket_work'].get('publication_complete'))
+                    self.fixture.add_dependency.assert_not_called(); self.fixture.add_item.assert_not_called()
+                    self.assertEqual(self.inspect(), blocked)
+                else:
+                    if effect == 'unknown-issue': self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
+                    self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
+                    recovered = tickets.publish(self.database, blocked, self.github)
+                    self.assertTrue(recovered['ticket_work']['publication_complete'])
+                    self.github.request.assert_not_called(); self.assertEqual(self.inspect(), recovered)
 
-    def test_lost_creation_response_preserves_intent_before_effect_and_replay(self):
-        self.fixture.publication()
-        def create(path, body, method=None):
-            self.assertIn('issue', self.inspect()['ticket_work']['intents']['note'])
-            self.fixture.request(path, body, method)
-            raise repositories.RepositoryError('github_unavailable', 'lost acknowledgement')
-        self.github.request.side_effect = create
-        blocked = tickets.publish(self.database, self.item, self.github)
-        self.assertEqual(blocked['ticket_work']['status'], 'blocked'); self.assertEqual(len(self.issues), 1)
-        self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
-        result = tickets.publish(self.database, blocked, self.github)
-        self.assertTrue(result['ticket_work']['publication_complete']); self.github.request.assert_not_called()
 
-    def test_missing_board_retains_execution_and_prevents_issue_intent(self):
-        self.fixture.publication()
-        with patch.object(tickets, 'verified_board', side_effect=repositories.RepositoryError('projects_blocked', 'board absent')):
-            blocked = tickets.publish(self.database, self.item, self.github)
-        self.assertEqual(blocked['ticket_work']['blocker']['code'], 'projects_blocked')
-        self.assertTrue(blocked['ticket_work']['execution']); self.assertNotIn('intents', blocked['ticket_work'])
-        self.assertEqual(self.inspect(), blocked); self.github.request.assert_not_called()
 
-    def test_exact_issue_body_and_identity_readback_fail_closed(self):
-        self.fixture.publication()
-        self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
-        self.fixture.work['intents'] = {'note': {'identity': {'number': 10, 'id': 999, 'node_id': 'I10'}}}; self.fixture.persist()
-        result = tickets.publish(self.database, self.item, self.github)
-        self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_mismatch')
-        self.assertFalse(result['ticket_work'].get('publication_complete')); self.fixture.add_item.assert_not_called()
+    def test_issue_publication_identity_contract(self):
+        for defect, code in (('board', 'projects_blocked'), ('identity', 'publication_mismatch')):
+            with self.subTest(defect=defect), self.ticket_case(defect):
+                self.fixture.publication()
+                if defect == 'identity':
+                    self.issues[10] = self.fixture.issue(10, tickets.body(self.item, self.fixture.ticket(), {}))
+                    self.fixture.work['intents'] = {'note': {'identity': {'number': 10, 'id': 999, 'node_id': 'I10'}}}; self.fixture.persist()
+                    result = tickets.publish(self.database, self.item, self.github)
+                else:
+                    with patch.object(tickets, 'verified_board', side_effect=repositories.RepositoryError('projects_blocked', 'board absent')):
+                        result = tickets.publish(self.database, self.item, self.github)
+                self.assertEqual(result['ticket_work']['blocker']['code'], code)
+                self.assertEqual(self.inspect(), result)
+                if defect == 'board':
+                    self.assertTrue(result['ticket_work']['execution']); self.assertNotIn('intents', result['ticket_work']); self.github.request.assert_not_called()
+                else:
+                    self.assertFalse(result['ticket_work'].get('publication_complete')); self.fixture.add_item.assert_not_called()
 
-    def test_one_reservation_replays_same_run_and_refuses_sibling(self):
-        result = tickets.reserve(self.database, self.item, self.github, 10)
-        self.assertEqual(result['reservation']['status'], 'reserved')
-        self.assertEqual(self.inspect(), result)
-        replay = tickets.reserve(self.database, result, self.github, 10)
-        self.assertEqual(replay['reservation'], result['reservation'])
-        with self.assertRaises(repositories.RepositoryError) as caught:
-            tickets.reserve(self.database, replay, self.github, 12)
-        self.assertEqual(caught.exception.code, 'reservation_conflict'); self.database.rollback()
-        self.assertEqual(self.inspect()['reservation'], result['reservation'])
 
-    def test_lost_reservation_status_response_reconciles_durable_run(self):
-        def write(*args):
-            self.assertEqual(self.inspect()['reservation']['status'], 'pending')
-            self.fixture.field(*args)
-            raise repositories.RepositoryError('github_unavailable', 'lost status response')
-        self.fixture.set_field.side_effect = write
-        with self.assertRaises(repositories.RepositoryError):
-            tickets.reserve(self.database, self.item, self.github, 10)
-        pending = self.inspect()['reservation']; self.database.rollback()
-        self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
-        result = tickets.reserve(self.database, self.item, self.github, 10)
-        self.assertEqual(result['reservation']['run_id'], pending['run_id'])
-        self.assertEqual(result['reservation']['status'], 'reserved'); self.fixture.set_field.assert_not_called()
 
-    def test_partial_publication_and_foreign_active_refuse_reservation(self):
-        for defect in ('partial', 'foreign'):
-            with self.subTest(defect=defect):
-                self.fixture.work['publication_complete'] = defect != 'partial'; self.fixture.persist()
-                self.members[12]['fields'].update(SCOPE='M2' if defect == 'foreign' else 'M1', STATUS='Active' if defect == 'foreign' else 'Ready')
-                with self.assertRaises(repositories.RepositoryError) as caught:
-                    tickets.reserve(self.database, self.item, self.github, 10)
-                self.assertEqual(caught.exception.code, 'publication_pending' if defect == 'partial' else 'reservation_conflict')
-                self.database.rollback(); self.assertNotIn('reservation', self.inspect()); self.fixture.set_field.assert_not_called()
+    def test_reservation_exact_replay(self):
+        for lost in (False, True):
+            with self.subTest(lost=lost), self.ticket_case('lost' if lost else 'normal'):
+                if lost:
+                    def write(*args):
+                        self.assertEqual(self.inspect()['reservation']['status'], 'pending'); self.fixture.field(*args)
+                        raise repositories.RepositoryError('github_unavailable', 'lost status response')
+                    self.fixture.set_field.side_effect = write
+                    with self.assertRaises(repositories.RepositoryError): tickets.reserve(self.database, self.item, self.github, 10)
+                    pending = self.inspect()['reservation']; self.database.rollback()
+                    self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
+                result = tickets.reserve(self.database, self.item, self.github, 10)
+                self.assertEqual(result['reservation']['status'], 'reserved'); self.assertEqual(self.inspect(), result)
+                if lost:
+                    self.assertEqual(result['reservation']['run_id'], pending['run_id']); self.fixture.set_field.assert_not_called()
+                else:
+                    replay = tickets.reserve(self.database, result, self.github, 10)
+                    self.assertEqual(replay['reservation'], result['reservation'])
+                    with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, replay, self.github, 12)
+                    self.assertEqual(caught.exception.code, 'reservation_conflict'); self.database.rollback()
+                    self.assertEqual(self.inspect()['reservation'], result['reservation'])
+
+
+
+    def test_reservation_fresh_frontier(self):
+        for defect in ('partial', 'foreign', 'new-ticket', 'late-pause'):
+            with self.subTest(defect=defect), self.ticket_case(defect):
+                number = 10; expected = 'reservation_conflict'
+                if defect == 'partial': self.fixture.work['publication_complete'] = False; self.fixture.persist(); expected = 'publication_pending'
+                elif defect == 'foreign': self.members[12]['fields'].update(SCOPE='M2', STATUS='Active')
+                elif defect == 'new-ticket':
+                    self.issues[20] = self.fixture.issue(20, self.issues[12]['body'])
+                    self.members[20] = {'id': 'ITEM20', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
+                    result = tickets.frontier(self.database, self.item, self.github)
+                    self.assertEqual(result['ticket_work']['frontier']['eligible'], [10, 12, 20])
+                    self.issues[20]['labels'] = []; number = 20; expected = 'ticket_ineligible'
+                else:
+                    def write(*args): self.fixture.field(*args); self.fixture.pause()
+                    self.fixture.set_field.side_effect = write; expected = 'iteration_paused'
+                with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, number)
+                self.assertEqual(caught.exception.code, expected); self.database.rollback()
+                if defect == 'late-pause':
+                    self.assertEqual(self.inspect()['reservation']['status'], 'pending')
+                    self.assertTrue(controls.blocked(self.database, 'product', 'm1')); self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')
+                else:
+                    self.assertNotIn('reservation', self.inspect()); self.fixture.set_field.assert_not_called()
+                if defect == 'new-ticket':
+                    reserved = tickets.reserve(self.database, self.item, self.github, 10)
+                    self.issues[10]['body'] = self.issues[10]['body'].replace('None (can start immediately).', '- #12'); self.deps[10] = [12]
+                    with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 10)
+                    self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback()
+                    self.assertEqual(self.inspect()['reservation'], reserved['reservation']); self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')
 
     def test_real_pinned_inputs_reject_endpoint_repository_and_raw_document_drift(self):
         handoff = {'repository': 'example/product', 'api_base': self.github.base, 'commit': 'a' * 40,
@@ -387,42 +449,3 @@ class TicketTests(unittest.TestCase):
         self.github.base += '/other'; self.github.request.reset_mock()
         with self.assertRaises(repositories.RepositoryError) as caught: REAL_PINNED_INPUTS(self.database, self.item, self.github)
         self.assertEqual(caught.exception.code, 'capability_conflict'); self.github.request.assert_not_called()
-
-    def test_authoritative_board_additions_and_changed_reserved_blockers_refuse(self):
-        self.issues[20] = self.fixture.issue(20, self.issues[12]['body'])
-        self.members[20] = {'id': 'ITEM20', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
-        result = tickets.frontier(self.database, self.item, self.github)
-        self.assertEqual(result['ticket_work']['frontier']['eligible'], [10, 12, 20])
-        self.issues[20]['labels'] = []
-        with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 20)
-        self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback(); self.assertNotIn('reservation', self.inspect())
-        reserved = tickets.reserve(self.database, self.item, self.github, 10)
-        self.issues[10]['body'] = self.issues[10]['body'].replace('None (can start immediately).', '- #12'); self.deps[10] = [12]
-        with self.assertRaises(repositories.RepositoryError) as caught: tickets.reserve(self.database, self.item, self.github, 10)
-        self.assertEqual(caught.exception.code, 'ticket_ineligible'); self.database.rollback()
-        self.assertEqual(self.inspect()['reservation'], reserved['reservation']); self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')
-
-    def test_unknown_dependency_and_membership_intents_block_without_repeated_effect(self):
-        self.fixture.publication(); ticket = self.fixture.ticket(blockers=['blocker'])
-        self.fixture.work.update(tickets=[ticket], published={'blocker': {'number': 10, 'id': 1010, 'node_id': 'I10'}})
-        self.issues[10] = self.fixture.issue(10, 'external blocker')
-        self.issues[11] = self.fixture.issue(11, tickets.body(self.item, ticket, {'blocker': 10}))
-        for fault in ('dependency', 'membership'):
-            self.fixture.work['intents'] = {'note': {'dependencies': [1010]} if fault == 'dependency' else {'membership': True}}
-            self.deps[11] = [] if fault == 'dependency' else [10]; self.fixture.persist()
-            result = tickets.publish(self.database, self.item, self.github)
-            self.assertEqual(result['ticket_work']['blocker']['code'], 'publication_uncertain')
-            self.assertFalse(result['ticket_work'].get('publication_complete'))
-            self.fixture.add_dependency.assert_not_called(); self.fixture.add_item.assert_not_called(); self.github.request.assert_not_called()
-            self.assertEqual(self.inspect(), result)
-
-    def test_late_pause_after_status_receipt_refuses_reserved_advancement(self):
-        def write(*args):
-            self.fixture.field(*args); self.fixture.pause()
-        self.fixture.set_field.side_effect = write
-        with self.assertRaises(repositories.RepositoryError) as caught:
-            tickets.reserve(self.database, self.item, self.github, 10)
-        self.assertEqual(caught.exception.code, 'iteration_paused'); self.database.rollback()
-        self.assertEqual(self.inspect()['reservation']['status'], 'pending')
-        self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
-        self.assertEqual(self.members[10]['fields']['STATUS'], 'Active')

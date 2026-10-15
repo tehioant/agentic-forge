@@ -108,94 +108,82 @@ class PlanningWakeupTests(unittest.TestCase):
                                           'user_id': user_id, 'user_name': 'Operator'}
         self.write_approval()
 
-    def test_original_completion_adopted_without_request_enqueue_or_execution_turn(self):
+    def test_original_completion_fresh_authority(self):
         self.original_completion()
-        # Adoption is read-only execution accounting, not a new allowance use.
-        self.approval['allowance']['expires_at'] = 1
-        self.write_approval()
-        original = copy.deepcopy(self.item)
-        with patch.object(planning, 'read_publication', return_value=copy.deepcopy(self.item['handoff'])) as read:
-            self.assertEqual(self.supervise(), 'consumed')
-            self.assertEqual(self.supervise(), 'consumed')
-        record = self.fixture.stored()['planning'].pop('native_wakeup')
-        self.assertEqual(record['mode'], 'origin_turn')
-        self.assertEqual(record['receipt']['task_id'], 'original-task')
-        self.assertEqual(record['receipt']['turn_id'], 'original-turn')
-        self.assertEqual(record['receipt']['run_id'], 'actual-host-run-fixture')
-        self.assertNotIn('request_id', record)
-        self.assertNotIn('execution_turn', record)
-        stored = self.fixture.stored(); stored['planning'].pop('native_wakeup')
-        self.assertEqual(stored, original)
-        self.assertGreaterEqual(read.call_count, 2)
-        self.ctx.inject_message.assert_not_called()
-
-    def test_original_completion_refuses_missing_or_changed_native_authority(self):
-        self.original_completion()
-        original = copy.deepcopy(self.item)
-        mutations = [lambda w: w['native_execution'].update(origin={'platform': 'other'}),
-            lambda w: w['native_execution'].update(assignment_id='wrong'),
-            lambda w: w['native_execution'].update(sources={}),
-            lambda w: w['native_execution'].update(sufficient=False),
-            lambda w: w['native_execution'].pop('turn_id'),
-            lambda w: w['host_publication'].update(status='revoked'),
-            lambda w: w.update(completion_digest='changed-before-entry'),
-            lambda w: w.pop('completion_digest')]
-        for mutate in mutations:
-            self.item = copy.deepcopy(original); self.fixture.item = self.item
-            mutate(self.item['planning']); self.fixture.persist()
-            with self.subTest(mutate=mutate), self.assertRaises(repositories.RepositoryError): self.supervise()
-            self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
-        self.ctx.inject_message.assert_not_called()
-
-    def test_original_completion_final_read_return_revocation_and_pause_refuse(self):
-        self.original_completion()
-        original = copy.deepcopy(self.item)
-        for boundary in (1, 2):
-            for change in ('publication', 'completion', 'approval', 'pause', 'handoff'):
-                self.item = copy.deepcopy(original); self.fixture.item = self.item; self.fixture.persist()
-                self.approval['profile_name'] = 'approved-profile'; self.write_approval()
-                calls = []
+        original = copy.deepcopy(self.item); approval = copy.deepcopy(self.approval)
+        cases = [('adopt', None, None)]
+        cases += [('entry', field, None) for field in ('origin', 'assignment_id', 'sources', 'sufficient', 'turn_id', 'publication', 'completion', 'missing-completion')]
+        cases += [('read', field, boundary) for boundary in (1, 2) for field in ('publication', 'completion', 'approval', 'pause', 'handoff')]
+        cases += [('read', 'durable-pause', 2)]
+        for phase, field, boundary in cases:
+            with self.subTest(phase=phase, field=field, boundary=boundary):
+                self.item = copy.deepcopy(original); self.fixture.item = self.item
+                self.approval = copy.deepcopy(approval)
+                if phase == 'adopt': self.approval['allowance']['expires_at'] = 1
+                self.write_approval(); calls = []
+                def mutate():
+                    work = self.item['planning']
+                    if field == 'publication': work['host_publication']['status'] = 'revoked'
+                    elif field == 'completion': work['completion_digest'] = 'changed'
+                    elif field == 'missing-completion': work.pop('completion_digest')
+                    elif field == 'approval': self.approval['profile_name'] = 'changed'; self.write_approval()
+                    elif field == 'pause': self.item['status'] = 'paused'
+                    elif field == 'durable-pause':
+                        controls.request(self.fixture.database, 'product', 'm1', '42', 'pause', 'final-read-pause')
+                        return
+                    elif field == 'handoff': self.item['handoff']['commit'] = 'b' * 40
+                    elif field == 'turn_id': work['native_execution'].pop('turn_id')
+                    else:
+                        work['native_execution'][field] = {'origin': {'platform': 'other'}, 'assignment_id': 'wrong', 'sources': {}, 'sufficient': False}[field]
+                    self.fixture.persist()
+                self.fixture.persist()
+                if phase == 'entry': mutate()
                 def read(*args):
                     calls.append(True)
-                    if len(calls) == boundary:
-                        if change == 'publication': self.item['planning']['host_publication']['status'] = 'revoked'
-                        elif change == 'completion': self.item['planning']['completion_digest'] = 'changed'
-                        elif change == 'approval':
-                            self.approval['profile_name'] = 'changed'; self.write_approval()
-                        elif change == 'pause': self.item['status'] = 'paused'
-                        else: self.item['handoff']['commit'] = 'b' * 40
-                        self.fixture.persist()
+                    if phase == 'read' and len(calls) == boundary: mutate()
                     return copy.deepcopy(original['handoff'])
-                with self.subTest(boundary=boundary, change=change), patch.object(planning, 'read_publication', side_effect=read), self.assertRaises(repositories.RepositoryError):
-                    self.supervise()
-                self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
-        self.ctx.inject_message.assert_not_called()
+                with patch.object(planning, 'read_publication', side_effect=read) as reads:
+                    if phase == 'adopt':
+                        self.assertEqual(self.supervise(), 'consumed'); self.assertEqual(self.supervise(), 'consumed')
+                        stored = self.fixture.stored(); record = stored['planning'].pop('native_wakeup')
+                        self.assertEqual(record['mode'], 'origin_turn')
+                        for key, expected in (('task_id', 'original-task'), ('turn_id', 'original-turn'), ('run_id', 'actual-host-run-fixture')):
+                            self.assertEqual(record['receipt'][key], expected)
+                        self.assertNotIn('request_id', record); self.assertNotIn('execution_turn', record)
+                        self.assertEqual(stored, original); self.assertGreaterEqual(reads.call_count, 2)
+                    else:
+                        with self.assertRaises(repositories.RepositoryError): self.supervise()
+                        self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
+                        if field == 'durable-pause': self.assertTrue(controls.blocked(self.fixture.database, 'product', 'm1'))
+                self.ctx.inject_message.assert_not_called()
 
-    def test_original_completion_real_pause_after_final_publication_read_refuses(self):
-        self.original_completion()
-        handoff = copy.deepcopy(self.item['handoff'])
-        calls = []
-        def read(*args):
-            calls.append(True)
-            if len(calls) == 2:
-                controls.request(self.fixture.database, 'product', 'm1', '42', 'pause', 'final-read-pause')
-            return handoff
-        with patch.object(planning, 'read_publication', side_effect=read), self.assertRaises(repositories.RepositoryError):
-            self.supervise()
-        self.assertTrue(controls.blocked(self.fixture.database, 'product', 'm1'))
-        self.assertNotIn('native_wakeup', self.fixture.stored()['planning'])
-        self.ctx.inject_message.assert_not_called()
 
-    def test_sender_envelope_cannot_supply_unapproved_slack_rendering(self):
-        self.approve_sender('slack', 'U123ABC')
-        original = copy.deepcopy(self.approval)
-        for sender in ('42', '<@U123ABC>', 'Ubad', 'U12\nABC'):
-            self.approval = copy.deepcopy(original)
-            self.approval['binding']['operator_id'] = sender
-            self.approval['input_envelope']['user_id'] = sender
-            self.write_approval()
-            with self.subTest(sender=sender), self.assertRaises(repositories.RepositoryError):
-                wakeup.configuration(str(self.path))
+
+
+
+    def test_sender_envelope_authority_refusals(self):
+        for platform, sender in (('slack', 'U123ABC'), ('discord', '42')):
+            self.approve_sender(platform, sender); self.mailbox('enqueued')
+            original = copy.deepcopy(self.approval)
+            changes = ([{'binding': {**original['binding'], 'operator_id': bad},
+                         'input_envelope': {**original['input_envelope'], 'user_id': bad}}
+                        for bad in ('42', '<@U123ABC>', 'Ubad', 'U12\nABC')] if platform == 'slack' else
+                       [{'input_envelope': {**original['input_envelope'], **change}} for change in
+                        ({'user_name': 'bad\nname'}, {'user_name': 'bad\x00name'}, {'user_name': '[nested]'},
+                         {'platform': 'slack'}, {'user_id': 'wrong'}, {'prefix': '[Operator] '}, {'kind': 'arbitrary'})])
+            for change in changes:
+                self.approval = {**copy.deepcopy(original), **change}; self.write_approval()
+                with self.subTest(platform=platform, change=change), self.assertRaises(repositories.RepositoryError): wakeup.configuration(str(self.path))
+            if platform == 'discord':
+                for change in ({'profile_name': 'other'}, {'allowance': {**original['allowance'], 'expires_at': 1}},
+                               {'input_envelope': {**original['input_envelope'], 'user_name': 'Other'}}):
+                    self.approval = {**copy.deepcopy(original), **change}; self.write_approval()
+                    with self.subTest(change=change), self.assertRaises(repositories.RepositoryError):
+                        self.binding.context('native-origin', task_id='task', turn_id='turn', sender_id='42', model='fixture-model',
+                            user_message='[Operator] ' + wakeup.message(self.item['planning']['native_wakeup']),
+                            conversation_history=[{'role': 'user', 'content': 'Use Python.'}])
+                self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'enqueued')
+
 
     def test_approved_sender_envelope_exact_rendering_only_preserves_answers(self):
         for platform, sender in (('discord', '42'), ('slack', 'U123ABC')):
@@ -225,128 +213,108 @@ class PlanningWakeupTests(unittest.TestCase):
             self.assertEqual(self.fixture.stored()['planning']['native_execution'], original)
             self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
 
-    def test_sender_envelope_approval_validation_expiry_and_change_refuse(self):
-        self.approve_sender(); self.mailbox('enqueued')
-        original = copy.deepcopy(self.approval)
-        for change in ({'user_name': 'bad\nname'}, {'user_name': 'bad\x00name'}, {'user_name': '[nested]'},
-                       {'platform': 'slack'}, {'user_id': 'wrong'}, {'prefix': '[Operator] '}, {'kind': 'arbitrary'}):
-            self.approval = copy.deepcopy(original)
-            self.approval['input_envelope'].update(change); self.write_approval()
-            with self.subTest(change=change), self.assertRaises(repositories.RepositoryError): wakeup.configuration(str(self.path))
-        for change in ({'profile_name': 'other'}, {'allowance': {**original['allowance'], 'expires_at': 1}},
-                       {'input_envelope': {**original['input_envelope'], 'user_name': 'Other'}}):
-            self.approval = {**copy.deepcopy(original), **change}; self.write_approval()
-            with self.subTest(change=change), self.assertRaises(repositories.RepositoryError):
-                self.binding.context('native-origin', task_id='task', turn_id='turn', sender_id='42', model='fixture-model',
-                    user_message='[Operator] ' + wakeup.message(self.item['planning']['native_wakeup']),
-                    conversation_history=[{'role': 'user', 'content': 'Use Python.'}])
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'enqueued')
 
-    def test_supervisor_commits_one_request_and_deduplicates_before_transport(self):
-        self.assertEqual(self.supervise(), 'requested')
-        before = self.fixture.stored()
-        self.assertEqual(self.supervise(), 'requested')
-        self.assertEqual(self.fixture.stored(), before)
-        self.ctx.inject_message.assert_not_called()
+    def test_enqueue_intent_and_no_blind_retry(self):
+        original = copy.deepcopy(self.item)
+        for label, outcome in (('request-only', None), ('acknowledged', True), ('rejected', False), ('unknown', RuntimeError('unknown outcome'))):
+            with self.subTest(label=label):
+                self.item = copy.deepcopy(original); self.fixture.item = self.item; self.fixture.persist()
+                self.ctx.inject_message.reset_mock(); self.ctx.inject_message.side_effect = None
+                if label == 'request-only':
+                    self.assertEqual(self.supervise(), 'requested'); before = self.fixture.stored()
+                    self.assertEqual(self.supervise(), 'requested'); self.assertEqual(self.fixture.stored(), before)
+                    self.ctx.inject_message.assert_not_called()
+                    continue
+                self.mailbox()
+                def enqueue(content, **kwargs):
+                    stored = self.fixture.stored()['planning']
+                    self.assertEqual(stored['native_wakeup']['status'], 'enqueue_unknown')
+                    self.assertEqual(content, wakeup.message(stored['native_wakeup']))
+                    self.assertEqual(kwargs, {'role': 'user', 'origin': self.item['origin']})
+                    if isinstance(outcome, Exception): raise outcome
+                    return outcome
+                self.ctx.inject_message.side_effect = enqueue
+                self.native.step(); self.native.step()
+                self.ctx.inject_message.assert_called_once()
+                expected = 'enqueue_unknown' if isinstance(outcome, Exception) else 'enqueued' if outcome else 'rejected'
+                self.assertEqual(self.supervise(), expected)
+                self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
+                self.assertNotIn('handoff', self.fixture.stored())
 
-    def test_native_enqueue_reads_durable_unknown_before_call_and_never_advances(self):
-        self.mailbox()
-        def enqueue(content, **kwargs):
-            stored = self.fixture.stored()['planning']
-            self.assertEqual(stored['native_wakeup']['status'], 'enqueue_unknown')
-            self.assertEqual(content, wakeup.message(stored['native_wakeup']))
-            self.assertEqual(kwargs, {'role': 'user', 'origin': self.item['origin']})
-            return True
-        self.ctx.inject_message.side_effect = enqueue
-        self.native.step(); self.native.step()
-        self.ctx.inject_message.assert_called_once()
-        self.assertEqual(self.supervise(), 'enqueued')
-        self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
-        self.assertNotIn('handoff', self.fixture.stored())
 
-    def test_false_exception_and_unknown_outcome_never_blind_retry(self):
-        for result in (False, RuntimeError('unknown outcome')):
-            self.mailbox()
-            self.ctx.inject_message.reset_mock()
-            self.ctx.inject_message.side_effect = result if isinstance(result, Exception) else None
-            self.ctx.inject_message.return_value = result
-            self.native.step(); self.native.step()
-            self.ctx.inject_message.assert_called_once()
-            expected = 'enqueue_unknown' if isinstance(result, Exception) else 'rejected'
-            self.assertEqual(self.supervise(), expected)
 
-    def test_changed_scope_source_session_allowance_profile_refuses_before_enqueue(self):
-        self.mailbox()
-        original = copy.deepcopy(self.approval)
-        for key, value in (('assignment_id', 'wrong'), ('profile_name', 'other'), ('source_digest', 'wrong'),
-                           ('binding', {**self.config, 'session_id': 'wrong'}),
-                           ('allowance', {**original['allowance'], 'max_wakeups': 2}),
-                           ('allowance', {**original['allowance'], 'expires_at': 1})):
-            self.approval = {**copy.deepcopy(original), key: value}; self.write_approval()
-            with self.subTest(key=key, value=value), self.assertRaises(repositories.RepositoryError):
-                self.native.step()
-        self.ctx.inject_message.assert_not_called()
 
-    def test_missing_authorization_and_stop_pause_refuse(self):
-        self.mailbox()
-        self.native.stop(); self.native.step()
-        self.ctx.inject_message.assert_not_called()
-        self.native.stopped = False
-        self.item['status'] = 'paused'; self.fixture.persist()
-        with self.assertRaises(repositories.RepositoryError): self.native.step()
-        self.path.unlink()
-        with self.assertRaises((OSError, repositories.RepositoryError)): self.native.step()
-        self.ctx.inject_message.assert_not_called()
+    def test_enqueue_current_authority(self):
+        self.mailbox(); original = copy.deepcopy(self.item); approved = copy.deepcopy(self.approval)
+        cases = [('assignment_id', 'wrong'), ('profile_name', 'other'), ('source_digest', 'wrong'),
+                 ('binding', {**self.config, 'session_id': 'wrong'}),
+                 ('allowance', {**approved['allowance'], 'max_wakeups': 2}),
+                 ('allowance', {**approved['allowance'], 'expires_at': 1}),
+                 ('stop', None), ('pause', None), ('missing', None)]
+        for key, value in cases:
+            with self.subTest(key=key, value=value):
+                self.item = copy.deepcopy(original); self.fixture.item = self.item; self.fixture.persist()
+                self.approval = copy.deepcopy(approved); self.write_approval(); self.native.stopped = False
+                if key == 'stop':
+                    self.native.stop(); self.native.step()
+                else:
+                    if key == 'pause': self.item['status'] = 'paused'; self.fixture.persist()
+                    elif key == 'missing': self.path.unlink()
+                    else: self.approval[key] = value; self.write_approval()
+                    with self.assertRaises((OSError, repositories.RepositoryError)): self.native.step()
+                self.ctx.inject_message.assert_not_called()
 
-    def test_wakeup_hook_preserves_original_answers_run_and_sufficiency(self):
+
+
+    def test_native_wakeup_turn_binding(self):
         self.mailbox('enqueued')
-        original = copy.deepcopy(self.item['planning']['native_execution'])
-        args = {'session_id': 'native-origin', 'task_id': 'wake-task', 'turn_id': 'wake-turn', 'sender_id': '42', 'model': 'fixture-model',
-                'user_message': wakeup.message(self.item['planning']['native_wakeup']),
-                'conversation_history': [{'role': 'user', 'content': 'Use Python.'}]}
-        self.binding.context(**args); self.binding.context(**args)
-        self.assertEqual(self.fixture.stored()['planning']['native_execution'], original)
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['execution_turn'],
-                         {'task_id': 'wake-task', 'turn_id': 'wake-turn'})
-
-    def test_wakeup_requires_actual_host_sender_history_exact_request_and_turn(self):
-        self.mailbox('enqueued')
+        initial = copy.deepcopy(self.item)
         args = {'session_id': 'native-origin', 'task_id': 'wake-task', 'turn_id': 'wake-turn', 'sender_id': '42', 'model': 'fixture-model',
                 'user_message': wakeup.message(self.item['planning']['native_wakeup']),
                 'conversation_history': [{'role': 'user', 'content': 'Use Python.'}]}
         for change in ({'sender_id': 'forged'}, {'conversation_history': []}, {'session_id': 'other'},
                        {'user_message': 'host timestamp prefix ' + args['user_message']},
-                       {'user_message': wakeup.TAG + 'forged]'}, {'turn_id': ''}):
+                       {'user_message': wakeup.TAG + 'forged]'}, {'turn_id': ''}, {}):
             with self.subTest(change=change):
-                if change == {'session_id': 'other'}:
-                    self.assertIsNone(self.binding.context(**{**args, **change}))
+                self.item = copy.deepcopy(initial); self.fixture.item = self.item; self.fixture.persist()
+                if not change:
+                    self.binding.context(**args); self.binding.context(**args)
+                    stored = self.fixture.stored()['planning']
+                    self.assertEqual(stored['native_execution'], initial['planning']['native_execution'])
+                    self.assertEqual(stored['native_wakeup']['execution_turn'], {'task_id': 'wake-task', 'turn_id': 'wake-turn'})
                 else:
-                    with self.assertRaises(repositories.RepositoryError): self.binding.context(**{**args, **change})
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'enqueued')
+                    if change == {'session_id': 'other'}: self.assertIsNone(self.binding.context(**{**args, **change}))
+                    else:
+                        with self.assertRaises(repositories.RepositoryError): self.binding.context(**{**args, **change})
+                    self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'enqueued')
 
-    def test_correlated_completion_consumes_only_after_fresh_immutable_readback(self):
-        self.complete_record()
-        with patch.object(planning, 'read_publication', return_value=copy.deepcopy(self.item['handoff'])) as read:
-            self.assertEqual(self.supervise(), 'consumed')
-            self.assertEqual(self.supervise(), 'consumed')
-        read.assert_called_once()
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['receipt']['run_id'], 'actual-host-run-fixture')
-        self.ctx.inject_message.assert_not_called()
 
-    def test_missing_wrong_receipts_and_readback_drift_never_consume(self):
-        self.complete_record()
-        original = copy.deepcopy(self.item)
-        for mutate in (lambda w: w['native_execution'].update(run_id='wrong'),
-                       lambda w: w.pop('host_publication'),
-                       lambda w: w['host_publication'].update(status='unverified'),
-                       lambda w: w['native_wakeup'].pop('execution_turn'),
-                       lambda w: w.pop('completion_digest')):
-            self.item = copy.deepcopy(original); mutate(self.item['planning']); self.fixture.item = self.item; self.fixture.persist()
-            with self.assertRaises(repositories.RepositoryError): self.supervise()
-        self.item = copy.deepcopy(original); self.fixture.item = self.item; self.fixture.persist()
-        with patch.object(planning, 'read_publication', return_value={'wrong': 'handoff'}), self.assertRaises(repositories.RepositoryError):
-            self.supervise()
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
+
+    def test_completion_consumes_exact_fresh_receipt(self):
+        self.complete_record(); original = copy.deepcopy(self.item)
+        for defect in ('run_id', 'publication-absent', 'publication-unverified', 'turn-absent', 'digest-absent', 'wrong-readback', 'late-revocation', None):
+            with self.subTest(defect=defect):
+                self.item = copy.deepcopy(original); self.fixture.item = self.item; work = self.item['planning']
+                if defect == 'run_id': work['native_execution']['run_id'] = 'wrong'
+                if defect == 'publication-absent': work.pop('host_publication')
+                if defect == 'publication-unverified': work['host_publication']['status'] = 'unverified'
+                if defect == 'turn-absent': work['native_wakeup'].pop('execution_turn')
+                if defect == 'digest-absent': work.pop('completion_digest')
+                self.fixture.persist()
+                def read(*args):
+                    if defect == 'late-revocation': work['host_publication']['status'] = 'revoked'; self.fixture.persist()
+                    return {'wrong': 'handoff'} if defect == 'wrong-readback' else copy.deepcopy(original['handoff'])
+                with patch.object(planning, 'read_publication', side_effect=read) as reads:
+                    if defect is None:
+                        self.assertEqual(self.supervise(), 'consumed'); self.assertEqual(self.supervise(), 'consumed')
+                        reads.assert_called_once()
+                        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['receipt']['run_id'], 'actual-host-run-fixture')
+                    else:
+                        with self.assertRaises(repositories.RepositoryError): self.supervise()
+                        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
+                self.ctx.inject_message.assert_not_called()
+
+
 
     def test_lifecycle_unavailable_is_explicit_and_unload_cancels_owned_task(self):
         self.ctx.spawn_task.side_effect = RuntimeError('no running loop')
@@ -379,16 +347,6 @@ class PlanningWakeupTests(unittest.TestCase):
                 conversation_history=[{'role': 'user', 'content': 'Use Python.'}])
         self.ctx.inject_message.assert_not_called()
 
-    def test_completion_drift_during_final_readback_cannot_consume(self):
-        self.complete_record()
-        handoff = copy.deepcopy(self.item['handoff'])
-        def read(*args):
-            self.item['planning']['host_publication']['status'] = 'revoked'
-            self.fixture.persist()
-            return handoff
-        with patch.object(planning, 'read_publication', side_effect=read), self.assertRaises(repositories.RepositoryError):
-            self.supervise()
-        self.assertEqual(self.fixture.stored()['planning']['native_wakeup']['status'], 'running')
 
     def test_pinned_native_host_spawn_body_and_bounded_join(self):
         import concurrent.futures
@@ -411,29 +369,32 @@ class PlanningWakeupTests(unittest.TestCase):
         self.native.joined.wait.assert_called_once_with(2)
         self.assertEqual(self.native.status, 'shutdown_unconfirmed')
 
-    def test_pinned_native_injection_router_rechecks_grant_and_same_origin(self):
+    def test_pinned_native_injection_contract(self):
         import logging
-        ns = {'Any': Any, 'Optional': __import__('typing').Optional, 'Mapping': Mapping,
-              'logger': logging.getLogger('native-body-probe')}
-        native_contract('inject_plugin_message', ns)
-        manager = SimpleNamespace(_cli_ref=None, has_gateway_message_injector=True,
-                                  home_path=Path('/explicit-approved-profile'), inject_gateway_message=Mock(return_value=True))
-        ctx = SimpleNamespace(_manager=manager, plugin_id='factory-planning', _gateway_injection_allowed=Mock(return_value=False))
-        kwargs = {'session_key': None, 'origin': self.item['origin']}
-        self.assertFalse(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs))
-        manager.inject_gateway_message.assert_not_called()
-        ctx._gateway_injection_allowed.return_value = True
-        self.assertTrue(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs))
-        manager.inject_gateway_message.assert_called_once_with(origin=self.item['origin'],
-            plugin_home=manager.home_path, content='wake', plugin_id='factory-planning')
+        for interface in ('router', 'context'):
+            with self.subTest(interface=interface):
+                if interface == 'router':
+                    ns = {'Any': Any, 'Optional': __import__('typing').Optional, 'Mapping': Mapping,
+                          'logger': logging.getLogger('native-body-probe')}
+                    native_contract('inject_plugin_message', ns)
+                    manager = SimpleNamespace(_cli_ref=None, has_gateway_message_injector=True,
+                        home_path=Path('/explicit-approved-profile'), inject_gateway_message=Mock(return_value=True))
+                    ctx = SimpleNamespace(_manager=manager, plugin_id='factory-planning', _gateway_injection_allowed=Mock(return_value=False))
+                    kwargs = {'session_key': None, 'origin': self.item['origin']}
+                    self.assertFalse(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs))
+                    manager.inject_gateway_message.assert_not_called()
+                    ctx._gateway_injection_allowed.return_value = True
+                    self.assertIs(ns['inject_plugin_message'](ctx, 'wake', 'user', **kwargs), True)
+                    manager.inject_gateway_message.assert_called_once_with(origin=self.item['origin'],
+                        plugin_home=manager.home_path, content='wake', plugin_id='factory-planning')
+                else:
+                    ns = {'Mapping': Mapping, 'Any': Any}; native_contract('inject_message', ns)
+                    seam = ModuleType('hermes_cli.plugins_injection'); seam.inject_plugin_message = Mock(return_value=True)
+                    with patch.dict(sys.modules, {'hermes_cli': ModuleType('hermes_cli'), 'hermes_cli.plugins_injection': seam}):
+                        self.assertIs(ns['inject_message'](self.ctx, 'wake', role='user', origin=self.item['origin']), True)
+                    seam.inject_plugin_message.assert_called_once_with(self.ctx, 'wake', 'user', session_key=None, origin=self.item['origin'])
 
-    def test_pinned_native_inject_body_preserves_origin_and_boolean_semantics(self):
-        ns = {'Mapping': Mapping, 'Any': Any}
-        native_contract('inject_message', ns)
-        seam = ModuleType('hermes_cli.plugins_injection'); seam.inject_plugin_message = Mock(return_value=True)
-        with patch.dict(sys.modules, {'hermes_cli': ModuleType('hermes_cli'), 'hermes_cli.plugins_injection': seam}):
-            self.assertIs(ns['inject_message'](self.ctx, 'wake', role='user', origin=self.item['origin']), True)
-        seam.inject_plugin_message.assert_called_once_with(self.ctx, 'wake', 'user', session_key=None, origin=self.item['origin'])
+
 
     def test_service_pending_branch_routes_one_operation_and_holds_next_stage(self):
         from factory_v1 import service_dispatch as dispatch

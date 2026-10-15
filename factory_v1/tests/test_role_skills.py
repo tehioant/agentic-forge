@@ -15,29 +15,40 @@ CURRENT_STRUCTURED_TEXT = '3f38253626d8b1a828d2511e2dfe1ac6937a5a25544138c0530dd
 
 
 class ReviewedImplementTests(unittest.TestCase):
-    def test_current_operator_revision_has_no_forced_tdd_dependency(self):
-        self.assertEqual(role_skills.closure('implementation'), ['implement'])
-        self.assertEqual(role_skills.SELECTED['implement'][1], CURRENT_IMPLEMENT)
-        self.assertNotIn('tdd', role_skills.DEPENDENCIES.get('implement', []))
-        self.assertIn('simplif', role_skills.SUPPORT_POLICY['implement-review'])
-        self.assertIn('controller', role_skills.SUPPORT_POLICY['implement-review'])
 
-    def test_reviewed_snapshot_is_admitted_but_later_byte_drift_is_refused(self):
-        snapshot = Path(__file__).parent / 'role_skill_snapshots/implement/SKILL.md'
-        raw = snapshot.read_bytes()
-        self.assertEqual(hashlib.sha256(raw).hexdigest(), CURRENT_IMPLEMENT)
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'SKILL.md'
-            path.write_bytes(raw)
-            descriptor = {'name': 'implement', 'source': role_skills.SELECTED['implement'][0],
-                          'path': str(path), 'sha256': CURRENT_IMPLEMENT, 'dependencies': []}
-            selected = role_skills.snapshots('implementation', [descriptor])
-            self.assertEqual(selected[0]['instructions'], raw.decode())
-            path.write_bytes(raw + b'\nUNREVIEWED CHANGE\n')
-            for pin in (CURRENT_IMPLEMENT, hashlib.sha256(path.read_bytes()).hexdigest()):
-                with self.subTest(pin=pin), self.assertRaises(RepositoryError) as refused:
-                    role_skills.snapshots('implementation', [{**descriptor, 'sha256': pin}])
-                self.assertEqual(refused.exception.code, 'skill_blocked')
+    def test_role_snapshot_graph_and_bytes(self):
+        for stage in ('implementation', 'review-standards', 'review-spec'):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                if stage == 'implementation':
+                    raw = (Path(__file__).parent / 'role_skill_snapshots/implement/SKILL.md').read_bytes()
+                    self.assertEqual(hashlib.sha256(raw).hexdigest(), CURRENT_IMPLEMENT)
+                    path = Path(directory) / 'SKILL.md'; path.write_bytes(raw)
+                    descriptors = [{'name': 'implement', 'source': role_skills.SELECTED['implement'][0],
+                                    'path': str(path), 'sha256': CURRENT_IMPLEMENT, 'dependencies': []}]
+                else:
+                    self.assertEqual(role_skills.closure(stage), ['code-review', STRUCTURED_TEXT])
+                    descriptors = self.review_descriptors(directory)
+                selected = role_skills.snapshots(stage, descriptors)
+                for item, descriptor in zip(selected, descriptors):
+                    self.assertEqual(item['instructions'], Path(descriptor['path']).read_text())
+                for index, descriptor in enumerate(descriptors):
+                    if stage != 'implementation':
+                        for field, value in [('sha256', '47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50'),
+                                             ('dependencies', ['references/release-readiness.md']),
+                                             ('source', '/unreviewed/code-review/SKILL.md')]:
+                            changed = copy.deepcopy(descriptors); changed[index][field] = value
+                            with self.subTest(name=descriptor['name'], field=field), self.assertRaises(RepositoryError) as refused:
+                                role_skills.snapshots(stage, changed)
+                            self.assertEqual(refused.exception.code, 'skill_blocked')
+                    path = Path(descriptor['path']); raw = path.read_bytes()
+                    path.write_bytes(raw + b'\nUNREVIEWED CHANGE\n')
+                    for pin in (descriptor['sha256'], hashlib.sha256(path.read_bytes()).hexdigest()):
+                        changed = copy.deepcopy(descriptors); changed[index]['sha256'] = pin
+                        with self.subTest(name=descriptor['name'], pin=pin), self.assertRaises(RepositoryError) as refused:
+                            role_skills.snapshots(stage, changed)
+                        self.assertEqual(refused.exception.code, 'skill_blocked')
+                    path.write_bytes(raw)
+
 
     def review_descriptors(self, directory):
         descriptors = []
@@ -54,33 +65,6 @@ class ReviewedImplementTests(unittest.TestCase):
                                 'path': str(path), 'sha256': pin, 'dependencies': dependencies})
         return descriptors
 
-    def test_both_review_axes_admit_reviewed_bytes_and_refuse_drift_or_caller_repins(self):
-        for stage in ('review-standards', 'review-spec'):
-            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
-                self.assertEqual(role_skills.closure(stage), ['code-review', STRUCTURED_TEXT])
-                descriptors = self.review_descriptors(directory)
-                selected = role_skills.snapshots(stage, descriptors)
-                for item, descriptor in zip(selected, descriptors):
-                    self.assertEqual(item['instructions'], Path(descriptor['path']).read_text())
-                for index, descriptor in enumerate(descriptors):
-                    for field, value in [('sha256', '47f4e52c21694def9c7c11cbfbf891ca35eac7a93e395797515be3c8a409ae50'),
-                                         ('dependencies', ['references/release-readiness.md']),
-                                         ('source', '/unreviewed/code-review/SKILL.md')]:
-                        changed = copy.deepcopy(descriptors)
-                        changed[index][field] = value
-                        with self.subTest(name=descriptor['name'], field=field), self.assertRaises(RepositoryError) as refused:
-                            role_skills.snapshots(stage, changed)
-                        self.assertEqual(refused.exception.code, 'skill_blocked')
-                    path = Path(descriptor['path'])
-                    raw = path.read_bytes()
-                    path.write_bytes(raw + b'\nUNREVIEWED CHANGE\n')
-                    for pin in (descriptor['sha256'], hashlib.sha256(path.read_bytes()).hexdigest()):
-                        changed = copy.deepcopy(descriptors)
-                        changed[index]['sha256'] = pin
-                        with self.subTest(name=descriptor['name'], pin=pin), self.assertRaises(RepositoryError) as refused:
-                            role_skills.snapshots(stage, changed)
-                        self.assertEqual(refused.exception.code, 'skill_blocked')
-                    path.write_bytes(raw)
 
     def test_both_review_axes_refuse_dependency_omission_without_hiding_the_graph_guard(self):
         for stage in ('review-standards', 'review-spec'):
@@ -140,6 +124,11 @@ class ReviewedImplementTests(unittest.TestCase):
                     database.close()
 
     def test_updated_adaptations_defer_final_suite_and_release_review_to_explicit_stages(self):
+        self.assertEqual(role_skills.closure('implementation'), ['implement'])
+        self.assertEqual(role_skills.SELECTED['implement'][1], CURRENT_IMPLEMENT)
+        self.assertNotIn('tdd', role_skills.DEPENDENCIES.get('implement', []))
+        self.assertIn('simplif', role_skills.SUPPORT_POLICY['implement-review'])
+        self.assertIn('controller', role_skills.SUPPORT_POLICY['implement-review'])
         for stage in ('implementation', 'corrections', 'repair'):
             with self.subTest(stage=stage):
                 self.assertIn('stabilized', ' '.join(role_skills.STAGE_RULES[stage]))

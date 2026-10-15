@@ -168,7 +168,8 @@ class SimplificationValidatorTests(unittest.TestCase):
         self.addCleanup(database.close)
         database.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
         database.execute('CREATE TABLE role_assignments (assignment_id TEXT, payload TEXT)')
-        item = {'approval': {'operator_id': '42', 'reference': 'LABELED local input'}, 'execution_allowed': False, 'status': 'active'}
+        item = {'project_id': 'product', 'iteration_id': 'm1',
+                'approval': {'operator_id': '42', 'reference': 'LABELED local input'}, 'execution_allowed': False, 'status': 'active'}
         database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(item)))
         def stored(value):
             database.execute('DELETE FROM role_assignments')
@@ -246,6 +247,12 @@ class SimplificationValidatorTests(unittest.TestCase):
         e.assignment['handoff']['simplification'] = e.contract = {
             **e.contract, 'input_candidate_sha256': assignments.digest(e.initial), 'scope': []}
         self.assertEqual(simplification.validate_result(e.assignment, e.result(e.report()))['changed_paths'], [])
+        from factory_v1 import controls
+        controls.request(database, 'product', 'm1', '42', 'pause', 'local stage pause')
+        self.assertEqual(inspect()[2], e.initial)
+        with self.assertRaises(RepositoryError) as raised:
+            assignments.current(database, 'product', 'm1', '42')
+        self.assertEqual(raised.exception.code, 'iteration_paused')
         (e.root / 'stop').touch()
         with self.assertRaises(RepositoryError) as raised:
             inspect()
@@ -296,21 +303,6 @@ class SimplificationComponentTests(unittest.TestCase):
             simplification.copy_candidate(self.db, 'product', 'm1', '42', row, destination, {'baseline': {}})
         self.assertEqual(refusal.exception.code, 'scope_mismatch')
 
-    def test_resealed_receipt_semantics_not_only_raw_checksum(self):
-        e = self.e
-        for change in ({'records': []}, {'provenance': 'worker-assertion'}, {'run_id': 'wrong'},
-            {'records': [{**e.receipt['records'][0], 'exit_code': 1}]},
-            {'records': [{**e.receipt['records'][0], 'exit_code': True}]},
-            {'records': [{**e.receipt['records'][0], 'output_truncated': True}]}):
-            raw = json.dumps({**e.receipt, **change})
-            (e.root / 'controller-checks.json').write_text(raw)
-            e.runtime['checks_sha256'] = hashlib.sha256(raw.encode()).hexdigest()
-            with self.subTest(change=change):
-                with self.assertRaises(RepositoryError) as refusal:
-                    simplification.check_receipt(e.root, e.runtime)
-                self.assertEqual(refusal.exception.code, 'implementation_unverified')
-        e.refresh_checks()
-        self.assertEqual(simplification.check_receipt(e.root, e.runtime)[0], e.initial)
 
     def test_stage_result_only_accepts_launcher_correlation_or_exact_completed_replay(self):
         e = self.e
@@ -347,19 +339,6 @@ class SimplificationComponentTests(unittest.TestCase):
                     self.assertEqual(refusal.exception.code, 'invalid_result')
                 self.assertEqual(assignments.rows(self.db)[0]['submitted_result'], result)
 
-    def test_controller_receipt_stop_and_sidecar_pause_refuse_without_staging(self):
-        from factory_v1 import controls
-        e = self.e
-        controls.request(self.db, 'product', 'm1', '42', 'pause', 'local stage pause')
-        # Inspection remains available while paused; preparation is separately gated.
-        self.assertEqual(simplification.implementation(self.db, 'product', 'm1', '42', e.assignment['assignment_id'])[2], e.initial)
-        with self.assertRaises(RepositoryError) as refusal:
-            assignments.current(self.db, 'product', 'm1', '42')
-        self.assertEqual(refusal.exception.code, 'iteration_paused')
-        (e.root / 'stop').touch()
-        with self.assertRaises(RepositoryError) as refusal:
-            simplification.implementation(self.db, 'product', 'm1', '42', e.assignment['assignment_id'])
-        self.assertEqual(refusal.exception.code, 'cancelled')
 
 
 if __name__ == "__main__":

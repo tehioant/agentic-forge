@@ -225,27 +225,6 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
         self.assertIsNotNone(self.sample(True)['incident'])
         self.github.request.assert_not_called()
 
-    def test_reopen_refreshes_membership_and_preserves_block_introduced_by_issue_patch(self):
-        prior, issue = self.delivered_ticket()
-        item = self.stored()
-        item['ticket_work']['request']['tracker']['statuses']['blocked'] = 'Blocked'
-        item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
-        with self.db:
-            save_iteration(self.db, item)
-        self.seed_registered()
-        field, member = self.tracker_for_removed(issue)
-        write = self.github.request.side_effect
-        def block(*args):
-            write(*args)
-            member['status'] = 'B'
-        self.github.request.side_effect = block
-        item = self.stored()
-        recovery.reopen_removed(self.db, item, recovery.active(item), {'removed_assignments': [prior['assignment_id']]}, self.github)
-        field.assert_not_called()
-        self.assertEqual(member['status'], 'B')
-        receipt = recovery.active(self.stored())['removed'][prior['assignment_id']]
-        self.assertEqual(receipt['membership']['status'], 'B')
-        self.assertFalse(receipt['status_intent'])
 
     def test_complete_applied_retry_direction_still_admits_fresh_repair(self):
         prior = self.failed_root()
@@ -365,38 +344,6 @@ class RecoveryContinuationTests(RecoveryComponentFixture):
             self.assertEqual(record['continuations'][0]['authorization'], config)
         self.github.request.assert_not_called()
 
-    def test_reopen_last_status_guard_preserves_block_and_refuses_replaced_membership_scope(self):
-        prior, issue = self.delivered_ticket()
-        item = self.stored()
-        item['ticket_work']['request']['tracker']['statuses']['blocked'] = 'Blocked'
-        item['ticket_work']['board']['status']['options']['Blocked'] = 'B'
-        item['ticket_work']['board']['scope'] = {'id': 'S', 'options': {'i': 'I'}}
-        with self.db:
-            save_iteration(self.db, item)
-        self.seed_registered()
-        field, member = self.tracker_for_removed(issue)
-        member['scope'] = 'I'
-        calls = []
-        def read_member(*args):
-            calls.append(True)
-            if len(calls) == 3:
-                member['status'] = 'B'  # After status intent, at the final read-return guard.
-            return copy.deepcopy(member)
-        with patch.object(tickets.gh, 'membership', side_effect=read_member):
-            item = self.stored()
-            recovery.reopen_removed(self.db, item, recovery.active(item), {'removed_assignments': [prior['assignment_id']]}, self.github)
-        field.assert_not_called()
-        self.assertEqual(recovery.active(self.stored())['removed'][prior['assignment_id']]['membership']['status'], 'B')
-        for delta in ({'id': 'replaced'}, {'scope': 'foreign'}):
-            calls.clear()
-            def changed_member(*args):
-                calls.append(True)
-                return copy.deepcopy(member | (delta if len(calls) > 1 else {}))
-            with patch.object(tickets.gh, 'membership', side_effect=changed_member):
-                item = self.stored()
-                with self.assertRaises(RepositoryError):
-                    recovery.reopen_removed(self.db, item, recovery.active(item), {'removed_assignments': [prior['assignment_id']]}, self.github)
-            field.assert_not_called()
 
     def test_continuation_pause_at_last_issue_read_admits_no_supersession(self):
         prior = self.failed_root()

@@ -34,28 +34,42 @@ class CleanupErrorTests(unittest.TestCase):
         self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('a', json.dumps(self.assignment)))
         self.database.commit()
 
-    def test_docker_call_normalizes_exec_oserror(self):
+    def test_docker_exec_errors_structured_matrix(self):
         with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
             docker = Docker()
-        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=FileNotFoundError('injected executable vanished')):
-            with self.assertRaises(RepositoryError):
-                docker.call('rm', '-f', 'fixture')
+        for operation, args, kwargs, error in (
+            (docker.call, ('rm', '-f', 'fixture'), {}, FileNotFoundError('injected executable vanished')),
+            (docker.inspect, ('fixture',), {'optional': True}, PermissionError('injected exec refusal')),
+        ):
+            with self.subTest(operation=operation.__name__), patch('factory_v1.sandbox_policy.subprocess.run', side_effect=error):
+                with self.assertRaises(RepositoryError):
+                    operation(*args, **kwargs)
 
 
-    def test_emergency_stop_removes_independently_of_halt_and_diagnostic_failures(self):
+    def test_stop_cleanup_optional_errors_still_remove_matrix(self):
+        from copy import deepcopy
         from factory_v1 import controls
-        self.assignment['runtime'].update(controller_pid=123, controller_start='LABELED absent process')
-        self.database.execute('UPDATE role_assignments SET payload=?', (json.dumps(self.assignment),))
-        self.database.commit()
-        for defect in ('kill', 'inspect', 'logs', 'artifact', 'remove'):
-            with self.subTest(defect=defect), ExitStack() as stack:
+        baseline = deepcopy(self.assignment)
+        cases = [('emergency', defect) for defect in ('kill', 'inspect', 'logs', 'artifact', 'remove')]
+        cases += [('assignment', defect) for defect in ('logs', 'artifact')]
+        for adapter, defect in cases:
+            with self.subTest(adapter=adapter, defect=defect), ExitStack() as stack:
+                assignment = deepcopy(baseline)
+                assignment['runtime'].update(controller_pid=123, controller_start='LABELED absent process')
+                with self.database:
+                    self.database.execute('UPDATE role_assignments SET payload=?', (json.dumps(assignment),))
+                _, marker = controls.paths(self.database, 'p', 'i')
+                if marker is not None:
+                    marker.unlink(missing_ok=True)
+                for name in ('stop', 'container.log', 'container-log-error.json'):
+                    (self.root / name).unlink(missing_ok=True)
                 docker = Mock()
                 calls = []
                 def call(command, *args, **kwargs):
                     calls.append(command)
                     if command == defect:
                         raise RepositoryError('container_unavailable', 'LABELED injected Docker failure')
-                    return b'LABELED retained logs'
+                    return b'labeled fixture logs'
                 docker.call.side_effect = call
                 docker.inspect.return_value = {'State': {'Running': False}}
                 if defect == 'inspect':
@@ -63,112 +77,73 @@ class CleanupErrorTests(unittest.TestCase):
                 if defect == 'remove':
                     docker.remove.side_effect = RepositoryError('stop_unconfirmed', 'LABELED removal failure')
                 if defect == 'artifact':
-                    stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('LABELED log write failure')))
+                    stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('injected log write refusal')))
+                stack.enter_context(patch('factory_v1.sandbox_guard.process_identity', return_value=None))
                 stack.enter_context(patch('factory_v1.sandbox_policy.Docker', return_value=docker))
-                result = controls.request(self.database, 'p', 'i', 42, 'emergency-stop', 'LABELED cleanup failure matrix')
-                outcome = result['cleanup']['a']
+                stack.enter_context(patch('factory_v1.sandbox.Docker', return_value=docker))
+                if adapter == 'emergency':
+                    result = controls.request(self.database, 'p', 'i', 42, 'emergency-stop', 'LABELED cleanup failure matrix')
+                    outcome = result['cleanup']['a']
+                else:
+                    result = sandbox.stop_assignment(self.database, 'p', 'i', 42, 'a')
+                    self.assertIsNotNone(result)
+                    outcome = result['runtime']
+                    self.assertEqual(outcome['status'], 'stopped')
+                    if defect == 'artifact':
+                        self.assertEqual(json.loads((self.root / 'container-log-error.json').read_text())['type'], 'PermissionError')
+                self.assertTrue((self.root / 'stop').exists())
                 docker.remove.assert_called_once_with('fixture')
-                self.assertIn('kill', calls)
-                self.assertEqual(calls[0], 'kill')
                 self.assertEqual(outcome['container_removed'], defect != 'remove')
-                self.assertEqual(outcome['error'], 'stop_unconfirmed' if defect in {'kill', 'inspect', 'remove'} else None)
-                if defect in {'kill', 'inspect'}:
-                    self.assertNotIn('logs', calls, 'Do not defer fallback removal when halt is unconfirmed')
-
-    def test_docker_inspect_normalizes_exec_oserror(self):
-        with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
-            docker = Docker()
-        with patch('factory_v1.sandbox_policy.subprocess.run', side_effect=PermissionError('injected exec refusal')):
-            with self.assertRaises(RepositoryError):
-                docker.inspect('fixture', optional=True)
-
-    def test_stop_removes_even_when_optional_log_capture_fails(self):
-        docker = Mock()
-        docker.call.side_effect = RepositoryError('container_unavailable', 'injected log timeout')
-        with patch('factory_v1.sandbox.Docker', return_value=docker):
-            try:
-                sandbox.stop_assignment(self.database, 'p', 'i', 42, 'a')
-            except RepositoryError:
-                pass
-        self.assertTrue((self.root / 'stop').exists())
-        docker.remove.assert_called_once_with('fixture')
-
-    def test_guard_removes_even_when_optional_log_capture_fails(self):
-        record = {'seconds': 1, 'controller_pid': 123, 'controller_start': 'fixture',
-                  'container': 'fixture', 'capability': str(self.root / 'absent-capability')}
-        path = self.root / 'guard.json'
-        path.write_text(json.dumps(record))
-        (self.root / 'guard-finish').touch()
-        docker = Mock()
-        docker.call.side_effect = RepositoryError('container_unavailable', 'injected log timeout')
-        with patch('sys.argv', ['guard', str(path)]), patch('factory_v1.sandbox_guard.Docker', return_value=docker):
-            sandbox_guard.main()
-        observed = json.loads((self.root / 'guard-result.json').read_text())
-        print('guard failure readback:', observed)
-        docker.remove.assert_called_once_with('fixture')
-
-    def test_launch_cleanup_oserror_is_retained_as_unconfirmed(self):
-        artifacts = self.root / 'artifacts'
-        artifacts.mkdir()
-        assignment = {'assignment_id': 'a', 'ticket_scope': {'project': 'p', 'iteration': 'i'},
-                      'handoff': {'stage': 'implementation', 'profile': {'home': str(self.root / 'absent-home')},
-                                  'workspace': str(self.root / 'source'), 'baseline': 'b' * 40,
-                                  'candidate': None}}
-        self.database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(assignment), 'a'))
-        self.database.commit()
-        config = {'subscription_socket': str(self.root / 'unused-socket'),
-                  'artifacts_root': str(artifacts), 'image': 'fixture', 'limits': {'seconds': 1}}
-        (self.root / 'source').mkdir()
-        (self.root / 'config.json').write_text(json.dumps(config))
-        docker = Mock()
-        docker.image.return_value = 'fixture'
-        docker.remove.side_effect = FileNotFoundError('injected Docker disappearance during cleanup')
-        with ExitStack() as stack:
-            stack.enter_context(patch('factory_v1.restart.before_dispatch'))
-            stack.enter_context(patch('factory_v1.sandbox.load_config', return_value=config))
-            stack.enter_context(patch('factory_v1.sandbox.Docker', return_value=docker))
-            stack.enter_context(patch('factory_v1.model_access.transport'))
-            stack.enter_context(patch('factory_v1.sandbox.assignments.inspect', return_value=assignment))
-            stack.enter_context(patch('factory_v1.sandbox.assignments.prepare'))
-            stack.enter_context(patch('factory_v1.sandbox.original', return_value={}))
-            stack.enter_context(patch('factory_v1.sandbox.snapshot', side_effect=RepositoryError('source_blocked', 'injected snapshot refusal')))
-            stack.enter_context(patch('factory_v1.sandbox.signal.signal'))
-            try:
-                result = sandbox.launch(str(self.state), 'p', 'i', 42, 'a', str(self.root / 'config.json'), None)
-            except OSError as error:
-                saved = json.loads(self.database.execute('SELECT payload FROM role_assignments').fetchone()[0])
-                print('launch escaped:', type(error).__name__, 'persisted runtime:', saved['runtime']['status'])
-                self.fail('cleanup OSError escaped instead of retaining unconfirmed runtime')
-        self.assertEqual(result['runtime']['status'], 'unconfirmed')
-        self.assertEqual(result['runtime']['error'], 'stop_unconfirmed')
-        self.assertFalse(result['runtime']['container_removed'])
+                if adapter == 'emergency':
+                    self.assertIn('kill', calls)
+                    self.assertEqual(calls[0], 'kill')
+                    self.assertEqual(outcome['error'], 'stop_unconfirmed' if defect in {'kill', 'inspect', 'remove'} else None)
+                    if defect in {'kill', 'inspect'}:
+                        self.assertNotIn('logs', calls, 'Do not defer fallback removal when halt is unconfirmed')
 
 
-    def test_stop_removes_even_when_log_artifact_write_fails(self):
-        docker = Mock()
-        docker.call.return_value = b'labeled fixture logs'
-        with patch('factory_v1.sandbox.Docker', return_value=docker), \
-                patch.object(Path, 'write_bytes', side_effect=PermissionError('injected log write refusal')):
-            result = sandbox.stop_assignment(self.database, 'p', 'i', 42, 'a')
-        docker.remove.assert_called_once_with('fixture')
-        assert result is not None
-        self.assertEqual(result['runtime']['status'], 'stopped')
-        self.assertTrue(result['runtime']['container_removed'])
-        self.assertEqual(json.loads((self.root / 'container-log-error.json').read_text())['type'], 'PermissionError')
 
-    def test_guard_removes_even_when_log_artifact_write_fails(self):
+    def test_guard_cleanup_optional_errors_still_remove_matrix(self):
         path = self.root / 'guard.json'
         path.write_text(json.dumps({'seconds': 1, 'controller_pid': 123, 'controller_start': 'fixture',
-                                    'container': 'fixture', 'capability': str(self.root / 'absent')}))
+                                   'container': 'fixture', 'capability': str(self.root / 'absent')}))
         (self.root / 'guard-finish').touch()
-        docker = Mock()
-        docker.call.return_value = b'labeled fixture logs'
-        with patch('sys.argv', ['guard', str(path)]), \
-                patch('factory_v1.sandbox_guard.Docker', return_value=docker), \
-                patch.object(Path, 'write_bytes', side_effect=PermissionError('injected log write refusal')):
-            sandbox_guard.main()
-        docker.remove.assert_called_once_with('fixture')
-        self.assertEqual(json.loads((self.root / 'guard-result.json').read_text())['status'], 'stopped')
+        for failure in ('logs', 'artifact'):
+            with self.subTest(failure=failure), ExitStack() as stack:
+                for name in ('container.log', 'guard-result.json'):
+                    (self.root / name).unlink(missing_ok=True)
+                docker = Mock()
+                docker.call.return_value = b'labeled fixture logs'
+                if failure == 'logs':
+                    docker.call.side_effect = RepositoryError('container_unavailable', 'injected log timeout')
+                else:
+                    stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('injected log write refusal')))
+                stack.enter_context(patch('sys.argv', ['guard', str(path)]))
+                stack.enter_context(patch('factory_v1.sandbox_guard.Docker', return_value=docker))
+                sandbox_guard.main()
+                docker.remove.assert_called_once_with('fixture')
+                self.assertEqual(json.loads((self.root / 'guard-result.json').read_text())['status'], 'stopped')
+
+    def test_launch_cleanup_unconfirmed_matrix(self):
+        import threading
+        for failure in (FileNotFoundError('injected Docker disappearance during cleanup'),
+                        RepositoryError('stop_unconfirmed', 'injected uncertain removal')):
+            with self.subTest(failure=type(failure).__name__):
+                with self.database:
+                    self.database.execute('UPDATE role_assignments SET payload=?', (json.dumps(self.assignment),))
+                docker = Mock()
+                docker.remove.side_effect = failure
+                runtime = self.assignment['runtime']
+                result = sandbox.cleanup_attempt(str(self.state), 'p', 'i', 42, 'a', 'r', self.root,
+                    runtime, threading.Event(), docker, None, None, [], None, {},
+                    'failed', 'source_blocked', str(self.root / 'config.json'))
+                docker.remove.assert_called_once_with('fixture')
+                self.assertEqual(result['runtime']['status'], 'unconfirmed')
+                self.assertEqual(result['runtime']['error'], 'stop_unconfirmed')
+                self.assertFalse(result['runtime']['container_removed'])
+
+
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)

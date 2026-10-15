@@ -23,6 +23,19 @@ class TicketStatusTests(test_lean_tickets.LeanControllerCase):
         row = next(r for r in snapshot['items'] if r['number'] == 12)
         self.assertFalse(row['admissible'])
         self.assertTrue(row['held'] or not row['contract_valid'])
+
+    def test_canonical_status_refusal(self):
+        for label, status, heading in (
+            ('trailing-space', 'deferred', '## Status '),
+            ('annotated', 'deferred (waiting for operator)', '## Status'),
+            ('unknown', 'unrecognized', '## Status'),
+            ('multiline', 'ready\ndeferred', '## Status'),
+            ('unclosed', 'ready (waiting for operator', '## Status'),
+            ('duplicate', 'ready\n\n## Status \n\ndeferred', '## Status'),
+        ):
+            with self.subTest(label=label):
+                self.assert_status_refused(status, heading)
+        members = copy.deepcopy(self.members)
         reserved = self.reserve(10)
         self.assertEqual(reserved['reservation']['issue_number'], 10)
         self.assertEqual(reserved['reservation']['status'], 'reserved')
@@ -30,23 +43,11 @@ class TicketStatusTests(test_lean_tickets.LeanControllerCase):
         self.assertEqual(self.members[10]['fieldValues']['nodes'][0]['optionId'], 'Active')
         self.assertFalse(reserved['execution_allowed'])
 
-    def test_deferred_under_trailing_space_status_heading_is_refused(self):
-        self.assert_status_refused('deferred', '## Status ')
 
-    def test_annotated_deferred_is_refused(self):
-        self.assert_status_refused('deferred (waiting for operator)')
 
-    def test_unknown_status_is_refused(self):
-        self.assert_status_refused('unrecognized')
 
-    def test_multiline_status_is_refused(self):
-        self.assert_status_refused('ready\ndeferred')
 
-    def test_unclosed_status_annotation_is_refused(self):
-        self.assert_status_refused('ready (waiting for operator')
 
-    def test_duplicate_status_section_is_refused(self):
-        self.assert_status_refused('ready\n\n## Status \n\ndeferred')
 
     def test_canonical_generated_ready_annotation_remains_admissible(self):
         self.issues[12]['body'] = self.canonical_body

@@ -42,12 +42,13 @@ class ResultContractTests(unittest.TestCase):
             (root / 'model-evidence/response-1.json').write_text('{"label":"unit fixture, not inference"}')
             return sandbox.check_worker_evidence({'runtime': {'run_id': 'fixture'}}, root, [])
 
-    def test_exact_compound_command_is_accepted(self):
-        command = 'python -m unittest discover -v && python -m compileall -q hello.py test_hello.py'
-        self.assertEqual(self.check_command(command)['tests'][0]['command'], command)
-
-    def test_split_or_fabricated_commands_still_fail_closed(self):
-        for command in ('python -m unittest discover -v', 'python -m compileall -q hello.py test_hello.py', 'echo OK'):
-            with self.subTest(command=command), self.assertRaises(RepositoryError) as caught:
-                self.check_command(command)
-            self.assertEqual(caught.exception.code, 'invalid_result')
+    def test_compound_command_accept_and_refuse_matrix(self):
+        exact = 'python -m unittest discover -v && python -m compileall -q hello.py test_hello.py'
+        for command in (exact, 'python -m unittest discover -v', 'python -m compileall -q hello.py test_hello.py', 'echo OK'):
+            with self.subTest(command=command):
+                if command == exact:
+                    self.assertEqual(self.check_command(command)['tests'][0]['command'], command)
+                else:
+                    with self.assertRaises(RepositoryError) as caught:
+                        self.check_command(command)
+                    self.assertEqual(caught.exception.code, 'invalid_result')

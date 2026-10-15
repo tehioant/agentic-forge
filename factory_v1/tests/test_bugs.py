@@ -62,47 +62,58 @@ class BugTests(unittest.TestCase):
     def retry(self, assignment):
         return bugs.publish(self.database, self.fixture.stored(), {'assignment_id': assignment}, self.github)
 
-    def test_discovery_requires_observation_and_justified_scope(self):
-        good = self.discovery()['discovery']; bugs.validate_discovery(good)
-        for changes in ({'affected': []}, {'affected': [True]}, {'affected': [10, 10]}, {'scope': 'future'},
-                        {'symptoms': ''}, {'expected': ''}, {'actual': ''}, {'scope_reason': ''},
-                        {'reproduction': [], 'evidence': []}, {'environment': ''}, {'scope': 'deferred'}, {'scope': 'recovery'}):
-            with self.subTest(changes=changes), self.assertRaises(repositories.RepositoryError) as caught:
-                bugs.validate_discovery({**good, **changes})
-            self.assertEqual(caught.exception.code, 'invalid_bug')
-        for scope in ('deferred', 'recovery'): bugs.validate_discovery(self.discovery(scope)['discovery'])
-        bugs.validate_discovery({**good, 'environment': None, 'reproduction': []})
+    def test_bug_discovery_and_result_contract_1(self):
+        good = self.discovery()['discovery']
+        normalized = {**good, 'symptoms': ' REOPENED  notes lose accents\n', 'affected': [12]}
+        cases = [(changes, False) for changes in
+                 ({'affected': []}, {'affected': [True]}, {'affected': [10, 10]}, {'scope': 'future'},
+                  {'symptoms': ''}, {'expected': ''}, {'actual': ''}, {'scope_reason': ''},
+                  {'reproduction': [], 'evidence': []}, {'environment': ''}, {'scope': 'deferred'}, {'scope': 'recovery'})]
+        cases += [({}, True), ({'environment': None, 'reproduction': []}, True), (normalized, True)]
+        cases += [(self.discovery(scope)['discovery'], True) for scope in ('deferred', 'recovery')]
+        for changes, valid in cases:
+            with self.subTest(changes=changes, valid=valid):
+                observation = {**good, **changes}
+                if valid:
+                    bugs.validate_discovery(observation)
+                else:
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        bugs.validate_discovery(observation)
+                    self.assertEqual(caught.exception.code, 'invalid_bug')
+        self.assertEqual(bugs.fingerprint(good, self.item), bugs.fingerprint(normalized, self.item))
+        self.assertNotEqual(bugs.fingerprint(good, self.item), bugs.fingerprint({**normalized, 'scope': 'deferred'}, self.item))
 
-    def test_result_contract_scope_references_comparisons_and_cycles(self):
-        work = self.work_record; good = work['bug']
-        self.assertIsNone(bugs.validate_result(work, good, self.item))
-        for changes in ({'title': ''}, {'acceptance_criteria': []}, {'affected': [12]}, {'blockers': [10]},
-                        {'blockers': [11]}, {'blockers': [99]}, {'scope': 'deferred'}, {'status': 'done'},
-                        {'triage_label': 'unconfigured'}, {'comparisons': []},
-                        {'references': [{'spec': self.fixture.inputs['documents']['vision.md']['url'], 'requirement': 'Team sharing'}]}):
-            with self.subTest(changes=changes), self.assertRaises(repositories.RepositoryError):
-                bugs.validate_result(work, {**good, **changes}, self.item)
+    def test_bug_discovery_and_result_contract_2(self):
+        work = self.work_record
+        good = work['bug']
+        cases = [(changes, None, True) for changes in
+                 ({'title': ''}, {'acceptance_criteria': []}, {'affected': [12]}, {'blockers': [10]},
+                  {'blockers': [11]}, {'blockers': [99]}, {'scope': 'deferred'}, {'status': 'done'},
+                  {'triage_label': 'unconfigured'}, {'comparisons': []},
+                  {'references': [{'spec': self.fixture.inputs['documents']['vision.md']['url'], 'requirement': 'Team sharing'}]})]
         for field in ('symptoms_match', 'scope_match'):
-            bad = copy.deepcopy(good); bad['comparisons'][0][field] = 'yes'
-            with self.assertRaises(repositories.RepositoryError): bugs.validate_result(work, bad, self.item)
-
-    def test_semantic_duplicates_require_symptoms_and_scope_not_title(self):
-        work = self.work_record; result = copy.deepcopy(work['bug'])
-        result['comparisons'][0]['symptoms_match'] = True
-        self.assertIsNone(bugs.validate_result(work, result, self.item))
-        result['comparisons'][0]['scope_match'] = True
-        self.assertEqual(bugs.validate_result(work, result, self.item), 10)
-        result['comparisons'][1].update(symptoms_match=True, scope_match=True)
-        with self.assertRaises(repositories.RepositoryError) as caught: bugs.validate_result(work, result, self.item)
-        self.assertEqual(caught.exception.code, 'publication_uncertain')
+            comparisons = copy.deepcopy(good['comparisons']); comparisons[0][field] = 'yes'
+            cases.append(({'comparisons': comparisons}, None, True))
+        cases.insert(0, ({}, None, False))
+        comparisons = copy.deepcopy(good['comparisons']); comparisons[0]['symptoms_match'] = True
+        cases.append(({'comparisons': copy.deepcopy(comparisons)}, None, False))
+        comparisons[0]['scope_match'] = True
+        cases.append(({'comparisons': copy.deepcopy(comparisons)}, 10, False))
+        comparisons[1].update(symptoms_match=True, scope_match=True)
+        cases.append(({'comparisons': comparisons}, 'publication_uncertain', True))
+        for changes, expected, refused in cases:
+            with self.subTest(changes=changes):
+                if refused:
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        bugs.validate_result(work, {**good, **changes}, self.item)
+                    if expected:
+                        self.assertEqual(caught.exception.code, expected)
+                else:
+                    self.assertEqual(bugs.validate_result(work, {**good, **changes}, self.item), expected)
         work['candidates'][0]['issue']['body'] += '\n## Bug scope\ncurrent\n## Observable symptoms\n REOPENED notes lose accents \n## Expected behavior\nReopening retains café.\n## Actual behavior\nReopening displays caf.\n'
-        self.assertEqual(bugs.validate_result(work, work['bug'], self.item), 10)
+        self.assertEqual(bugs.validate_result(work, good, self.item), 10)
 
-    def test_fingerprint_normalizes_defect_but_keeps_scope(self):
-        a = self.discovery()['discovery']; b = copy.deepcopy(a)
-        b['symptoms'] = ' REOPENED  notes lose accents\n'; b['affected'] = [12]
-        self.assertEqual(bugs.fingerprint(a, self.item), bugs.fingerprint(b, self.item))
-        b['scope'] = 'deferred'; self.assertNotEqual(bugs.fingerprint(a, self.item), bugs.fingerprint(b, self.item))
+
 
     def test_synthesis_replay_new_ids_and_added_scope_refusal_are_durable(self):
         self.item.pop('bug_work'); self.fixture.persist()
@@ -138,46 +149,54 @@ class BugTests(unittest.TestCase):
             self.assertEqual(tickets.external_contract({'title': work['bug']['title'], 'body': rendered}, work['inputs']), work['bug']['status'])
             self.assertEqual(parts['Priority'], {'current': 'required iteration work', 'deferred': 'next grilling only', 'recovery': 'immediate recovery'}[scope])
 
-    def test_affected_body_whitespace_crlf_and_footer_bytes_survive_edge_update(self):
+    def test_bug_affected_body_effect(self):
         original = self.fixture.issues[10]['body']
-        variants = [original.replace('## Blocked by\n', h) for h in ('## Blocked by \t\n', '##  Blocked by\n')]
-        variants += [original.replace('\nNone (can start immediately).\n\n', '\n \t\n  None (can start immediately). \t\n\n'), original.replace('\n', '\r\n')]
-        for body in variants:
-            with self.subTest(body=body):
-                self.fixture.issues[10]['body'] = body; work = self.make_work(); self.item['bug_work'] = {'accent': work}; self.fixture.persist()
-                before_other = copy.deepcopy((self.fixture.issues[11], self.fixture.issues[12]))
-                start, end = tickets.section_spans(body)['Blocked by']; newline = '\r\n' if body[start - 2:start] == '\r\n' else '\n'
+        bodies = [original.replace('## Blocked by\n', heading) for heading in ('## Blocked by \t\n', '##  Blocked by\n')]
+        bodies += [original.replace('\nNone (can start immediately).\n\n', '\n \t\n  None (can start immediately). \t\n\n'), original.replace('\n', '\r\n')]
+        rows = [('acknowledged', body) for body in bodies] + [('lost', original), ('stale', original)]
+        for outcome, body in rows:
+            with self.subTest(outcome=outcome, body=body):
+                self.fixture.issues[10]['body'] = body
+                self.fixture.deps[10] = []
+                self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
+                self.fixture.add_dependency.reset_mock()
+                work = self.make_work(); self.item['bug_work'] = {'accent': work}
+                start, end = tickets.section_spans(body)['Blocked by']
+                newline = '\r\n' if body[start - 2:start] == '\r\n' else '\n'
                 expected = body[:start] + newline + '- #13' + newline * 2 + body[end:]
                 issue = self.fixture.issue(13, 'fixture bug'); self.fixture.issues[13] = issue
+                if outcome == 'stale':
+                    work['affected_intents'] = {'10': {'before': body, 'body': body}}
+                self.fixture.persist(); before = self.fixture.stored()
+                before_other = copy.deepcopy((self.fixture.issues[11], self.fixture.issues[12]))
+                if outcome == 'lost':
+                    def patch_body(path, payload, method=None):
+                        self.assertIn('10', self.fixture.stored()['bug_work']['accent']['affected_intents'])
+                        self.fixture.request(path, payload, method)
+                        raise repositories.RepositoryError('github_unavailable', 'lost acknowledgement')
+                    self.github.request.side_effect = patch_body
+                if outcome in ('stale', 'lost'):
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        bugs.affected_edges(self.database, self.item, work, self.github, issue)
+                    if outcome == 'stale':
+                        self.assertEqual(caught.exception.code, 'publication_mismatch')
+                        self.github.request.assert_not_called(); self.fixture.add_dependency.assert_not_called()
+                        self.assertEqual(self.fixture.stored(), before)
+                        self.fixture.issues.pop(13)
+                        continue
+                    self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
                 bugs.affected_edges(self.database, self.item, work, self.github, issue)
-                self.assertEqual(self.fixture.issues[10]['body'], expected); self.assertEqual(self.fixture.deps[10], [13])
+                if outcome == 'lost': self.github.request.assert_not_called()
+                self.assertEqual(self.fixture.issues[10]['body'], expected)
+                self.assertEqual(self.fixture.deps[10], [13])
                 self.assertEqual((self.fixture.issues[11], self.fixture.issues[12]), before_other)
                 self.github.request.reset_mock(); self.fixture.add_dependency.reset_mock()
                 bugs.affected_edges(self.database, self.item, work, self.github, issue)
                 self.github.request.assert_not_called(); self.fixture.add_dependency.assert_not_called()
                 self.assertEqual(self.fixture.stored()['bug_work']['accent']['affected_intents']['10']['body'], expected)
-                self.fixture.issues.pop(13); self.fixture.deps[10] = []
+                self.fixture.issues.pop(13)
 
-    def test_lost_body_effect_replay_retains_intent_without_repeated_patch(self):
-        work = self.work_record; issue = self.fixture.issue(13, 'fixture bug'); self.fixture.issues[13] = issue
-        def patch_body(path, body, method=None):
-            self.assertIn('10', self.fixture.stored()['bug_work']['accent']['affected_intents'])
-            self.fixture.request(path, body, method)
-            raise repositories.RepositoryError('github_unavailable', 'lost acknowledgement')
-        self.github.request.side_effect = patch_body
-        with self.assertRaises(repositories.RepositoryError): bugs.affected_edges(self.database, self.item, work, self.github, issue)
-        self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
-        bugs.affected_edges(self.database, self.item, work, self.github, issue)
-        self.github.request.assert_not_called(); self.assertEqual(self.fixture.deps[10], [13])
 
-    def test_stale_affected_intent_refuses_native_mutation(self):
-        work = self.work_record; issue = self.fixture.issue(13, 'fixture bug')
-        self.fixture.issues[13] = issue
-        work['affected_intents'] = {'10': {'before': self.fixture.issues[10]['body'], 'body': self.fixture.issues[10]['body']}}
-        self.fixture.persist(); before = self.fixture.stored()
-        with self.assertRaises(repositories.RepositoryError) as caught: bugs.affected_edges(self.database, self.item, work, self.github, issue)
-        self.assertEqual(caught.exception.code, 'publication_mismatch')
-        self.github.request.assert_not_called(); self.fixture.add_dependency.assert_not_called(); self.assertEqual(self.fixture.stored(), before)
 
     def test_edge_intent_durable_and_unknown_absent_edge_not_retried(self):
         work = self.work_record; self.fixture.issues[13] = self.fixture.issue(13, 'fixture bug')
@@ -192,50 +211,68 @@ class BugTests(unittest.TestCase):
         with self.assertRaises(repositories.RepositoryError) as caught: bugs.edges(self.database, self.item, work, self.github, 13, {1010})
         self.assertEqual(caught.exception.code, 'publication_uncertain'); self.fixture.add_dependency.assert_not_called()
 
-    def test_final_affected_readback_requires_body_native_identity_membership_scope(self):
-        work = self.work_record; issue = self.fixture.issue(13, 'fixture bug'); self.fixture.issues[13] = issue
-        self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #13'); self.fixture.deps[10] = [13]
-        bugs.verify_affected(self.item, work, self.github, issue); good = copy.deepcopy(self.fixture.issues[10])
-        for fault in ('scope', 'body', 'identity', 'native', 'membership'):
-            self.fixture.issues[10] = copy.deepcopy(good); self.fixture.deps[10] = [13]
-            if fault == 'scope': self.fixture.members[10]['fields']['SCOPE'] = 'M2'
-            if fault == 'body': self.fixture.issues[10]['body'] = good['body'].replace('- #13', 'None.')
-            if fault == 'identity': self.fixture.issues[10]['id'] = 999
-            if fault == 'native': self.fixture.deps[10] = []
-            if fault == 'membership': member = self.fixture.members.pop(10)
-            with self.subTest(fault=fault), self.assertRaises(repositories.RepositoryError): bugs.verify_affected(self.item, work, self.github, issue)
-            if fault == 'membership': self.fixture.members[10] = member
-            self.fixture.members[10]['fields']['SCOPE'] = 'M1'
+    def test_bug_affected_observation_readback(self):
+        work = self.work_record
+        issue = self.fixture.issue(13, 'fixture bug'); self.fixture.issues[13] = issue
+        self.fixture.issues[10]['body'] = self.fixture.issues[10]['body'].replace('None (can start immediately).', '- #13')
+        self.fixture.deps[10] = [13]
+        good = copy.deepcopy(self.fixture.issues[10])
+        observation = self.observation()
+        for boundary, faults in (('affected', ('scope', 'body', 'identity', 'native', 'membership')),
+                                 ('published', ('body', 'status', 'scope', 'labels', 'native', 'huge', 'title'))):
+            if boundary == 'affected': bugs.verify_affected(self.item, work, self.github, issue)
+            else:
+                bugs.verify_observation(self.item, work, observation)
+                work['observation'] = copy.deepcopy(observation)
+            for fault in faults:
+                with self.subTest(boundary=boundary, fault=fault):
+                    self.fixture.issues[10] = copy.deepcopy(good); self.fixture.deps[10] = [13]
+                    bad = copy.deepcopy(observation)
+                    member = self.fixture.members[10]
+                    if boundary == 'affected':
+                        if fault == 'scope': member['fields']['SCOPE'] = 'M2'
+                        if fault == 'body': self.fixture.issues[10]['body'] = good['body'].replace('- #13', 'None.')
+                        if fault == 'identity': self.fixture.issues[10]['id'] = 999
+                        if fault == 'native': self.fixture.deps[10] = []
+                        if fault == 'membership': self.fixture.members.pop(10)
+                    else:
+                        if fault == 'body': bad['issue']['body'] = bad['issue']['body'].replace('caf.', 'lost.')
+                        if fault == 'status': bad['membership']['status'] = 'unknown'
+                        if fault == 'scope': bad['scope'] = 'M2'
+                        if fault == 'labels': bad['issue']['labels'] = []
+                        if fault == 'native': bad['dependencies'] = [{'number': 12}]
+                        if fault == 'huge': bad['issue']['body'] = bad['issue']['body'].replace('None (can start immediately).', '- #' + '9' * 6000)
+                        if fault == 'title': bad['issue']['title'] = 'changed'
+                    with self.assertRaises(repositories.RepositoryError):
+                        if boundary == 'affected': bugs.verify_affected(self.item, work, self.github, issue)
+                        else: bugs.verify_observation(self.item, work, bad)
+                    self.fixture.members[10] = member; member['fields']['SCOPE'] = 'M1'
+        self.github.request.assert_not_called()
 
     def observation(self):
         work = self.work_record; issue = self.fixture.issue(13, bugs.render(self.item, work)); issue['title'] = work['bug']['title']
         return {'issue': issue, 'scope': 'M1', 'membership': {'id': 'ITEM13', 'status': 'Ready'}, 'dependencies': []}
 
-    def test_published_observation_drift_and_huge_text_blocker_are_read_only(self):
-        observation = self.observation(); work = self.work_record; bugs.verify_observation(self.item, work, observation); work['observation'] = copy.deepcopy(observation)
-        for fault in ('body', 'status', 'scope', 'labels', 'native', 'huge', 'title'):
-            bad = copy.deepcopy(observation)
-            if fault == 'body': bad['issue']['body'] = bad['issue']['body'].replace('caf.', 'lost.')
-            if fault == 'status': bad['membership']['status'] = 'unknown'
-            if fault == 'scope': bad['scope'] = 'M2'
-            if fault == 'labels': bad['issue']['labels'] = []
-            if fault == 'native': bad['dependencies'] = [{'number': 12}]
-            if fault == 'huge': bad['issue']['body'] = bad['issue']['body'].replace('None (can start immediately).', '- #' + '9' * 6000)
-            if fault == 'title': bad['issue']['title'] = 'changed'
-            with self.subTest(fault=fault), self.assertRaises(repositories.RepositoryError): bugs.verify_observation(self.item, work, bad)
-        self.github.request.assert_not_called()
 
-    def test_unknown_creation_current_or_archived_prevents_duplicate_write(self):
-        for archived in (False, True):
-            with self.subTest(archived=archived):
-                work = self.work_record; work['status'] = 'publication_pending'
-                if archived:
-                    work.pop('issue_intent', None); self.item['bug_work_history'] = [{'assignment_id': 'archived-unknown', 'issue_intent': {'title': 'unknown'}, 'publication_complete': False}]
-                else: work['issue_intent'] = {'title': 'unknown'}
-                self.fixture.persist()
-                with patch.object(bugs, 'work_context', return_value=(work['inputs'], work['board'])), patch.object(bugs, 'observations', return_value=work['candidates']):
+    def test_bug_publication_effect_admission_1(self):
+        baseline = copy.deepcopy(self.item)
+        for fault, expected in (('current-intent', 'publication_uncertain'), ('archived-intent', 'publication_uncertain'),
+                                ('observation', 'bug_conflict'), ('board', 'projects_blocked')):
+            with self.subTest(fault=fault):
+                self.item = self.fixture.item = copy.deepcopy(baseline)
+                work = self.item['bug_work']['accent']; work['status'] = 'publication_pending'
+                if fault == 'current-intent': work['issue_intent'] = {'title': 'unknown'}
+                if fault == 'archived-intent':
+                    self.item['bug_work_history'] = [{'assignment_id': 'archived-unknown', 'issue_intent': {'title': 'unknown'}, 'publication_complete': False}]
+                self.fixture.persist(); self.github.request.reset_mock()
+                context = patch.object(bugs, 'work_context', side_effect=repositories.RepositoryError('projects_blocked', 'missing board')) if fault == 'board' else patch.object(bugs, 'work_context', return_value=(work['inputs'], work['board']))
+                observations = work['candidates'] + ([{'issue': self.fixture.issue(20, 'new observation')}] if fault == 'observation' else [])
+                with context, patch.object(bugs, 'observations', return_value=observations):
                     result = bugs.publish_locked(self.database, self.item, work, self.github)
-                self.assertEqual(work['blocker']['code'], 'publication_uncertain'); self.assertFalse(work.get('publication_complete'))
+                self.assertEqual(work['blocker']['code'], expected)
+                self.assertFalse(work.get('publication_complete'))
+                if fault in ('observation', 'board'):
+                    self.assertNotIn('issue_intent', work); self.assertTrue(work['execution']); self.assertTrue(work['bug'])
                 self.github.request.assert_not_called(); self.assertEqual(self.fixture.stored(), result)
 
     def test_single_current_bug_publication_then_read_only_replay_and_completed_release(self):
@@ -284,16 +321,6 @@ class BugTests(unittest.TestCase):
         self.fixture.add_item.assert_not_called(); self.github.request.assert_called_once()
         self.assertEqual(self.fixture.stored(), result)
 
-    def test_new_observation_and_missing_board_refuse_creation_without_discarding_result(self):
-        work = self.work_record; work['status'] = 'publication_pending'; self.fixture.persist()
-        for fault in ('observation', 'board'):
-            with self.subTest(fault=fault):
-                context = patch.object(bugs, 'work_context', return_value=(work['inputs'], work['board'])) if fault == 'observation' else patch.object(bugs, 'work_context', side_effect=repositories.RepositoryError('projects_blocked', 'missing board'))
-                with context, patch.object(bugs, 'observations', return_value=[*work['candidates'], {'issue': self.fixture.issue(20, 'new observation')}]):
-                    result = bugs.publish_locked(self.database, self.item, work, self.github)
-                self.assertEqual(work['blocker']['code'], 'bug_conflict' if fault == 'observation' else 'projects_blocked')
-                self.assertNotIn('issue_intent', work); self.assertTrue(work['execution']); self.assertTrue(work['bug'])
-                self.github.request.assert_not_called(); self.assertEqual(self.fixture.stored(), result)
 
     def test_noncurrent_unknown_and_duplicate_normalized_scope_never_reserve(self):
         self.item.pop('bug_work'); self.fixture.persist()
@@ -364,15 +391,3 @@ class BugTests(unittest.TestCase):
                 self.assertIn(inputs['documents']['milestone.md']['url'], self.fixture.issues[n]['body'])
             self.assertEqual(self.fixture.issues[11], untouched); self.assertEqual(self.fixture.stored(), result)
             self.github.request.reset_mock(); bugs.publish_locked(self.database, self.item, work, self.github); self.github.request.assert_not_called()
-
-    def test_obsolete_current_and_archived_assignment_ids_never_admit_result(self):
-        for history in (False, True):
-            work = copy.deepcopy(self.work_record); work['requirement_disposition'] = {'status': 'obsolete'}
-            item = {**self.item, 'bug_work': {} if history else {'accent': work}, 'bug_work_history': [work] if history else []}
-            with self.subTest(history=history):
-                with self.assertRaises(repositories.RepositoryError) as caught:
-                    bugs.assigned(item, work['assignment_id'])
-                self.assertEqual(caught.exception.code, 'stale_requirements')
-        self.item['requirement_changes'] = {'revision': {'kind': 'material', 'status': 'published', 'affected': [10]}}
-        with self.assertRaises(repositories.RepositoryError) as caught: bugs.assigned(self.item, self.work_record['assignment_id'])
-        self.assertEqual(caught.exception.code, 'requirements_held')

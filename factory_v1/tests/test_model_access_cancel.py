@@ -27,8 +27,8 @@ def subscription_adapter(path='/fixture/upstream.sock'):
 
 
 class ModelAccessCancellationTests(unittest.TestCase):
-    def test_cancel_interrupts_real_subscription_response_headers_and_bodies(self):
-        for name, partial in STALLS.items():
+    def test_subscription_socket_cancellation(self):
+        for name, partial in [('before-connect', b''), *STALLS.items()]:
             with self.subTest(stall=name):
                 adapter = subscription_adapter()
                 cancelled = []
@@ -71,14 +71,6 @@ class ModelAccessCancellationTests(unittest.TestCase):
                     self.assertEqual(sock.connect.call_count, 1)
                     self.assertEqual(socket_factory.call_count, 2)
 
-    def test_cancel_before_call_refuses_outbound_connection(self):
-        adapter = subscription_adapter()
-        adapter.cancel()
-        with patch.object(model_access.socket, 'socket') as socket_factory:
-            with self.assertRaises(OSError):
-                adapter.call({'input': 'must not connect'})
-        socket_factory.return_value.connect.assert_not_called()
-        socket_factory.return_value.sendall.assert_not_called()
 
     def test_cancellable_fixture_does_not_follow_redirects(self):
         adapter = FixtureTransport('http://127.0.0.1:1/fixed-fixture', 2, 3)
@@ -92,39 +84,36 @@ class ModelAccessCancellationTests(unittest.TestCase):
         sock.connect.assert_called_once_with(('127.0.0.1', 1))
         self.assertEqual(adapter.cancellation.sockets, {})
 
-    def test_subscription_parser_pins_route_tier_and_reconstructs_completed_output(self):
-        adapter = subscription_adapter()
+    def test_subscription_wire_contract_2(self):
         item = {'type': 'message', 'content': [{'type': 'output_text', 'text': 'labeled-fixture'}]}
         events = [{'type': 'response.output_item.done', 'output_index': 0, 'item': item},
                   {'type': 'response.completed', 'response': {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': []}}]
         body = ''.join('data: ' + json.dumps(event) + '\n\n' for event in events).encode()
-        raw = b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: ' + str(len(body)).encode() + b'\r\n\r\n' + body
-        sock = MagicMock()
-        sock.makefile.return_value = io.BytesIO(raw)
-        with patch.object(model_access.socket, 'socket', return_value=sock):
-            units, response = adapter.call({'input': 'labeled fixture request'})
-        self.assertEqual(units, 1)
-        self.assertEqual(response, {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': [item]})
-        outbound = b''.join(call.args[0] for call in sock.sendall.call_args_list)
-        headers, encoded = outbound.split(b'\r\n\r\n', 1)
-        self.assertTrue(headers.startswith(b'POST /v1/responses HTTP/1.1'))
-        self.assertEqual(json.loads(encoded), {'input': 'labeled fixture request', 'model': 'gpt-6.1-sol',
-                                               'store': False, 'stream': True, 'service_tier': 'default'})
-        self.assertEqual(adapter.cancellation.sockets, {})
-        sock.close.assert_called()
-
-    def test_subscription_quota_and_failed_response_are_not_fabricated_completion(self):
-        for status, code in ((429, 'quota_exhausted'), (500, 'outcome_uncertain')):
+        for status, code in ((200, None), (429, 'quota_exhausted'), (500, 'outcome_uncertain')):
             with self.subTest(status=status):
                 adapter = subscription_adapter()
+                raw = (f'HTTP/1.1 {status} Fixture\r\nContent-Type: text/event-stream\r\nContent-Length: '.encode()
+                       + str(len(body) if status == 200 else 0).encode() + b'\r\n\r\n' + (body if status == 200 else b''))
                 sock = MagicMock()
-                sock.makefile.return_value = io.BytesIO(f'HTTP/1.1 {status} Refused\r\nContent-Length: 0\r\n\r\n'.encode())
+                sock.makefile.return_value = io.BytesIO(raw)
                 with patch.object(model_access.socket, 'socket', return_value=sock):
-                    with self.assertRaises(ModelAccessError) as error:
-                        adapter.call({'input': 'labeled refusal'})
-                self.assertEqual(error.exception.code, code)
+                    if code:
+                        with self.assertRaises(ModelAccessError) as error:
+                            adapter.call({'input': 'labeled fixture request'})
+                        self.assertEqual(error.exception.code, code)
+                    else:
+                        units, response = adapter.call({'input': 'labeled fixture request'})
+                        self.assertEqual(units, 1)
+                        self.assertEqual(response, {'status': 'completed', 'model': 'gpt-6.1-sol', 'output': [item]})
+                outbound = b''.join(call.args[0] for call in sock.sendall.call_args_list)
+                headers, encoded = outbound.split(b'\r\n\r\n', 1)
+                self.assertTrue(headers.startswith(b'POST /v1/responses HTTP/1.1'))
+                self.assertEqual(json.loads(encoded), {'input': 'labeled fixture request', 'model': 'gpt-6.1-sol',
+                                                       'store': False, 'stream': True, 'service_tier': 'default'})
                 self.assertEqual(adapter.cancellation.sockets, {})
                 sock.connect.assert_called_once()
+                sock.close.assert_called()
+
 
     def test_cancellation_registration_and_release_are_idempotent(self):
         cancellation = model_access.SocketCancellation()

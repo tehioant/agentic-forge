@@ -50,44 +50,22 @@ class RelayTests(unittest.TestCase):
         status = handler.send_error.call_args.args[0] if handler.send_error.called else handler.send_response.call_args.args[0]
         return status, handler.wfile.getvalue().decode()
 
-    def test_large_request_streams_keepalive_and_exact_completed_response(self):
-        status, content = self.post({'model': 'gpt-6.1-sol', 'stream': True, 'store': False, 'input': 'x' * 50000})
-        self.assertEqual(status, 200)
-        self.assertIn(': admitted-operation-pending', content)
-        self.assertIn('response.output_item.done', content)
-        self.assertIn('response.completed', content)
-        self.assertIn('FIXTURE_ONLY', content)
-        self.assertTrue(content.endswith('data: [DONE]\n\n'))
-        self.assertEqual(self.calls, [('/fixture/model.sock', {'input': 'x' * 50000, 'reasoning': {'effort': 'high'}})])
-
-    def test_native_hermes_cache_key_is_local_only_metadata(self):
-        status, content = self.post({'model': 'gpt-6.1-sol', 'stream': True, 'store': False,
-            'input': 'x', 'reasoning': {'effort': 'high', 'summary': 'auto'},
-            'include': ['reasoning.encrypted_content'], 'prompt_cache_key': 'pck_native_hermes'})
-        self.assertEqual(status, 200)
-        self.assertIn('response.completed', content)
-        self.assertEqual(self.calls[0][1], {'input': 'x', 'reasoning': {'effort': 'high'}})
-
-    def test_invalid_cache_metadata_never_reaches_socket(self):
-        for key in (None, 123, {}, '', 'x' * 129):
-            status, _ = self.post({'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x', 'prompt_cache_key': key})
-            self.assertEqual(status, 400)
-        self.assertEqual(self.calls, [])
-
-    def test_wrong_model_arbitrary_route_and_extra_provider_fields_never_reach_socket(self):
-        for payload, path in [({'model': 'paid-model', 'stream': True, 'input': 'x'}, '/v1/responses'),
-                              ({'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x'}, '/v1/chat/completions'),
-                              ({'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x', 'url': 'https://github.com'}, '/v1/responses')]:
-            status, _ = self.post(payload, path)
-            self.assertEqual(status, 400)
-        self.assertEqual(self.calls, [])
-
-    def test_oversized_body_is_denied_without_model_request(self):
-        for headers in ({'Content-Length': '2000001'}, {'Content-Length': '0'}, {'Transfer-Encoding': 'chunked'}):
-            self.assertEqual(self.post({}, headers=headers)[0], 400)
-        self.assertEqual(self.calls, [])
-
-    def test_socket_protocol_uses_fixed_reservation_and_exact_completed_response(self):
+    def test_exact_response_and_local_cache_metadata_matrix(self):
+        base = {'model': 'gpt-6.1-sol', 'stream': True, 'store': False}
+        cases = [
+            ('large', base | {'input': 'x' * 50000}),
+            ('local-cache', base | {'input': 'x', 'reasoning': {'effort': 'high', 'summary': 'auto'},
+             'include': ['reasoning.encrypted_content'], 'prompt_cache_key': 'pck_native_hermes'}),
+        ]
+        for label, payload in cases:
+            with self.subTest(case=label):
+                self.calls.clear()
+                status, content = self.post(payload)
+                self.assertEqual(status, 200)
+                for event in (': admitted-operation-pending', 'response.output_item.done', 'response.completed', 'FIXTURE_ONLY'):
+                    self.assertIn(event, content)
+                self.assertTrue(content.endswith('data: [DONE]\n\n'))
+                self.assertEqual(self.calls, [('/fixture/model.sock', {'input': payload['input'], 'reasoning': {'effort': 'high'}})])
         connection = MagicMock()
         connection.__enter__.return_value = connection
         connection.recv.return_value = json.dumps({'result': {'result': self.response}}).encode() + b'\n'
@@ -100,7 +78,23 @@ class RelayTests(unittest.TestCase):
         self.assertEqual(request['payload'], {'input': 'x'})
         self.assertTrue(request['operation_id'].startswith('sandbox-'))
 
-    def test_socket_response_and_request_bounds_fail_closed(self):
+    def test_provider_route_body_and_metadata_denials_matrix(self):
+        base = {'model': 'gpt-6.1-sol', 'stream': True, 'input': 'x'}
+        cases = [('cache-' + str(index), base | {'prompt_cache_key': key}, '/v1/responses', {})
+                 for index, key in enumerate((None, 123, {}, '', 'x' * 129))]
+        cases += [
+            ('model', base | {'model': 'paid-model'}, '/v1/responses', {}),
+            ('route', base, '/v1/chat/completions', {}),
+            ('provider-field', base | {'url': 'https://github.com'}, '/v1/responses', {}),
+        ]
+        cases += [('body-' + str(index), {}, '/v1/responses', headers) for index, headers in enumerate(
+            ({'Content-Length': '2000001'}, {'Content-Length': '0'}, {'Transfer-Encoding': 'chunked'}))]
+        for label, payload, path, headers in cases:
+            with self.subTest(case=label):
+                self.assertEqual(self.post(payload, path, headers)[0], 400)
+                self.assertEqual(self.calls, [])
+
+    def test_socket_protocol_bounds_matrix(self):
         with patch.object(relay.socket, 'socket') as socket:
             with self.assertRaises(ValueError):
                 relay.call('/fixture/model.sock', {'input': 'x' * relay.MAX_REQUEST})

@@ -1,76 +1,11 @@
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
-class IntakeLifecycleTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
-        self.state = self.root / 'state.sqlite'
-        self.request = {
-            'project_id': 'approved-product',
-            'iteration_id': 'milestone-1',
-            'repository': 'example/approved-product',
-            'idea': 'A product explicitly requested by its operator',
-            'approval': {'operator_id': '42', 'reference': 'operator-message-101'},
-            'origin': {
-                'platform': 'discord', 'chat_id': '123', 'thread_id': '123',
-                'parent_chat_id': '456', 'scope_id': '789',
-            },
-        }
-
-    def invoke(self, *arguments, state=None):
-        return subprocess.run(
-            [sys.executable, '-m', 'factory_v1', '--state', str(self.state if state is None else state),
-             '--operator-id', '42', *arguments],
-            text=True, capture_output=True, timeout=15,
-            env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'},
-        )
-
-    def register(self, request=None):
-        path = self.root / 'request.json'
-        path.write_text(json.dumps(self.request if request is None else request))
-        return self.invoke('register', '--request', str(path))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# Legacy helpers above remain for untouched consumers; focused tests never call them.
 import copy
 import io
 import sqlite3
@@ -108,22 +43,28 @@ class IntakeComponentTests(unittest.TestCase):
         with closing(sqlite3.connect(self.state.as_uri() + '?mode=ro', uri=True)) as db:
             return intake.read_iteration(db, project, 'm1')
 
-    def test_approved_intake_reopens_with_exact_provenance_and_no_execution(self):
-        first = self.register_direct(dict(self.request, work_item_number=5))
-        self.assertEqual(self.stored(), first)
-        for field in ('repository', 'approval', 'origin'):
-            self.assertEqual(first[field], self.request[field])
-        self.assertEqual(first['stage'], 'intake_registered')
-        self.assertFalse(first['execution_allowed'])
-        correlation = first['correlation']
-        self.assertEqual(correlation['work_item'], {'repository': 'example/product', 'issue_number': 5})
-        self.assertEqual(correlation['project_id'], 'product')
-        self.assertEqual(correlation['iteration_id'], 'm1')
-        self.assertEqual(correlation['stage'], first['stage'])
-        self.assertTrue(correlation['control_run_id'])
-        self.assertIsNone(correlation['worker_run_id'])
-        self.assertEqual(correlation['evidence_id'], first['evidence']['id'])
-        self.assertEqual(first['evidence']['kind'], 'approved_intake')
+    def test_registration_preserves_approved_provenance(self):
+        repositories = ('example/product', 'x/Product.Name_1', 'Owner-Name/Product.Name_1',
+                        'a-b-c/Product.Name_1', 'x' * 39 + '/Product.Name_1')
+        for index, repository in enumerate(repositories):
+            with self.subTest(repository=repository):
+                self.state = self.root / f'approved-{index}.sqlite'
+                request = dict(self.request, repository=repository, work_item_number=5)
+                first = self.register_direct(request)
+                self.assertEqual(self.stored(), first)
+                for field in ('repository', 'approval', 'origin'):
+                    self.assertEqual(first[field], request[field])
+                self.assertEqual(first['stage'], 'intake_registered')
+                self.assertFalse(first['execution_allowed'])
+                correlation = first['correlation']
+                self.assertEqual(correlation['work_item'], {'repository': repository, 'issue_number': 5})
+                self.assertEqual(correlation['project_id'], 'product')
+                self.assertEqual(correlation['iteration_id'], 'm1')
+                self.assertEqual(correlation['stage'], first['stage'])
+                self.assertTrue(correlation['control_run_id'])
+                self.assertIsNone(correlation['worker_run_id'])
+                self.assertEqual(correlation['evidence_id'], first['evidence']['id'])
+                self.assertEqual(first['evidence']['kind'], 'approved_intake')
 
     def test_invalid_approval_scope_origin_and_owner_are_refused_before_storage(self):
         cases = [dict(self.request, approval=value) for value in (None, {},
@@ -142,17 +83,13 @@ class IntakeComponentTests(unittest.TestCase):
             self.assertEqual(raised.exception.code, 'invalid_intake')
             self.assertFalse(self.state.exists())
 
-    def test_valid_owner_boundaries_keep_exact_case_and_bytes(self):
-        for index, owner in enumerate(('x', 'Owner-Name', 'a-b-c', 'x' * 39)):
-            request = dict(self.request, project_id=f'product-{index}', repository=owner + '/Product.Name_1')
-            record = self.register_direct(request)
-            self.assertEqual(self.stored(request['project_id']), record)
-            self.assertEqual(record['repository'], request['repository'])
 
-    def test_idempotent_registration_and_all_optional_scope_conflicts(self):
+    def test_intake_replay_and_inspection_are_read_only(self):
         first = self.register_direct()
         self.assertEqual(self.register_direct(), first)
         before = self.state.read_bytes()
+        self.assertIsNone(self.stored('unknown'))
+        self.assertEqual(self.state.read_bytes(), before)
         for changed in (dict(self.request, repository='example/other'),
                         dict(self.request, work_item_number=5),
                         dict(self.request, repository_intent={'mode': 'new', 'marker': 'approved'})):
@@ -177,11 +114,7 @@ class IntakeComponentTests(unittest.TestCase):
         for record in records:
             self.assertEqual(self.stored(record['project_id']), record)
 
-    def test_missing_inspection_is_read_only(self):
-        self.register_direct()
-        before = self.state.read_bytes()
-        self.assertIsNone(self.stored('unknown'))
-        self.assertEqual(self.state.read_bytes(), before)
+
 
     def test_duplicate_and_parser_limit_json_are_not_admitted(self):
         with self.assertRaises(IntakeError):

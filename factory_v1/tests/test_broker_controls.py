@@ -15,16 +15,13 @@ from factory_v1.model_access import SUBSCRIPTION_SCOPE
 
 
 class BrokerControlFailureTests(unittest.TestCase):
-    def test_database_failure_cancels_admitted_transport_and_keeps_billing_uncertain(self):
-        for defect in ('connect', 'read'):
-            with self.subTest(defect=defect):
-                self._assert_admitted_cancellation(defect=defect)
+    def test_broker_control_revocation(self):
+        for defect, action in (('connect', None), ('read', None), (None, 'pause'), (None, 'emergency-stop')):
+            with self.subTest(defect=defect, action=action):
+                self._assert_admitted_cancellation(defect=defect, action=action)
 
-    def test_durable_pause_cancels_admitted_transport_and_denies_retries(self):
-        self._assert_admitted_cancellation(action='pause')
 
-    def test_durable_emergency_stop_cancels_admitted_transport_and_denies_retries(self):
-        self._assert_admitted_cancellation(action='emergency-stop')
+
 
     def _assert_admitted_cancellation(self, *, defect=None, action=None):
         with tempfile.TemporaryDirectory() as directory:

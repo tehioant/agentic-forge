@@ -81,8 +81,9 @@ class IterationComponents(unittest.TestCase):
     def complete(self, request=None):
         return iteration.complete(self.db, 'product', 'm1', '42', request or {'merge_configs': ['private-merge.json']}, self.github)
 
-    def test_report_wait_and_outbox_are_atomic_restart_idempotent_and_silent(self):
+    def test_atomic_completion_wait_and_retirement_matrix(self):
         self.item['bug_work'] = {'future': {'discovery': {'scope': 'deferred', 'symptoms': 'Optional formatting'}, 'status': 'synthesis_pending'}}
+        self.item['reservation'] = {'issue_number': 1, 'status': 'reserved'}
         self.store()
         report = self.complete()
         stored = self.stored()
@@ -90,6 +91,8 @@ class IterationComponents(unittest.TestCase):
         self.assertFalse(stored['execution_allowed'])
         self.assertNotIn('planning', stored)
         self.assertNotIn('next_iteration', stored)
+        self.assertNotIn('reservation', stored)
+        self.assertEqual(stored['reservation_history'], [self.item['reservation']])
         self.assertEqual(report['report']['verification'], 'simulation')
         self.assertEqual(report['report']['bugs'][0]['discovery']['scope'], 'deferred')
         records = attention.records(self.db, 'product', 'm1', stored)
@@ -109,56 +112,66 @@ class IterationComponents(unittest.TestCase):
         self.assertNotIn('completion', self.stored())
         self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
 
-    def test_tracker_states_and_missing_original_scope_refuse_without_outbox(self):
-        for field, value in [('status', 'blocked'), ('status', 'ready'), ('status', 'deferred'),
-                             ('issue_state', 'open'), ('held', True), ('contract_valid', False), ('state_reason', 'not_planned')]:
-            with self.subTest(field=field, value=value):
+    def test_required_scope_and_tracker_guards_matrix(self):
+        cases = [('field', (field, value)) for field, value in [('status', 'blocked'), ('status', 'ready'), ('status', 'deferred'), ('issue_state', 'open'), ('held', True), ('contract_valid', False), ('state_reason', 'not_planned')]]
+        cases += [('missing', None), ('foreign', None), ('required', None), ('deferred', None)]
+        for kind, change in cases:
+            with self.subTest(kind=kind, change=change), ExitStack() as stack:
                 observed = copy.deepcopy(self.observed)
-                observed['items'][0][field] = value
-                self.mocks['iteration.frontier'].return_value = observed
+                if kind == 'field':
+                    observed['items'][0][change[0]] = change[1]
+                elif kind == 'missing':
+                    observed['items'] = []
+                elif kind == 'foreign':
+                    observed['foreign_active'] = [8]
+                else:
+                    extra = work_row(2)
+                    if kind == 'deferred':
+                        extra.update(status='deferred', held=True, issue_state='open')
+                        stack.enter_context(patch('factory_v1.tickets.gh.read_issue', side_effect=lambda github, repo, n: {'body': '## Bug scope\n\ndeferred\n', 'state': 'closed' if n == 1 else 'open'}))
+                    observed['items'].append(extra)
+                stack.enter_context(patch.object(iteration, 'frontier', return_value=observed))
+                if kind == 'deferred':
+                    report = self.complete()
+                    self.assertEqual(report['report']['deferred_issues'], [2])
+                    self.assertEqual([w['issue']['number'] for w in report['report']['delivered']], [1])
+                    self.assertEqual(self.stored()['ticket_work']['published'], {'T1': {'number': 1}})
+                else:
+                    with self.assertRaises(RepositoryError):
+                        self.complete()
+                    self.assertNotIn('completion', self.stored())
+                    self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
+
+
+    def test_health_worker_and_pending_holds_matrix(self):
+        assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1'}, 'runtime': {'status': 'running', 'container_removed': False}}
+        cases = [('health', status) for status in ('unknown', 'failed')]
+        cases += [('incident', None), ('decision', None), ('worker', None)]
+        cases += [('hold', source) for source in ('requirements', 'diagnosis', 'bugs')]
+        for kind, value in cases:
+            with self.subTest(kind=kind, value=value), ExitStack() as stack:
+                self.item = context()
+                self.store()
+                if kind == 'health':
+                    stack.enter_context(patch.object(delivery, 'observe', return_value=dict(self.health, status=value)))
+                elif kind == 'incident':
+                    self.item['main_incident'] = {'status': 'active'}
+                    self.store()
+                elif kind == 'decision':
+                    stack.enter_context(patch.object(iteration, 'pending_decisions', return_value=[{'decision_id': 'unanswered', 'issue_number': 1}]))
+                elif kind == 'worker':
+                    stack.enter_context(patch.object(assignments, 'rows', return_value=[assignment]))
+                elif kind == 'hold':
+                    stack.enter_context(patch('factory_v1.' + value + '.held_numbers', return_value={1}))
                 with self.assertRaises(RepositoryError):
                     self.complete()
                 self.assertNotIn('completion', self.stored())
-        for observed in (dict(self.observed, items=[]), dict(self.observed, foreign_active=[8])):
-            self.mocks['iteration.frontier'].return_value = observed
-            with self.assertRaises(RepositoryError):
-                self.complete()
-        self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
 
-    def test_required_set_cannot_be_selected_by_caller_and_deferred_bug_stays_nonexec(self):
-        self.observed['items'].append(work_row(2))
-        with self.assertRaises(RepositoryError):
-            self.complete()
-        deferred = work_row(2)
-        deferred.update(status='deferred', held=True, issue_state='open')
-        self.observed['items'][1] = deferred
-        self.mocks['tickets.gh.read_issue'].side_effect = lambda github, repo, n: {'body': '## Bug scope\n\ndeferred\n', 'state': 'closed' if n == 1 else 'open'}
-        report = self.complete()
-        self.assertEqual(report['report']['deferred_issues'], [2])
-        self.assertEqual([w['issue']['number'] for w in report['report']['delivered']], [1])
-        self.assertEqual(self.stored()['ticket_work']['published'], {'T1': {'number': 1}})
-
-    def test_unknown_failed_health_incident_and_pending_decisions_refuse(self):
-        for status in ('unknown', 'failed'):
-            self.mocks['delivery.observe'].return_value = dict(self.health, status=status)
-            with self.assertRaises(RepositoryError):
-                self.complete()
-        self.mocks['delivery.observe'].return_value = self.health
-        self.item['main_incident'] = {'status': 'active'}
-        self.store()
-        with self.assertRaises(RepositoryError):
-            self.complete()
-        self.item.pop('main_incident')
-        self.store()
-        with patch('factory_v1.iteration.pending_decisions', return_value=[{'decision_id': 'unanswered', 'issue_number': 1}]):
-            with self.assertRaises(RepositoryError):
-                self.complete()
-        self.assertNotIn('completion', self.stored())
-
-    def test_revalidation_after_health_and_transaction_guard_refuse_races(self):
+    def test_last_read_and_transaction_races_matrix(self):
         self.mocks['delivery.observe'].side_effect = [self.health, dict(self.health, status='unknown')]
         with self.assertRaises(RepositoryError):
             self.complete()
+
         def pause_after_io(*args):
             changed = self.stored()
             changed['status'] = 'paused'
@@ -166,6 +179,7 @@ class IterationComponents(unittest.TestCase):
             self.db.commit()
             return self.health
         count = 0
+
         def observe(config):
             nonlocal count
             count += 1
@@ -177,7 +191,7 @@ class IterationComponents(unittest.TestCase):
         self.assertEqual(self.stored()['status'], 'paused')
         self.assertNotIn('completion', self.stored())
 
-    def test_plain_plan_and_intake_cannot_bypass_wait(self):
+    def test_wait_cannot_be_bypassed_matrix(self):
         self.item.update(status='waiting-for-operator', completion={'report_id': 'fixture-report'})
         self.store()
         item = self.stored()
@@ -188,58 +202,13 @@ class IterationComponents(unittest.TestCase):
         with self.db, self.assertRaises(IntakeError):
             register_iteration(self.db, dict(context(), iteration_id='m2'))
 
-    def test_every_required_item_has_exact_delivery_evidence_and_drift_refuses(self):
-        self.observed['items'].append(work_row(2))
-        self.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
-        def delivered(database, item, row, *args):
-            value = copy.deepcopy(self.delivered)
-            value['issue']['number'] = row['number']
-            return value
-        self.mocks['iteration.delivered_item'].side_effect = delivered
-        report = self.complete({'merge_configs': ['one.json', 'two.json']})
-        self.assertEqual([r['issue']['number'] for r in report['report']['delivered']], [1, 2])
-        self.assertEqual(report['report']['delivered'], [dict(self.delivered, issue=dict(self.delivered['issue'], number=n)) for n in (1, 2)])
-        for changed_number in (1, 2):
-            with self.subTest(changed_number=changed_number):
-                self.db.execute('DELETE FROM notifications')
-                self.item = context()
-                self.store()
-                seen = set()
-                def changed_delivery(database, item, row, *args):
-                    value = delivered(database, item, row)
-                    if row['number'] == changed_number and row['number'] in seen:
-                        value['integration'] = {'integrated': 'e' * 40}
-                    seen.add(row['number'])
-                    return value
-                self.mocks['iteration.delivered_item'].side_effect = changed_delivery
-                with self.assertRaisesRegex(RepositoryError, 'changed during verification'):
-                    self.complete({'merge_configs': ['one.json', 'two.json']})
-                self.assertNotIn('completion', self.stored())
-                self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
 
-    def test_unreconciled_worker_or_required_hold_prevents_completion(self):
-        assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1'},
-                      'runtime': {'status': 'running', 'container_removed': False}}
-        with patch.object(assignments, 'rows', return_value=[assignment]), self.assertRaises(RepositoryError):
-            self.complete()
-        for source in ('requirements', 'diagnosis', 'bugs'):
-            with patch('factory_v1.' + source + '.held_numbers', return_value={1}), self.assertRaises(RepositoryError):
-                self.complete()
-        self.assertNotIn('completion', self.stored())
 
-    def test_reservation_is_archived_not_left_as_an_executable_claim(self):
-        self.item['reservation'] = {'issue_number': 1, 'status': 'reserved'}
-        self.store()
-        self.complete()
-        stored = self.stored()
-        self.assertNotIn('reservation', stored)
-        self.assertEqual(stored['reservation_history'], [self.item['reservation']])
 
-    def test_public_cli_routes_completion_and_structured_malformed_refusals(self):
+    def test_completion_cli_structured_refusals_matrix(self):
         path = self.root / 'request.json'
         path.write_text('{"merge_configs":["private-merge.json"]}')
-        args = ['factory_v1', '--state', str(self.state), '--operator-id', '42', 'complete-iteration',
-                '--project', 'product', '--iteration', 'm1', '--request', str(path), '--api-base', self.github.base]
+        args = ['factory_v1', '--state', str(self.state), '--operator-id', '42', 'complete-iteration', '--project', 'product', '--iteration', 'm1', '--request', str(path), '--api-base', self.github.base]
         output = io.StringIO()
         with patch.object(sys, 'argv', args), redirect_stdout(output):
             main()
@@ -275,42 +244,8 @@ class DeliveredEvidenceComponents(unittest.TestCase):
     def check(self):
         return iteration.delivered_item(None, self.item, self.row, '/fixture.json', '42', SimpleNamespace(base='https://api.github.com'), SHA)
 
-    def test_external_evidence_and_original_chain_are_revalidated(self):
-        result = self.check()
-        self.assertEqual(result, {
-            'issue': {'number': 1, 'id': 10, 'url': 'https://github.com/example/product/issues/1'},
-            'pr': {'number': 2, 'url': 'https://github.com/example/product/pull/2'},
-            'assignment_id': self.prior['assignment_id'], 'requirements': self.prior['revision'],
-            'reviews': ['s', 'p'], 'integration': self.evidence, 'checks': ['exact-integrated-check']})
 
-    def test_closed_issue_and_delivered_boolean_never_replace_original_proof(self):
-        for boundary in ('chain', 'mapped_candidate', 'target', 'merged_evidence', 'protection', 'checks', 'require_publication'):
-            with self.subTest(boundary=boundary):
-                self.mocks[boundary].side_effect = RepositoryError('missing_evidence', 'fixture refusal')
-                with self.assertRaises(RepositoryError):
-                    self.check()
-                self.mocks[boundary].side_effect = None
-        for key, value in [('status', 'merged'), ('status', 'revalidation-required'), ('close_allowed', False), ('failure', {'code': 'removed'})]:
-            old = self.prior['merge'][key]
-            self.prior['merge'][key] = value
-            with self.subTest(key=key), self.assertRaises(RepositoryError):
-                self.check()
-            self.prior['merge'][key] = old
 
-    def test_reopened_different_requirements_wrong_scope_and_integration_refuse(self):
-        for field, value in [('state', 'open'), ('body', 'changed'), ('id', 999), ('state_reason', 'not_planned')]:
-            old = self.issue[field]
-            self.issue[field] = value
-            with self.subTest(field=field), self.assertRaises(RepositoryError):
-                self.check()
-            self.issue[field] = old
-        self.mocks['merged_evidence'].return_value = dict(self.evidence, main='e' * 40)
-        with self.assertRaises(RepositoryError):
-            self.check()
-        self.mocks['merged_evidence'].return_value = self.evidence
-        self.mocks['checks'].return_value = ['new-check']
-        with self.assertRaises(RepositoryError):
-            self.check()
 
 
 class ContinuationComponents(unittest.TestCase):
@@ -375,50 +310,55 @@ class ContinuationComponents(unittest.TestCase):
             save_iteration(self.db, previous)
         return result
 
-    def test_explicit_same_product_input_starts_only_pinned_pending_interview(self):
-        result = self.start()
-        self.assertEqual(result['project_id'], self.item['project_id'])
-        self.assertEqual(result['repository'], self.item['repository'])
-        self.assertEqual(result['origin'], ORIGIN)
-        self.assertEqual(result['planning']['continuation']['previous_spec'], self.item['handoff'])
-        self.assertEqual(result['planning']['continuation']['dependencies']['grill-me'], ['grilling'])
-        self.assertEqual(result['stage'], 'planning_pending')
-        self.assertNotIn('handoff', result)
-        self.assertNotIn('ticket_work', result)
-        self.assertFalse(result['execution_allowed'])
-        self.assertEqual(self.start(), result)
-        result = self.pending_interview()
-        with self.db, self.assertRaises(RepositoryError):
-            planning.plan(self.db, result, result['planning']['request'])
+    def test_same_product_interview_origin_and_skill_pins_matrix(self):
+        changes = [{'operator_id': '99'}, {'origin': dict(ORIGIN, thread_id='999')}, {'event_id': 'other'}, {'input': ''}, {'reference': ''}, {'iteration_id': 'm1'}, {'repository': 'other/product'}, {'message_id': '100'}, {'message_id': '101'}, {'message_id': '00102'}, {'message_id': '１０２'}]
+        cases = [('request', change) for change in changes]
+        cases += [('delivery', state) for state in ('pending', 'accepted', 'uncertain')]
+        cases += [('skill', defect) for defect in ('missing', 'repin', 'alternate', 'drift')]
+        cases += [('valid', None)]
+        for kind, value in cases:
+            with self.subTest(kind=kind, value=value), ExitStack() as stack:
+                request = copy.deepcopy(self.request)
+                self.record['state'] = 'delivered'
+                if kind == 'request':
+                    request.update(value)
+                elif kind == 'delivery':
+                    self.record['state'] = value
+                elif kind == 'skill':
+                    source = Path(request['skills'][1]['path'])
+                    original = source.read_bytes()
+                    if value == 'missing':
+                        request['skills'].pop(1)
+                    if value == 'repin':
+                        request['skills'][1]['sha256'] = '0' * 64
+                    if value == 'alternate':
+                        alternate = self.root / 'alternate.md'
+                        alternate.write_bytes(original)
+                        request['skills'][1]['path'] = str(alternate)
+                    if value == 'drift':
+                        source.write_bytes(original + b'\nUnreviewed change')
+                    stack.callback(source.write_bytes, original)
+                if kind == 'valid':
+                    result = self.start(request)
+                    self.assertEqual(result['project_id'], self.item['project_id'])
+                    self.assertEqual(result['repository'], self.item['repository'])
+                    self.assertEqual(result['origin'], ORIGIN)
+                    self.assertEqual(result['planning']['continuation']['previous_spec'], self.item['handoff'])
+                    self.assertEqual(result['planning']['continuation']['dependencies']['grill-me'], ['grilling'])
+                    self.assertEqual(result['stage'], 'planning_pending')
+                    self.assertNotIn('handoff', result)
+                    self.assertNotIn('ticket_work', result)
+                    self.assertFalse(result['execution_allowed'])
+                    self.assertEqual(self.start(), result)
+                    result = self.pending_interview()
+                    with self.db, self.assertRaises(RepositoryError):
+                        planning.plan(self.db, result, result['planning']['request'])
+                else:
+                    with self.assertRaises(RepositoryError):
+                        self.start(request)
+                    self.assertEqual(self.db.execute('SELECT COUNT(*) FROM iterations').fetchone()[0], 1)
 
-    def test_wrong_operator_origin_event_empty_input_and_unverified_delivery_refuse(self):
-        for changes in ({'operator_id': '99'}, {'origin': dict(ORIGIN, thread_id='999')}, {'event_id': 'other'},
-                        {'input': ''}, {'reference': ''}, {'iteration_id': 'm1'}, {'repository': 'other/product'},
-                        {'message_id': '100'}, {'message_id': '101'}, {'message_id': '00102'}, {'message_id': '１０２'}):
-            with self.subTest(changes=changes), self.assertRaises(RepositoryError):
-                self.start(dict(self.request, **changes))
-        for state in ('pending', 'accepted', 'uncertain'):
-            self.record['state'] = state
-            with self.subTest(state=state), self.assertRaises(RepositoryError):
-                self.start()
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM iterations').fetchone()[0], 1)
 
-    def test_skill_source_alternate_repins_missing_dependencies_and_drift_refuse(self):
-        for defect in ('missing', 'repin', 'alternate', 'drift'):
-            request = copy.deepcopy(self.request)
-            source = Path(request['skills'][1]['path'])
-            original = source.read_bytes()
-            if defect == 'missing': request['skills'].pop(1)
-            if defect == 'repin': request['skills'][1]['sha256'] = '0' * 64
-            if defect == 'alternate':
-                alternate = self.root / 'alternate.md'
-                alternate.write_bytes(original)
-                request['skills'][1]['path'] = str(alternate)
-            if defect == 'drift': source.write_bytes(original + b'\nUnreviewed change')
-            with self.subTest(defect=defect), self.assertRaises(RepositoryError):
-                self.start(request)
-            source.write_bytes(original)
-        self.assertEqual(self.db.execute('SELECT COUNT(*) FROM iterations').fetchone()[0], 1)
 
     def evidence(self, item, sufficient=True):
         selected = item['planning']['skills']
@@ -439,91 +379,94 @@ class ContinuationComponents(unittest.TestCase):
             'result_digest': assignments.digest(docs)}
         return request
 
-    def test_correlated_load_work_answers_and_round_gate_are_required(self):
+    def test_interview_correlation_and_publication_gates_matrix(self):
         item = self.pending_interview()
         request = self.evidence(item)
         self.assertEqual(planning.continuation_evidence(item['planning'], request, item['planning']['skills']), request['execution'])
         for defect in ('assignment', 'origin', 'load', 'hash', 'work', 'answer', 'actor', 'gate', 'result', 'adaptation'):
             bad = copy.deepcopy(request)
             evidence = bad['execution']
-            if defect == 'assignment': evidence['assignment_id'] = 'stale'
-            if defect == 'origin': evidence['origin'] = {}
-            if defect == 'load': evidence['loads'].pop()
-            if defect == 'hash': evidence['loads'][0]['sha256'] = '0' * 64
-            if defect == 'work': evidence['work'] = []
-            if defect == 'answer': evidence['rounds'][0]['questions'][0]['answer'] = None
-            if defect == 'actor': evidence['rounds'][0]['questions'][0]['operator_id'] = 'worker'
-            if defect == 'gate': evidence['rounds'][0]['complete'] = False
-            if defect == 'result': evidence['result_digest'] = '0' * 64
-            if defect == 'adaptation': evidence['adaptation'] = 'invented'
+            if defect == 'assignment':
+                evidence['assignment_id'] = 'stale'
+            if defect == 'origin':
+                evidence['origin'] = {}
+            if defect == 'load':
+                evidence['loads'].pop()
+            if defect == 'hash':
+                evidence['loads'][0]['sha256'] = '0' * 64
+            if defect == 'work':
+                evidence['work'] = []
+            if defect == 'answer':
+                evidence['rounds'][0]['questions'][0]['answer'] = None
+            if defect == 'actor':
+                evidence['rounds'][0]['questions'][0]['operator_id'] = 'worker'
+            if defect == 'gate':
+                evidence['rounds'][0]['complete'] = False
+            if defect == 'result':
+                evidence['result_digest'] = '0' * 64
+            if defect == 'adaptation':
+                evidence['adaptation'] = 'invented'
             with self.subTest(defect=defect), self.assertRaises(RepositoryError):
                 planning.continuation_evidence(item['planning'], bad, item['planning']['skills'])
-
-    def test_pending_interview_never_reads_publication_and_complete_updates_spec_pointers(self):
-        item = self.pending_interview()
-        request = self.evidence(item, sufficient=False)
-        request.pop('documents')
-        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
-                       rationale='Need the actual answer', reference='agent-pending', pending_questions=['Which search?'])
-        request['execution']['result_digest'] = assignments.digest(request['pending_questions'])
-        question = request['execution']['rounds'][0]['questions'][0]
-        question.update(answer=None, operator_id=None, reference=None)
-        request['execution']['rounds'][0]['complete'] = False
         github = Mock(base='http://127.0.0.1:9876')
-        with self.db:
-            pending = planning.complete(self.db, item, request, github)
-        self.assertEqual(pending['planning']['pending_questions'], ['Which search?'])
-        self.assertNotIn('handoff', pending)
-        github.request.assert_not_called()
-        pending = self.pending_interview()
-        request = self.evidence(item)
-        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
-                       rationale='Answered current frontier', reference='agent-sufficient', commit='e' * 40, issue_number=8)
-        request['documents']['milestone.md'] = '\n'.join('## ' + section + '\nSubstantive agreed text.\n' for section in planning.SECTIONS)
-        request['execution']['result_digest'] = assignments.digest(request['documents'])
-        def read(path):
-            if '/git/commits/' in path:
-                return {'sha': request['commit']}
-            if '/contents/' in path:
-                name = path.split('/')[-1].split('?')[0]
-                raw = request['documents'][name].encode()
-                return {'type': 'file', 'path': item['planning']['docs_path'] + '/' + name, 'encoding': 'base64',
-                        'content': base64.b64encode(raw).decode(),
-                        'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\0' + raw).hexdigest()}
-            return {'number': 8, 'id': 80, 'state': 'open', 'body': request['documents']['milestone.md'],
-                    'html_url': 'https://github.com/example/product/issues/8',
-                    'repository_url': 'https://api.github.com/repos/example/product', 'labels': [{'name': 'ready-for-agent'}]}
-        github.request.side_effect = read
-        with patch.object(planning, 'reconcile'), self.db:
-            completed = planning.complete(self.db, pending, request, github)
-        self.assertEqual(completed['stage'], 'planning_complete')
-        self.assertEqual(completed['handoff']['commit'], 'e' * 40)
-        self.assertEqual(completed['handoff']['issue']['number'], 8)
-        self.assertEqual(completed['planning']['execution'], request['execution'])
-        previous = json.loads(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m1'").fetchone()[0])
-        self.assertEqual(previous['handoff'], self.item['handoff'])
-        self.assertNotIn('ticket_work', completed)
-        self.assertFalse(completed['execution_allowed'])
+        for mode in ('pending', 'stale', 'catalog', 'complete'):
+            with self.subTest(mode=mode):
+                item = self.pending_interview()
+                request = self.evidence(item, sufficient=mode != 'pending')
+                request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN, rationale='Answered current frontier', reference='agent-sufficient', commit='e' * 40, issue_number=8)
+                if mode == 'pending':
+                    request.pop('documents')
+                    request.pop('commit')
+                    request.pop('issue_number')
+                    request.update(rationale='Need the actual answer', reference='agent-pending', pending_questions=['Which search?'])
+                    request['execution']['result_digest'] = assignments.digest(request['pending_questions'])
+                    request['execution']['rounds'][0]['questions'][0].update(answer=None, operator_id=None, reference=None)
+                    request['execution']['rounds'][0]['complete'] = False
+                else:
+                    request['documents']['milestone.md'] = '\n'.join(('## ' + section + '\nSubstantive agreed text.\n' for section in planning.SECTIONS))
+                    request['execution']['result_digest'] = assignments.digest(request['documents'])
+                    if mode in ('stale', 'catalog'):
+                        request.update(commit=SHA, issue_number=7)
+                    if mode == 'catalog':
+                        request.pop('execution')
 
-    def test_stale_spec_pointer_catalog_only_and_conflicting_next_input_refuse(self):
-        item = self.pending_interview()
-        request = self.evidence(item)
-        request.update(assignment_id=item['planning']['assignment_id'], origin=ORIGIN,
-                       rationale='Ready', reference='agent', commit=SHA, issue_number=7)
-        request['documents']['milestone.md'] = '\n'.join('## ' + section + '\nReal text.\n' for section in planning.SECTIONS)
-        request['execution']['result_digest'] = assignments.digest(request['documents'])
-        with self.db, self.assertRaises(RepositoryError):
-            planning.complete(self.db, item, request, Mock())
-        request.pop('execution')
-        with self.db, self.assertRaises(RepositoryError):
-            planning.complete(self.db, item, request, Mock())
+                def read(path):
+                    if '/git/commits/' in path:
+                        return {'sha': request['commit']}
+                    if '/contents/' in path:
+                        name = path.split('/')[-1].split('?')[0]
+                        raw = request['documents'][name].encode()
+                        return {'type': 'file', 'path': item['planning']['docs_path'] + '/' + name, 'encoding': 'base64', 'content': base64.b64encode(raw).decode(), 'sha': hashlib.sha1(b'blob ' + str(len(raw)).encode() + b'\x00' + raw).hexdigest()}
+                    return {'number': 8, 'id': 80, 'state': 'open', 'body': request['documents']['milestone.md'], 'html_url': 'https://github.com/example/product/issues/8', 'repository_url': 'https://api.github.com/repos/example/product', 'labels': [{'name': 'ready-for-agent'}]}
+                github.request.reset_mock()
+                github.request.side_effect = read
+                if mode in ('stale', 'catalog'):
+                    with self.db, self.assertRaises(RepositoryError):
+                        planning.complete(self.db, item, request, github)
+                else:
+                    with patch.object(planning, 'reconcile'), self.db:
+                        completed = planning.complete(self.db, item, request, github)
+                    if mode == 'pending':
+                        self.assertEqual(completed['planning']['pending_questions'], ['Which search?'])
+                        self.assertNotIn('handoff', completed)
+                        github.request.assert_not_called()
+                    else:
+                        self.assertEqual(completed['stage'], 'planning_complete')
+                        self.assertEqual(completed['handoff']['commit'], 'e' * 40)
+                        self.assertEqual(completed['handoff']['issue']['number'], 8)
+                        self.assertEqual(completed['planning']['execution'], request['execution'])
+                        previous = json.loads(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m1'").fetchone()[0])
+                        self.assertEqual(previous['handoff'], self.item['handoff'])
+                        self.assertNotIn('ticket_work', completed)
+                        self.assertFalse(completed['execution_allowed'])
         with self.assertRaises(RepositoryError):
             self.start(dict(self.request, input='Conflicting new batch'))
         self.assertEqual(self.db.execute('SELECT COUNT(*) FROM iterations').fetchone()[0], 2)
 
-    def test_completed_iteration_claim_retirement_is_not_issue_closure(self):
-        assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 1, 'issue_id': 10},
-                      'runtime': {'status': 'complete', 'container_removed': True}}
+
+
+    def test_completed_claim_is_not_issue_closure_matrix(self):
+        assignment = {'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 1, 'issue_id': 10}, 'runtime': {'status': 'complete', 'container_removed': True}}
         self.assertFalse(assignments.completed_iteration_claim(self.db, assignment))
         report = {'delivered': [{'issue': {'number': 1, 'id': 10}}]}
         self.item['completion'] = {'report_id': assignments.digest(report), 'report': report}
@@ -532,6 +475,72 @@ class ContinuationComponents(unittest.TestCase):
         self.assertTrue(assignments.completed_iteration_claim(self.db, assignment))
         assignment['runtime']['container_removed'] = False
         self.assertFalse(assignments.completed_iteration_claim(self.db, assignment))
+
+
+
+class FocusedInvariantMatrices(unittest.TestCase):
+    def test_delivery_original_chain_evidence_matrix(self):
+        f = IterationComponents('runTest')
+        f.setUp()
+        self.addCleanup(f.doCleanups)
+        f.observed['items'].append(work_row(2))
+        f.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
+
+        def delivered(database, item, row, *args):
+            return dict(f.delivered, issue=dict(f.delivered['issue'], number=row['number']))
+        for changed_number in (None, 1, 2):
+            with self.subTest(changed_number=changed_number):
+                f.db.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
+                f.db.execute('DELETE FROM notifications')
+                f.item = context()
+                f.store()
+                seen = set()
+
+                def observed_delivery(database, item, row, *args):
+                    value = delivered(database, item, row)
+                    if row['number'] == changed_number and row['number'] in seen:
+                        value['integration'] = {'integrated': 'e' * 40}
+                    seen.add(row['number'])
+                    return value
+                f.mocks['iteration.delivered_item'].side_effect = observed_delivery
+                if changed_number is None:
+                    report = f.complete({'merge_configs': ['one.json', 'two.json']})
+                    self.assertEqual([r['issue']['number'] for r in report['report']['delivered']], [1, 2])
+                    self.assertEqual(report['report']['delivered'], [dict(f.delivered, issue=dict(f.delivered['issue'], number=n)) for n in (1, 2)])
+                else:
+                    with self.assertRaisesRegex(RepositoryError, 'changed during verification'):
+                        f.complete({'merge_configs': ['one.json', 'two.json']})
+                    self.assertNotIn('completion', f.stored())
+                    self.assertEqual(attention.records(f.db, 'product', 'm1', f.item), [])
+        f.doCleanups()
+        proof = DeliveredEvidenceComponents('runTest')
+        proof.setUp()
+        self.addCleanup(proof.doCleanups)
+        cases = [('boundary', name, None) for name in ('chain', 'mapped_candidate', 'target', 'merged_evidence', 'protection', 'checks', 'require_publication')]
+        cases += [('journal', key, value) for key, value in [('status', 'merged'), ('status', 'revalidation-required'), ('close_allowed', False), ('failure', {'code': 'removed'})]]
+        cases += [('issue', key, value) for key, value in [('state', 'open'), ('body', 'changed'), ('id', 999), ('state_reason', 'not_planned')]]
+        cases += [('integration', None, dict(proof.evidence, main='e' * 40)), ('checks', None, ['new-check']), ('valid', None, None)]
+        for kind, key, value in cases:
+            with self.subTest(kind=kind, key=key, value=value), ExitStack() as stack:
+                if kind == 'boundary':
+                    mock = proof.mocks[key]
+                    mock.side_effect = RepositoryError('missing_evidence', 'fixture refusal')
+                    stack.callback(setattr, mock, 'side_effect', None)
+                elif kind in ('journal', 'issue'):
+                    obj = proof.prior['merge'] if kind == 'journal' else proof.issue
+                    old = obj[key]
+                    obj[key] = value
+                    stack.callback(obj.__setitem__, key, old)
+                elif kind in ('integration', 'checks'):
+                    mock = proof.mocks['merged_evidence' if kind == 'integration' else 'checks']
+                    old = mock.return_value
+                    mock.return_value = value
+                    stack.callback(setattr, mock, 'return_value', old)
+                if kind == 'valid':
+                    self.assertEqual(proof.check(), {'issue': {'number': 1, 'id': 10, 'url': 'https://github.com/example/product/issues/1'}, 'pr': {'number': 2, 'url': 'https://github.com/example/product/pull/2'}, 'assignment_id': proof.prior['assignment_id'], 'requirements': proof.prior['revision'], 'reviews': ['s', 'p'], 'integration': proof.evidence, 'checks': ['exact-integrated-check']})
+                else:
+                    with self.assertRaises(RepositoryError):
+                        proof.check()
 
 
 if __name__ == '__main__':

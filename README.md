@@ -38,13 +38,17 @@ To run the staged checks manually:
 mise exec -- lefthook run pre-commit
 ```
 
-CI runs the complete discovered factory suite in two isolated subprocess shards
-through `python scripts/run_factory_tests.py`. Discovery refuses errors or duplicate
-IDs; every discovered test is assigned exactly once, and either shard's failure
-fails the existing check. The Python matrix, check names, assertions, permissions
-and 15-minute job limit are unchanged. Antoine explicitly approved sharding after
-the sequential suite exceeded that limit. `mise run test` still runs sequentially;
-use `mise exec -- python scripts/run_factory_tests.py` for the CI execution layout.
+CI and `mise run test` run all discovered factory tests serially through
+`python scripts/run_factory_tests.py`. The runner rejects discovery errors, empty
+or duplicate inventories, incomplete execution and unmocked external execution,
+even when a test catches the refusal. External boundaries must be mocked. Tests
+must be unit tests or small focused components, not full worker/controller
+journeys, including simulated chains; the execution guard alone cannot enforce
+that scope. Keep core behavior and safety regressions, removing duplicate coverage
+rather than hiding tests, adding sharding/retries or extending the 15-minute CI limit.
+The suite has a 500-test-method budget, enforced after complete discovery. Related
+cases may share a small focused matrix; report those cases separately rather than
+presenting a method-count reduction as a runtime or coverage reduction.
 
 See [`factory_v1/README.md`](factory_v1/README.md) for the controller CLI and its
 trust boundaries.

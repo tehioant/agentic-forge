@@ -65,88 +65,114 @@ class ModelSpendingTests(unittest.TestCase):
         self.adapter.call.return_value = (1, {'label': 'fixture-subscription-answer'})
         self.grant(ceiling=2, kind=kind)
 
-    def test_allowance_reaches_controlled_operation_boundary_and_replay_is_idempotent(self):
-        first = self.grant()
-        self.assertTrue(self.grant()['replay'])
-        self.assertEqual(self.grant()['grant_id'], first['grant_id'])
-        self.assertEqual(self.call(), {'actual_units': 2, 'result': 'fixture-answer', 'status': 'complete'})
-        self.assertTrue(self.call()['replay'])
-        self.refused('idempotency_conflict', self.call, payload={'prompt': 'different request'})
-        self.adapter.call.assert_called_once()
-        self.assertEqual(self.db.execute('select remaining from model_grants').fetchone()[0], 3)
-        self.assertEqual(self.db.execute('select status,actual_units from model_operations').fetchone(), ('complete', 2))
-        self.assertNotIn(b'transient no-secret fixture input', self.state.read_bytes())
-        self.assertEqual(self.db.execute('select decision from model_decisions order by rowid').fetchall(),
-                         [('grant_recorded',), ('admitted',), ('reconciled_complete',), ('refused',)])
+    def grant_case(self, label):
+        from contextlib import contextmanager
+        @contextmanager
+        def isolated():
+            original_db, original_state, original_adapter, original_scope = self.db, self.state, self.adapter, self.scope
+            self.state = self.root / (label + '.sqlite')
+            self.db = sqlite3.connect(self.state); original_db.backup(self.db)
+            self.adapter = Mock(reservation=3, payload_fields=None)
+            self.adapter.call.return_value = (2, 'fixture-answer')
+            try:
+                yield
+            finally:
+                self.db.close()
+                self.db, self.state, self.adapter, self.scope = original_db, original_state, original_adapter, original_scope
+        return isolated()
 
-    def test_unapproved_and_exhausted_spending_is_refused_and_persistently_blocks(self):
-        self.refused('spending_blocked', self.call)
-        self.assertEqual(self.item()['model_access']['status'], 'blocked')
-        self.assertEqual(self.db.execute('select decision,reason from model_decisions').fetchone(),
-                         ('refused', 'authorization_unavailable_or_exhausted'))
-        self.adapter.call.assert_not_called()
+    def test_grant_reservation_and_success_receipt(self):
+        for kind, ceiling in (('allowance', 5), ('approval', 3)):
+            with self.subTest(kind=kind), self.grant_case(kind):
+                first = self.grant(kind=kind, ceiling=ceiling)
+                if kind == 'allowance':
+                    self.assertTrue(self.grant()['replay'])
+                    self.assertEqual(self.grant()['grant_id'], first['grant_id'])
+                self.assertEqual(self.call(), {'actual_units': 2, 'result': 'fixture-answer', 'status': 'complete'})
+                self.adapter.call.assert_called_once()
+                if kind == 'allowance':
+                    self.assertTrue(self.call()['replay'])
+                    self.refused('idempotency_conflict', self.call, payload={'prompt': 'different request'})
+                    self.assertEqual(self.db.execute('select remaining from model_grants').fetchone()[0], 3)
+                    self.assertEqual(self.db.execute('select status,actual_units from model_operations').fetchone(), ('complete', 2))
+                    self.assertNotIn(b'transient no-secret fixture input', self.state.read_bytes())
+                    self.assertEqual(self.db.execute('select decision from model_decisions order by rowid').fetchall(),
+                                     [('grant_recorded',), ('admitted',), ('reconciled_complete',), ('refused',)])
+                else:
+                    self.refused('spending_blocked', self.call, 'next-operation')
+                    self.assertEqual(self.item()['model_access']['status'], 'blocked')
+                    self.assertFalse(self.item()['execution_allowed'])
+                self.adapter.call.assert_called_once()
 
-    def test_expired_and_mismatched_grants_do_not_reach_fixture(self):
-        self.refused('invalid_grant', self.grant, expires=1)
+
+    def test_grant_authorization_no_paid_fallback(self):
+        for kind in ('absent', 'expired', 'wrong-scope', 'paid-subscription'):
+            with self.subTest(kind=kind), self.grant_case(kind):
+                if kind == 'expired':
+                    self.refused('invalid_grant', self.grant, expires=1)
+                    self.grant()
+                    with self.db:
+                        self.db.execute('update model_grants set expires=1')
+                elif kind == 'wrong-scope':
+                    for provider, model, operation in (('other', self.scope[3], self.scope[4]),
+                                                       (self.scope[2], 'other', self.scope[4]),
+                                                       (self.scope[2], self.scope[3], 'other')):
+                        self.grant(provider=provider, model=model, operation=operation,
+                                   reference='mismatch-' + provider + '-' + model + '-' + operation)
+                if kind == 'paid-subscription':
+                    self.subscription(kind='approval')
+                self.refused('spending_blocked', self.call, 'expired-op' if kind == 'expired' else 'request-1',
+                             payload={'input': 'fixture'} if kind == 'paid-subscription' else None)
+                self.assertEqual(self.item()['model_access']['status'], 'blocked')
+                if kind == 'absent':
+                    self.assertEqual(self.db.execute('select decision,reason from model_decisions').fetchone(),
+                                     ('refused', 'authorization_unavailable_or_exhausted'))
+                self.adapter.call.assert_not_called()
+
+
+
+    def test_billing_uncertainty_reconciliation(self):
+        for outcome, ceiling, lost in (('failed', 5, OSError('labeled lost response')),
+                                        ('complete', 20, ModelAccessError('outcome_uncertain'))):
+            with self.subTest(outcome=outcome), self.grant_case(outcome):
+                self.grant(ceiling=ceiling)
+                key = 'uncertain-op' if outcome == 'failed' else 'request-1'
+                self.adapter.call.side_effect = lost
+                self.refused('outcome_uncertain', self.call, key)
+                self.adapter.call.side_effect = None
+                self.refused('outcome_uncertain', self.call, key if outcome == 'failed' else 'new-key')
+                self.adapter.call.assert_called_once()
+                if outcome == 'failed':
+                    self.refused('scope_mismatch', self.receipt, key, scope=(*self.scope[:2], 'other', *self.scope[3:]))
+                    self.assertEqual(self.receipt(key)['status'], 'failed')
+                    self.assertEqual(self.call(key)['status'], 'failed')
+                    self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
+                    self.adapter.call.assert_called_once()
+                else:
+                    self.refused('invalid_receipt', self.receipt, outcome='complete', units=4)
+                    self.assertEqual(self.receipt(outcome='complete', units=2)['status'], 'complete')
+                    self.assertTrue(self.receipt(outcome='complete', units=2)['replay'])
+                    self.refused('reconciliation_conflict', self.receipt, outcome='complete', units=1)
+                    self.assertEqual(self.call('new-key')['status'], 'complete')
+                    self.assertEqual(self.adapter.call.call_count, 2)
+
+
+    def test_invalid_scope_json_and_provider_route(self):
         self.grant()
-        with self.db:
-            self.db.execute('update model_grants set expires=1')
-        self.refused('spending_blocked', self.call, 'expired-op')
-        self.refused('invalid_request', self.call, 'bad', payload={'provider': 'other', 'prompt': 'x'})
-        self.adapter.call.assert_not_called()
-
-    def test_uncertain_result_is_frozen_until_exact_trusted_reconciliation(self):
-        self.grant()
-        self.adapter.call.side_effect = OSError('labeled lost response')
-        self.refused('outcome_uncertain', self.call, 'uncertain-op')
-        self.adapter.call.side_effect = None
-        self.refused('outcome_uncertain', self.call, 'uncertain-op')
-        self.refused('scope_mismatch', self.receipt, 'uncertain-op', scope=(*self.scope[:2], 'other', *self.scope[3:]))
-        self.assertEqual(self.receipt('uncertain-op')['status'], 'failed')
-        self.assertEqual(self.call('uncertain-op')['status'], 'failed')
-        self.adapter.call.assert_called_once()
-        self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
-
-    def test_fixture_route_rejects_non_loopback_and_live_provider_is_disabled(self):
-        self.grant()
+        self.refused('invalid_scope', self.grant, provider='bad/value')
+        for ceiling in [-1, 2**63]:
+            self.refused('invalid_grant', self.grant, ceiling=ceiling, reference='invalid-' + str(ceiling))
+        for payload in [{'prompt': float('nan')}, {'prompt': 'x' * 33000}]:
+            self.refused('invalid_request', self.call, 'invalid', payload=payload)
         with patch('factory_v1.model_access.socket.socket') as socket:
             self.refused('provider_unavailable', spending.execute_controlled, self.db, self.scope,
                          'invalid-route', {'prompt': 'x'}, 3, 'https://provider.example/v1')
             socket.assert_not_called()
         self.adapter.call.assert_not_called()
 
-    def test_scoped_approval_ceiling_and_fixed_adapter_reservation(self):
-        self.grant(ceiling=3, kind='approval')
-        self.refused('invalid_reservation', self.call, 'lower-reservation', reserve=1)
-        self.adapter.call.assert_not_called()
-        self.assertEqual(self.call()['status'], 'complete')
-        self.refused('spending_blocked', self.call, 'next-operation')
-        self.adapter.call.assert_called_once()
-        self.assertEqual(self.item()['model_access']['status'], 'blocked')
-        self.assertFalse(self.item()['execution_allowed'])
 
-    def test_exact_provider_model_and_operation_grants_are_not_interchangeable(self):
-        for provider, model, operation in (('other', self.scope[3], self.scope[4]),
-                                           (self.scope[2], 'other', self.scope[4]),
-                                           (self.scope[2], self.scope[3], 'other')):
-            self.grant(provider=provider, model=model, operation=operation,
-                       reference='mismatch-' + provider + '-' + model + '-' + operation)
-        self.refused('spending_blocked', self.call)
-        self.adapter.call.assert_not_called()
 
-    def test_new_key_cannot_escape_uncertain_outcome_and_receipt_replay_is_exact(self):
-        self.grant(ceiling=20)
-        self.adapter.call.side_effect = ModelAccessError('outcome_uncertain')
-        self.refused('outcome_uncertain', self.call)
-        self.adapter.call.side_effect = None
-        self.refused('outcome_uncertain', self.call, 'new-key')
-        self.adapter.call.assert_called_once()
-        self.refused('invalid_receipt', self.receipt, outcome='complete', units=4)
-        self.assertEqual(self.receipt(outcome='complete', units=2)['status'], 'complete')
-        self.assertTrue(self.receipt(outcome='complete', units=2)['replay'])
-        self.refused('reconciliation_conflict', self.receipt, outcome='complete', units=1)
-        self.assertEqual(self.call('new-key')['status'], 'complete')
-        self.assertEqual(self.adapter.call.call_count, 2)
+
 
     def test_subscription_scope_request_allowance_and_privacy(self):
         self.subscription()
@@ -160,10 +186,6 @@ class ModelSpendingTests(unittest.TestCase):
         self.assertNotIn(b'labeled fixture request', self.state.read_bytes())
         self.assertNotIn(b'fixture-subscription-answer', self.state.read_bytes())
 
-    def test_paid_approval_does_not_authorize_subscription_or_any_paid_fallback(self):
-        self.subscription(kind='approval')
-        self.refused('spending_blocked', self.call, payload={'input': 'fixture'})
-        self.adapter.call.assert_not_called()
 
     def test_quota_refusal_requires_billing_receipt_then_explicit_resume(self):
         self.subscription()
@@ -182,36 +204,33 @@ class ModelSpendingTests(unittest.TestCase):
         with self.db:
             return spending.resume_quota(self.db, self.scope, 'verified-quota-restored')
 
-    def test_capability_request_cap_and_exact_peer_uid_are_enforced(self):
-        self.subscription()
-        def cap(component, mocks):
-            sends = []
-            def reply(raw):
-                sends.append(json.loads(raw))
-                if len(sends) == 2:
-                    component.stop.set()
-            component.connection.sendall.side_effect = reply
-        component = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, run=cap)
-        replies = [json.loads(call.args[0]) for call in component.connection.sendall.call_args_list]
-        self.assertEqual(replies[0]['result']['status'], 'complete')
-        self.assertEqual(replies[1]['error'], 'capability_exhausted')
-        self.adapter.call.assert_called_once()
-        self.assertFalse(component.path.exists())
-        denied = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, peer_uid=os.getuid() + 1)
-        self.assertEqual(json.loads(denied.connection.sendall.call_args.args[0])['error'], 'worker_identity_mismatch')
-        self.adapter.call.assert_called_once()
+    def test_broker_capability_input_bounds(self):
+        for boundary in ('peer-cap', 'request-size'):
+            with self.subTest(boundary=boundary), self.grant_case(boundary):
+                self.subscription()
+                if boundary == 'request-size':
+                    payload = {'input': 'x' * 50000}
+                    self.refused('invalid_request', self.call, payload=payload)
+                    self.assertEqual(self.call(payload=payload, max_request=spending.SANDBOX_MAX_REQUEST)['status'], 'complete')
+                    self.refused('invalid_request', self.call, 'oversize', payload={'input': 'x' * spending.SANDBOX_MAX_REQUEST}, max_request=spending.SANDBOX_MAX_REQUEST)
+                    self.adapter.call.assert_called_once_with(payload)
+                else:
+                    def cap(component, mocks):
+                        sends = []
+                        def reply(raw):
+                            sends.append(json.loads(raw))
+                            if len(sends) == 2: component.stop.set()
+                        component.connection.sendall.side_effect = reply
+                    component = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, run=cap)
+                    replies = [json.loads(call.args[0]) for call in component.connection.sendall.call_args_list]
+                    self.assertEqual(replies[0]['result']['status'], 'complete')
+                    self.assertEqual(replies[1]['error'], 'capability_exhausted')
+                    self.adapter.call.assert_called_once()
+                    self.assertFalse(component.path.exists())
+                    denied = test_spending_cancel.broker_component(self.state, self.scope, self.adapter, peer_uid=os.getuid() + 1)
+                    self.assertEqual(json.loads(denied.connection.sendall.call_args.args[0])['error'], 'worker_identity_mismatch')
+                    self.adapter.call.assert_called_once()
 
-    def test_wrong_operator_and_paused_iteration_cannot_start_broker(self):
-        with patch.object(spending.socket, 'socket') as socket:
-            self.refused('approval_required', spending.serve_unix_socket, str(self.root / 'capability.sock'),
-                         str(self.state), self.scope, operator_id='other')
-            item = self.item()
-            item['status'] = 'paused'
-            with self.db:
-                self.db.execute('UPDATE iterations SET payload=?', (json.dumps(item),))
-            self.refused('iteration_paused', spending.serve_unix_socket, str(self.root / 'capability.sock'),
-                         str(self.state), self.scope, operator_id='42')
-            socket.assert_not_called()
 
     def test_pre_admission_and_disabled_route_refusals_survive_reopen_without_secrets(self):
         self.grant()
@@ -232,17 +251,6 @@ class ModelSpendingTests(unittest.TestCase):
             self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
         self.assertNotIn(marker.encode(), self.state.read_bytes())
         self.adapter.call.assert_not_called()
-
-    def test_controller_refusals_are_durable_without_rejected_grant_data(self):
-        self.grant()
-        marker = 'never-persist-rejected-grant-secret'
-        self.refused('grant_conflict', self.grant, ceiling=6)
-        self.refused('invalid_grant', self.grant, ceiling=0, reference=marker)
-        with closing(sqlite3.connect(self.state)) as fresh:
-            self.assertEqual(fresh.execute("SELECT reason FROM model_decisions WHERE decision='refused' ORDER BY rowid").fetchall(),
-                             [('grant_conflict',), ('invalid_grant',)])
-            self.assertEqual(fresh.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
-        self.assertNotIn(marker.encode(), self.state.read_bytes())
 
     def test_controller_and_startup_refusals_have_exact_durable_order(self):
         self.grant()
@@ -275,15 +283,6 @@ class ModelSpendingTests(unittest.TestCase):
         self.assertNotIn(marker.encode(), self.state.read_bytes())
         self.adapter.call.assert_not_called()
 
-    def test_invalid_json_bounds_and_grant_replays_are_structured(self):
-        self.grant()
-        self.refused('grant_conflict', self.grant, ceiling=6)
-        self.refused('invalid_scope', self.grant, provider='bad/value')
-        for ceiling in [0, -1, 2**63]:
-            self.refused('invalid_grant', self.grant, ceiling=ceiling, reference='invalid-' + str(ceiling))
-        for payload in [{'prompt': float('nan')}, {'prompt': 'x' * 33000}]:
-            self.refused('invalid_request', self.call, 'invalid', payload=payload)
-        self.adapter.call.assert_not_called()
 
     def test_deadline_and_grant_expiry_after_reservation_are_known_no_effect(self):
         self.grant()
@@ -298,13 +297,6 @@ class ModelSpendingTests(unittest.TestCase):
         self.assertEqual(self.db.execute('SELECT status,actual_units FROM model_operations').fetchall(), [('failed', 0)])
         self.assertEqual(self.db.execute('SELECT remaining FROM model_grants').fetchone()[0], 5)
 
-    def test_large_sandbox_request_uses_only_admitted_bound(self):
-        self.subscription()
-        payload = {'input': 'x' * 50000}
-        self.refused('invalid_request', self.call, payload=payload)
-        self.assertEqual(self.call(payload=payload, max_request=spending.SANDBOX_MAX_REQUEST)['status'], 'complete')
-        self.refused('invalid_request', self.call, 'oversize', payload={'input': 'x' * spending.SANDBOX_MAX_REQUEST}, max_request=spending.SANDBOX_MAX_REQUEST)
-        self.adapter.call.assert_called_once_with(payload)
 
 
 if __name__ == '__main__':

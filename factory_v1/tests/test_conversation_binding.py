@@ -38,52 +38,52 @@ class ConversationBindingTests(unittest.TestCase):
         self.binding = ConversationBinding(self.ctx, self.config, self.fixture.github)
         self.judgment = {'assignment_id': 'origin-assignment', 'rationale': 'Genuine choices settled.', 'pending_questions': []}
 
-    def test_native_origin_hook_loads_installed_interview_not_another_agent(self):
-        self.assertIsNone(self.binding.context('other-session'))
-        self.ctx.dispatch_tool.assert_not_called()
+    def test_native_skill_loads_preserve_session_and_pending_state(self):
+        self.assertIsNone(self.binding.context('other-session')); self.ctx.dispatch_tool.assert_not_called()
         result = self.binding.context('native-origin')
         self.assertIn('factory_planning_sufficient', result['context'])
         self.assertEqual([c.args[1]['name'] for c in self.ctx.dispatch_tool.call_args_list], ['grill-me', 'grilling'])
         self.assertTrue(all(c.kwargs == {'session_id': 'native-origin'} for c in self.ctx.dispatch_tool.call_args_list))
         stored = self.fixture.stored()
-        self.assertEqual(stored['planning'].pop('native_binding'),
-                         {'assignment_id': 'origin-assignment', 'session_id': 'native-origin',
-                          'reference': self.config['reference']})
+        self.assertEqual(stored['planning'].pop('native_binding'), {'assignment_id': 'origin-assignment',
+                         'session_id': 'native-origin', 'reference': self.config['reference']})
         self.assertEqual(stored, self.item)
-
-    def test_sufficient_judgment_automatically_loads_to_spec_in_same_tool_loop(self):
-        self.binding.context('native-origin')
         output = json.loads(self.binding.sufficient(self.judgment, session_id='native-origin'))
         self.assertEqual(output['instructions'], self.selected['to-spec']['instructions'])
         self.assertIn('Execute to-spec now', output['next'])
         self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
         self.fixture.github.request.assert_not_called()
 
-    def test_unanswered_stale_wrong_session_and_unloaded_judgments_refused(self):
-        with self.assertRaises(repositories.RepositoryError):
-            self.binding.sufficient(self.judgment, session_id='native-origin')
-        self.binding.context('native-origin')
-        for args, session in (({**self.judgment, 'pending_questions': ['Which language?']}, 'native-origin'),
-                              ({**self.judgment, 'assignment_id': 'stale'}, 'native-origin'),
-                              (self.judgment, 'other-session')):
-            with self.subTest(args=args, session=session), self.assertRaises(repositories.RepositoryError):
-                self.binding.sufficient(args, session_id=session)
-        self.assertNotIn('to-spec', [c.args[1]['name'] for c in self.ctx.dispatch_tool.call_args_list])
 
-    def test_loader_catalog_claim_or_different_instructions_never_admitted(self):
-        for response in ({'success': True, 'name': 'grill-me', 'content': 'forged'}, {'success': False}):
-            self.ctx.dispatch_tool.return_value = json.dumps(response)
-            self.ctx.dispatch_tool.side_effect = None
-            with self.subTest(response=response), self.assertRaises(repositories.RepositoryError):
-                self.binding.context('native-origin')
 
-    def test_loading_to_spec_is_not_execution_or_publication_completion(self):
-        self.binding.context('native-origin')
-        self.binding.sufficient(self.judgment, session_id='native-origin')
-        with self.assertRaises(repositories.RepositoryError):
-            self.binding.complete({'sufficient': True}, session_id='native-origin')
-        self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
-        self.assertNotIn('completion_digest', self.fixture.stored()['planning'])
+    def test_native_judgment_and_loader_contract(self):
+        original = copy.deepcopy(self.item)
+        loader = self.ctx.dispatch_tool.side_effect
+        for label, loaded, changes, session, response in (
+            ('unloaded', False, {}, 'native-origin', None),
+            ('unanswered', True, {'pending_questions': ['Which language?']}, 'native-origin', None),
+            ('stale', True, {'assignment_id': 'stale'}, 'native-origin', None),
+            ('wrong-session', True, {}, 'other-session', None),
+            ('forged-instructions', False, {}, 'native-origin', {'success': True, 'name': 'grill-me', 'content': 'forged'}),
+            ('failed-loader', False, {}, 'native-origin', {'success': False}),
+        ):
+            with self.subTest(label=label):
+                self.item.clear(); self.item.update(copy.deepcopy(original)); self.fixture.persist()
+                self.ctx.dispatch_tool.reset_mock(); self.ctx.dispatch_tool.side_effect = loader
+                if loaded:
+                    self.binding.context('native-origin')
+                if response is not None:
+                    self.ctx.dispatch_tool.side_effect = None
+                    self.ctx.dispatch_tool.return_value = json.dumps(response)
+                with self.assertRaises(repositories.RepositoryError):
+                    if response is not None:
+                        self.binding.context('native-origin')
+                    else:
+                        self.binding.sufficient({**self.judgment, **changes}, session_id=session)
+                self.assertNotIn('to-spec', [c.args[1]['name'] for c in self.ctx.dispatch_tool.call_args_list])
+        self.ctx.dispatch_tool.side_effect = loader
+
+
 
     def test_registers_real_native_hook_and_tool_contracts(self):
         self.binding.register()
@@ -109,22 +109,24 @@ class ConversationBindingTests(unittest.TestCase):
             self.binding.complete(request, session_id='native-origin')
         self.assertEqual(error.exception.code, 'execution_required')
         self.assertEqual(self.fixture.stored()['planning']['status'], 'pending')
+        self.assertNotIn('completion_digest', self.fixture.stored()['planning'])
 
-    def test_pause_or_origin_drift_prevents_native_instruction_admission(self):
-        for key, value in (('status', 'paused'), ('origin', {'platform': 'discord', 'chat_id': 'different'})):
-            original = copy.deepcopy(self.item)
-            self.item[key] = value; self.fixture.persist()
-            with self.subTest(key=key), self.assertRaises(repositories.RepositoryError):
-                self.binding.context('native-origin')
-            self.ctx.dispatch_tool.assert_not_called()
-            self.item.clear(); self.item.update(original); self.fixture.persist()
+    def test_native_instruction_current_authority(self):
+        original = copy.deepcopy(self.item)
+        for field, value in (('status', 'paused'), ('origin', {'platform': 'discord', 'chat_id': 'different'}),
+                             ('instructions', original['planning']['instructions'] + '\nInvent the missing answers.')):
+            with self.subTest(field=field):
+                self.item.clear(); self.item.update(copy.deepcopy(original))
+                target = self.item['planning'] if field == 'instructions' else self.item
+                target[field] = value
+                self.fixture.persist()
+                self.ctx.dispatch_tool.reset_mock()
+                with self.assertRaises(repositories.RepositoryError):
+                    self.binding.context('native-origin')
+                self.ctx.dispatch_tool.assert_not_called()
+        self.item.clear(); self.item.update(original); self.fixture.persist()
 
-    def test_adaptation_drift_refuses_before_loading(self):
-        self.item['planning']['instructions'] += '\nInvent the missing answers.'
-        self.fixture.persist()
-        with self.assertRaises(repositories.RepositoryError):
-            self.binding.context('native-origin')
-        self.ctx.dispatch_tool.assert_not_called()
+
 
     def test_initial_plan_accepts_reviewed_installed_sources_without_repinning(self):
         original = copy.deepcopy(self.item)

@@ -98,7 +98,7 @@ class RecoveryRegistrationTests(unittest.TestCase):
         self.assertEqual(assignments.rows(self.db), rows)
         self.github.request.assert_not_called()
 
-    def test_unregistered_failure_registers_then_requires_fresh_reconciliation_without_clearing_freeze(self):
+    def test_registration_requires_fresh_reconciliation_matrix(self):
         for status in ('failed', 'unknown'):
             self.evidence['status'] = status
             identity = assignments.digest(self.evidence)
@@ -128,31 +128,30 @@ class RecoveryRegistrationTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, 'main_frozen')
                 self.assertEqual(assignments.rows(self.db), [])
 
-    def test_missing_partial_stale_and_wrong_scope_authority_reaches_real_contract_guards(self):
-        self.blocked_health()
-        for mutation, code in [({'reference': ''}, 'invalid_recovery'), ({'evidence_id': '0' * 64}, 'recovery_conflict'),
-                               ({'incident_id': 'other'}, 'recovery_held'), ({'issue': self.authorization['issue'] | {'id': 999}}, 'scope_mismatch'),
-                               ({'removable_assignments': ['f' * 64]}, 'scope_mismatch'), ({'operator_id': 'wrong'}, 'invalid_recovery')]:
-            with self.subTest(mutation=mutation): self.write_authority(self.authorization | mutation); self.refused(code)
-        self.write_authority({k: v for k, v in self.authorization.items() if k != 'paths'}); self.refused('invalid_recovery')
-        self.write_authority(); self.config_file.chmod(0o644); self.refused('execution_required')
-
-    def test_monitor_and_persisted_incident_guards_remain_authoritative(self):
+    def test_authority_monitor_and_incident_scope_matrix(self):
         original = self.blocked_health()
-        for mutation, code in [({'delivery_monitor': None}, 'recovery_held'),
-                               ({'delivery_monitor': original['delivery_monitor'] | {'config_sha256': '0' * 64}}, 'invalid_delivery'),
-                               ({'main_incident': original['main_incident'] | {'latest_evidence': '0' * 64}}, 'invalid_delivery')]:
-            self.save(original | mutation); self.refused(code)
-        self.save(original); self.github.base = 'https://wrong.test'; self.refused('scope_mismatch')
+        authority_cases = [({'reference': ''}, 'invalid_recovery'), ({'evidence_id': '0' * 64}, 'recovery_conflict'),
+                           ({'incident_id': 'other'}, 'recovery_held'), ({'issue': self.authorization['issue'] | {'id': 999}}, 'scope_mismatch'),
+                           ({'removable_assignments': ['f' * 64]}, 'scope_mismatch'), ({'operator_id': 'wrong'}, 'invalid_recovery')]
+        cases = [('authority-' + str(index), self.authorization | change, {}, 0o600, self.config['api_base'], code)
+                 for index, (change, code) in enumerate(authority_cases)]
+        cases += [
+            ('missing-paths', {k: v for k, v in self.authorization.items() if k != 'paths'}, {}, 0o600, self.config['api_base'], 'invalid_recovery'),
+            ('public-authority', self.authorization, {}, 0o644, self.config['api_base'], 'execution_required'),
+            ('missing-monitor', self.authorization, {'delivery_monitor': None}, 0o600, self.config['api_base'], 'recovery_held'),
+            ('monitor-digest', self.authorization, {'delivery_monitor': original['delivery_monitor'] | {'config_sha256': '0' * 64}}, 0o600, self.config['api_base'], 'invalid_delivery'),
+            ('incident-evidence', self.authorization, {'main_incident': original['main_incident'] | {'latest_evidence': '0' * 64}}, 0o600, self.config['api_base'], 'invalid_delivery'),
+            ('api-scope', self.authorization, {}, 0o600, 'https://wrong.test', 'scope_mismatch'),
+        ]
+        for label, authority, item_change, mode, api_base, code in cases:
+            with self.subTest(case=label):
+                self.save(original | copy.deepcopy(item_change))
+                self.write_authority(authority)
+                self.config_file.chmod(mode)
+                self.github.base = api_base
+                self.refused(code)
 
-    def test_pause_and_affected_revision_holds_refuse_registration(self):
-        original = self.blocked_health()
-        controls.request(self.db, 'p', 'i', 'operator', 'pause', 'SIMULATED interruption'); self.refused('iteration_paused')
-        _, path = controls.paths(self.db, 'p', 'i'); path.unlink()
-        self.save(original | {'status': 'paused'}); self.refused('iteration_paused')
-        self.save(original | {'requirement_changes': {'revision': {'kind': 'material', 'status': 'held', 'affected': [20]}}}); self.refused('requirements_held')
-
-    def test_unknown_other_effects_and_malformed_receipts_cannot_use_health_registration_lane(self):
+    def test_pending_effect_and_worker_absence_matrix(self):
         original = self.blocked_health()
         for blocker in [{'boundary': 'tracker', 'code': 'publication_uncertain'}, {'boundary': 'model', 'code': 'operation_uncertain'},
                         {'boundary': 'worker', 'code': 'worker_uncertain'}, {'boundary': 'restart', 'code': 'reconciliation_interrupted'}]:
@@ -161,8 +160,7 @@ class RecoveryRegistrationTests(unittest.TestCase):
                 self.refused('reconciliation_required')
         self.save(original | {'restart_reconciliation': {'status': 'blocked'}}); self.refused('invalid_restart')
 
-    def test_worker_absence_guard_is_reached_before_registration_parks_ownership(self):
-        self.blocked_health()
+        self.save(original)
         for runtime in ({'status': 'running', 'container_removed': True}, {'status': 'failed', 'container_removed': False},
                         {'status': 'stopped', 'container_removed': None}):
             row = {'assignment_id': 'f' * 64, 'ticket_scope': {'project': 'p', 'iteration': 'i'},
@@ -171,8 +169,22 @@ class RecoveryRegistrationTests(unittest.TestCase):
             with self.db: self.db.execute('INSERT OR REPLACE INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
             with self.subTest(runtime=runtime): self.refused('run_conflict')
 
-    def test_pause_and_restart_or_revision_drift_at_last_issue_read_admit_no_registration(self):
+    def test_control_revision_and_last_read_drift_matrix(self):
         original = self.blocked_health()
+        for label, change, code in [
+            ('sidecar', {}, 'iteration_paused'),
+            ('status', {'status': 'paused'}, 'iteration_paused'),
+            ('revision', {'requirement_changes': {'revision': {'kind': 'material', 'status': 'held', 'affected': [20]}}}, 'requirements_held'),
+        ]:
+            with self.subTest(before_read=label):
+                self.save(original | change)
+                if label == 'sidecar':
+                    controls.request(self.db, 'p', 'i', 'operator', 'pause', 'SIMULATED interruption')
+                self.refused(code)
+                if label == 'sidecar':
+                    _, path = controls.paths(self.db, 'p', 'i')
+                    assert path is not None
+                    path.unlink()
         for drift, code in [('pause', 'iteration_paused'), ('restart', 'reconciliation_required'), ('revision', 'requirements_held')]:
             self.save(original)
             def read(*args):

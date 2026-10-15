@@ -145,24 +145,33 @@ class PlanningTests(unittest.TestCase):
         self.assertEqual(self.complete(request), result); self.assertEqual(self.inspect(), result)
         self.assertTrue(all(len(c.args) == 1 for c in self.github.request.call_args_list))
 
-    def test_missing_ambiguous_wrong_name_and_changed_skill_pins(self):
+    def test_planning_skill_and_revision_admission(self):
         before = self.inspect()
-        for defect in ('missing', 'duplicate', 'hash', 'name', 'future', 'path'):
-            request = copy.deepcopy(self.plan_request)
-            if defect == 'missing': request['skills'].pop()
-            if defect == 'duplicate': request['skills'].append(request['skills'][0])
-            if defect == 'hash': request['skills'][0]['sha256'] = '0' * 64
-            if defect == 'name': request['skills'][0]['path'] = request['skills'][1]['path']
-            if defect == 'future': request['skills'].append({'name': 'to-tickets', 'path': '/never-read', 'sha256': '0' * 64})
-            if defect == 'path': request['skills'][0]['path'] = str(self.root / 'absent')
+        for defect in ('missing', 'duplicate', 'hash', 'name', 'future', 'path', 'assigned-byte-drift'):
             with self.subTest(defect=defect):
+                request = copy.deepcopy(self.plan_request)
+                if defect == 'assigned-byte-drift':
+                    path = self.root / 'grilling.md'; path.write_bytes(Path(self.skills[1]['path']).read_bytes())
+                    self.skills[1]['path'] = str(path)
+                    completion = self.completion(); pending = self.inspect(); path.write_text('Changed instructions')
+                    self.assert_refused(lambda: self.complete(completion), pending, 'skill_blocked')
+                    self.github.request.assert_not_called()
+                    continue
+                if defect == 'missing': request['skills'].pop()
+                if defect == 'duplicate': request['skills'].append(request['skills'][0])
+                if defect == 'hash': request['skills'][0]['sha256'] = '0' * 64
+                if defect == 'name': request['skills'][0]['path'] = request['skills'][1]['path']
+                if defect == 'future': request['skills'].append({'name': 'to-tickets', 'path': '/never-read', 'sha256': '0' * 64})
+                if defect == 'path': request['skills'][0]['path'] = str(self.root / 'absent')
                 self.assert_refused(lambda: planning.plan(self.database, self.item, request), before, 'skill_blocked')
+
 
     def test_docs_issue_and_commit_mismatches_never_complete(self):
         request = self.completion(); before = self.inspect()
-        for defect in ('bytes', 'blob', 'path', 'symlink', 'base64', 'commit', 'body', 'number', 'url', 'repo', 'pr', 'closed', 'label', 'issue_id'):
+        for defect in ('bytes', 'blob', 'path', 'symlink', 'base64', 'commit', 'body', 'number', 'url', 'repo', 'pr', 'closed', 'label', 'issue_id', 'repository-id'):
             self.publication(request)
             doc = next(v for k, v in self.published.items() if '/contents/' in k); issue = self.published[self.issue_path]
+            if defect == 'repository-id': self.published['/repos/example/product']['id'] = 999
             if defect == 'bytes': doc['content'] = base64.b64encode(b'stale').decode()
             if defect == 'blob': doc['sha'] = 'b' * 40
             if defect == 'path': doc['path'] = 'wrong.md'
@@ -177,38 +186,33 @@ class PlanningTests(unittest.TestCase):
             if defect == 'closed': issue['state'] = 'closed'
             if defect == 'label': issue['labels'] = []
             if defect == 'issue_id': issue['id'] = 0
-            with self.subTest(defect=defect): self.assert_refused(lambda: self.complete(request), before, 'publication_mismatch')
-
-    def test_new_assignment_invalidates_handoff_ticket_stage_and_reservation(self):
-        request = self.completion(); self.publication(request); result = self.completed(request)
-        result.update(ticket_work={'status': 'published'}, reservation={'status': 'reserved'})
-        repositories.save_iteration(self.database, result); self.database.commit()
-        replacement = planning.plan(self.database, result, {**self.plan_request, 'expected_revision': 1})
-        self.assertEqual(replacement['planning']['revision'], 2); self.assertEqual(replacement['planning_history'][0]['status'], 'complete')
-        self.assertNotIn('handoff', replacement); self.assertNotIn('ticket_work', replacement)
-        self.assertEqual(replacement['ticket_history'], [{'status': 'published'}]); self.assertEqual(replacement['reservation']['status'], 'invalidated')
-        self.assert_refused(lambda: self.complete(request), replacement, 'planning_conflict')
-
-    def test_locked_reload_ignores_stale_onboarding_snapshot_for_assignment_and_completion(self):
-        stale = self.inspect(); request = self.completion(); self.publication(request)
-        result = planning.complete(self.database, stale, request, self.github)
-        self.assertEqual(self.inspect(), result); self.assertEqual(result['planning']['status'], 'complete')
-        self.completed(request)
-        replacement = planning.plan(self.database, stale, {**self.plan_request, 'expected_revision': 1})
-        self.assertEqual(self.inspect(), replacement); self.assertEqual(replacement['planning']['revision'], 2)
-        self.assertEqual(replacement['planning_history'][0]['status'], 'complete'); self.assertNotIn('handoff', replacement)
-
-    def test_identity_endpoint_and_completed_issue_continuity(self):
-        request = self.completion(); self.publication(request); before = self.inspect()
-        self.repo['id'] = 999
-        self.assert_refused(lambda: self.complete(request), before, 'repository_mismatch')
-        self.repo['id'] = 123; result = self.complete(request)
+            with self.subTest(defect=defect): self.assert_refused(lambda: self.complete(request), before,
+                'repository_mismatch' if defect == 'repository-id' else 'publication_mismatch')
+            self.repo['id'] = 123
+        self.publication(request); result = self.complete(request)
         for field, value in (('id', 701), ('body', 'changed')):
             self.published[self.issue_path][field] = value
             self.assert_refused(lambda: self.complete(request), result, 'publication_mismatch')
             self.published[self.issue_path][field] = 700 if field == 'id' else request['documents']['milestone.md']
         self.github.base += '/other'; self.github.request.reset_mock()
         self.assert_refused(lambda: self.complete(request), result, 'capability_conflict'); self.github.request.assert_not_called()
+
+    def test_planning_replacement_uses_locked_current_state(self):
+        stale = self.inspect(); request = self.completion(); self.publication(request)
+        result = planning.complete(self.database, stale, request, self.github)
+        self.assertEqual(self.inspect(), result); self.assertEqual(result['planning']['status'], 'complete')
+        result = self.completed(request)
+        result.update(ticket_work={'status': 'published'}, reservation={'status': 'reserved'})
+        repositories.save_iteration(self.database, result); self.database.commit()
+        replacement = planning.plan(self.database, stale, {**self.plan_request, 'expected_revision': 1})
+        self.assertEqual(self.inspect(), replacement)
+        self.assertEqual(replacement['planning']['revision'], 2); self.assertEqual(replacement['planning_history'][0]['status'], 'complete')
+        self.assertNotIn('handoff', replacement); self.assertNotIn('ticket_work', replacement)
+        self.assertEqual(replacement['ticket_history'], [{'status': 'published'}]); self.assertEqual(replacement['reservation']['status'], 'invalidated')
+        self.assert_refused(lambda: self.complete(request), replacement, 'planning_conflict')
+
+
+
 
     def test_malformed_origin_stale_revision_parent_and_completed_replacement_refused(self):
         request = self.completion(); before = self.inspect()
@@ -232,10 +236,6 @@ class PlanningTests(unittest.TestCase):
         request = copy.deepcopy(self.plan_request); request['skills'][0]['path'] = str(path)
         self.assert_refused(lambda: planning.plan(self.database, self.item, request), before, 'planning_conflict')
 
-    def test_changed_skill_after_assignment_blocks_completion_without_reads(self):
-        path = self.root / 'grilling.md'; path.write_bytes(Path(self.skills[1]['path']).read_bytes()); self.skills[1]['path'] = str(path)
-        request = self.completion(); before = self.inspect(); path.write_text('Changed instructions')
-        self.assert_refused(lambda: self.complete(request), before, 'skill_blocked'); self.github.request.assert_not_called()
 
     def test_wrong_operator_is_refused_at_current_state_seam(self):
         from factory_v1 import assignments

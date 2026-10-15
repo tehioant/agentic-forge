@@ -1,5 +1,6 @@
 """Direct engineering seams; legacy sibling fixture helpers are not discovered."""
 import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -14,6 +15,53 @@ from factory_v1 import assignments, review, simplification
 from factory_v1.repositories import GitHub, RepositoryError
 from factory_v1.tests import test_assignments, test_simplification
 
+
+
+@contextmanager
+def component_case(cls):
+    case = cls(methodName='runTest')
+    try:
+        case.setUp()
+        yield case
+    finally:
+        case.doCleanups()
+
+
+@contextmanager
+def candidate_case():
+    case = ReviewComponentTests(methodName='runTest')
+    try:
+        directory = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
+        case.addCleanup(directory.cleanup)
+        case.root = Path(directory.name)
+        case.database = sqlite3.connect(case.root / 'state.sqlite')
+        case.addCleanup(case.database.close)
+        case.database.executescript('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT);'
+                                   'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
+        case.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps({
+            'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+            'approval': {'operator_id': '42', 'reference': 'local review fixture'}})))
+        root = case.root / 'candidate'
+        root.mkdir(mode=0o700)
+        case.e = test_simplification.LocalStageEvidence(root)
+        case.candidate = case.e.assignment
+        case.candidate['simplification_result'] = {
+            'contract': simplification.CONTRACT, 'outcome': 'no-op',
+            'candidate_sha256': case.e.runtime['candidate_sha256'],
+            'input_candidate_sha256': case.e.contract['input_candidate_sha256'], 'changed_paths': [],
+            'checks_verified': True, 'behavior_preservation_claim': 'preserved',
+            'native_execution_trusted': False, 'approval': False, 'advance_allowed': False,
+            'review_required': ['Standards', 'Spec'], 'findings': [],
+            'reason': 'native_execution_unattested_and_independent_review_required'}
+        case.candidate['submitted_result'] = case.e.result(case.e.report())
+        case.candidate['handoff'].update(repository='example/product', repository_id=123,
+            workspace=str(case.root / 'workspace'), standards=[], profile={'name': 'candidate', 'home': str(case.root / 'candidate-home')})
+        case.e.seal_handoff()
+        case.store(case.candidate)
+        case.pins = review.pins(case.candidate, case.e.initial, case.e.baseline)
+        yield case
+    finally:
+        case.doCleanups()
 
 class ReviewTests(unittest.TestCase):
     def setUp(self):
@@ -251,41 +299,46 @@ class ReviewComponentTests(unittest.TestCase):
     def evaluate(self, config=None):
         return review.evaluate(self.database, 'product', 'm1', '42', self.request, self.github, config)
 
-    def test_pair_authority_replay_and_private_exact_binding(self):
-        self.assertEqual(self.evaluate()['status'], 'execution-unverified')
-        path = self.authorization()
-        accepted = self.evaluate(path)
-        self.assertTrue(accepted['advance_allowed'])
-        self.assertFalse(accepted['merge_allowed'])
-        self.assertFalse(accepted['close_allowed'])
-        self.assertEqual(self.evaluate(), accepted)
-        with closing(sqlite3.connect(self.root / 'state.sqlite')) as restarted:
-            self.assertEqual(assignments.inspect(restarted, 'product', 'm1', '42', self.axes[0]['assignment_id'])['review_authorization']['axes'],
-                             [review.execution_binding(a) for a in self.axes])
-        (Path(self.axes[0]['runtime']['artifacts']) / 'scratch/conversation.json').write_text('drift')
-        with self.assertRaises(RepositoryError) as refusal:
-            self.evaluate()
-        self.assertEqual(refusal.exception.code, 'execution_required')
+    def test_review_host_authority_cases(self):
+        cases = [('absent', None), ('durable', None), ('public', 'approval_required'),
+                 ('pin', 'execution_required'), ('mounted', 'approval_required'), ('saved-drift', 'execution_required')]
+        for mode, code in cases:
+            with self.subTest(mode=mode), component_case(ReviewComponentTests) as case:
+                path = None if mode == 'absent' else case.authorization()
+                if mode == 'public':
+                    path.chmod(0o644)
+                elif mode == 'pin':
+                    data = json.loads(path.read_text())
+                    data['axes'][0]['pins']['spec_commit'] = 'f' * 40
+                    path.write_text(json.dumps(data))
+                elif mode == 'mounted':
+                    mounted = Path(case.axes[0]['runtime']['artifacts']) / 'scratch/authority.json'
+                    mounted.write_bytes(path.read_bytes())
+                    mounted.chmod(0o600)
+                    path = mounted
+                elif mode == 'saved-drift':
+                    grant = json.loads(path.read_text())
+                    for axis in case.axes:
+                        axis['review_authorization'] = copy.deepcopy(grant)
+                        case.store(axis)
+                    (Path(case.axes[0]['runtime']['artifacts']) / 'scratch/conversation.json').write_text('drift')
+                    path = None
+                if code:
+                    with self.assertRaises(RepositoryError) as refusal:
+                        case.evaluate(path)
+                    self.assertEqual(refusal.exception.code, code)
+                else:
+                    feedback = case.evaluate(path)
+                    self.assertEqual(feedback['status'], 'execution-unverified' if mode == 'absent' else 'accepted')
+                    if mode == 'durable':
+                        self.assertTrue(feedback['advance_allowed'])
+                        self.assertFalse(feedback['merge_allowed'])
+                        self.assertFalse(feedback['close_allowed'])
+                        self.assertEqual(case.evaluate(), feedback)
+                        with closing(sqlite3.connect(case.root / 'state.sqlite')) as restarted:
+                            self.assertEqual(assignments.inspect(restarted, 'product', 'm1', '42', case.axes[0]['assignment_id'])['review_authorization']['axes'],
+                                [review.execution_binding(a) for a in case.axes])
 
-    def test_authorization_mode_mount_and_pin_drift_refuse(self):
-        path = self.authorization()
-        path.chmod(0o644)
-        with self.assertRaises(RepositoryError) as refusal:
-            self.evaluate(path)
-        self.assertEqual(refusal.exception.code, 'approval_required')
-        path.chmod(0o600)
-        data = json.loads(path.read_text())
-        data['axes'][0]['pins']['spec_commit'] = 'f' * 40
-        path.write_text(json.dumps(data))
-        with self.assertRaises(RepositoryError) as refusal:
-            self.evaluate(path)
-        self.assertEqual(refusal.exception.code, 'execution_required')
-        mounted = Path(self.axes[0]['runtime']['artifacts']) / 'scratch/authority.json'
-        mounted.write_bytes(self.authorization().read_bytes())
-        mounted.chmod(0o600)
-        with self.assertRaises(RepositoryError) as refusal:
-            self.evaluate(mounted)
-        self.assertEqual(refusal.exception.code, 'approval_required')
 
     def test_lone_adverse_axis_holds_old_and_later_passing_pairs(self):
         self.evaluate(self.authorization())
@@ -390,29 +443,41 @@ class ReviewComponentTests(unittest.TestCase):
         self.preflight.assert_called_once_with(self.database, 'product', 'm1', '42', expected, self.github, True)
         self.assertEqual(assignments.rows(self.database), before)
 
-    def test_security_weakening_requires_exact_scoped_policy_grant_and_still_corrections(self):
-        self.adverse(self.axes[1], kind='security-weakening')
-        feedback = self.evaluate()
-        self.assertEqual(feedback['status'], 'operator-decision')
-        self.assertEqual(feedback['policy_findings'], ['Spec:R1'])
-        self.assertFalse(feedback['advance_allowed'])
-        for decision in (None,
-                         {'reference': 'Local unrelated axis grant', 'paths': [], 'findings': ['Standards:R1']},
-                         {'reference': 'Local unrelated finding grant', 'paths': [], 'findings': ['Spec:R2']},
-                         {'reference': 'Local excess path grant', 'paths': ['hello.py'], 'findings': ['Spec:R1']}):
-            with self.subTest(decision=decision):
-                feedback = self.evaluate(self.authorization(decision))
-                self.assertEqual(feedback['status'], 'operator-decision')
-                self.assertFalse(feedback['advance_allowed'])
-        exact = {'reference': 'Local explicit security decision', 'paths': [], 'findings': ['Spec:R1']}
-        feedback = self.evaluate(self.authorization(exact))
-        self.assertEqual(feedback['status'], 'corrections')
-        self.assertEqual(feedback['policy_findings'], ['Spec:R1'])
-        self.assertEqual(feedback['findings'][0]['kind'], 'security-weakening')
-        self.assertFalse(feedback['advance_allowed'])
-        self.assertFalse(feedback['merge_allowed'])
-        self.assertFalse(feedback['close_allowed'])
-        self.assertEqual(self.evaluate(), feedback)
+    def test_review_exact_policy_decision_cases(self):
+        workflow = '.github/workflows/check.yml'
+        cases = [('security', None, 'operator-decision'),
+            ('security', {'reference': 'Local unrelated axis grant', 'paths': [], 'findings': ['Standards:R1']}, 'operator-decision'),
+            ('security', {'reference': 'Local unrelated finding grant', 'paths': [], 'findings': ['Spec:R2']}, 'operator-decision'),
+            ('security', {'reference': 'Local excess path grant', 'paths': ['hello.py'], 'findings': ['Spec:R1']}, 'operator-decision'),
+            ('security', {'reference': 'Local explicit security decision', 'paths': [], 'findings': ['Spec:R1']}, 'corrections'),
+            ('workflow', None, 'operator-decision'),
+            ('workflow', {'reference': 'Local unrelated decision', 'paths': [], 'findings': []}, 'operator-decision'),
+            ('workflow', {'reference': 'Local exact decision', 'paths': [workflow], 'findings': []}, 'accepted')]
+        for family, decision, status in cases:
+            with self.subTest(family=family, decision=decision), component_case(ReviewComponentTests) as case:
+                if family == 'security':
+                    case.adverse(case.axes[1], kind='security-weakening')
+                else:
+                    for axis in case.axes:
+                        axis['handoff']['review'].update(policy_paths=[workflow], test_changes=['test_hello.py'])
+                        axis['handoff_digest'] = assignments.digest(axis['handoff'])
+                        axis['submitted_result']['handoff_digest'] = axis['handoff_digest']
+                        (Path(axis['runtime']['artifacts']) / 'scratch/result.json').write_text(json.dumps(axis['submitted_result']))
+                        case.store(axis)
+                feedback = case.evaluate(case.authorization(decision))
+                self.assertEqual(feedback['status'], status)
+                if family == 'security':
+                    self.assertEqual(feedback['policy_findings'], ['Spec:R1'])
+                    self.assertEqual(feedback['findings'][0]['kind'], 'security-weakening')
+                    self.assertFalse(feedback['advance_allowed'])
+                    self.assertFalse(feedback['merge_allowed'])
+                    self.assertFalse(feedback['close_allowed'])
+                    if status == 'corrections':
+                        self.assertEqual(case.evaluate(), feedback)
+                    if decision is None:
+                        self.assertEqual(case.evaluate()['status'], 'operator-decision')
+                else:
+                    self.assertEqual(case.axes[1]['handoff']['review']['test_changes'], ['test_hello.py'])
 
     def test_handoff_refuses_each_changed_scope_or_preceding_with_valid_candidate(self):
         prior, root, source, baseline, checks = review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
@@ -437,49 +502,45 @@ class ReviewComponentTests(unittest.TestCase):
                 self.assertEqual(assignments.rows(self.database), before)
         self.assertEqual(review.handoff(self.database, 'product', 'm1', '42', request), contract)
 
-    def test_candidate_reader_binds_raw_receipt_baseline_and_resealed_check_commands(self):
-        def read():
-            return review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
-        self.assertEqual(read()[2], self.e.initial)
-        receipt_path = self.e.root / 'controller-checks.json'
-        raw = receipt_path.read_bytes()
-        # Identical JSON semantics cannot authorize changed private raw bytes.
-        receipt_path.write_bytes(raw + b'\n')
-        self.assertEqual(json.loads(receipt_path.read_bytes()), json.loads(raw))
-        with self.assertRaises(RepositoryError) as refusal:
-            read()
-        self.assertEqual(refusal.exception.code, 'candidate_unverified')
-        receipt_path.write_bytes(raw)
-        self.assertEqual(read()[2], self.e.initial)
-        baseline_path = self.e.root / 'inputs/baseline/hello.py'
-        baseline_raw = baseline_path.read_bytes()
-        initial_path = self.e.root / 'initial-source.json'
-        initial_raw = initial_path.read_bytes()
-        baseline_path.write_text('changed baseline\n')
-        changed_baseline = review.manifest(self.e.root / 'inputs/baseline')
-        # Reseal ancillary source metadata; retain the admitted runtime baseline pin.
-        initial_path.write_text(json.dumps({'workspace': self.e.initial, 'baseline': changed_baseline}))
-        self.assertEqual(simplification.check_receipt(self.e.root, self.e.runtime)[0], self.e.initial)
-        with self.assertRaises(RepositoryError) as refusal:
-            read()
-        self.assertEqual(refusal.exception.code, 'candidate_unverified')
-        baseline_path.write_bytes(baseline_raw)
-        initial_path.write_bytes(initial_raw)
-        self.assertEqual(read()[3], self.e.baseline)
-        # Valid passing receipt, correctly resealed raw digest, but an unadmitted command.
-        changed = json.loads(raw)
-        changed['records'][0]['command'] = 'python -m unittest unrelated_tests -v'
-        receipt_path.write_text(json.dumps(changed))
-        row = copy.deepcopy(self.candidate)
-        row['runtime']['checks_sha256'] = hashlib.sha256(receipt_path.read_bytes()).hexdigest()
-        self.store(row)
-        self.assertEqual(simplification.check_receipt(self.e.root, row['runtime'])[2], changed)
-        with self.assertRaises(RepositoryError) as refusal:
-            read()
-        self.assertEqual(refusal.exception.code, 'candidate_unverified')
-        receipt_path.write_bytes(raw)
-        self.store(self.candidate)
-        self.assertEqual(read()[2:4], (self.e.initial, self.e.baseline))
+    def test_review_candidate_admission_cases(self):
+        cases = [('valid', None), ('raw-newline', 'candidate_unverified'), ('baseline', 'candidate_unverified'),
+                 ('command', 'candidate_unverified'), ('outcome', 'candidate_unverified'),
+                 ('checks', 'candidate_unverified'), ('findings', 'candidate_unverified'), ('correction', 'stale_review')]
+        for mode, code in cases:
+            with self.subTest(mode=mode), candidate_case() as case:
+                receipt = case.e.root / 'controller-checks.json'
+                raw = receipt.read_bytes()
+                row = copy.deepcopy(case.candidate)
+                if mode == 'raw-newline':
+                    receipt.write_bytes(raw + b'\n')
+                    self.assertEqual(json.loads(receipt.read_bytes()), json.loads(raw))
+                elif mode == 'baseline':
+                    (case.e.root / 'inputs/baseline/hello.py').write_text('changed baseline\n')
+                    changed = review.manifest(case.e.root / 'inputs/baseline')
+                    (case.e.root / 'initial-source.json').write_text(json.dumps({'workspace': case.e.initial, 'baseline': changed}))
+                    self.assertEqual(simplification.check_receipt(case.e.root, row['runtime'])[0], case.e.initial)
+                elif mode == 'command':
+                    changed = json.loads(raw)
+                    changed['records'][0]['command'] = 'python -m unittest unrelated_tests -v'
+                    receipt.write_text(json.dumps(changed))
+                    row['runtime']['checks_sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
+                    self.assertEqual(simplification.check_receipt(case.e.root, row['runtime'])[2], changed)
+                elif mode in ('outcome', 'checks', 'findings'):
+                    changes = {'outcome': {'outcome': 'findings'}, 'checks': {'checks_verified': False},
+                               'findings': {'findings': ['unresolved']}}
+                    row['simplification_result'].update(changes[mode])
+                elif mode == 'correction':
+                    case.store({'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(row['ticket_scope']),
+                        'handoff': {'corrections': {'pins': case.pins}},
+                        'runtime': {'status': 'complete'}, 'submitted_result': {'status': 'done'}})
+                case.store(row)
+                if code:
+                    with self.assertRaises(RepositoryError) as refusal:
+                        review.candidate(case.database, 'product', 'm1', '42', row['assignment_id'])
+                    self.assertEqual(refusal.exception.code, code)
+                else:
+                    admitted = review.candidate(case.database, 'product', 'm1', '42', row['assignment_id'])
+                    self.assertEqual(admitted[2:4], (case.e.initial, case.e.baseline))
 
     def test_pair_independence_checks_and_resealed_pin_matrix(self):
         for field, value, code in [('status', 'failed', 'review_incomplete'), ('container_removed', False, 'review_incomplete')]:
@@ -504,24 +565,6 @@ class ReviewComponentTests(unittest.TestCase):
             self.evaluate()
         self.assertEqual(refusal.exception.code, 'stale_review')
 
-    def test_candidate_receipts_supersession_and_independent_holds(self):
-        self.assertEqual(review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])[2], self.e.initial)
-        for change in ({'outcome': 'findings'}, {'checks_verified': False}, {'findings': ['unresolved']}):
-            row = copy.deepcopy(self.candidate)
-            row['simplification_result'].update(change)
-            self.store(row)
-            with self.subTest(change=change):
-                with self.assertRaises(RepositoryError) as refusal:
-                    review.candidate(self.database, 'product', 'm1', '42', row['assignment_id'])
-                self.assertEqual(refusal.exception.code, 'candidate_unverified')
-        self.store(self.candidate)
-        child = {'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(self.candidate['ticket_scope']),
-                 'handoff': {'corrections': {'pins': self.pins}},
-                 'runtime': {'status': 'complete'}, 'submitted_result': {'status': 'done'}}
-        self.store(child)
-        with self.assertRaises(RepositoryError) as refusal:
-            review.candidate(self.database, 'product', 'm1', '42', self.candidate['assignment_id'])
-        self.assertEqual(refusal.exception.code, 'stale_review')
 
     def test_real_staging_and_policy_test_path_derivation(self):
         e = self.e
@@ -590,19 +633,6 @@ class ReviewComponentTests(unittest.TestCase):
             review.corrections_handoff(self.database, 'product', 'm1', '42', request, self.github)
         self.assertEqual(refusal.exception.code, 'scope_mismatch')
 
-    def test_exact_policy_path_direction_does_not_hide_test_changes(self):
-        for axis in self.axes:
-            axis['handoff']['review'].update(policy_paths=['.github/workflows/check.yml'], test_changes=['test_hello.py'])
-            axis['handoff_digest'] = assignments.digest(axis['handoff'])
-            axis['submitted_result']['handoff_digest'] = axis['handoff_digest']
-            (Path(axis['runtime']['artifacts']) / 'scratch/result.json').write_text(json.dumps(axis['submitted_result']))
-            self.store(axis)
-        self.assertEqual(self.evaluate(self.authorization())['status'], 'operator-decision')
-        wrong = {'reference': 'Local unrelated decision', 'paths': [], 'findings': []}
-        self.assertEqual(self.evaluate(self.authorization(wrong))['status'], 'operator-decision')
-        exact = {**wrong, 'paths': ['.github/workflows/check.yml']}
-        self.assertEqual(self.evaluate(self.authorization(exact))['status'], 'accepted')
-        self.assertEqual(self.axes[1]['handoff']['review']['test_changes'], ['test_hello.py'])
 
     def test_pause_and_stopped_axis_never_authorize_acceptance(self):
         from factory_v1 import controls

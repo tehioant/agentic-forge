@@ -152,48 +152,40 @@ class ResolutionCheckpointTests(unittest.TestCase):
                             self.assertTrue(work.get('membership_intent') if is_bug else work['intents']['note']['membership'])
                         f.doCleanups()
 
-    def test_ordinary_publication_does_not_acquire_a_new_restart_exception(self):
-        for cls in (fixtures.TicketResolutionTests, fixtures.BugResolutionTests):
-            with self.subTest(cls=cls.__name__):
+    def test_ordinary_publication_no_restart_exception_matrix(self):
+        for cls, phase in ((fixtures.TicketResolutionTests, 'membership'),
+                           (fixtures.BugResolutionTests, 'membership'),
+                           (fixtures.TicketResolutionTests, 'final-frontier')):
+            with self.subTest(cls=cls.__name__, phase=phase):
                 f = self.fixture(cls)
-                f.f.item.pop('restart_reconciliation')
+                if phase == 'membership':
+                    f.f.item.pop('restart_reconciliation')
+                else:
+                    f.f.work.update(publication_complete=True, status='published')
                 f.f.persist() if cls is fixtures.TicketResolutionTests else f.f.save()
                 original = f.f.membership if cls is fixtures.TicketResolutionTests else f.f.membership.side_effect
                 injected = None
                 def read(*args):
                     nonlocal injected
-                    member = original(*args)
-                    if member is None and injected is None:
+                    member = original(*args) if phase == 'membership' else []
+                    if injected is None and (phase == 'final-frontier' or member is None):
                         item = f.f.stored()
-                        item['restart_reconciliation'] = fixtures.blocked('tracker')
+                        if phase == 'membership':
+                            item['restart_reconciliation'] = fixtures.blocked('tracker')
+                        else:
+                            item['restart_reconciliation']['blockers'].append({'boundary': 'model', 'code': 'operation_uncertain'})
                         tickets.checkpoint(f.f.database, item)
                         injected = item
                     return member
-                with patch.object(tickets.gh, 'membership', side_effect=read), self.assertRaises(IntakeError):
+                target = 'membership' if phase == 'membership' else 'project_items'
+                with patch.object(tickets.gh, target, side_effect=read), self.assertRaises(IntakeError):
                     f.publish()
                 self.assertIsNotNone(injected)
                 self.assertEqual(f.f.stored(), injected)
                 f.f.add_item.assert_not_called()
+                f.f.set_field.assert_not_called()
                 f.doCleanups()
 
-    def test_published_ticket_final_frontier_read_cannot_erase_new_hold(self):
-        f = self.fixture(fixtures.TicketResolutionTests)
-        f.f.work.update(publication_complete=True, status='published')
-        f.f.persist()
-        injected = None
-        def read(*args):
-            nonlocal injected
-            item = f.f.stored()
-            item['restart_reconciliation']['blockers'].append({'boundary': 'model', 'code': 'operation_uncertain'})
-            tickets.checkpoint(f.f.database, item)
-            injected = item
-            return []
-        with patch.object(tickets.gh, 'project_items', side_effect=read), self.assertRaises(IntakeError):
-            f.publish()
-        self.assertIsNotNone(injected)
-        self.assertEqual(f.f.stored(), injected)
-        f.f.add_item.assert_not_called()
-        f.f.set_field.assert_not_called()
 
 
 if __name__ == '__main__':

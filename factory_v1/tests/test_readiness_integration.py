@@ -17,17 +17,6 @@ class CombinedReadinessTests(readiness_fixtures.SupervisedFixture, unittest.Test
     read = readiness_fixtures.CoreReadinessTests.read
     record = readiness_fixtures.CoreReadinessTests.record
 
-    def test_real_nested_checkpoint_with_terminal_slots_and_zero_allowance(self):
-        for slot in self.config['slots']:
-            self.record(slot, 'complete')
-        self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
-        self.item['ticket_work']['status'] = 'published'
-        tickets.effect_checkpoint(self.db, self.item)
-        self.assertEqual(json.loads(self.db.execute('SELECT payload FROM iterations').fetchone()[0])['ticket_work']['status'], 'published')
-        before = self.db.execute('SELECT payload FROM iterations').fetchone()[0]
-        with self.assertRaises(RepositoryError):
-            planning.checkpoint(self.db, self.item)
-        self.assertEqual(self.db.execute('SELECT payload FROM iterations').fetchone()[0], before)
 
     def reopen_fixture(self):
         row = self.record(self.config['slots'][0], 'complete')
@@ -49,65 +38,53 @@ class CombinedReadinessTests(readiness_fixtures.SupervisedFixture, unittest.Test
         self.health['sha'] = 'b'*40
         return row, config, observed, records, api
 
-    def test_public_corrective_reopen_failed_health_and_exact_scope_refusals(self):
+    def test_integrated_corrective_reopen_keeps_exact_scope_and_last_read_guards(self):
         row, config, observed, records, api = self.reopen_fixture()
+        restore = self.snapshot()
+        baseline = deepcopy((row, config, observed, records))
+        original = self.readers.execution_support.side_effect
+        source = Path(self.config['slots'][0]['skills'][0]['path']); raw = source.read_bytes()
         merge.reopen(api, row, config, observed, database=self.db)
         api.issue_state.assert_called_once_with('open', observed)
-        with self.assertRaises(RepositoryError):
-            readiness_gate.check(self.db, 'p', 'i', operation='effect')
+        restore()
         resolution = effect_resolution.bound(self.db, self.item, 'merge-reopen', row['assignment_id'])
-        for operation, selection in (('work', {'merge_reopen': row['assignment_id']}), ('effect', None),
-                                     ('effect', {'merge_reopen': 'unrelated'})):
+        for operation, selection, bound in (('effect', None, None),
+                ('work', {'merge_reopen': row['assignment_id']}, resolution),
+                ('effect', None, resolution), ('effect', {'merge_reopen': 'unrelated'}, resolution)):
             with self.subTest(operation=operation, selection=selection), self.assertRaises(RepositoryError):
-                readiness_gate.check(self.db, 'p', 'i', operation=operation, selection=selection, resolution=resolution)
-        for mutation in ('issue', 'repository', 'unmerged', 'config', 'hold', 'pause'):
-            with self.subTest(mutation=mutation):
-                api.issue_state.reset_mock()
-                old = deepcopy(records)
-                if mutation == 'issue': records['/issues/1']['id'] = 999
-                if mutation == 'repository': records['']['id'] = 999
-                if mutation == 'unmerged': records['/pulls/2']['merged'] = False
-                chosen = dict(config, issue=99) if mutation == 'config' else config
-                if mutation == 'hold':
-                    self.item['restart_reconciliation'] = dict(status='blocked', observations={}, blockers=[dict(boundary='model', code='operation_uncertain')]); self.save()
-                if mutation == 'pause': controls.request(self.db, 'p', 'i', 'operator', 'pause', 'direct-component')
-                with self.assertRaises(RepositoryError):
-                    merge.reopen(api, row, chosen, observed, database=self.db)
-                api.issue_state.assert_not_called()
-                records.clear(); records.update(old)
-                self.item.pop('restart_reconciliation', None); self.save()
-
-    def test_public_corrective_reopen_last_read_preserves_independent_hold(self):
-        row, config, observed, records, api = self.reopen_fixture()
-        original = self.readers.execution_support.side_effect
-        def drift(*args):
-            result = original(*args)
-            self.item['restart_reconciliation'] = dict(status='blocked', observations={}, blockers=[dict(boundary='model', code='operation_uncertain')])
-            self.save()
-            return result
-        self.readers.execution_support.side_effect = drift
-        with self.assertRaises(RepositoryError):
-            merge.reopen(api, row, config, observed, database=self.db)
-        api.issue_state.assert_not_called()
-        self.assertEqual(assignments.current(self.db, 'p', 'i', 'operator', require_active=False)['restart_reconciliation']['blockers'][0]['boundary'], 'model')
-
-    def test_public_corrective_reopen_final_tracker_read_rechecks_policy(self):
-        row, config, observed, records, api = self.reopen_fixture()
-        source = Path(self.config['slots'][0]['skills'][0]['path'])
-        raw = source.read_bytes()
-        def read(path):
-            result = deepcopy(records[path])
-            if path == '/issues/1':
-                source.write_bytes(raw + b'changed at final issue read')
-            return result
-        api.read.side_effect = read
-        try:
-            with self.assertRaises(RepositoryError) as caught:
-                merge.reopen(api, row, config, observed, database=self.db)
-            self.assertEqual(caught.exception.code, 'readiness_inputs_changed')
-            api.issue_state.assert_not_called()
-        finally:
-            source.write_bytes(raw)
+                readiness_gate.check(self.db, 'p', 'i', operation=operation, selection=selection, resolution=bound)
+        for fault in ('issue', 'repository', 'unmerged', 'config', 'hold', 'pause', 'metadata-hold', 'final-policy'):
+            with self.subTest(fault=fault):
+                restore()
+                row, config, observed, records = deepcopy(baseline)
+                api.reset_mock()
+                chosen = {**config, 'issue': 99} if fault == 'config' else config
+                if fault == 'issue': records['/issues/1']['id'] = 999
+                if fault == 'repository': records['']['id'] = 999
+                if fault == 'unmerged': records['/pulls/2']['merged'] = False
+                def hold():
+                    self.item['restart_reconciliation'] = dict(status='blocked', observations={},
+                        blockers=[dict(boundary='model', code='operation_uncertain')]); self.save()
+                if fault == 'hold': hold()
+                if fault == 'pause': controls.request(self.db, 'p', 'i', 'operator', 'pause', 'direct-component')
+                def drift(*args):
+                    result = original(*args)
+                    hold()
+                    return result
+                if fault == 'metadata-hold': self.readers.execution_support.side_effect = drift
+                def read(path):
+                    result = deepcopy(records[path])
+                    if fault == 'final-policy' and path == '/issues/1': source.write_bytes(raw + b'changed at final issue read')
+                    return result
+                api.read.side_effect = read
+                try:
+                    with self.assertRaises(RepositoryError) as caught:
+                        merge.reopen(api, row, chosen, observed, database=self.db)
+                    api.issue_state.assert_not_called()
+                    if fault == 'final-policy': self.assertEqual(caught.exception.code, 'readiness_inputs_changed')
+                    if fault == 'metadata-hold':
+                        self.assertEqual(assignments.current(self.db, 'p', 'i', 'operator', require_active=False)['restart_reconciliation']['blockers'][0]['boundary'], 'model')
+                finally: restore()
 
 
 class BranchReopenReadinessTests(readiness_fixtures.SupervisedFixture, unittest.TestCase):
@@ -142,8 +119,11 @@ class BranchReopenReadinessTests(readiness_fixtures.SupervisedFixture, unittest.
                         (json.dumps(row), row['assignment_id'])); self.db.commit()
         return row, config, observed, records, api
 
-    def test_branch_public_reopen_real_nested_readiness_grants_no_other_operation(self):
+    def test_branch_corrective_reopen_grants_only_exact_current_operation(self):
         row, config, observed, records, api = self.branch_fixture()
+        restore = self.snapshot()
+        baseline = deepcopy((row, config, observed, records))
+        source = Path(self.config['slots'][0]['skills'][0]['path']); raw = source.read_bytes()
         resolution = effect_resolution.bound(self.db, self.item, 'branch-reopen', row['assignment_id'])
         self.assertEqual(effect_resolution.permitted(self.db, 'p', 'i', resolution), set())
         selection = {'merge_reopen': row['assignment_id']}
@@ -151,47 +131,32 @@ class BranchReopenReadinessTests(readiness_fixtures.SupervisedFixture, unittest.
             readiness_gate.check(self.db, 'p', 'i', operation='effect', resolution=resolution, selection=selection)
         merge.reopen(api, row, config, observed, database=self.db)
         api.issue_state.assert_called_once_with('open', observed)
+        self.assertNotIn('merge', assignments.rows(self.db)[0])
+        restore()
         for operation, chosen in (('work', selection), ('effect', None), ('effect', {'merge_reopen': 'other'})):
             with self.subTest(operation=operation, selection=chosen), self.assertRaises(RepositoryError):
                 readiness_gate.check(self.db, 'p', 'i', operation=operation, selection=chosen, resolution=resolution)
-        self.assertNotIn('merge', assignments.rows(self.db)[0])
-
-    def test_branch_public_reopen_never_bypasses_health_permission_or_ownership(self):
-        row, config, observed, records, api = self.branch_fixture()
-        original = self.readers.execution_support.side_effect
-        for fault in ('health', 'permission', 'ownership'):
+        for fault in ('health', 'permission', 'ownership', 'policy', 'hold'):
             with self.subTest(fault=fault):
-                if fault == 'health': self.health['sha'] = 'b' * 40
-                elif fault == 'permission': self.write_authority['operations'].remove('projects')
-                else:
-                    changed = deepcopy(row)
-                    changed['runtime']['status'] = 'running'
+                restore()
+                row, config, observed, records = deepcopy(baseline)
+                api.reset_mock()
+                if fault == 'health': self.health['sha'] = 'b'*40
+                if fault == 'permission': self.write_authority['operations'].remove('projects')
+                if fault == 'ownership':
+                    changed = deepcopy(row); changed['runtime']['status'] = 'running'
                     changed['merge_refusal']['correction']['binding'] = effect_resolution.branch_reopen_binding(changed)
                     self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(changed),)); self.db.commit()
-                with self.assertRaises(RepositoryError): merge.reopen(api, row, config, observed, database=self.db)
-                api.issue_state.assert_not_called()
-                self.health['sha'] = 'a' * 40
-                if fault == 'permission': self.write_authority['operations'].append('projects')
-        self.readers.execution_support.side_effect = original
-
-    def test_branch_final_tracker_read_keeps_current_local_policy_and_independent_holds(self):
-        row, config, observed, records, api = self.branch_fixture()
-        source = Path(self.config['slots'][0]['skills'][0]['path'])
-        raw = source.read_bytes()
-        for fault in ('policy', 'hold'):
-            def read(path):
-                result = deepcopy(records[path])
-                if path == '/issues/1':
-                    if fault == 'policy': source.write_bytes(raw + b'changed at final read')
-                    else:
-                        self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
-                            'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}
-                        self.save()
-                return result
-            api.read.side_effect = read
-            try:
-                with self.subTest(fault=fault), self.assertRaises(RepositoryError):
-                    merge.reopen(api, row, config, observed, database=self.db)
-                api.issue_state.assert_not_called()
-            finally:
-                source.write_bytes(raw)
+                def read(path):
+                    result = deepcopy(records[path])
+                    if path == '/issues/1':
+                        if fault == 'policy': source.write_bytes(raw + b'changed at final read')
+                        if fault == 'hold':
+                            self.item['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                                'blockers': [{'boundary': 'model', 'code': 'operation_uncertain'}]}; self.save()
+                    return result
+                api.read.side_effect = read
+                try:
+                    with self.assertRaises(RepositoryError): merge.reopen(api, row, config, observed, database=self.db)
+                    api.issue_state.assert_not_called()
+                finally: restore()

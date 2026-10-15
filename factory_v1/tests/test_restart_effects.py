@@ -10,7 +10,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
-from contextlib import closing, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -29,75 +29,73 @@ class TrackerRestartTests(unittest.TestCase):
     def read(self):
         return restart.tracker(self.f.database, self.f.stored(), restart.Readback(self.f.github, 'example/product'))
 
-    def test_exact_board_frontier_and_dependencies_are_read_without_reservation(self):
-        result = self.read()
-        self.assertEqual(result['eligible'], [10, 12])
-        self.assertFalse(next(r for r in result['items'] if r['number'] == 11)['admissible'])
-        self.assertNotIn('reservation', self.f.stored())
-        self.f.set_field.assert_not_called()
-        self.f.add_item.assert_not_called()
-        self.f.add_dependency.assert_not_called()
-
-    def test_native_textual_dependency_disagreement_blocks_restart(self):
-        self.f.deps[11] = []
-        with self.assertRaises(RepositoryError):
-            self.read()
-        self.f.set_field.assert_not_called()
-
-    def test_board_duplicate_and_unknown_progress_matrix(self):
-        for mutation in ('duplicate', 'unknown'):
-            with self.subTest(mutation=mutation):
-                if mutation == 'duplicate':
-                    original = self.f.project_items()
-                    with patch.object(tickets.gh, 'project_items', return_value=original + original[:1]), self.assertRaises(RepositoryError):
-                        self.read()
-                else:
+    def test_tracker_dependencies_and_progress_matrix(self):
+        baseline_members, baseline_deps = (copy.deepcopy(self.f.members), copy.deepcopy(self.f.deps))
+        original_items = self.f.project_items()
+        for defect in (None, 'dependency', 'duplicate', 'unknown'):
+            with self.subTest(defect=defect), ExitStack() as stack:
+                self.f.members, self.f.deps = (copy.deepcopy(baseline_members), copy.deepcopy(baseline_deps))
+                if defect == 'dependency':
+                    self.f.deps[11] = []
+                if defect == 'unknown':
                     self.f.members[10]['fields']['STATUS'] = 'UNKNOWN'
+                if defect == 'duplicate':
+                    stack.enter_context(patch.object(tickets.gh, 'project_items', return_value=original_items + original_items[:1]))
+                if defect:
                     with self.assertRaises(RepositoryError):
                         self.read()
-        self.f.set_field.assert_not_called()
+                else:
+                    result = self.read()
+                    self.assertEqual(result['eligible'], [10, 12])
+                    self.assertFalse(next((r for r in result['items'] if r['number'] == 11))['admissible'])
+                    self.assertNotIn('reservation', self.f.stored())
+                self.f.set_field.assert_not_called()
+                self.f.add_item.assert_not_called()
+                self.f.add_dependency.assert_not_called()
 
-    def test_lost_issue_response_adopts_only_fully_read_back_publication(self):
-        self.f.publication()
-        ticket = self.f.work['tickets'][0]
-        body = tickets.body(self.f.item, ticket, {})
-        self.f.work['intents'] = {'note': {'issue': {'title': ticket['title'], 'body': body}}}
-        self.f.issues[10] = self.f.issue(10, body)
-        self.f.members[10] = {'id': 'ITEM10', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
-        self.f.persist()
-        item = self.f.stored()
-        restart.tracker(self.f.database, item, restart.Readback(self.f.github, 'example/product'))
-        self.assertTrue(item['ticket_work']['publication_complete'])
-        self.assertEqual(item['ticket_work']['published']['note'], {'number': 10, 'id': 1010, 'node_id': 'I10'})
-        self.f.github.request.assert_not_called()
-        self.f.set_field.assert_not_called()
-        self.f.add_item.assert_not_called()
-        self.f.add_dependency.assert_not_called()
-        self.assertFalse(self.f.stored()['ticket_work'].get('publication_complete', False))
 
-    def test_absent_issue_effect_never_creates_again(self):
-        self.f.publication()
-        self.f.work['intents'] = {'note': {'issue': {'title': 'Retain a note'}}}
-        self.f.persist()
-        with self.assertRaises(RepositoryError):
-            self.read()
-        self.f.github.request.assert_not_called()
-        self.f.add_item.assert_not_called()
 
-    def test_lost_status_response_is_read_back_without_second_write(self):
-        self.f.item['reservation'] = {'issue_number': 10, 'run_id': 'retained-run', 'status': 'pending',
-                                      'assignment_id': self.f.work['assignment_id'], 'input_digest': self.f.work['input_digest']}
-        self.f.members[10]['fields']['STATUS'] = 'Active'
-        self.f.persist()
-        item = self.f.stored()
-        restart.tracker(self.f.database, item, restart.Readback(self.f.github, 'example/product'))
-        self.assertEqual(item['reservation']['status'], 'reserved')
-        self.assertEqual(item['reservation']['run_id'], 'retained-run')
-        self.f.set_field.assert_not_called()
-        self.f.members[10]['fields']['STATUS'] = 'Ready'
-        with self.assertRaises(RepositoryError):
-            self.read()
-        self.f.set_field.assert_not_called()
+    def test_issue_status_readback_never_rewrite_matrix(self):
+        baseline = copy.deepcopy(self.f.item)
+        issues, members, deps = (copy.deepcopy(self.f.issues), copy.deepcopy(self.f.members), copy.deepcopy(self.f.deps))
+        for effect in ('issue', 'absent-issue', 'status-active', 'status-ready'):
+            with self.subTest(effect=effect):
+                self.f.item = copy.deepcopy(baseline)
+                self.f.work = self.f.item['ticket_work']
+                self.f.issues, self.f.members, self.f.deps = (copy.deepcopy(issues), copy.deepcopy(members), copy.deepcopy(deps))
+                if effect in ('issue', 'absent-issue'):
+                    self.f.publication()
+                    ticket = self.f.work['tickets'][0]
+                    body = tickets.body(self.f.item, ticket, {})
+                    self.f.work['intents'] = {'note': {'issue': {'title': ticket['title'], 'body': body}}}
+                    self.f.issues.clear()
+                    self.f.members.clear()
+                    if effect == 'issue':
+                        self.f.issues[10] = self.f.issue(10, body)
+                        self.f.members[10] = {'id': 'ITEM10', 'fields': {'STATUS': 'Ready', 'SCOPE': 'M1'}}
+                else:
+                    self.f.item['reservation'] = {'issue_number': 10, 'run_id': 'retained-run', 'status': 'pending', 'assignment_id': self.f.work['assignment_id'], 'input_digest': self.f.work['input_digest']}
+                    self.f.members[10]['fields']['STATUS'] = 'Active' if effect == 'status-active' else 'Ready'
+                self.f.persist()
+                item = self.f.stored()
+                if effect in ('absent-issue', 'status-ready'):
+                    with self.assertRaises(RepositoryError):
+                        self.read()
+                else:
+                    restart.tracker(self.f.database, item, restart.Readback(self.f.github, 'example/product'))
+                    if effect == 'issue':
+                        self.assertTrue(item['ticket_work']['publication_complete'])
+                        self.assertEqual(item['ticket_work']['published']['note'], {'number': 10, 'id': 1010, 'node_id': 'I10'})
+                        self.assertFalse(self.f.stored()['ticket_work'].get('publication_complete', False))
+                    else:
+                        self.assertEqual(item['reservation']['status'], 'reserved')
+                        self.assertEqual(item['reservation']['run_id'], 'retained-run')
+                self.f.github.request.assert_not_called()
+                self.f.set_field.assert_not_called()
+                self.f.add_item.assert_not_called()
+                self.f.add_dependency.assert_not_called()
+
+
 
 
 class CandidateRestartTests(unittest.TestCase):
@@ -134,56 +132,49 @@ class CandidateRestartTests(unittest.TestCase):
         for target in ('subprocess.run', 'subprocess.Popen', 'socket.socket'):
             self.enterContext(patch(target, side_effect=AssertionError('External execution forbidden')))
 
-    def test_lost_pr_response_adopts_exact_existing_effect_without_writes(self):
-        result = restart.candidate(self.assignment, self.api)
-        assert result is not None
-        self.assertEqual(result['pr_number'], 20)
-        self.assertEqual(self.assignment['publication']['status'], 'published')
-        self.api.write.assert_not_called()
-        self.assertNotIn('submitted_result', self.assignment)
 
-    def test_absent_duplicate_or_wrong_ref_never_replays_publication(self):
-        for suffix, replacement in ((publication.pr_query(self.config), []),
-                                    (publication.pr_query(self.config), [self.pr, self.pr]),
-                                    ('/git/ref/heads/factory/issue-10', None)):
-            with self.subTest(suffix=suffix, replacement=replacement):
-                before = copy.deepcopy(self.assignment)
-                original = self.values[suffix]
-                self.values[suffix] = replacement
-                with self.assertRaises(RepositoryError):
-                    restart.candidate(self.assignment, self.api)
-                self.assertEqual(self.assignment, before)
-                self.values[suffix] = original
-        self.api.write.assert_not_called()
-
-    def test_pr_identity_body_repository_and_candidate_drift_matrix(self):
-        for field in ('body', 'head-repo', 'head-sha', 'closed'):
-            with self.subTest(field=field):
-                pr = copy.deepcopy(self.pr)
-                if field == 'body': pr['body'] += 'external edit'
-                elif field == 'head-repo': pr['head']['repo']['id'] = 999
-                elif field == 'head-sha': pr['head']['sha'] = 'f' * 40
-                else: pr['state'] = 'closed'
-                with patch.object(self.api, 'read', side_effect=lambda suffix: [pr] if suffix == publication.pr_query(self.config) else copy.deepcopy(self.values[suffix])), self.assertRaises(RepositoryError):
-                    restart.candidate(self.assignment, self.api)
-        self.api.write.assert_not_called()
-
-    def test_known_published_pr_can_be_ready_without_granting_merge(self):
-        self.assignment['publication'].update(status='published', pr_number=20)
-        self.pr['draft'] = False
-        restart.candidate(self.assignment, self.api)
-        self.assertNotIn('merge', self.assignment)
-        self.api.write.assert_not_called()
-
-    def test_unsafe_or_wrong_journal_targets_refuse_before_remote_reads(self):
-        for change in ({'branch': '../../other'}, {'branch': 'main'}, {'issue': 11}, {'candidate': 'B' * 40}):
-            with self.subTest(change=change):
-                row = copy.deepcopy(self.assignment)
-                row['publication']['approval'].update(change)
+    def test_candidate_ref_pr_identity_and_ready_not_merge_matrix(self):
+        row, values, pr = (copy.deepcopy(self.assignment), copy.deepcopy(self.values), copy.deepcopy(self.pr))
+        defects = ('absent', 'duplicate', 'ref', 'body', 'head-repo', 'head-sha', 'closed')
+        targets = ({'branch': '../../other'}, {'branch': 'main'}, {'issue': 11}, {'candidate': 'B' * 40})
+        for defect in (None, *defects, *targets):
+            with self.subTest(defect=defect):
+                self.assignment, self.values, self.pr = (copy.deepcopy(row), copy.deepcopy(values), copy.deepcopy(pr))
                 self.api.read.reset_mock()
-                with self.assertRaises(RepositoryError):
-                    restart.candidate(row, self.api)
-                self.api.read.assert_not_called()
+                self.values[publication.pr_query(self.config)] = [self.pr]
+                if isinstance(defect, dict):
+                    self.assignment['publication']['approval'].update(defect)
+                elif defect == 'absent':
+                    self.values[publication.pr_query(self.config)] = []
+                elif defect == 'duplicate':
+                    self.values[publication.pr_query(self.config)] = [self.pr, self.pr]
+                elif defect == 'ref':
+                    self.values['/git/ref/heads/factory/issue-10'] = None
+                elif defect == 'body':
+                    self.pr['body'] += 'external edit'
+                elif defect == 'head-repo':
+                    self.pr['head']['repo']['id'] = 999
+                elif defect == 'head-sha':
+                    self.pr['head']['sha'] = 'f' * 40
+                elif defect == 'closed':
+                    self.pr['state'] = 'closed'
+                else:
+                    self.assignment['publication'].update(status='published', pr_number=20)
+                    self.pr['draft'] = False
+                before = copy.deepcopy(self.assignment)
+                if defect:
+                    with self.assertRaises(RepositoryError):
+                        restart.candidate(self.assignment, self.api)
+                    self.assertEqual(self.assignment, before)
+                    if isinstance(defect, dict):
+                        self.api.read.assert_not_called()
+                else:
+                    restart.candidate(self.assignment, self.api)
+                    self.assertNotIn('merge', self.assignment)
+                self.api.write.assert_not_called()
+
+
+
 
     def merged(self):
         self.assignment['publication'].update(status='published', pr_number=20)
@@ -209,34 +200,36 @@ class CandidateRestartTests(unittest.TestCase):
         self.values['/commits/' + 'b' * 40 + '/check-runs?per_page=100&filter=latest'] = branch
         self.enterContext(patch.object(merge, 'protection', return_value={'SIMULATED effective policy': True}))
 
-    def test_lost_merge_response_adopts_exact_commit_and_ci_without_merge_or_closure(self):
-        self.merged()
-        result = restart.integration(self.assignment, self.api)
-        assert result is not None
-        self.assertEqual(result['integration']['integrated'], 'f' * 40)
-        self.assertEqual(self.assignment['merge']['status'], 'merged')
-        self.assertFalse(self.assignment['merge']['close_allowed'])
-        self.api.write.assert_not_called()
-        self.api.issue_state.assert_not_called()
 
-    def test_merge_effect_absent_before_write_is_never_repeated(self):
+    def test_merge_absent_or_unverified_never_redeliver_matrix(self):
         self.merged()
-        self.pr['merged'] = False
-        with self.assertRaises(RepositoryError):
-            restart.integration(self.assignment, self.api)
-        self.assertEqual(self.assignment['merge']['status'], 'pending')
-        self.api.write.assert_not_called()
-
-    def test_failed_integrated_checks_retain_proven_effect_but_not_delivery(self):
-        self.merged()
+        row = copy.deepcopy(self.assignment)
         checks = self.values['/commits/' + 'f' * 40 + '/check-runs?per_page=100&filter=latest']
-        checks['check_runs'][0]['conclusion'] = 'failure'
-        with self.assertRaises(RepositoryError):
-            restart.integration(self.assignment, self.api)
-        self.assertEqual(self.assignment['merge']['integrated_evidence']['integrated'], 'f' * 40)
-        self.assertFalse(self.assignment['merge']['close_allowed'])
-        self.assertNotEqual(self.assignment['merge']['status'], 'delivered')
-        self.api.write.assert_not_called()
+        for defect in ('absent', 'failed-checks', 'delivered', 'delivered-failed-checks'):
+            with self.subTest(defect=defect):
+                self.assignment = copy.deepcopy(row)
+                self.pr['merged'] = defect != 'absent'
+                checks['check_runs'][0]['conclusion'] = 'failure' if defect.endswith('failed-checks') else 'success'
+                journal = self.assignment['merge']
+                if defect.startswith('delivered'):
+                    journal.update(status='delivered', close_allowed=True, delivery_checks=['historical-integrated-checks'], integrated_evidence={'candidate': 'b' * 40, 'integrated': 'f' * 40, 'tree': 'c' * 40, 'parents': ['a' * 40, 'b' * 40], 'main': 'f' * 40, 'membership': 'identical'})
+                    before = copy.deepcopy(journal)
+                if defect == 'delivered':
+                    restart.integration(self.assignment, self.api)
+                else:
+                    with self.assertRaises(RepositoryError):
+                        restart.integration(self.assignment, self.api)
+                if defect.startswith('delivered'):
+                    self.assertEqual(journal, before)
+                    self.api.issue_state.assert_not_called()
+                elif defect == 'absent':
+                    self.assertEqual(journal['status'], 'pending')
+                else:
+                    self.assertEqual(journal['integrated_evidence']['integrated'], 'f' * 40)
+                    self.assertFalse(journal['close_allowed'])
+                    self.assertNotEqual(journal['status'], 'delivered')
+                self.api.write.assert_not_called()
+
 
     def public_effect(self, merged=False):
         """One CLI call from simulated persisted intent, not prior lifecycle calls."""
@@ -281,21 +274,35 @@ class CandidateRestartTests(unittest.TestCase):
              patch('factory_v1.requirements.revalidate_inputs', return_value={}), \
              patch.object(tickets.gh, 'read_issue', return_value={'number': 10, 'id': 100, 'node_id': 'I10', 'body': 'Pinned work'}), redirect_stdout(output):
             main()
-        result = json.loads(output.getvalue())
+        result = self.public_report = json.loads(output.getvalue())
         self.assertEqual(result['status'], 'ready', result['blockers'])
         self.assertTrue(all(all(value is None for value in call.args[1:]) for call in github.request.call_args_list))
         with closing(sqlite3.connect(state)) as db:
             saved = json.loads(db.execute('SELECT payload FROM role_assignments').fetchone()[0])
         return saved
 
-    def test_public_restart_recovers_lost_pr_response_without_remote_writes(self):
-        saved = self.public_effect()
-        self.assertEqual(saved['publication']['status'], 'published')
-        self.assertEqual(saved['publication']['pr_number'], 20)
-        self.assertNotIn('submitted_result', saved)
-
-    def test_public_restart_recovers_lost_merge_response_without_merge_or_closure(self):
-        saved = self.public_effect(merged=True)
-        self.assertEqual(saved['merge']['status'], 'merged')
-        self.assertEqual(saved['merge']['integrated_evidence']['integrated'], 'f' * 40)
-        self.assertFalse(saved['merge']['close_allowed'])
+    def test_public_readback_lost_pr_and_merge_matrix(self):
+        row, values, pr = (copy.deepcopy(self.assignment), copy.deepcopy(self.values), copy.deepcopy(self.pr))
+        root = self.root
+        for merged in (False, True):
+            with self.subTest(merged=merged):
+                self.assignment, self.values, self.pr = (copy.deepcopy(row), copy.deepcopy(values), copy.deepcopy(pr))
+                self.config = self.assignment['publication']['approval']
+                self.values['/pulls/20'] = self.pr
+                self.values[publication.pr_query(self.config)] = [self.pr]
+                self.root = root / ('merge' if merged else 'pr')
+                self.root.mkdir()
+                saved = self.public_effect(merged=merged)
+                phase = 'merge' if merged else 'publication'
+                observation = self.public_report['observations'][self.assignment['assignment_id'] + ':' + phase]
+                self.assertIsNotNone(observation)
+                if merged:
+                    self.assertEqual(observation['integration']['integrated'], 'f' * 40)
+                    self.assertEqual(saved['merge']['status'], 'merged')
+                    self.assertEqual(saved['merge']['integrated_evidence']['integrated'], 'f' * 40)
+                    self.assertFalse(saved['merge']['close_allowed'])
+                else:
+                    self.assertEqual(observation['pr_number'], 20)
+                    self.assertEqual(saved['publication']['status'], 'published')
+                    self.assertEqual(saved['publication']['pr_number'], 20)
+                    self.assertNotIn('submitted_result', saved)

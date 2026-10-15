@@ -75,7 +75,7 @@ class RequirementChangeTests(unittest.TestCase):
         return requirements.resume_change(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes',
             'direction': record['direction'], 'new_revision': record['new_revision']}, self.github)
 
-    def test_material_hold_retires_assignments_dependents_bugs_and_reservation(self):
+    def test_requirement_revision_authority_1(self):
         assignment = {'assignment_id': 'old', 'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
                       'revision': requirements.authority(self.item, 10), 'assignment_ready': True, 'launchable': True,
                       'result_disposition': {'advance_allowed': True, 'close_allowed': True, 'requirements_valid': True}}
@@ -97,6 +97,18 @@ class RequirementChangeTests(unittest.TestCase):
         self.assertEqual([self.fixture.members[n]['fields']['STATUS'] for n in (10, 11, 12)], ['Blocked', 'Blocked', 'Ready'])
         self.assertEqual(self.fixture.stored(), result)
 
+        new = copy.deepcopy(self.fixture.inputs)
+        new['documents']['milestone.md']['content'] += 'durable-write'
+        record['new_inputs'] = new
+        record['new_revision'] = {'spec': {'revision': 'new'}, 'ticket_assignment': 'durable-notes', 'ticket_inputs': 'b' * 64}
+        self.item = self.fixture.item = result
+        self.item['requirement_authority'] = {'10': record['new_revision']}
+        self.fixture.persist()
+        self.assertEqual(requirements.inputs(self.item, 10), new)
+        self.assertEqual(requirements.inputs(self.item, 12), self.fixture.inputs)
+        self.assertEqual(requirements.authority(self.item, 10), record['new_revision'])
+        self.assertNotEqual(requirements.authority(self.item, 10), requirements.authority(self.item, 12))
+
     def test_minor_trace_requires_validity_without_status_writes_or_material_release(self):
         self.change['kind'] = 'minor'
         with patch.object(requirements, 'validity', return_value=[{'verified': 'unchanged'}]) as validity:
@@ -111,56 +123,87 @@ class RequirementChangeTests(unittest.TestCase):
         with self.assertRaises(repositories.RepositoryError) as caught: self.record()
         self.assertEqual(caught.exception.code, 'change_conflict'); self.database.rollback()
 
-    def test_wrong_operator_stale_revision_and_unresolved_artifacts_refuse(self):
-        before = self.fixture.stored()
-        for changes, code in (({'direction': {**self.direction, 'operator_id': 'worker'}}, 'approval_required'),
-                              ({'old_revision': {'10': {'stale': True}}}, 'stale_requirements'), ({'issues': [99]}, 'scope_mismatch')):
-            with self.subTest(changes=changes), self.assertRaises(repositories.RepositoryError) as caught:
-                requirements.record_change(self.database, 'product', 'm1', '42', {**self.change, **changes}, self.github)
-            self.assertEqual(caught.exception.code, code); self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
-        record = self.published(); record['status'] = 'held'; self.fixture.persist()
-        with self.assertRaises(repositories.RepositoryError) as caught:
-            requirement_execution.execute(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes', 'skills': []}, self.github, '/never-read')
-        self.assertEqual(caught.exception.code, 'direction_required')
-        with self.assertRaises(repositories.RepositoryError) as caught: self.resume(self.fixture.stored())
-        self.assertEqual(caught.exception.code, 'publication_required')
+    def test_requirement_resume_authorization(self):
+        cases = [('record', {'direction': {**self.direction, 'operator_id': 'worker'}}, 'approval_required'),
+                 ('record', {'old_revision': {'10': {'stale': True}}}, 'stale_requirements'),
+                 ('record', {'issues': [99]}, 'scope_mismatch'),
+                 ('execute', {}, 'direction_required'), ('resume-held', {}, 'publication_required'),
+                 ('resume-worker', {}, 'worker_active')]
+        for stage, changes, code in cases:
+            with self.subTest(stage=stage, code=code):
+                self.item = self.fixture.item = copy.deepcopy(self.original)
+                self.database.execute('DELETE FROM role_assignments'); self.database.commit()
+                self.fixture.set_field.reset_mock()
+                if stage != 'record':
+                    record = self.published()
+                    if stage != 'resume-worker': record['status'] = 'held'
+                    self.fixture.persist()
+                if stage == 'resume-worker':
+                    old = {'assignment_id': 'old', 'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
+                           'requirement_disposition': {'change_id': 'durable-notes'},
+                           'runtime': {'status': 'unconfirmed', 'container_removed': False, 'controller_pid': 123,
+                                       'controller_start': 'LABELED live fixture controller'}}
+                    self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('old', json.dumps(old))); self.database.commit()
+                before = self.fixture.stored()
+                with patch('factory_v1.restart.process_identity', return_value='LABELED live fixture controller'), \
+                        patch.object(requirement_publication, 'verify_synthesis'), self.assertRaises(repositories.RepositoryError) as caught:
+                    if stage == 'record':
+                        requirements.record_change(self.database, 'product', 'm1', '42', {**self.change, **changes}, self.github)
+                    elif stage == 'execute':
+                        requirement_execution.execute(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes', 'skills': []}, self.github, '/never-read')
+                    else:
+                        self.resume(self.fixture.stored())
+                self.assertEqual(caught.exception.code, code)
+                self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
+                if stage == 'resume-worker':
+                    self.fixture.set_field.assert_not_called()
+                    self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['status'], 'published')
 
-    def test_scope_authority_and_input_selection_keep_independent_original_inputs(self):
-        record = self.published((10,)); new = copy.deepcopy(record['new_inputs']); new['documents']['milestone.md']['content'] += 'durable-write'
-        record['new_inputs'] = new; record['new_revision']['spec'] = {'revision': 'new'}
-        self.item['requirement_authority'] = {'10': record['new_revision']}; self.fixture.persist()
-        self.assertEqual(requirements.inputs(self.item, 10), new)
-        self.assertEqual(requirements.inputs(self.item, 12), self.fixture.inputs)
-        self.assertEqual(requirements.authority(self.item, 10), record['new_revision'])
-        self.assertNotEqual(requirements.authority(self.item, 10), requirements.authority(self.item, 12))
 
-    def test_release_preserves_prior_blocked_deferred_done_and_normalizes_active(self):
-        record = self.published((10,))
-        for prior, expected in (('blocked', 'Blocked'), ('deferred', 'Deferred'), ('done', 'Blocked'), ('active', 'Ready'), ('ready', 'Ready')):
-            with self.subTest(prior=prior):
-                record['previous_statuses']['10'] = prior; self.fixture.members[10]['fields']['STATUS'] = 'Blocked'
-                requirements.sync_blocks(self.database, self.item, record, self.github, release=True)
+    def test_requirement_status_restore(self):
+        variants = [(prior, 'Blocked', 'open', True, expected, None) for prior, expected in
+                    (('blocked', 'Blocked'), ('deferred', 'Deferred'), ('done', 'Blocked'), ('active', 'Ready'), ('ready', 'Ready'))]
+        variants += [('ready', 'Deferred', 'open', True, 'Deferred', 'publication_mismatch'),
+                     ('done', 'Blocked', 'closed', False, 'Blocked', None)]
+        for prior, current, state, release, expected, error in variants:
+            with self.subTest(prior=prior, current=current, state=state, release=release):
+                record = self.published((10,))
+                record['previous_statuses']['10'] = prior
+                self.fixture.members[10]['fields']['STATUS'] = current
+                self.fixture.issues[10].update(state=state, state_reason='completed' if state == 'closed' else None)
+                self.fixture.set_field.reset_mock(); self.github.request.reset_mock()
+                if error:
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        requirements.sync_blocks(self.database, self.item, record, self.github, release=release)
+                    self.assertEqual(caught.exception.code, error)
+                    self.fixture.set_field.assert_not_called()
+                else:
+                    requirements.sync_blocks(self.database, self.item, record, self.github, release=release)
+                    self.assertFalse(self.item['execution_allowed'])
+                    self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['status'], 'published')
                 self.assertEqual(self.fixture.members[10]['fields']['STATUS'], expected)
-                self.assertFalse(self.item['execution_allowed']); self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['status'], 'published')
+                if state == 'closed':
+                    self.assertEqual(self.fixture.issues[10]['state'], 'open')
+                    self.assertEqual(self.github.request.call_args.args[1], {'state': 'open'})
 
-    def test_requirement_release_cannot_overwrite_independent_new_progress(self):
-        record = self.published((10,)); self.fixture.members[10]['fields']['STATUS'] = 'Deferred'
-        with self.assertRaises(repositories.RepositoryError) as caught: requirements.sync_blocks(self.database, self.item, record, self.github, release=True)
-        self.assertEqual(caught.exception.code, 'publication_mismatch'); self.fixture.set_field.assert_not_called()
-        self.assertEqual(self.fixture.members[10]['fields']['STATUS'], 'Deferred')
 
-    def test_record_reopens_delivered_work_but_keeps_it_blocked(self):
-        record = self.published((10,)); record['previous_statuses']['10'] = 'done'
-        self.fixture.issues[10].update(state='closed', state_reason='completed')
-        requirements.sync_blocks(self.database, self.item, record, self.github)
-        self.assertEqual(self.fixture.issues[10]['state'], 'open'); self.assertEqual(self.fixture.members[10]['fields']['STATUS'], 'Blocked')
-        self.assertEqual(self.github.request.call_args.args[1], {'state': 'open'})
 
-    def test_post_status_membership_body_native_and_spec_drift_retains_pending_hold(self):
-        for fault in ('membership', 'body', 'native', 'spec'):
+    def test_requirement_resume_readback_and_replay(self):
+        original_inputs = copy.deepcopy(self.fixture.inputs)
+        original_issues = copy.deepcopy(self.fixture.issues)
+        original_members = copy.deepcopy(self.fixture.members)
+        for fault in ('membership', 'body', 'native', 'spec', 'partial-status'):
             with self.subTest(fault=fault):
-                record = self.published(); before_issues = copy.deepcopy(self.fixture.issues); before_members = copy.deepcopy(self.fixture.members)
+                self.fixture.inputs.clear(); self.fixture.inputs.update(copy.deepcopy(original_inputs))
+                self.fixture.issues.clear(); self.fixture.issues.update(copy.deepcopy(original_issues))
+                self.fixture.members.clear(); self.fixture.members.update(copy.deepcopy(original_members))
+                self.fixture.deps[11] = [10]
+                self.item = self.fixture.item = copy.deepcopy(self.original)
+                self.fixture.set_field.reset_mock()
+                self.published()
                 def write(*args):
+                    if args[2] == 'ITEM11' and fault == 'partial-status':
+                        raise repositories.RepositoryError('github_unavailable', 'status not acknowledged')
                     self.fixture.field(*args)
                     if args[2] == 'ITEM11':
                         if fault == 'membership': self.fixture.members[11]['id'] = 'replaced'
@@ -169,39 +212,21 @@ class RequirementChangeTests(unittest.TestCase):
                         if fault == 'spec': self.fixture.inputs['documents']['milestone.md']['content'] += 'drift'
                 self.fixture.set_field.side_effect = write
                 with patch.object(requirement_publication, 'verify_synthesis'):
-                    with self.assertRaises(repositories.RepositoryError): self.resume(self.fixture.stored())
-                self.database.rollback(); stored = self.fixture.stored()
-                self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'resume-pending')
-                self.assertEqual(requirements.held_numbers(stored), {10, 11}); self.assertNotIn('reservation', stored)
-                self.fixture.issues.clear(); self.fixture.issues.update(before_issues); self.fixture.members.clear(); self.fixture.members.update(before_members)
-                self.fixture.deps[11] = [10]
+                    with self.assertRaises(repositories.RepositoryError):
+                        self.resume(self.fixture.stored())
+                    self.database.rollback(); pending = self.fixture.stored()
+                    self.assertEqual(pending['requirement_changes']['durable-notes']['status'], 'resume-pending')
+                    self.assertEqual(requirements.held_numbers(pending), {10, 11})
+                    self.assertNotIn('reservation', pending)
+                    if fault == 'partial-status':
+                        self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
+                        result = self.resume(pending)
+                        self.assertEqual(result['requirement_changes']['durable-notes']['status'], 'resumed')
+                        self.assertEqual(result['ticket_work']['frontier']['eligible'], [10, 12])
+                        self.assertEqual(self.fixture.set_field.call_count, 1)
+                        self.assertEqual(self.fixture.stored(), result)
 
-    def test_partial_status_restore_replays_same_pending_hold_without_repeat_write(self):
-        self.published()
-        def write(*args):
-            if args[2] == 'ITEM11': raise repositories.RepositoryError('github_unavailable', 'status not acknowledged')
-            self.fixture.field(*args)
-        self.fixture.set_field.side_effect = write
-        with patch.object(requirement_publication, 'verify_synthesis'):
-            with self.assertRaises(repositories.RepositoryError): self.resume(self.fixture.stored())
-            self.database.rollback(); pending = self.fixture.stored()
-            self.assertEqual(pending['requirement_changes']['durable-notes']['status'], 'resume-pending'); self.assertEqual(requirements.held_numbers(pending), {10, 11})
-            self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
-            result = self.resume(pending)
-        self.assertEqual(result['requirement_changes']['durable-notes']['status'], 'resumed')
-        self.assertEqual(result['ticket_work']['frontier']['eligible'], [10, 12]); self.assertEqual(self.fixture.set_field.call_count, 1)
-        self.assertEqual(self.fixture.stored(), result)
 
-    def test_unconfirmed_old_worker_cleanup_prevents_resume(self):
-        self.published(); old = {'assignment_id': 'old', 'ticket_scope': {'project': 'product', 'iteration': 'm1', 'issue_number': 10},
-                                'requirement_disposition': {'change_id': 'durable-notes'},
-                                'runtime': {'status': 'unconfirmed', 'container_removed': False,
-                                            'controller_pid': 123, 'controller_start': 'LABELED live fixture controller'}}
-        self.database.execute('INSERT INTO role_assignments VALUES (?,?)', ('old', json.dumps(old))); self.database.commit()
-        with patch('factory_v1.restart.process_identity', return_value='LABELED live fixture controller'), \
-                patch.object(requirement_publication, 'verify_synthesis'), self.assertRaises(repositories.RepositoryError) as caught: self.resume(self.fixture.stored())
-        self.assertEqual(caught.exception.code, 'worker_active'); self.fixture.set_field.assert_not_called()
-        self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['status'], 'published')
 
     def stage(self):
         record = self.published((10,)); record['executions'] = {}; record['status'] = 'resolved'; self.fixture.persist()
@@ -211,49 +236,55 @@ class RequirementChangeTests(unittest.TestCase):
         produced = {'result': result, 'execution': self.fixture.evidence(result, work)}
         return record, work, produced
 
-    def test_final_blocked_status_write_cannot_finalize_drifted_publication(self):
-        record = self.published(); record.update(status='publication-pending', synthesis_request={'skills': []},
-            documents={'milestone.md': 'fixture versioned milestone'}, tickets=[{'number': n} for n in (10, 11)])
-        record['publication'] = {'path': 'docs/revision', 'commit': 'd' * 40}
-        for n in (10, 11): self.fixture.members[n]['fields']['STATUS'] = 'Ready'
-        self.fixture.persist(); fired = []
-        def write(*args):
-            self.fixture.field(*args)
-            if args[2] == 'ITEM11':
-                self.fixture.issues[10]['title'] = 'Unexpected material edit'; fired.append(True)
-        self.fixture.set_field.side_effect = write
-        with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
-                patch.object(requirement_publication, 'version_documents', return_value=record['publication']), \
-                patch.object(requirement_publication, 'spec_issue', return_value=8), \
-                patch('factory_v1.planning.read_publication', return_value=record['new_inputs']['handoff']):
-            with self.assertRaises(repositories.RepositoryError) as caught:
-                requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
-        self.assertEqual(caught.exception.code, 'stale_requirements'); self.database.rollback()
-        self.assertEqual(fired, [True]); stored = self.fixture.stored()
-        self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'publication-pending')
-        self.assertEqual(requirements.held_numbers(stored), {10, 11}); self.github.request.assert_not_called()
+    def test_requirement_publication_intent_1(self):
+        original = copy.deepcopy(self.original)
+        for fault in ('blocked-status-drift', 'lost-update-response'):
+            with self.subTest(fault=fault):
+                self.item = self.fixture.item = copy.deepcopy(original)
+                self.github.request.reset_mock(); self.github.request.side_effect = self.fixture.request
+                self.fixture.set_field.reset_mock(); self.fixture.set_field.side_effect = self.fixture.field
+                affected = (10, 11) if fault == 'blocked-status-drift' else (10,)
+                record = self.published(affected)
+                record.update(status='publication-pending', synthesis_request={'skills': []},
+                              documents={'milestone.md': 'fixture immutable milestone'}, tickets=[{'number': n} for n in affected])
+                record['publication'] = {'path': 'docs/revision', 'commit': 'd' * 40}
+                fired = []
+                if fault == 'blocked-status-drift':
+                    for n in affected: self.fixture.members[n]['fields']['STATUS'] = 'Ready'
+                    def write(*args):
+                        self.fixture.field(*args)
+                        if args[2] == 'ITEM11':
+                            self.fixture.issues[10]['title'] = 'Unexpected material edit'; fired.append(True)
+                    self.fixture.set_field.side_effect = write
+                else:
+                    record['updates']['10']['body'] += '\n<!-- fixture revision -->\n'
+                    def patch_issue(path, body, method=None):
+                        self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['update_intents'], ['10'])
+                        self.fixture.request(path, body, method)
+                        raise repositories.RepositoryError('github_unavailable', 'lost patch acknowledgement')
+                    self.github.request.side_effect = patch_issue
+                self.fixture.persist()
+                with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
+                        patch.object(requirement_publication, 'version_documents', return_value=record['publication']), \
+                        patch.object(requirement_publication, 'spec_issue', return_value=8), \
+                        patch('factory_v1.planning.read_publication', return_value=record['new_inputs']['handoff']):
+                    if fault == 'blocked-status-drift':
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
+                        self.assertEqual(caught.exception.code, 'stale_requirements'); self.database.rollback()
+                        self.assertEqual(fired, [True]); stored = self.fixture.stored()
+                        self.assertEqual(stored['requirement_changes']['durable-notes']['status'], 'publication-pending')
+                        self.assertEqual(requirements.held_numbers(stored), {10, 11})
+                        self.github.request.assert_not_called()
+                    else:
+                        result = requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
+                        self.assertEqual(result['requirement_changes']['durable-notes']['status'], 'published')
+                        self.github.request.assert_called_once(); self.github.request.reset_mock()
+                        replay = requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
+                        self.github.request.assert_not_called(); self.assertEqual(self.fixture.stored(), replay)
+                        self.assertEqual(replay['requirement_changes']['durable-notes']['updated_issues']['10'], requirements.issue_pin(self.fixture.issues[10]))
+                        self.assertEqual(requirements.held_numbers(replay), {10})
 
-    def test_updated_issue_effect_lost_response_replays_without_repeated_patch(self):
-        record = self.published((10,)); record.update(status='publication-pending', synthesis_request={'skills': []},
-            documents={'milestone.md': 'fixture immutable milestone'}, tickets=[{'number': 10}])
-        record['publication'] = {'path': 'docs/revision', 'commit': 'd' * 40}
-        record['updates']['10']['body'] += '\n<!-- fixture revision -->\n'; self.fixture.persist()
-        def patch_issue(path, body, method=None):
-            self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['update_intents'], ['10'])
-            self.fixture.request(path, body, method)
-            raise repositories.RepositoryError('github_unavailable', 'lost patch acknowledgement')
-        self.github.request.side_effect = patch_issue
-        with patch.object(requirement_publication, 'verify_synthesis'), patch.object(requirement_publication, 'reconcile'), \
-                patch.object(requirement_publication, 'version_documents', return_value=record['publication']), \
-                patch.object(requirement_publication, 'spec_issue', return_value=8), \
-                patch('factory_v1.planning.read_publication', return_value=record['new_inputs']['handoff']):
-            result = requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
-            self.assertEqual(result['requirement_changes']['durable-notes']['status'], 'published')
-            self.github.request.assert_called_once(); self.github.request.reset_mock()
-            replay = requirement_publication.publish(self.database, 'product', 'm1', '42', {'change_id': 'durable-notes'}, self.github)
-        self.github.request.assert_not_called(); self.assertEqual(self.fixture.stored(), replay)
-        self.assertEqual(replay['requirement_changes']['durable-notes']['updated_issues']['10'], requirements.issue_pin(self.fixture.issues[10]))
-        self.assertEqual(requirements.held_numbers(replay), {10})
 
     def test_host_executor_byte_permissions_and_arguments_are_checked_without_execution(self):
         path = self.root / 'executor'; path.write_text('fixture adapter bytes, never executed'); path.chmod(0o700)
@@ -272,59 +303,70 @@ class RequirementChangeTests(unittest.TestCase):
                 config_path.write_text(json.dumps(bad))
                 with self.assertRaises(repositories.RepositoryError): requirement_execution.configuration(self.database, str(config_path), '42')
 
-    def test_stage_records_validated_execution_and_reuses_exact_inputs(self):
-        record, work, produced = self.stage(); config = {'execution_reference': 'fixture-host-execution'}
-        with patch.object(requirement_execution, 'invoke', return_value=produced) as invoke:
-            self.assertEqual(requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work), produced['result'])
-            self.assertEqual(requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work), produced['result'])
-            invoke.assert_called_once(); self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['executions']['to-spec']['evidence'], produced['execution'])
-            with self.assertRaises(repositories.RepositoryError): requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, {**work, 'adaptation': 'drift'})
+    def test_requirement_stage_receipt_admission_1(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid):
+                record, work, produced = self.stage()
+                record.pop('attempts', None); record.pop('execution_receipts', None)
+                if not valid:
+                    produced['execution']['loads'] = []
+                config = {'execution_reference': 'fixture-host-execution'} if valid else {}
+                with patch.object(requirement_execution, 'invoke', return_value=produced) as invoke:
+                    for replay in (False, True):
+                        if valid:
+                            self.assertEqual(requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work), produced['result'])
+                        else:
+                            with self.assertRaises(repositories.RepositoryError) as caught:
+                                requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work)
+                            self.assertEqual(caught.exception.code, 'execution_uncertain' if replay else 'execution_evidence_required')
+                    invoke.assert_called_once()
+                    stored = self.fixture.stored()['requirement_changes']['durable-notes']
+                    if valid:
+                        self.assertEqual(stored['executions']['to-spec']['evidence'], produced['execution'])
+                        with self.assertRaises(repositories.RepositoryError):
+                            requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, {**work, 'adaptation': 'drift'})
+                    else:
+                        self.assertEqual(stored['execution_receipts']['to-spec'], produced)
+                        self.assertNotIn('to-spec', stored['executions'])
 
-    def test_missing_execution_evidence_retains_receipt_and_denies_automatic_retry(self):
-        record, work, produced = self.stage(); produced['execution']['loads'] = []
-        with patch.object(requirement_execution, 'invoke', return_value=produced) as invoke:
-            with self.assertRaises(repositories.RepositoryError) as caught: requirement_execution.run_stage(self.database, self.item, record, 'to-spec', {}, work)
-            self.assertEqual(caught.exception.code, 'execution_evidence_required')
-            stored = self.fixture.stored()['requirement_changes']['durable-notes']
-            self.assertEqual(stored['execution_receipts']['to-spec'], produced); self.assertNotIn('to-spec', stored['executions'])
-            with self.assertRaises(repositories.RepositoryError) as caught: requirement_execution.run_stage(self.database, self.item, record, 'to-spec', {}, work)
-            self.assertEqual(caught.exception.code, 'execution_uncertain'); invoke.assert_called_once()
 
-    def test_late_pause_keeps_truthful_stage_receipt_but_never_admits_result(self):
-        record, work, produced = self.stage()
-        def invoke(*_, **kwargs): self.fixture.pause(); return produced
-        with patch.object(requirement_execution, 'invoke', side_effect=invoke):
-            with self.assertRaises(repositories.RepositoryError) as caught:
-                requirement_execution.run_stage(self.database, self.item, record, 'to-spec', {'execution_reference': 'fixture'}, work)
-        self.assertEqual(caught.exception.code, 'iteration_paused'); self.database.rollback()
-        stored = self.fixture.stored()['requirement_changes']['durable-notes']
-        self.assertEqual(stored['execution_receipts']['to-spec'], produced); self.assertNotIn('to-spec', stored['executions'])
-        self.assertIn('to-spec', stored['attempts']); self.assertTrue(controls.blocked(self.database, 'product', 'm1'))
-
-    def test_late_sqlite_exception_keeps_receipt_without_admitting_execution(self):
+    def test_requirement_stage_receipt_admission_2(self):
         class FaultConnection(sqlite3.Connection):
             fail_control_read = False
-
             def execute(connection, sql, *args):
                 if connection.fail_control_read and sql == 'PRAGMA database_list':
                     connection.fail_control_read = False
-                    # Raise an actual SQLite dependency error, not a mocked guard refusal.
                     return super().execute('SELECT * FROM nonexistent_control_read')
                 return super().execute(sql, *args)
+        for fault in ('sqlite', 'pause'):
+            with self.subTest(fault=fault):
+                self.database.close()
+                database = sqlite3.connect(self.fixture.state, factory=FaultConnection)
+                self.fixture.database = self.database = database
+                record, work, produced = self.stage()
+                def invoke(*_, **kwargs):
+                    if fault == 'pause':
+                        self.fixture.pause()
+                    else:
+                        database.fail_control_read = True
+                    return produced
+                with patch.object(requirement_execution, 'invoke', side_effect=invoke) as external:
+                    if fault == 'pause':
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            requirement_execution.run_stage(database, self.item, record, 'to-spec', {'execution_reference': 'fixture host receipt'}, work)
+                        self.assertEqual(caught.exception.code, 'iteration_paused')
+                    else:
+                        with self.assertRaisesRegex(sqlite3.OperationalError, 'nonexistent_control_read'):
+                            requirement_execution.run_stage(database, self.item, record, 'to-spec', {'execution_reference': 'fixture host receipt'}, work)
+                database.rollback()
+                stored = self.fixture.stored()['requirement_changes']['durable-notes']
+                self.assertEqual(stored['execution_receipts']['to-spec'], produced)
+                self.assertIn('to-spec', stored['attempts']); self.assertNotIn('to-spec', stored['executions'])
+                external.assert_called_once()
+                if fault == 'pause':
+                    self.assertTrue(controls.blocked(database, 'product', 'm1'))
+        self.addCleanup(database.close)
 
-        self.database.close()
-        database = sqlite3.connect(self.fixture.state, factory=FaultConnection)
-        self.fixture.database = self.database = database
-        record, work, produced = self.stage()
-        def invoke(_config, _work, **kwargs):
-            database.fail_control_read = True
-            return produced
-        with patch.object(requirement_execution, 'invoke', side_effect=invoke) as external:
-            with self.assertRaisesRegex(sqlite3.OperationalError, 'nonexistent_control_read'):
-                requirement_execution.run_stage(database, self.item, record, 'to-spec', {'execution_reference': 'fixture host receipt'}, work)
-        database.rollback(); stored = self.fixture.stored()['requirement_changes']['durable-notes']
-        self.assertEqual(stored['execution_receipts']['to-spec'], produced)
-        self.assertIn('to-spec', stored['attempts']); self.assertNotIn('to-spec', stored['executions']); external.assert_called_once()
 
     def test_unknown_commit_intent_never_creates_another_version(self):
         record = self.published((10,)); record['publication'] = {'branch': 'factory/revision/m1/durable-notes',
