@@ -9,4 +9,9 @@ def register(ctx):
     # Legacy readback is credential-blind. The strict publisher separately loads
     # its private exact host authorization; no ambient credential discovery.
     github = GitHub(api_base, 'credential-blind-controller', 10)
-    return ConversationBinding(ctx, binding, github, ctx.get_config('publication_config')).register()
+    native = ConversationBinding(ctx, binding, github, ctx.get_config('publication_config')).register()
+    wakeup_config = ctx.get_config('wakeup_config')
+    if wakeup_config is not None:
+        from factory_v1.planning_wakeup import NativeWakeup
+        native.wakeup = NativeWakeup(native, wakeup_config).start()
+    return native

@@ -27,7 +27,7 @@ def blocked(reason):
 
 
 def validate(config, service):
-    require(isinstance(config, dict) and set(config) == FIELDS and text(config['reference']) and
+    require(isinstance(config, dict) and set(config) in (FIELDS, FIELDS | {'planning_config'}) and text(config['reference']) and
             all(config[k] == service[k] for k in ('operator_id', 'project', 'iteration')) and
             isinstance(config['roles'], dict) and set(config['roles']) <= ROLES and
             isinstance(config['launchers'], dict) and set(config['launchers']) <= ROLES | {'implementation'},
@@ -41,6 +41,8 @@ def validate(config, service):
     for key in ('synthesis_config', 'review_config', 'publication_config', 'merge_config'):
         require(config[key] is None or assignments.absolute(config[key]),
                 'Use explicit host capability paths or null.', 'invalid_dispatch')
+    require(config.get('planning_config') is None or assignments.absolute(config['planning_config']),
+            'Use an explicit private native wakeup approval or null.', 'invalid_dispatch')
     require(all(assignments.absolute(p) for p in config['launchers'].values()),
             'Explicit private launcher paths required.', 'invalid_dispatch')
     return config
@@ -231,6 +233,12 @@ def tick(service, github, *, stop_event=None):
         config = validate(publication.read_json(Path(path)), service)
         item = assignments.current(database, *scope(service))
         controls.require_active(database, service['project'], service['iteration'])
+        if config.get('planning_config') is not None and (item.get('planning', {}).get('status') != 'complete' or
+                item.get('planning', {}).get('native_wakeup', {}).get('status') != 'consumed'):
+            from .planning_wakeup import supervise
+            status = supervise(database, item, config['planning_config'], github, stop_event=stop_event)
+            return {'status': status, 'stage': 'planning-wakeup', 'dispatch_allowed': False,
+                    'blockers': [] if status == 'consumed' else ['origin_conversation_pending']}
         rows = [row for row in assignments.rows(database) if
                 row['ticket_scope']['project'] == service['project'] and
                 row['ticket_scope']['iteration'] == service['iteration']]

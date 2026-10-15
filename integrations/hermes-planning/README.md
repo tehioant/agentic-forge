@@ -58,14 +58,46 @@ neither invents credentials nor authorizes a model call.
    remains compatible for non-native assignments. A successful publish call
    completes the durable handoff, so the existing scheduler can select synthesis.
 
-## Remaining scope
+## Supervised initial S1 wakeup
 
-The only remaining **initial S1 source integration** is supervisor-to-native
-wakeup and correlated asynchronous receipt consumption. Native injection is
-supported; Boolean enqueue acceptance is not completion. The supervisor must
-read the exact durable assignment/run completion, never infer it from enqueue.
-Initial publication is implemented here; continuation/revision publication uses
-its existing separate contract. S2/frontier progression is not changed.
+The service dispatch JSON optionally supplies `planning_config`; plugin settings
+supply the **same** private absolute path as `wakeup_config`. Its exact JSON fields:
+`binding` (the exact binding above), `assignment_id`, `profile_name`,
+`source_digest` (existing `assignments.digest` of selected `skills` and `adaptation`),
+and `allowance`. The allowance has only `reference`, explicitly approved
+`provider_route`, native `model`, integer Unix `expires_at`, and `max_wakeups: 1`.
+Plugin setting `provider_route` must independently match that approved route.
+These are authorization inputs, not discovered personal credentials or permission
+to install/enable a profile. The separately approved HOST publisher is unchanged.
+
+The initial native turn must already have retained genuine original observations.
+One service tick commits an idempotent request in the existing SQLite iteration.
+A native `ctx.spawn_task` subscriber consumes this fixed mailbox, records an
+unknown enqueue outcome **before** calling `ctx.inject_message` with the exact
+origin, and never repeats any attempted enqueue. True means only accepted,
+False is rejected, exceptions/crashes remain unknown. No endpoint, shell callback,
+custom framework, plugin-created process or thread is introduced.
+
+This bounded subscriber targets the installed Hermes **isolated plugin host**:
+`RemotePluginContext.spawn_task` → `HostRuntime.spawn`, using its existing loop.
+In-process loading without the required independently joinable native lifecycle
+reports `native_lifecycle_unavailable` rather than creating an unmanaged loop.
+Unload retains a cancellation flag, cancels the owned native future and waits at
+most two seconds for coroutine-finally confirmation; an unconfirmed join remains
+`shutdown_unconfirmed`. Mailbox locking uses the existing controller lock with
+nonblocking acquisition so an occupied controller does not wedge that host loop.
+
+The tagged synthetic turn must match approved session, host sender, native model,
+request and retained original host history. It preserves the original run and
+observations; the wakeup text is **never an operator answer**. Sufficient/publish
+and every publisher guard recheck current wakeup approval/cancellation. The
+supervisor consumes only an exact native run with verified HOST publication and
+completed immutable handoff, freshly reads that publication, then rereads the
+SQLite completion before retaining its receipt. Consumption occupies one tick;
+only a later tick can select synthesis. Unknown/changed scopes stay held.
+
+Initial publication and wakeup are implemented here; continuation/revision use
+their existing separate contracts. S2/frontier progression is not changed.
 
 Tests exercise real publisher/admission functions using explicitly labeled fake
 GitHub/native boundaries and retained durable state. No real native model

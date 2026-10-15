@@ -22,6 +22,7 @@ class ConversationBinding:
                 'An exact host-approved durable conversation binding is required.', 'approval_required')
         self.ctx, self.config, self.github = ctx, dict(config), github
         self.publication_config = publication_config
+        self.wakeup = None
         self.loaded = {}  # Legacy loader-only callers cannot use the strict publication route.
 
     def current(self, database, session_id):
@@ -59,16 +60,22 @@ class ConversationBinding:
             if work['status'] == 'complete':
                 return None
             native = work.get('native_execution')
-            if task_id or turn_id:
+            from .planning_wakeup import TAG, observe_wakeup
+            wakeup = isinstance(user_message, str) and TAG in user_message
+            if wakeup:
+                observe_wakeup(work, self.config, user_message, task_id, turn_id, sender_id, conversation_history,
+                               kwargs.get('model'))
+            if not wakeup and (task_id or turn_id):
                 require(text(task_id) and text(turn_id) and sender_id == self.config['operator_id'] and text(user_message),
                         'Native host task/turn/operator/input correlation required.', 'scope_mismatch')
-            if text(task_id) and text(turn_id) and sender_id == self.config['operator_id'] and text(user_message):
+            if not wakeup and text(task_id) and text(turn_id) and sender_id == self.config['operator_id'] and text(user_message):
                 identity = {'assignment_id': work['assignment_id'], 'session_id': session_id,
                             'task_id': task_id, 'turn_id': turn_id}
                 if native is None or any(native.get(k) != v for k, v in identity.items()):
                     require(not work.get('host_publication'), 'Resolve the existing publication before a new run.', 'publication_uncertain')
                     messages = [m for m in (conversation_history or []) if isinstance(m, dict) and
-                                m.get('role') in {'user', 'assistant'} and text(m.get('content'))]
+                                m.get('role') in {'user', 'assistant'} and text(m.get('content')) and
+                                TAG not in m['content']]
                     observations = [{'reference': 'native-history:' + str(i), 'role': m['role'], 'content': m['content']}
                                     for i, m in enumerate(messages)]
                     observations.append({'reference': 'native-turn:' + turn_id, 'role': 'user', 'content': user_message})
@@ -105,6 +112,8 @@ class ConversationBinding:
         """Return installed to-spec to this same running native agent tool loop."""
         with connect(self.config) as database, state_lock(database):
             item, selected = self.current(database, session_id)
+            from .planning_wakeup import execution_allowed
+            execution_allowed(item)
             work = item['planning']
             native = work.get('native_execution')
             require((native is not None and native['session_id'] == session_id) or
@@ -127,6 +136,8 @@ class ConversationBinding:
         """Publish actual same-origin synthesis through the exact approved HOST capability."""
         with connect(self.config) as database, state_lock(database):
             item, _ = self.current(database, session_id)
+            from .planning_wakeup import execution_allowed
+            execution_allowed(item)
             work = item['planning']
             native = work.get('native_execution')
             require(native is not None and native['session_id'] == session_id and native['sufficient'] is True and
@@ -159,6 +170,7 @@ class ConversationBinding:
 
             def guard():
                 fresh, _ = self.current(database, session_id)
+                execution_allowed(fresh)
                 require(fresh['planning'].get('native_execution') == native and
                         planning_publication.configuration(self.publication_config, self.config['operator_id']) == config,
                         'Native execution or HOST authority changed.', 'execution_required')
