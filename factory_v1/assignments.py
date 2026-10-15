@@ -149,6 +149,21 @@ def completed_iteration_claim(database, assignment):
                     for work in report.get('delivered', [])))
 
 
+def retirement_record_digest(assignment):
+    """Seal delivery authority, not restart's current-main ancestry observation."""
+    record = dict(assignment)
+    journal = record.get('merge')
+    if journal is not None:
+        evidence = journal['integrated_evidence']
+        require(isinstance(evidence, dict) and commit(evidence.get('main')) and
+                evidence.get('membership') in {'identical', 'ahead'} and
+                (evidence['membership'] == 'identical') == (evidence['main'] == evidence['integrated']),
+                'Known integrated membership observation required.', 'invalid_retirement')
+        record['merge'] = dict(journal, integrated_evidence={k: v for k, v in evidence.items()
+                                                          if k not in {'main', 'membership'}})
+    return digest(record)
+
+
 def delivered_ticket_proof(database, item, delivered, authority, lineage=None):
     """Correlate retained delivery and absent workers without external reads."""
     from . import bugs, diagnosis, recovery, requirements
@@ -198,7 +213,7 @@ def delivered_ticket_proof(database, item, delivered, authority, lineage=None):
                 'Every launched lineage worker needs verified terminal cleanup.', 'cleanup_required')
         pins[identity] = {'handoff_digest': a['handoff_digest'], 'claim_id': a['claim_id'],
                           'revision': a['revision'], 'run_id': (runtime or {}).get('run_id'),
-                          'record_sha256': digest(a)}
+                          'record_sha256': retirement_record_digest(a)}
     work = item['ticket_work']
     reservations = [*item.get('reservation_history', []), item.get('reservation', {})]
     reservation = next((r for r in reversed(reservations) if r.get('issue_number') == number and
@@ -227,7 +242,7 @@ def delivered_ticket_claim(database, assignment):
         return False
     try:
         proof = receipt['proof']
-        return bool(proof['lineage'][assignment['assignment_id']]['record_sha256'] == digest(assignment) and
+        return bool(proof['lineage'][assignment['assignment_id']]['record_sha256'] == retirement_record_digest(assignment) and
                     receipt.get('receipt_id') == digest(proof) and
                     proof == delivered_ticket_proof(database, item, proof['delivered'],
                                                    proof['merge_authority'], proof['lineage']))

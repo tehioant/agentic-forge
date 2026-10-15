@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, controls, iteration, merge, requirements, restart, tickets
+from factory_v1 import assignments, controls, iteration, merge, publication, requirements, restart, tickets
 from factory_v1.repositories import RepositoryError, save_iteration
 
 
@@ -44,19 +44,22 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.config = {'issue': 1, 'base': 'main', 'repository': 'example/product', 'repository_id': 7,
                        'api_base': 'https://api.github.com', 'bearer': 'fixture', 'pr_number': 3,
                        'candidate_assignment': 'candidate', 'standards_assignment': 'standards',
-                       'spec_assignment': 'spec', 'head': 'c' * 40}
+                       'spec_assignment': 'spec', 'head': 'c' * 40,
+                       'branch': 'factory/candidate', 'baseline': 'a' * 40}
         self.evidence = {'candidate': 'c' * 40, 'integrated': 'd' * 40, 'tree': 'e' * 40,
-                         'parents': ['a' * 40, 'c' * 40], 'main': 'd' * 40}
+                         'parents': ['a' * 40, 'c' * 40], 'main': 'd' * 40, 'membership': 'identical'}
         self.authority = {k: v for k, v in self.config.items() if k != 'bearer'}
         self.records = {}
         for identity, stage in [('builder', 'implementation'), ('candidate', 'simplify'),
                                 ('standards', 'review-standards'), ('spec', 'review-spec')]:
             handoff = {'stage': stage, 'issue': copy.deepcopy(self.pin), 'skills': [],
+                       'repository': 'example/product', 'repository_id': 7,
                        'profile': {'name': identity, 'home': '/fixture/' + identity}}
             self.records[identity] = {'assignment_id': identity, 'claim_id': 'claim-' + identity,
                                       'handoff': handoff, 'handoff_digest': assignments.digest(handoff),
                                       'ticket_scope': copy.deepcopy(self.scope), 'revision': self.revision,
-                                      'runtime': {'status': 'complete', 'container_removed': True, 'run_id': 'run-' + identity}}
+                                      'runtime': {'status': 'complete', 'container_removed': True, 'run_id': 'run-' + identity,
+                                                  'artifacts': '/fixture/artifacts'}}
         self.records['candidate']['merge'] = {'status': 'delivered', 'failure': None, 'close_allowed': True,
                                               'authority': copy.deepcopy(self.authority),
                                               'integrated_evidence': copy.deepcopy(self.evidence),
@@ -107,7 +110,7 @@ class DeliveredOwnershipComponents(unittest.TestCase):
                  'delivered': delivered,
                  'lineage': {identity: {'handoff_digest': a['handoff_digest'], 'claim_id': a['claim_id'],
                                        'revision': a['revision'], 'run_id': a['runtime']['run_id'],
-                                       'record_sha256': assignments.digest(a)} for identity, a in self.records.items()}}
+                                       'record_sha256': assignments.retirement_record_digest(a)} for identity, a in self.records.items()}}
         self.item['delivered_ticket_retirements'] = {'candidate': {'receipt_id': assignments.digest(proof), 'proof': proof}}
         self.item['reservation_history'] = [self.item.pop('reservation')]
         self.store()
@@ -177,6 +180,7 @@ class DeliveredOwnershipComponents(unittest.TestCase):
     def test_shared_predicate_rejects_resealed_identity_revision_authority_and_cleanup_drift(self):
         self.seed_receipt()
         original = copy.deepcopy(self.item)
+        records = copy.deepcopy(self.records)
         for field, value in [('scope', dict(self.scope, issue_id=999)), ('revision', {'spec': {}}),
                              ('candidate', 'other'), ('merge_authority', dict(self.authority, head='f' * 40))]:
             proof = self.item['delivered_ticket_retirements']['candidate']['proof']
@@ -195,6 +199,71 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.store()
         self.assertFalse(assignments.delivered_ticket_claim(self.db, self.records['builder']))
 
+        # Record seals still bind every non-observation field, including newly added fields.
+        drift = [(('assignment_id',), 'other'), (('claim_id',), 'other'),
+                 (('handoff', 'baseline'), 'f' * 40), (('handoff', 'issue', 'id'), 999),
+                 (('handoff', 'source_authority'), {'trusted': False}),
+                 (('revision',), {'spec': {}}), (('submitted_result',), {'status': 'changed'}),
+                 (('native_execution',), {'trusted': False}),
+                 (('runtime', 'run_id'), 'other'), (('runtime', 'container_removed'), False),
+                 (('runtime', 'status'), 'running'), (('runtime', 'error'), 'stop_unconfirmed'),
+                 (('merge', 'authority', 'head'), 'f' * 40),
+                 (('merge', 'authority', 'baseline'), 'f' * 40),
+                 (('merge', 'authority', 'standards_assignment'), 'other'),
+                 (('merge', 'integrated_evidence', 'candidate'), 'f' * 40),
+                 (('merge', 'integrated_evidence', 'tree'), 'f' * 40),
+                 (('merge', 'integrated_evidence', 'integrated'), 'f' * 40),
+                 (('merge', 'integrated_evidence', 'parents'), ['f' * 40]),
+                 (('merge', 'delivery_checks'), ['changed']), (('updated_at',), 'changed')]
+        for path, value in drift:
+            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
+            candidate = self.records['candidate']
+            obj = candidate
+            for key in path[:-1]:
+                obj = obj[key]
+            obj[path[-1]] = value
+            self.store()
+            with self.subTest(record_drift=path):
+                self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
+
+        # Reseal correlated hashes so semantic delivery/cleanup guards, not byte drift, refuse.
+        for path, value in [entry for entry in drift if entry[0][0] in {'revision', 'runtime', 'merge'}]:
+            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
+            candidate = self.records['candidate']
+            obj = candidate
+            for key in path[:-1]:
+                obj = obj[key]
+            obj[path[-1]] = value
+            receipt = self.item['delivered_ticket_retirements']['candidate']
+            proof = receipt['proof']
+            # An integrated-identity change must remain a valid observation to isolate identity.
+            if path == ('merge', 'integrated_evidence', 'integrated'):
+                candidate['merge']['integrated_evidence']['main'] = value
+            proof['lineage']['candidate']['record_sha256'] = assignments.retirement_record_digest(candidate)
+            receipt['receipt_id'] = assignments.digest(proof)
+            self.store()
+            with self.subTest(resealed_drift=path):
+                self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
+
+        for change in [{'main': None}, {'membership': 'unknown'}, {'membership': 'behind'},
+                       {'main': 'f' * 40, 'membership': 'identical'}, {'membership': 'ahead'}]:
+            self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
+            self.records['candidate']['merge']['integrated_evidence'].update(change)
+            self.store()
+            with self.subTest(unknown_or_contradictory_observation=change):
+                self.assertFalse(assignments.delivered_ticket_claim(self.db, self.records['candidate']))
+                with self.assertRaises(RepositoryError):
+                    assignments.ticket_claims(self.db, dict(self.scope, issue_number=2, issue_id=20))
+
+        self.item, self.records = copy.deepcopy(original), copy.deepcopy(records)
+        self.store()
+        self.reads['merged_evidence'].side_effect = RepositoryError('Unknown membership.', 'not_integrated')
+        before, rows = self.stored(), self.rows()
+        with self.assertRaises(RepositoryError):
+            self.advance()
+        self.assertEqual(self.stored(), before)
+        self.assertEqual(self.rows(), rows)
+
     def test_current_requirement_and_final_frontier_guards_are_not_masked_by_checksums(self):
         self.seed_receipt()
         revised = dict(self.revision, ticket_inputs='f' * 64)
@@ -204,7 +273,7 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         proof = receipt['proof']
         proof['revision'] = proof['delivered']['requirements'] = revised
         proof['lineage']['candidate']['revision'] = revised
-        proof['lineage']['candidate']['record_sha256'] = assignments.digest(candidate)
+        proof['lineage']['candidate']['record_sha256'] = assignments.retirement_record_digest(candidate)
         receipt['receipt_id'] = assignments.digest(proof)
         self.store()
         self.assertFalse(assignments.delivered_ticket_claim(self.db, candidate))
@@ -275,8 +344,29 @@ class DeliveredOwnershipComponents(unittest.TestCase):
         self.assertEqual(result['reservation']['status'], 'reserved')
         return result
 
+    def refresh_integration(self):
+        before = copy.deepcopy(self.stored()['delivered_ticket_retirements'])
+        self.assertTrue(all(assignments.delivered_ticket_claim(self.db, a) for a in self.records.values()))
+        fresh = dict(self.evidence, main='f' * 40, membership='ahead')
+        self.reads['merged_evidence'].return_value = fresh
+        with patch.object(restart, 'physical', return_value=Path('/fixture/artifacts')):
+            observed = restart.integration(self.records['candidate'], self.github)
+        publication.save(self.db, self.records['candidate'])
+        self.assertIsNotNone(observed)
+        self.assertEqual(observed['integration'], fresh)
+        self.assertEqual(self.stored()['delivered_ticket_retirements'], before)
+        self.assertTrue(all(assignments.delivered_ticket_claim(self.db, a) for a in self.records.values()))
+        # An ownership observation is not fresh delivery approval for a different main.
+        rows = self.rows()
+        with self.assertRaises(RepositoryError) as refused:
+            self.advance()
+        self.assertEqual(refused.exception.code, 'not_integrated')
+        self.assertEqual(self.stored()['delivered_ticket_retirements'], before)
+        self.assertEqual(self.rows(), rows)
+
     def test_second_reservation_reaches_real_ownership_guard_with_direct_receipt(self):
         self.seed_receipt()
+        self.refresh_integration()
         result = self.reserve_second()
         scope = dict(self.scope, issue_number=2, issue_id=20)
         request = {'stage': 'implementation', 'claim_id': 'fresh', 'profile': {'name': 'fresh', 'home': '/fixture/fresh'}}
@@ -288,6 +378,7 @@ class DeliveredOwnershipComponents(unittest.TestCase):
 
     def test_role_claim_then_second_reservation_uses_the_same_retirement_authority(self):
         self.seed_receipt()
+        self.refresh_integration()
         scope = dict(self.scope, issue_number=2, issue_id=20)
         profile = {'name': 'fresh', 'home': '/fixture/fresh'}
         assignments.claims(self.db, {'stage': 'implementation', 'claim_id': 'fresh', 'profile': profile}, scope, 'fresh')
