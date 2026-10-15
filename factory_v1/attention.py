@@ -212,10 +212,22 @@ def deliver(database, item, event_id, config_path):
         save(database, record)
         database.commit()
         raise
-    record['state'] = 'uncertain'
-    record['attempts'] += 1
-    save(database, record)
-    database.commit()  # Intent survives death both before and after the external send.
+    from .readiness_gate import admission, check
+
+    def current_origin():
+        fresh = load_iteration(database, item['project_id'], item['iteration_id'])
+        if fresh['origin'] != record['destination']:
+            raise IntakeError('invalid_origin', 'Notification origin changed before send.')
+
+    with admission(database, item['project_id'], item['iteration_id'], operation='notification'):
+        current_origin()
+        record['state'] = 'uncertain'
+        record['attempts'] += 1
+        save(database, record)
+        database.commit()  # Intent survives death both before and after the external send.
+    transport = HermesTransport(config_path, record['destination'])
+    check(database, item['project_id'], item['iteration_id'], operation='notification')
+    current_origin()
     outcome = transport.send(record)
     database.execute('BEGIN IMMEDIATE')
     # Keep the shared lifecycle lock across commits and send; no concurrent resender.

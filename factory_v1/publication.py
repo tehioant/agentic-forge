@@ -358,11 +358,13 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
             return fresh
         def write(path, payload, method='POST'):
             from .readiness_gate import check
-            check(database, project, iteration, resolution=resolution)
+            check(database, project, iteration, resolution=resolution, operation='effect')
             controls.require_active(database, project, iteration, resolution=resolution)
             current_assignment()
             return api.write(path, payload, method)
-        with controls.admission(database, project, iteration, resolution=resolution):
+        from .readiness_gate import admission
+        with admission(database, project, iteration, resolution=resolution, operation='effect'):
+            controls.require_active(database, project, iteration, resolution=resolution)
             current_assignment()
             assignment['publication'] = publication
             save(database, assignment, publication_only=True)  # Intent is durable before any object/ref/PR write.
@@ -415,7 +417,8 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         require(ref_sha(api.read(ref_path), config['branch']) == plan['candidate'], 'Ref moved during PR verification.', 'github_mismatch')
         require(ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == handoff['baseline'],
                 'Base moved during publication.', 'github_mismatch')
-        with controls.admission(database, project, iteration, resolution=resolution):
+        with admission(database, project, iteration, resolution=resolution, operation='effect'):
+            controls.require_active(database, project, iteration, resolution=resolution)
             current_assignment()
             publication['status'] = 'published'
             save(database, assignment, publication_only=True)

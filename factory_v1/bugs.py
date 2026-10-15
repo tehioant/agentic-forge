@@ -302,7 +302,8 @@ def edges(database, item, work, github, number, expected, *, resolution=None):
         intent = [number, blocker]
         require(intent not in intents, 'Uncertain edge is absent; investigate before retry.', 'publication_uncertain')
         intents.append(intent)
-        tickets.admitted_checkpoint(database, item, resolution=resolution)
+        tickets.effect_checkpoint(database, item, resolution=resolution)
+        tickets.effect_check(database, item, resolution=resolution)
         gh.add_dependency(github, item['repository'], number, blocker)
     observed = gh.dependencies(github, item['repository'], number)
     require({d['id'] for d in observed} == expected and len(observed) == len(expected),
@@ -328,7 +329,7 @@ def affected_edges(database, item, work, github, issue, *, resolution=None):
             replacement = newline + newline.join('- #' + str(n) for n in expected_numbers) + newline * 2
             target = dependent['body'][:start] + replacement + dependent['body'][end:]
             intents[key] = {'before': dependent['body'], 'body': target}
-            tickets.admitted_checkpoint(database, item, resolution=resolution)
+            tickets.effect_checkpoint(database, item, resolution=resolution)
         intent = intents[key]
         require(tickets.external_contract({**dependent, 'body': intent['body']}, work.get('scoped_inputs', {}).get(key, work['inputs'])) and
                 set(re.findall(r'#([1-9][0-9]*)', sections(intent['body']).get('Blocked by', ''))) ==
@@ -337,6 +338,7 @@ def affected_edges(database, item, work, github, issue, *, resolution=None):
         require(dependent['body'] in {intent['before'], intent['body']}, 'Affected body conflicts with scoped edge update.', 'publication_mismatch')
         if dependent['body'] != intent['body']:
             tickets.active(item, database, resolution=resolution)
+            tickets.effect_check(database, item, resolution=resolution)
             github.request('/repos/' + item['repository'] + '/issues/' + str(number), {'body': intent['body']}, method='PATCH')
         dependent = gh.read_issue(github, item['repository'], number)
         require(dependent['body'] == intent['body'] and all(dependent[k] == original['issue'][k] for k in ('number', 'id', 'node_id')),
@@ -411,7 +413,7 @@ def publish_locked(database, item, work, github):
             tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
             work['status'] = 'duplicate' if work.get('duplicate_number') is not None else 'published'
             work.pop('blocker', None)
-            tickets.admitted_checkpoint(database, item, resolution=resolution)
+            tickets.effect_checkpoint(database, item, resolution=resolution)
             return tickets.frontier(database, item, github, resolution=resolution)
         observed = observations(item, github, board)
         duplicate = work.get('duplicate_number')
@@ -437,7 +439,8 @@ def publish_locked(database, item, work, github):
                 payload = {'title': work['bug']['title'], 'body': expected_body, 'labels': [work['bug']['triage_label']],
                            'milestone': board['milestone']['number'] if work['bug']['scope'] == 'current' and 'milestone' in board else None}
                 work['issue_intent'] = payload
-                tickets.admitted_checkpoint(database, item, resolution=resolution)
+                tickets.effect_checkpoint(database, item, resolution=resolution)
+                tickets.effect_check(database, item, resolution=resolution)
                 created = gh.issue_identity(github.request('/repos/' + item['repository'] + '/issues', payload), item['repository'])
                 work['identity'] = {k: created[k] for k in ('number', 'id', 'node_id')}
                 tickets.checkpoint(database, item, work=work, fields=('identity', 'observation'))
@@ -459,7 +462,8 @@ def publish_locked(database, item, work, github):
         if member is None:
             require(not work.get('membership_intent'), 'Uncertain membership is absent; investigate before retry.', 'publication_uncertain')
             work['membership_intent'] = True
-            tickets.admitted_checkpoint(database, item, resolution=resolution)
+            tickets.effect_checkpoint(database, item, resolution=resolution)
+            tickets.effect_check(database, item, resolution=resolution)
             gh.add_item(github, board['project_id'], issue['node_id'])
             member = gh.membership(github, board, item['repository'], issue)
             require(member is not None, 'Exact bug board membership missing.', 'publication_mismatch')
@@ -474,7 +478,8 @@ def publish_locked(database, item, work, github):
                 require(member[role] in {None, option}, 'Existing bug board scope/progress conflicts.', 'publication_mismatch')
                 if member[role] != option:
                     work.setdefault('field_intents', {})[role] = option
-                    tickets.admitted_checkpoint(database, item, resolution=resolution)
+                    tickets.effect_checkpoint(database, item, resolution=resolution)
+                    tickets.effect_check(database, item, resolution=resolution)
                     gh.set_field(github, board['project_id'], member['id'], board[role]['id'], option)
             member = gh.membership(github, board, item['repository'], issue)
             require(member is not None and all(member[k] == v for k, v in target.items()),
@@ -494,7 +499,7 @@ def publish_locked(database, item, work, github):
         work.update(status='duplicate' if duplicate is not None else 'published', publication_complete=True)
         work.pop('blocker', None)
         transition(item, 'bug_tracked')
-        tickets.admitted_checkpoint(database, item, resolution=resolution)
+        tickets.effect_checkpoint(database, item, resolution=resolution)
         return tickets.frontier(database, item, github, resolution=resolution)
     except RepositoryError as error:
         if error.code in {'iteration_paused', 'invalid_control'}:

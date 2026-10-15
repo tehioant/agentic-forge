@@ -255,9 +255,11 @@ def issue(api, assignment, config):
     return value
 
 
-def reopen(api, assignment, config, observed):
+def reopen(api, assignment, config, observed, *, database):
     if observed['state'] != 'closed':
         return
+    from .readiness_gate import check
+    check(database, assignment['ticket_scope']['project'], assignment['ticket_scope']['iteration'], operation='effect')
     try:
         api.issue_state('open', observed)
     except RepositoryError:
@@ -312,9 +314,10 @@ def merged_evidence(api, config, pr, plan):
 
 
 def save(database, assignment, journal):
-    assignment['merge'] = journal
-    assignment['merge_refusal'] = journal.get('failure')
-    publication.save(database, assignment)
+    fresh = next(a for a in assignments.rows(database) if a['assignment_id'] == assignment['assignment_id'])
+    fresh['merge'] = journal
+    fresh['merge_refusal'] = journal.get('failure')
+    publication.save(database, fresh)
 
 
 def inspect_merge(database, project, iteration, operator, assignment_id):
@@ -446,17 +449,19 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                 from .recovery import merge_boundary
                 prior, builder, root = chain(database, project, iteration, operator, config, config_path)
                 merge_boundary(database, latest, config, builder, root)
-            from .controls import admission, require_active
+            from .controls import require_active
+            from .readiness_gate import admission
             require_active(database, project, iteration)
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}
-            with admission(database, project, iteration):
+            with admission(database, project, iteration, operation='effect'):
+                require_active(database, project, iteration)
                 save(database, prior, journal)
             # Any outcome, including an HTTP failure, is reconciled by reading this exact PR.
             try:
                 from .readiness_gate import check
-                check(database, project, iteration)
+                check(database, project, iteration, operation='effect')
                 require_active(database, project, iteration)
                 api.request(api.prefix + '/pulls/' + str(config['pr_number']) + '/merge',
                             {'sha': config['head'], 'merge_method': 'merge'}, 'PUT')
@@ -503,16 +508,22 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             if previous_delivery is None or fresh_issue['state'] != 'closed':
                 save(database, prior, journal)  # Verified integration/checks precede any closure.
             if fresh_issue['state'] != 'closed':
+                from .readiness_gate import check
+                check(database, project, iteration, operation='effect')
                 try:
                     api.issue_state('closed', fresh_issue)
                 except RepositoryError:
                     after = issue(api, prior, config)
                     require(after['state'] == 'closed' and after['body'] == fresh_issue['body'],
                             'Closure outcome must reconcile before retry.', 'delivery_uncertain')
-            journal.update(status='delivered', failure=None)
-            save(database, prior, journal)
+            from .readiness_gate import admission
+            with admission(database, project, iteration, operation='effect'):
+                from .controls import require_active
+                require_active(database, project, iteration)
+                journal.update(status='delivered', failure=None)
+                save(database, prior, journal)
         else:
-            reopen(api, prior, config, observed_issue)
+            reopen(api, prior, config, observed_issue, database=database)
         return {**journal, 'merge_allowed': False}
     except (RepositoryError, OSError, ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError) as error:
         if not isinstance(error, RepositoryError):
@@ -532,5 +543,5 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             assignment['merge_refusal'] = {'candidate': config['head'], 'revision': assignment['revision'], **failure}
             publication.save(database, assignment)
         current_issue = issue(api, assignment, config)
-        reopen(api, assignment, config, current_issue)
+        reopen(api, assignment, config, current_issue, database=database)
         raise error

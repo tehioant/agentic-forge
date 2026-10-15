@@ -313,6 +313,23 @@ def checkpoint(database, item, *, work=None, fields=()):
     database.commit()
 
 
+def effect_check(database, item, *, resolution=None):
+    """Fresh capabilities for existing publication, not a new worker claim."""
+    from .readiness_gate import check
+    check(database, item['project_id'], item['iteration_id'], resolution=resolution, operation='effect')
+    active(item, database, resolution=resolution)
+
+
+def effect_checkpoint(database, item, *, resolution=None):
+    from .readiness_gate import admission
+    from .controls import require_active
+    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation='effect'):
+        require_active(database, item['project_id'], item['iteration_id'], resolution=resolution)
+        require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
+        save_iteration(database, item)
+        database.commit()
+
+
 def publication_blocked(database, item, error, *, resolution, bug=None):
     from .assignments import current
     fresh = current(database, item['project_id'], item['iteration_id'],
@@ -320,7 +337,7 @@ def publication_blocked(database, item, error, *, resolution, bug=None):
     work = fresh['ticket_work'] if bug is None else fresh['bug_work'][bug]
     work.update(status='blocked', blocker={'code': error.code, 'message': str(error)})
     transition(fresh, 'ticket_publication_blocked' if bug is None else 'bug_tracking_blocked')
-    admitted_checkpoint(database, fresh, resolution=resolution)
+    checkpoint(database, fresh)
     original = item['ticket_work'] if bug is None else item['bug_work'][bug]
     original.update(status=work['status'], blocker=work['blocker'])
     return fresh
@@ -361,12 +378,12 @@ def publish(database, item, github):
     try:
         board = verified_board(work, github, item['repository'], item['iteration_id'])
         work['board'] = board
-        admitted_checkpoint(database, item, resolution=resolution)
+        effect_checkpoint(database, item, resolution=resolution)
         if work.get('publication_complete'):
             item = frontier(database, item, github, resolution=resolution)
             item['ticket_work']['status'] = 'published'
             item['ticket_work'].pop('blocker', None)
-            admitted_checkpoint(database, item, resolution=resolution)
+            effect_checkpoint(database, item, resolution=resolution)
             return item
         numbers = {k: v['number'] for k, v in work.get('published', {}).items()}
         for ticket in work['tickets']:
@@ -382,10 +399,11 @@ def publish(database, item, github):
             if not candidates:
                 require(not intent.get('issue'), 'Lost issue response/absent readback: investigate before retry; never create a duplicate.', 'publication_uncertain')
                 intent['issue'] = {'title': ticket['title'], 'body': expected_body}
-                admitted_checkpoint(database, item, resolution=resolution)  # BEFORE mutation, including lost response/process death.
+                effect_checkpoint(database, item, resolution=resolution)  # BEFORE mutation, including lost response/process death.
                 payload = {'title': ticket['title'], 'body': expected_body, 'labels': [ticket['triage_label']]}
                 if 'milestone' in board:
                     payload['milestone'] = board['milestone']['number']
+                effect_check(database, item, resolution=resolution)
                 created = github.request('/repos/' + item['repository'] + '/issues', payload)
                 created = gh.issue_identity(created, item['repository'])
                 intent['identity'] = {'number': created['number'], 'id': created['id'], 'node_id': created['node_id']}
@@ -411,7 +429,8 @@ def publish(database, item, github):
                 require(blocker not in intent.get('dependencies', []),
                         'Lost native blocker write with absent relationship; investigate before retry.', 'publication_uncertain')
                 intent.setdefault('dependencies', []).append(blocker)
-                admitted_checkpoint(database, item, resolution=resolution)
+                effect_checkpoint(database, item, resolution=resolution)
+                effect_check(database, item, resolution=resolution)
                 gh.add_dependency(github, item['repository'], issue['number'], blocker)
             observed = gh.dependencies(github, item['repository'], issue['number'])
             require({gh.issue_identity(d, item['repository'])['id'] for d in observed} == expected_ids and len(observed) == len(expected_ids),
@@ -420,7 +439,8 @@ def publish(database, item, github):
             if member is None:
                 require(not intent.get('membership'), 'Lost board write and absent membership; investigate before retry.', 'publication_uncertain')
                 intent['membership'] = True
-                admitted_checkpoint(database, item, resolution=resolution)
+                effect_checkpoint(database, item, resolution=resolution)
+                effect_check(database, item, resolution=resolution)
                 gh.add_item(github, board['project_id'], issue['node_id'])
                 member = gh.membership(github, board, item['repository'], issue)
                 require(member is not None, 'Exact project membership missing after write.', 'publication_mismatch')
@@ -434,7 +454,8 @@ def publish(database, item, github):
                 require(member[role] in {None, option}, 'Existing board progress/scope conflicts; do not overwrite external work.', 'publication_mismatch')
                 if member[role] != option:
                     intent[role] = option
-                    admitted_checkpoint(database, item, resolution=resolution)
+                    effect_checkpoint(database, item, resolution=resolution)
+                    effect_check(database, item, resolution=resolution)
                     gh.set_field(github, board['project_id'], member['id'], board[role]['id'], option)
             member = gh.membership(github, board, item['repository'], issue)
             require(member is not None and all(member[k] == v for k, v in target.items()), 'Exact project scope/progress readback differs.', 'publication_mismatch')
@@ -444,7 +465,7 @@ def publish(database, item, github):
         work['publication_complete'] = True
         work.pop('blocker', None)
         transition(item, 'ticket_frontier_ready')
-        admitted_checkpoint(database, item, resolution=resolution)
+        effect_checkpoint(database, item, resolution=resolution)
         return frontier(database, item, github, resolution=resolution)
     except RepositoryError as error:
         if error.code in {'iteration_paused', 'invalid_control'}:
@@ -576,7 +597,7 @@ def frontier(database, item, github, *, resolution=None):
     if resolution is None:
         checkpoint(database, item)
     else:
-        admitted_checkpoint(database, item, resolution=resolution)
+        effect_checkpoint(database, item, resolution=resolution)
     return item
 
 
@@ -606,7 +627,9 @@ def advance_delivered(database, item, github, merge_config_path):
     requirements.revalidate_inputs(database, item, github, number)
     require(iteration.frontier(database, item, github, resolution=resolution) == observed,
             'Frontier changed during delivery verification.', 'delivery_race')
-    with controls.admission(database, project, iteration_id, resolution=resolution), database:
+    from .readiness_gate import admission as effect_admission
+    with effect_admission(database, project, iteration_id, resolution=resolution, operation='effect'), database:
+        controls.require_active(database, project, iteration_id, resolution=resolution)
         database.execute('BEGIN IMMEDIATE')
         latest = assignments.current(database, project, iteration_id, operator, require_active=False)
         require(latest == item and assignments.delivered_ticket_proof(database, latest, delivered, authority) == proof,

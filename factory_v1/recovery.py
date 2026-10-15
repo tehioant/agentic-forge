@@ -33,7 +33,19 @@ def held_numbers(item):
             if record['status'] != 'cleared' for receipt in record.get('removed', {}).values()}
 
 
-def checkpoint(database, item):
+def checkpoint(database, item, *, receipt=False):
+    if receipt:
+        fresh = assignments.current(database, item['project_id'], item['iteration_id'],
+                                    item['approval']['operator_id'], require_active=False)
+        for key, record in item.get('main_recoveries', {}).items():
+            target = fresh['main_recoveries'][key]
+            require(target['config'] == record['config'], 'Recovery receipt authority changed.', 'stale_admission')
+            for identity, observed in record.get('removed', {}).items():
+                saved = target.setdefault('removed', {}).setdefault(identity, {})
+                for field in ('issue_readback', 'membership', 'dependencies'):
+                    if field in observed:
+                        saved[field] = observed[field]
+        item = fresh
     incident = item['main_incident']
     delivery.validate_incident(incident, item['delivery_monitor']['config'])
     with database:
@@ -470,6 +482,7 @@ def affected_membership(github, item, issue, identity=None):
 
 
 def reopen_removed(database, item, record, report, github):
+    from .readiness_gate import admission as effect_admission
     project, iteration = item['project_id'], item['iteration_id']
     board = item['ticket_work']['board']
     statuses = item['ticket_work']['request']['tracker']['statuses']
@@ -479,15 +492,17 @@ def reopen_removed(database, item, record, report, github):
         issue = exact_issue(github, item['repository'], pin)
         member = affected_membership(github, item, issue)
         membership_id = member['id']
-        with controls.admission(database, project, iteration):
+        with effect_admission(database, project, iteration, operation='effect'):
+            controls.require_active(database, project, iteration)
             receipt = record['removed'].setdefault(identity, {'issue': pin, 'open_intent': False, 'status_intent': False})
             checkpoint(database, item)
         if issue['state'] != 'open':
-            with controls.admission(database, project, iteration):
+            with effect_admission(database, project, iteration, operation='effect'):
+                controls.require_active(database, project, iteration)
                 require(not receipt['open_intent'], 'Unknown reopening outcome; reconcile exact issue, never repeat blindly.', 'delivery_uncertain')
                 receipt['open_intent'] = True
                 checkpoint(database, item)
-            controls.require_active(database, project, iteration)
+            tickets.effect_check(database, item)
             try:
                 github.request('/repos/' + item['repository'] + '/issues/' + str(pin['number']),
                                {'state': 'open', 'state_reason': 'reopened'}, 'PATCH')
@@ -497,12 +512,13 @@ def reopen_removed(database, item, record, report, github):
         require(issue['state'] == 'open', 'Removed behavior ticket must read back open.', 'delivery_uncertain')
         # An admitted write may finish after pause; retain its truthful receipt before any next intent.
         receipt['issue_readback'] = issue
-        checkpoint(database, item)
+        checkpoint(database, item, receipt=True)
         protected = {board['status']['options'][name] for role, name in statuses.items() if role in {'blocked', 'deferred'}}
         member = affected_membership(github, item, issue, membership_id)
         option = member['status'] if member['status'] in protected else board['status']['options'][statuses['ready']]
         if member['status'] != option:
-            with controls.admission(database, project, iteration):
+            with effect_admission(database, project, iteration, operation='effect'):
+                controls.require_active(database, project, iteration)
                 require(not receipt['status_intent'], 'Unknown status outcome; reconcile before any retry.', 'delivery_uncertain')
                 receipt['status_intent'] = True
                 checkpoint(database, item)
@@ -513,7 +529,7 @@ def reopen_removed(database, item, record, report, github):
             require(issue['state'] == 'open', 'Reopened issue changed before status mutation.', 'delivery_uncertain')
             member = affected_membership(github, item, issue, membership_id)
             option = member['status'] if member['status'] in protected else option
-            controls.require_active(database, project, iteration)
+            tickets.effect_check(database, item)
             if member['status'] != option:
                 try:
                     tickets.gh.set_field(github, board['project_id'], member['id'], board['status']['id'], option)
@@ -530,8 +546,8 @@ def reopen_removed(database, item, record, report, github):
                               failure={'code': 'delivery_removed', 'message': 'Recovery removed accepted behavior.'})
         with database:
             database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?', (json.dumps(prior), identity))
-            checkpoint(database, item)
-        controls.require_active(database, project, iteration)
+            checkpoint(database, item, receipt=True)
+        tickets.effect_check(database, item)
 
 
 def verify(database, project, iteration, operator, config_path, github):
@@ -581,7 +597,9 @@ def verify(database, project, iteration, operator, config_path, github):
     record = active(item)
     assert record is not None
     evidence = final_sample['evidence']
-    with controls.admission(database, project, iteration), database:
+    from .readiness_gate import admission
+    with admission(database, project, iteration, operation='effect'), database:
+        controls.require_active(database, project, iteration)
         record.update(status='cleared', clearance={'merge': journal['integrated_evidence'], 'checks': journal['delivery_checks'],
                                                   'evidence_id': assignments.digest(evidence), 'frontier': observed['ticket_work']['frontier']})
         incident = item['main_incident']
