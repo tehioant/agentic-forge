@@ -494,6 +494,15 @@ class EnforcedReadinessTests(SupervisedFixture, unittest.TestCase):
         self.bind_service()
 
     def test_service_component_liveness_capability_and_runnable_are_separate(self):
+        from factory_v1 import service_dispatch
+        self.assertFalse(service.inspect_readiness(self.service, running=True)['iteration_runnable'])
+        dispatch_config = dict.fromkeys(service_dispatch.FIELDS)
+        dispatch_config.update(operator_id='operator', project='p', iteration='i', reference='fixture', roles={}, launchers={})
+        self.service['dispatch_config'] = self.file('dispatch.json', dispatch_config)
+        self.item['planning'] = {'status': 'complete'}; self.save()
+        self.file('service.json', self.service)
+        self.db.execute('UPDATE supervised_readiness SET policy=?',
+                        (readiness_gate.policy(self.service, self.config, self.db),)); self.db.commit()
         for running in (True, False, None):
             report = service.inspect_readiness(self.service, running=running)
             self.assertTrue(report['capability_ready'], report)
@@ -588,7 +597,11 @@ class EnforcedReadinessTests(SupervisedFixture, unittest.TestCase):
         self.assertFalse(service.inspect_readiness(self.service, running=True)['iteration_runnable'])
 
     def test_ready_and_denied_cycle_reach_only_existing_dispatch_seam(self):
-        self.service['dispatch_config'] = self.file('dispatch.json', {})
+        from factory_v1 import service_dispatch
+        self.item['planning'] = {'status': 'complete'}; self.save()
+        dispatch_config = dict.fromkeys(service_dispatch.FIELDS)
+        dispatch_config.update(operator_id='operator', project='p', iteration='i', reference='fixture', roles={}, launchers={})
+        self.service['dispatch_config'] = self.file('dispatch.json', dispatch_config)
         self.file('service.json', self.service)
         self.db.execute('UPDATE supervised_readiness SET policy=?',
                         (readiness_gate.policy(self.service, self.config, self.db),)); self.db.commit()
@@ -611,3 +624,244 @@ class EnforcedReadinessTests(SupervisedFixture, unittest.TestCase):
                 service_dispatch.tick(self.service, self.github)
         self.assertEqual(caught.exception.code, 'readiness_configuration_required')
         select.assert_not_called()
+
+
+class CoreReadinessTests(SupervisedFixture, unittest.TestCase):
+    setUp = EnforcedReadinessTests.setUp
+    file = ReadinessTests.file
+    save = ReadinessTests.save
+    read = ReadinessTests.read
+
+    def record(self, slot, status=None):
+        from factory_v1 import requirements
+        handoff = {k: deepcopy(slot[k]) for k in ('stage', 'profile', 'skills')}
+        for descriptor in handoff['skills']:
+            descriptor['instructions'] = Path(descriptor['path']).read_text()
+        handoff['workspace'] = str(self.root / 'workspace')
+        handoff['issue'] = dict(number=1, id=10, node_id='I1', body_sha256='c'*64)
+        row = dict(assignment_id=assignments.digest(slot['claim_id']), claim_id=slot['claim_id'],
+                   handoff=handoff, handoff_digest=assignments.digest(handoff),
+                   revision=requirements.authority(self.item, 1),
+                   ticket_scope=dict(project='p', iteration='i', repository='owner/product', repository_id=7,
+                                     issue_number=1, issue_id=10))
+        if status:
+            row['runtime'] = dict(run_id='run-' + slot['claim_id'], status=status,
+                artifacts=str(self.root / ('result-' + slot['claim_id'])), container_removed=status == 'complete',
+                controller_pid=123, controller_start='fixture-start')
+        self.db.execute('CREATE TABLE IF NOT EXISTS role_assignments (assignment_id TEXT, payload TEXT)')
+        self.db.execute('INSERT INTO role_assignments VALUES (?,?)', (row['assignment_id'], json.dumps(row)))
+        self.db.commit()
+        return row
+
+    def test_exact_prepared_running_terminal_run_and_launcher_selection(self):
+        slot = self.config['slots'][0]
+        row = self.record(slot)
+        selection = dict(assignment_id=row['assignment_id'], run_id=None, launcher=slot['launcher'])
+        self.assertEqual(self.admit(selection=selection), 'admitted')
+        for changes in ({'run_id': 'invented'}, {'launcher': '/unselected.json'}):
+            with self.subTest(changes=changes), self.assertRaises(repositories.RepositoryError):
+                self.admit(selection={**selection, **changes})
+        row['runtime'] = dict(run_id='actual-run', status='running', controller_pid=123,
+                             controller_start='fixture-start', artifacts=str(self.root / 'result'))
+        self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(row),)); self.db.commit()
+        with patch('factory_v1.restart.process_identity', return_value='fixture-start'):
+            self.assertEqual(self.admit(selection={**selection, 'run_id': 'actual-run'}), 'admitted')
+            with self.assertRaises(repositories.RepositoryError): self.admit(selection=selection)
+        row['runtime'].update(status='complete', container_removed=True)
+        self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(row),)); self.db.commit()
+        terminal = {**selection, 'run_id': 'actual-run'}
+        self.assertEqual(self.admit(selection=terminal, operation='effect'), 'admitted')
+        with self.assertRaises(repositories.RepositoryError): self.admit(selection=terminal)
+
+    def test_terminal_slots_allow_effect_and_notification_but_not_new_work(self):
+        for slot in self.config['slots']: self.record(slot, 'complete')
+        self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
+        self.assertEqual(self.admit(operation='effect'), 'admitted')
+        with self.assertRaises(repositories.RepositoryError): self.admit()
+        self.health['sha'] = 'b'*40
+        self.item.update(status='waiting-for-operator', completion={'report_id': 'completed'}); self.save()
+        self.assertEqual(self.admit(operation='notification'), 'admitted')
+        self.item['origin']['thread_id'] = 'changed'; self.save()
+        with self.assertRaises(repositories.RepositoryError): self.admit(operation='notification')
+
+    def test_nested_local_revalidation_checks_pins_origin_and_ownership_without_remote_reads(self):
+        for change in ('source', 'mode', 'origin', 'ownership'):
+            with self.subTest(change=change):
+                path = Path(self.config['slots'][0]['skills'][0]['path'])
+                raw, mode = path.read_bytes(), path.stat().st_mode
+                with controls.admission(self.db, 'p', 'i'):
+                    calls = self.github.request.call_count
+                    if change == 'source': path.write_bytes(raw + b'drift')
+                    if change == 'mode': path.chmod(0o600)
+                    if change == 'origin': self.item['origin']['thread_id'] = 'wrong'; self.save()
+                    if change == 'ownership':
+                        other = deepcopy(self.item); other['iteration_id'] = 'other'
+                        self.db.execute('INSERT INTO iterations VALUES (?,?,?)', ('p', 'other', json.dumps(other))); self.db.commit()
+                    with self.assertRaises(repositories.RepositoryError):
+                        readiness_gate.check(self.db, 'p', 'i')
+                    self.assertEqual(calls, self.github.request.call_count)
+                path.write_bytes(raw); path.chmod(stat.S_IMODE(mode))
+                self.item['origin']['thread_id'] = '11'; self.save()
+
+    def test_mutable_destinations_and_accounting_do_not_change_policy(self):
+        first = readiness_gate.policy(self.service, self.config, self.db)
+        Path(self.config['slots'][0]['profile']['home']).write_text('mutable home observation')
+        artifacts = Path(json.loads(Path(self.config['slots'][0]['launcher']).read_text())['artifacts_root'])
+        (artifacts / 'new-result').write_text('mutable result')
+        self.db.execute('UPDATE model_grants SET remaining=remaining-1'); self.db.commit()
+        self.assertEqual(first, readiness_gate.policy(self.service, self.config, self.db))
+        self.assertEqual(self.admit(operation='effect'), 'admitted')
+
+    def repair(self):
+        evidence = dict(repository='owner/product', repository_id=7, main='a'*40, checks=[], workflows=[],
+                        deployment=None, health=None, status='failed', failure='fixture-failure')
+        evidence_id = assignments.digest(evidence)
+        authority = dict(operator_id='operator', reference='host-scoped-registration', incident_id='incident',
+                         evidence_id=evidence_id, issue=dict(number=1, id=10, node_id='I1', body_sha256=sha(b'fixture')),
+                         paths=['app.py'], removable_assignments=[])
+        incident = dict(incident_id='incident', status='active', monitor_sha256=assignments.digest(self.delivery_config),
+                        first_evidence=evidence_id, latest_evidence=evidence_id,
+                        recovery_assignment=assignments.digest(authority), recovery_issue=1)
+        self.item['ticket_work'] = {'inputs': {'handoff': {}}}
+        self.item.update(main_incident=incident, main_recoveries={'incident': dict(status='registered', config=authority,
+            evidence=evidence, assignment=None, parked=[], removable={}, removed={}, clearance=None)},
+            delivery_monitor=dict(config=self.delivery_config, config_sha256=assignments.digest(self.delivery_config),
+                latest=dict(evidence_id=evidence_id, status='failed', main='a'*40), sequence=1),
+            restart_reconciliation=dict(status='blocked', observations={}, blockers=[dict(boundary='delivery', code='main_frozen')]))
+        self.db.executescript('CREATE TABLE delivery_observations(project TEXT, iteration TEXT, id TEXT, payload TEXT);'
+                              'CREATE TABLE delivery_incidents(project TEXT, iteration TEXT, id TEXT, payload TEXT);')
+        self.db.execute('INSERT INTO delivery_observations VALUES (?,?,?,?)', ('p', 'i', evidence_id, json.dumps(evidence)))
+        self.db.execute('INSERT INTO delivery_incidents VALUES (?,?,?,?)', ('p', 'i', 'incident', json.dumps(incident)))
+        self.db.commit(); self.save()
+        self.health['sha'] = 'b'*40
+        # Independent tracker/publication observations only; durable registration stays real.
+        self.stack.enter_context(patch.object(tickets.gh, 'read_issue', return_value={**authority['issue'], 'body': 'fixture', 'state': 'open'}))
+        self.stack.enter_context(patch.object(tickets, 'pinned_inputs', return_value={'handoff': {}}))
+        return authority
+
+    def test_registered_repair_failed_health_is_exact_and_preserves_unrelated_holds(self):
+        authority = self.repair()
+        slot = next(s for s in self.config['slots'] if s['stage'] == 'repair')
+        selection = {k: deepcopy(slot[k]) for k in ('stage', 'profile', 'skills', 'claim_id')}
+        selection['issue'] = authority['issue']
+        self.assertEqual(self.admit(selection=selection), 'admitted')
+        self.assertEqual(self.admit(operation='effect'), 'admitted')
+        with self.assertRaises(repositories.RepositoryError): self.admit()
+        wrong = {**selection, 'issue': {**selection['issue'], 'id': 999}}
+        with self.assertRaises(repositories.RepositoryError): self.admit(selection=wrong)
+        self.item['restart_reconciliation']['blockers'].append(dict(boundary='model', code='outcome_uncertain')); self.save()
+        with self.assertRaises(repositories.RepositoryError): self.admit(selection=selection)
+
+    def test_selected_revision_and_candidate_rejection_are_not_runnable(self):
+        row = self.record(self.config['slots'][0], 'complete')
+        selection = dict(assignment_id=row['assignment_id'], run_id=row['runtime']['run_id'])
+        for mutation in ('revision', 'rejection'):
+            with self.subTest(mutation=mutation):
+                if mutation == 'revision':
+                    self.item['requirement_changes'] = {'change': dict(kind='material', status='pending', affected=[1])}; self.save()
+                else:
+                    row['review_holds'] = {'axis': {'verdict': 'reject'}}
+                    self.db.execute('UPDATE role_assignments SET payload=?', (json.dumps(row),)); self.db.commit()
+                with self.assertRaises(repositories.RepositoryError): self.admit(selection=selection, operation='effect')
+                self.item.pop('requirement_changes', None); self.save()
+
+    def test_private_credential_client_selection_and_unsupported_route_refusal(self):
+        # Synthetic public fixture string, never an actual credential or provider call.
+        config = {**self.service, 'github_config': self.file('github.json', dict(api_base='https://api.github.com', bearer='gho_fixture_not_a_credential'))}
+        # bind_service mocks independent clients; call the original selector explicitly.
+        from factory_v1.service import GitHub
+        with patch.object(service, 'github_client', wraps=CoreReadinessTests.original_client):
+            selected = service.github_client(config)
+            self.assertIsInstance(selected, GitHub)
+            self.assertEqual(selected.base, 'https://api.github.com')
+            Path(config['github_config']).chmod(0o644)
+            with self.assertRaises(repositories.RepositoryError): service.github_client(config)
+            Path(config['github_config']).chmod(0o600)
+            self.file('github.json', dict(api_base='https://other.invalid', bearer='gho_fixture_not_a_credential'))
+            with self.assertRaises(repositories.RepositoryError): service.github_client(config)
+
+    original_client = staticmethod(service.github_client)
+
+    def test_public_child_launch_checks_exact_selected_launcher_without_worker_journey(self):
+        from factory_v1 import service_dispatch
+        slot = self.config['slots'][0]
+        row = self.record(slot)
+        child = Mock(pid=321, wait=Mock(return_value=0))
+        with patch.object(service_dispatch.subprocess, 'Popen', return_value=child) as spawn:
+            service_dispatch._launch_child(self.service, row['assignment_id'], slot['launcher'])
+            self.assertEqual(spawn.call_count, 1)
+            with self.assertRaises(repositories.RepositoryError):
+                service_dispatch._launch_child(self.service, row['assignment_id'], '/unselected.json')
+            self.assertEqual(spawn.call_count, 1)
+        self.assertNotIn('runtime', assignments.inspect(self.db, 'p', 'i', 'operator', row['assignment_id']))
+
+    def test_selected_final_effect_is_runnable_with_exhausted_slots_and_held_revision_is_not(self):
+        from factory_v1 import service_dispatch
+        for slot in self.config['slots']: self.record(slot, 'complete')
+        self.item.update(planning={'status': 'complete'}, ticket_work={'status': 'synthesis_complete', 'publication_complete': False})
+        self.save()
+        config = dict.fromkeys(service_dispatch.FIELDS)
+        config.update(operator_id='operator', project='p', iteration='i', reference='fixture', roles={}, launchers={})
+        self.service['dispatch_config'] = self.file('dispatch.json', config)
+        self.file('service.json', self.service)
+        self.db.execute('UPDATE supervised_readiness SET policy=?',
+                        (readiness_gate.policy(self.service, self.config, self.db),)); self.db.commit()
+        result = service.inspect_readiness(self.service, running=True)
+        self.assertFalse(result['capability_ready'])
+        self.assertTrue(result['iteration_runnable'], result)
+        self.assertEqual(result['selected_operation'], 'effect')
+        self.assertEqual(result['selected_stage'], 'publish-tickets')
+        self.item['restart_reconciliation'] = dict(status='blocked', observations={},
+            blockers=[dict(boundary='requirements', code='requirements_held')]); self.save()
+        self.assertFalse(service.inspect_readiness(self.service, running=True)['iteration_runnable'])
+
+    original_prepare = staticmethod(spending._prepare)
+
+    def spending_records(self):
+        self.db.executescript('DROP TABLE model_grants; DROP TABLE model_operations;')
+        spending.initialize(self.db)
+        self.db.execute('INSERT INTO model_grants VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            ('grant', 'p', 'i', *model_access.SUBSCRIPTION_SCOPE, 'allowance', 2, 2, 200, 'explicit-host-fixture'))
+        self.db.commit()
+        self.db.execute('UPDATE supervised_readiness SET policy=?',
+                        (readiness_gate.policy(self.service, self.config, self.db),)); self.db.commit()
+
+    def test_actual_model_call_consumes_allowance_without_policy_fence_and_quota_still_blocks(self):
+        self.spending_records()
+        adapter = SimpleNamespace(reservation=1, payload_fields=None, call=Mock(return_value=(1, {'fixture': True})))
+        policy = readiness_gate.policy(self.service, self.config, self.db)
+        with patch.object(spending, '_prepare', wraps=CoreReadinessTests.original_prepare):
+            result = spending.execute_controlled(self.db, ('p', 'i', *model_access.SUBSCRIPTION_SCOPE),
+                'call1', {'input': 'fixture'}, 1, now=100, adapter=adapter)
+            self.assertEqual(result['status'], 'complete')
+            self.assertEqual(policy, readiness_gate.policy(self.service, self.config, self.db))
+            adapter.call.side_effect = model_access.ModelAccessError('quota_exhausted')
+            with self.assertRaises(spending.SpendingError) as caught:
+                spending.execute_controlled(self.db, ('p', 'i', *model_access.SUBSCRIPTION_SCOPE),
+                    'call2', {'input': 'fixture'}, 1, now=100, adapter=adapter)
+            self.assertEqual(caught.exception.code, 'quota_exhausted')
+            self.assertEqual(adapter.call.call_count, 2)
+            with self.assertRaises((spending.SpendingError, repositories.RepositoryError)):
+                spending.execute_controlled(self.db, ('p', 'i', *model_access.SUBSCRIPTION_SCOPE),
+                    'call3', {'input': 'fixture'}, 1, now=100, adapter=adapter)
+            self.assertEqual(adapter.call.call_count, 2)
+
+    def test_last_model_forward_rechecks_policy_and_retains_known_no_effect(self):
+        self.spending_records()
+        source = Path(self.config['slots'][0]['skills'][0]['path'])
+        def drift(*args, **kwargs):
+            result = CoreReadinessTests.original_prepare(*args, **kwargs)
+            source.write_bytes(source.read_bytes() + b'drift')
+            return result
+        adapter = SimpleNamespace(reservation=1, payload_fields=None, call=Mock())
+        with patch.object(spending, '_prepare', side_effect=drift):
+            with self.assertRaises(spending.SpendingError) as caught:
+                spending.execute_controlled(self.db, ('p', 'i', *model_access.SUBSCRIPTION_SCOPE),
+                    'call1', {'input': 'fixture'}, 1, now=100, adapter=adapter)
+        self.assertEqual(caught.exception.code, 'readiness_inputs_changed')
+        adapter.call.assert_not_called()
+        self.assertEqual(self.db.execute('SELECT status,actual_units FROM model_operations').fetchone(), ('failed', 0))
+
+    def test_unknown_operation_cannot_be_a_bypass(self):
+        for operation in ('repair', '', None, {}, []):
+            with self.subTest(operation=operation), self.assertRaises(repositories.RepositoryError): self.admit(operation=operation)

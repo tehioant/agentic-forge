@@ -52,8 +52,10 @@ def policy(config, selected, database):
 
     def visit(value):
         if isinstance(value, dict):
-            for child in value.values():
-                visit(child)
+            for key, child in value.items():
+                # Mutable execution destinations are not immutable policy inputs.
+                if key not in {'home', 'workspace', 'artifacts_root', 'artifacts', 'state', 'subscription_socket'}:
+                    visit(child)
         elif isinstance(value, list):
             for child in value:
                 visit(child)
@@ -65,7 +67,7 @@ def policy(config, selected, database):
                         'Physical selected inputs required.', 'readiness_inputs_changed')
                 info = path.stat()
                 raw = path.read_bytes()
-                files[value] = [hashlib.sha256(raw).hexdigest(), info.st_mode, info.st_uid, info.st_ino]
+                files[value] = [hashlib.sha256(raw).hexdigest(), info.st_mode, info.st_uid]
                 if path.suffix == '.json':
                     visit(json.loads(raw))
     visit(config)
@@ -77,7 +79,8 @@ def policy(config, selected, database):
     grants = database.execute('SELECT ' + ','.join('"' + c.replace('"', '""') + '"' for c in grant_columns) +
                               ' FROM model_grants WHERE project=? AND iteration=? ORDER BY grant_id',
                               (config['project'], config['iteration'])).fetchall()
-    return assignments.digest({'service': config, 'selected': selected, 'files': files,
+    item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+    return assignments.digest({'scope': scope_identity(item), 'service': config, 'selected': selected, 'files': files,
                                'grant_columns': grant_columns, 'grants': grants})
 
 
@@ -110,7 +113,163 @@ def snapshot(database, project, iteration):
     return assignments.digest({'item': item, 'rows': rows, 'binding': binding(database, project, iteration)})
 
 
-def observe(database, project, iteration, *, resolution=None, selection=None):
+def dispatch_selection(database, service, github):
+    """Project the existing selector, never a retained green/runnable cursor."""
+    from . import service_dispatch, continuation_dispatch as continuation
+    require(service['dispatch_config'] is not None, 'Select an existing dispatch configuration.', 'readiness_blocked')
+    config = service_dispatch.validate(readiness.load_config(service['dispatch_config']), service)
+    item = assignments.current(database, service['project'], service['iteration'], service['operator_id'], require_active=False)
+    rows = assignments.rows(database)
+    if 'continuation' in config and item.get('planning', {}).get('status') == 'complete' and item.get('ticket_work', {}).get('publication_complete'):
+        chosen = continuation.choose(database, item, rows, continuation.observe(database, item, github))
+        stage, target = chosen['stage'], chosen['target']
+        if stage in {'blocked', 'wait', 'direction'}:
+            require(False, 'Selected action is held.', 'readiness_blocked')
+        if stage in {'implementation', 'repair'}:
+            slot = continuation.slot_for(config, rows, stage)
+            return 'work', continuation.request(config, item, target, slot, github), stage
+        if stage == 'launch':
+            row = assignments.inspect(database, service['project'], service['iteration'], service['operator_id'], target)
+            return 'work', {'assignment_id': target, 'run_id': None,
+                            'launcher': continuation.launcher_for(database, config, row)}, stage
+        if stage in assignments.ROLES:
+            slot = continuation.slot_for(config, rows, stage)
+            ancestor = assignments.inspect(database, service['project'], service['iteration'], service['operator_id'], target)
+            return 'work', {**{k: slot[k] for k in ('stage', 'profile', 'skills', 'claim_id')},
+                            'issue': ancestor['handoff']['issue']}, stage
+        return 'effect', None, stage
+    stage, target = service_dispatch.select(item, rows, config)
+    require(stage != 'blocked', 'Selected action is held.', 'readiness_blocked')
+    if stage == 'implementation':
+        return 'work', config['implementation'], stage
+    if stage == 'launch':
+        row = assignments.inspect(database, service['project'], service['iteration'], service['operator_id'], target)
+        return 'work', {'assignment_id': target, 'run_id': None,
+                        'launcher': config['launchers'].get(row['handoff']['stage'])}, stage
+    if stage in service_dispatch.ROLES:
+        ancestor = assignments.inspect(database, service['project'], service['iteration'], service['operator_id'], target)
+        return 'work', {'stage': stage, **config['roles'][stage], 'issue': ancestor['handoff']['issue']}, stage
+    if stage == 'evaluate':
+        axes = [assignments.inspect(database, service['project'], service['iteration'], service['operator_id'], identity)
+                for identity in target.values()]
+        require(all(a.get('review_result', {}).get('verdict') == 'pass' for a in axes),
+                'Selected review remains rejected or incomplete.', 'review_held')
+        candidate = assignments.inspect(database, service['project'], service['iteration'], service['operator_id'],
+                                        axes[0]['handoff']['review']['pins']['candidate_assignment'])
+        require(not candidate.get('review_holds'), 'Candidate rejection remains held.', 'review_held')
+    return ('effect' if stage in {'publish-tickets', 'evaluate'} else 'work'), None, stage
+
+
+def scope_identity(item):
+    return assignments.digest({k: item.get(k) for k in
+        ('project_id', 'iteration_id', 'repository', 'approval', 'origin')} | {
+            'repository_id': item['repository_onboarding']['metadata']['id'],
+            'api_base': item['repository_onboarding']['api_base']})
+
+
+def repair_scope(database, config, selection, operation):
+    """Recognize existing host authority, never a caller's repair flag."""
+    from . import recovery, delivery, requirements
+    item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+    record = recovery.active(item)
+    if record is None or record['status'] == 'cleared' or operation == 'notification':
+        return None
+    if selection is None and operation != 'effect':
+        return None
+    saved = delivery.monitor_state(item, config['operator_id'])
+    require(saved is not None, 'Registered delivery observer required.', 'recovery_held')
+    assert saved is not None
+    delivery.validate_persisted(database, item, saved)
+    incident, authority = item['main_incident'], record['config']
+    require(authority['operator_id'] == config['operator_id'] and
+            authority['incident_id'] == incident['incident_id'] and
+            incident['recovery_issue'] == authority['issue']['number'] and
+            incident['recovery_assignment'] == (record['assignment'] or assignments.digest(authority)) and
+            record['evidence'] == delivery.persisted_evidence(database, config['project'], config['iteration'], authority['evidence_id'], saved['config']) and
+            authority['issue']['number'] not in requirements.held_numbers(item),
+            'Exact current host recovery authority required.', 'recovery_held')
+    if selection is not None:
+        if 'assignment_id' in selection:
+            row = assignments.inspect(database, config['project'], config['iteration'], config['operator_id'], selection['assignment_id'])
+            require(row['handoff'].get('recovery') == recovery.contract(record),
+                    'Unrelated assignment cannot use repair health admission.', 'recovery_held')
+        else:
+            stage = selection.get('stage')
+            descendants = {'simplify', 'review-standards', 'review-spec', 'corrections', 'diagnosis'}
+            root = next((r for r in assignments.rows(database) if r['assignment_id'] == record['assignment']), None)
+            require(selection.get('issue') == authority['issue'] and (stage == 'repair' or
+                    (stage in descendants and root is not None and root['handoff'].get('recovery') == recovery.contract(record))),
+                    'Only registered repair lineage may start.', 'recovery_held')
+    return recovery.contract(record)
+
+
+def active_repair(database, project, iteration):
+    key = (database.execute('PRAGMA database_list').fetchone()[2], project, iteration)
+    observed = _active.get().get(key)
+    return observed is not None and observed[5] is not None
+
+
+def ownership(database, config, resolution):
+    from .restart import ownership as validate
+    from .repositories import RepositoryError
+    item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+    try:
+        validate(database, item)
+    except RepositoryError as error:
+        from .effect_resolution import permitted
+        require(resolution is not None and ('ownership', error.code) in
+                permitted(database, config['project'], config['iteration'], resolution),
+                'Current ownership remains held.', error.code)
+
+
+def local_check(database, project, iteration, observation, resolution, selection, operation):
+    if observation is None:
+        require(binding(database, project, iteration) is None, 'Supervision changed.', 'readiness_binding_changed')
+        return
+    config, selected, local, before, report, repair, identity = observation
+    current = binding(database, project, iteration)
+    require(current is not None, 'Supervised binding removed.', 'readiness_binding_changed')
+    assert current is not None
+    latest, latest_selected = configuration(current[0])
+    require(current[1] == local == policy(latest, latest_selected, database),
+            'Immutable local readiness policy changed.', 'readiness_inputs_changed')
+    item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
+    require(scope_identity(item) == identity, 'Exact origin/repository/operator changed.', 'readiness_inputs_changed')
+    if operation != 'notification':
+        require(item['status'] == 'active' and not controls.blocked(database, project, iteration),
+                'Iteration held.', 'iteration_paused')
+    controls.resume_scope(database, project, iteration)
+    ownership(database, config, resolution)
+    current_repair = repair_scope(database, config, selection, operation)
+    if operation != 'notification':
+        require(not item.get('main_incident') or current_repair is not None,
+                'Ordinary work remains frozen by the incident.', 'main_frozen')
+    require(current_repair == repair, 'Recovery admission scope changed.', 'recovery_held')
+    excluded = {'controls'}
+    if operation in {'effect', 'notification'}:
+        excluded |= {'capacity', 'spending'}
+    if operation == 'notification':
+        excluded |= {'containers', 'execution'}
+    if operation == 'notification' or repair is not None:
+        excluded.add('delivery')
+    if resolution is not None:
+        from .effect_resolution import permitted
+        if permitted(database, project, iteration, resolution):
+            excluded |= {'capacity', 'spending', 'delivery'}
+    require(all(v['state'] == 'ready' for k, v in report['checks'].items() if k not in excluded),
+            'Current operation capabilities unavailable.', 'readiness_blocked')
+    validate_selection(database, latest, latest_selected, selection, operation=operation)
+    if operation == 'work':
+        # Recompute mutable capacity/allowance locally, including nested checkpoints.
+        scope = {'project': project, 'iteration': iteration, 'repository': item['repository'],
+                 'repository_id': item['repository_onboarding']['metadata']['id']}
+        readiness.slot_capacity(database, latest_selected['slots'], scope)
+        from .model_access import SUBSCRIPTION_SCOPE
+        from . import spending
+        spending.capacity_preview(database, (project, iteration, *SUBSCRIPTION_SCOPE), now=int(readiness.time.time()))
+
+
+def observe(database, project, iteration, *, resolution=None, selection=None, operation='work'):
     current = binding(database, project, iteration)
     if current is None:
         return None
@@ -122,8 +281,20 @@ def observe(database, project, iteration, *, resolution=None, selection=None):
     before = snapshot(database, project, iteration)
     local = policy(config, selected, database)
     require(current[1] == local, 'Select/review changed local readiness inputs while paused.', 'readiness_inputs_changed')
-    report = readiness.collect(database, config, selected, github_client(config))
+    client = github_client(config)
+    report = readiness.collect(database, config, selected, client)
+    repair = repair_scope(database, config, selection, operation)
+    if repair is not None:
+        from .restart import registered_recovery
+        require(registered_recovery(database, assignments.current(database, project, iteration, config['operator_id'], require_active=False), client) == repair,
+                'Registered repair authority changed.', 'recovery_held')
     excluded = {'controls'}
+    if operation in {'effect', 'notification'}:
+        excluded |= {'capacity', 'spending'}
+    if operation == 'notification':
+        excluded |= {'containers', 'execution'}
+    if operation == 'notification' or repair is not None:
+        excluded.add('delivery')
     if resolution is not None:
         from .effect_resolution import permitted
         if permitted(database, project, iteration, resolution):
@@ -132,12 +303,19 @@ def observe(database, project, iteration, *, resolution=None, selection=None):
             excluded |= {'capacity', 'spending', 'delivery'}
     require(all(v['state'] == 'ready' for k, v in report['checks'].items() if k not in excluded),
             'Current scoped capabilities unavailable; inspect readiness.', 'readiness_blocked')
-    validate_selection(database, config, selected, selection)
-    return config, selected, local, before
+    validate_selection(database, config, selected, selection, operation=operation)
+    return config, selected, local, before, report, repair, scope_identity(assignments.current(database, project, iteration, config['operator_id'], require_active=False))
 
 
-def validate_selection(database, config, selected, selection):
+def validate_selection(database, config, selected, selection, *, operation='work'):
     if selection is None:
+        return
+    if 'native_config' in selection:
+        from . import planning_wakeup
+        native = planning_wakeup.configuration(selection['native_config'])
+        item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+        require(planning_wakeup.scope(item, native) == selection['identity'],
+                'Native wakeup selection changed.', 'slot_binding_changed')
         return
     scope = {'project': config['project'], 'iteration': config['iteration']}
     item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
@@ -145,55 +323,76 @@ def validate_selection(database, config, selected, selection):
     if 'assignment_id' in selection:
         row = assignments.inspect(database, config['project'], config['iteration'], config['operator_id'], selection['assignment_id'])
         request = row['handoff']
-        require(selection.get('run_id') == (row.get('runtime') or {}).get('run_id'),
+        runtime = row.get('runtime') or {}
+        require(selection.get('run_id') == runtime.get('run_id'),
                 'Selected run changed.', 'slot_binding_changed')
+        assignments.require_result_active(row)
+        require(not row.get('review_holds'), 'Candidate rejection remains held.', 'review_held')
+        from . import requirements, diagnosis, bugs, recovery
+        held = requirements.held_numbers(item) | diagnosis.held_numbers(item) | bugs.held_numbers(item) | recovery.held_numbers(item)
+        require(request['issue']['number'] not in held, 'Selected requirements remain held.', 'requirements_held')
+        readiness.slot_capacity(database, selected['slots'], scope, stage=request['stage'],
+                                assignment_id=row['assignment_id'], run_id=selection.get('run_id'),
+                                terminal=operation == 'effect')
         slot = next((s for s in selected['slots'] if s['claim_id'] == row['claim_id']), None)
     else:
         request = selection
+        from .requirements import held_numbers
+        require(request.get('issue', {}).get('number') not in held_numbers(item),
+                'Selected requirements remain held.', 'requirements_held')
         readiness.slot_capacity(database, selected['slots'], scope, stage=request['stage'])
         slot = next((s for s in selected['slots'] if s['claim_id'] == request['claim_id']), None)
     require(slot is not None and slot['stage'] == request['stage'] and slot['profile'] == request['profile'],
             'Selected stage/profile/claim not configured.', 'slot_binding_changed')
     assert slot is not None
+    if 'launcher' in selection:
+        require(selection['launcher'] == slot['launcher'], 'Selected launcher changed.', 'slot_binding_changed')
     descriptors = [{k: v for k, v in d.items() if k != 'instructions'} for d in request['skills']]
     require(slot['skills'] == descriptors, 'Selected source closure changed.', 'slot_binding_changed')
 
 
-def compare(database, project, iteration, observation):
+def compare(database, project, iteration, observation, *, resolution=None):
     if observation is None:
         require(binding(database, project, iteration) is None, 'Supervision changed.', 'readiness_binding_changed')
         return
-    config, selected, local, before = observation
-    latest, latest_selected = configuration(binding(database, project, iteration)[0])
+    config, selected, local, before, report, repair, identity = observation
+    current = binding(database, project, iteration)
+    require(current is not None, 'Supervised binding removed.', 'readiness_binding_changed')
+    assert current is not None
+    latest, latest_selected = configuration(current[0])
     require(policy(latest, latest_selected, database) == local and snapshot(database, project, iteration) == before,
             'Local inputs/ownership changed during capability observation.', 'readiness_inputs_changed')
     controls.resume_scope(database, project, iteration)
-    from .restart import ownership
-    item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
-    ownership(database, item)
+    ownership(database, config, resolution)
 
 
 @contextmanager
-def admission(database, project, iteration, *, resolution=None, selection=None):
+def admission(database, project, iteration, *, resolution=None, selection=None, operation='work'):
+    require(type(operation) is str and operation in {'work', 'effect', 'notification'}, 'Unknown readiness operation.', 'invalid_readiness')
     key = (database.execute('PRAGMA database_list').fetchone()[2], project, iteration)
     active = _active.get()
     if key in active:
         # Existing nested checkpoints may not perform remote I/O under the lane.
-        if active[key] is not None:
-            validate_selection(database, active[key][0], active[key][1], selection)
+        local_check(database, project, iteration, active[key], resolution, selection, operation)
+        if operation != 'notification':
+            controls.require_active(database, project, iteration, resolution=resolution)
         yield
         return
-    observation = observe(database, project, iteration, resolution=resolution, selection=selection)
+    observation = observe(database, project, iteration, resolution=resolution, selection=selection, operation=operation)
     with controls.lane(database, project, iteration):
-        compare(database, project, iteration, observation)
+        compare(database, project, iteration, observation, resolution=resolution)
+        local_check(database, project, iteration, observation, resolution, selection, operation)
         token = _active.set({**active, key: observation})
         try:
+            if operation != 'notification':
+                controls.require_active(database, project, iteration, resolution=resolution)
             yield
         finally:
             _active.reset(token)
 
 
-def check(database, project, iteration, *, resolution=None, selection=None):
+def check(database, project, iteration, *, resolution=None, selection=None, operation='work'):
     """Final pre-write check where the existing seam does not claim durable state."""
-    with admission(database, project, iteration, resolution=resolution, selection=selection):
-        controls.require_active(database, project, iteration, resolution=resolution)
+    with admission(database, project, iteration, resolution=resolution, selection=selection, operation=operation):
+        if operation != 'notification':
+            controls.require_active(database, project, iteration, resolution=resolution)

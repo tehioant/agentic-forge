@@ -21,9 +21,12 @@ See [READINESS.md](READINESS.md) for the exact private `readiness_config` and
 `select-readiness` / `readiness` commands. Missing selection blocks shared
 supervised admission even through direct CLI routes. A running service or retained
 green report is never authorization. Unknown configured health is not healthy.
-The current checkpoint's precise remaining enforcement criteria are listed there;
-it is not yet complete #26 coverage. Do not change permissions, grants, installed
-skill pins or host source modes merely to make the probe green.
+Readiness uses the current selected action: completed effects need no unused
+worker slot, while a selected new worker still needs its exact approved capacity.
+Registered repair and exact-origin notifications have narrow documented operation
+contracts, not an ordinary dispatch bypass. Parent integration still owns the
+combined sibling-effect checks and final review. Do not change permissions, grants,
+installed skill pins or host source modes merely to make the probe green.
 
 ## Install and control (requires separate operational authorization)
 

@@ -71,6 +71,8 @@ def inputs_for(assignment, root):
 
 
 def authorize(database, project, iteration, operator, assignment_id, run_id, request):
+    from .readiness_gate import check
+    check(database, project, iteration, operation='effect', selection={'assignment_id': assignment_id, 'run_id': run_id})
     assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
     assignments.current(database, project, iteration, operator)
     assignments.claims(database, original(assignment), assignment['ticket_scope'], assignment_id)
@@ -150,6 +152,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         from .restart import before_dispatch
         before_dispatch(database, project, iteration, operator, github, force=True, assignment_id=assignment_id)
+        from .readiness_gate import check
+        check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': None, 'launcher': config_path})
         prepared = assignments.inspect(database, project, iteration, operator, assignment_id)
         assert prepared is not None
         if prepared['handoff']['stage'] in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
@@ -186,7 +190,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                                      'controller_pid': os.getpid(), 'controller_start': process_identity(os.getpid()),
                                      'advance_allowed': False, 'close_allowed': False}
             from .controls import admission
-            with admission(database, project, iteration):
+            with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': None, 'launcher': config_path}):
                 save(database, assignment)
     runtime = assignment['runtime']
     stop = threading.Event()
@@ -280,6 +284,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         guard_log.close()
         (root / 'guard-process.json').write_text(json.dumps({'pid': guard.pid, 'start': process_identity(guard.pid)}))
         require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before container creation.', 'cancelled')
+        with closing(sqlite3.connect(state)) as database:
+            check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
         docker.call(*command(config, runtime['container'], mounts))
         observed = docker.inspect(runtime['container'])
         verify(observed, config, runtime['container'], image_id, mounts)
@@ -289,10 +295,12 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
             assignments.prepare(database, project, iteration, operator, original(assignment), github, dry_run=True)
             require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt was cancelled before start.', 'cancelled')
             assignment['runtime']['status'] = 'running'
-            with admission(database, project, iteration):
+            with admission(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path}):
                 save(database, assignment)
         require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before worker start.', 'cancelled')
-        docker.call('start', runtime['container'])
+        with closing(sqlite3.connect(state)) as database, state_lock(database):
+            check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
+            docker.call('start', runtime['container'])
         deadline = time.monotonic() + config['limits']['seconds']
         while True:
             if stop.is_set() or (root / 'stop').exists():
@@ -350,7 +358,8 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 assignment['result_disposition'].update(trusted_execution=False, isolated_execution=True,
                     checks_verified=checks_verified, advance_allowed=False, close_allowed=False,
                     reason='worker_reports_untrusted_require_controller_checks_and_separate_review')
-                with admission(database, project, iteration):
+                with admission(database, project, iteration, operation='effect',
+                        selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path}):
                     save(database, assignment)
             status = 'complete'
     except RepositoryError as error:
@@ -394,6 +403,12 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
                 if blocked(database, project, iteration):
                     status = 'stopped'
                     error_code = 'cancelled' if (root / 'stop').exists() else 'iteration_paused'
+            if status == 'complete':
+                try:
+                    check(database, project, iteration, operation='effect',
+                          selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
+                except RepositoryError as error:
+                    status, error_code = 'failed', error.code
             assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                          container_removed=status != 'unconfirmed', recoverable=status != 'complete')
             save(database, assignment)

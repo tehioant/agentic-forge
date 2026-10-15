@@ -121,10 +121,12 @@ def inspect_readiness(config, *, running=None, github=None):
             result = readiness.collect(db, config, selected, github or github_client(config), running=running)
             bound = readiness_gate.binding(db, config['project'], config['iteration'])
             pinned = bound is not None and bound[1] == readiness_gate.policy(config, selected, db)
-            runnable = result['capability_ready'] and result['iteration_eligible'] and pinned and running is True
+            runnable = result['iteration_eligible'] and pinned and running is True
             if runnable:
                 try:
-                    readiness_gate.check(db, config['project'], config['iteration'])
+                    operation, selection, stage = readiness_gate.dispatch_selection(db, config, github or github_client(config))
+                    readiness_gate.check(db, config['project'], config['iteration'], operation=operation, selection=selection)
+                    result.update(selected_operation=operation, selected_stage=stage)
                     result['checks']['admission'] = {'state': 'ready', 'code': 'verified', 'remediation': None}
                 except Exception:
                     runnable = False

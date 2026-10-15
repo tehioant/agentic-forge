@@ -172,15 +172,34 @@ pause/restart/ownership guards remain. Stop, cleanup, reconciliation and inciden
 decision attention are not routed through ordinary readiness; truthful existing
 effect receipts retain their original save paths.
 
-Remaining: exhaustive sibling publisher pre-write/final-success coverage (planning,
-ticket/revision/bug publication, merge delivery close/Projects mutations); explicit
-assignment/run/launcher selection at every native/worker/model boundary; terminal
-consumed-slot continuation and notification-after-completion; scoped registered
-repair admission with failed configured health; narrowly authenticated effect
-resolution and independent-hold/receipt regression matrices. Shared admission is
-not proof of those final-effect criteria. Probe runnable reporting also needs
-remaining revision/rejection-specific projection. Do not mark #26 complete
-on this checkpoint.
+Core admission now binds prepared/running/terminal assignment and run selection,
+launcher path, claim/profile/stage/source, native wakeup identity and actual model
+forward. Terminal results may use their consumed slots only for effects, never as
+fresh worker capacity. Public runnable reporting projects the current existing
+selector and revision/rejection eligibility instead of requiring aggregate spare
+slots for a final effect.
+
+`operation='work'` remains the default. `effect` exempts new-worker capacity and a
+second allowance for already-prepared publication/delivery/completion; it does not
+waive exact downstream effect authority, current policy, permission, revision,
+ownership or controls. `notification` validates the exact sealed origin and route
+without fresh worker capacity/allowance/executor/healthy-delivery prerequisites,
+including waiting/completed incident reports. Unknown operation values refuse.
+Exact existing EffectResolution tokens retain only their existing lane-specific
+restart/ownership exceptions. Registered repair health admission reuses durable
+incident/evidence/host authority and fresh registered-recovery readback; ordinary
+work remains frozen and unrelated interruption/revision/uncertainty holds survive.
+
+Every nested checkpoint rechecks local immutable policy/full modes, origin,
+controls, ownership, exact selection and operation scope without remote I/O under
+the interruption lane. It does not compare a broad old snapshot against its own
+legitimate receipt/accounting writes. Mutable homes/artifacts and allowance
+counters are excluded from immutable policy; actual per-call quota still refuses.
+
+Parent integration must verify sibling publisher pre-write/final-success and
+notification callers use the explicit operations, retain their own exact effect
+authority/receipt protocols, and run combined focused checks. Core tests alone do
+not establish those sibling-family mutation matrices or final #26 acceptance.
 
 Under the [operator amendment](../docs/specs/no-live-verification-amendment.md), live
 acceptance is waived for delivery and **not executed**. No live campaign or live

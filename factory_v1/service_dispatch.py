@@ -195,7 +195,8 @@ def _launch_child(service, assignment_id, launcher, *, stop_event=None):
     # Same host Docker routing allowlist as Docker, plus a scoped temp root.
     env = {key: os.environ[key] for key in
            ('PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR', 'TMPDIR') if key in os.environ}
-    with connect(service) as database, controls.admission(database, *scope(service)[:2]):
+    with connect(service) as database, controls.admission(database, *scope(service)[:2],
+            selection={'assignment_id': assignment_id, 'run_id': None, 'launcher': launcher}):
         require(stop_event is None or not stop_event.is_set(), 'Service is stopping.', 'service_stopping')
         try:
             process = subprocess.Popen(argv, cwd=Path(__file__).parent.parent, env=env,
@@ -228,7 +229,7 @@ def tick(service, github, *, stop_event=None):
     from .service import connect, scope
     from .readiness_gate import check
     with connect(service) as database:
-        check(database, *scope(service)[:2])
+        check(database, *scope(service)[:2], operation='effect')
     # Keep legacy fixed-envelope callers unchanged; continuation owns no second
     # executor and returns to the same public launcher/publication seams.
     with connect(service) as database:
@@ -356,7 +357,7 @@ def continuation_tick(service, github, *, stop_event=None):
     from .service import connect, scope
     from .readiness_gate import check
     with connect(service) as database:
-        check(database, *scope(service)[:2])
+        check(database, *scope(service)[:2], operation='effect')
     from . import continuation_dispatch as continuation, recovery, restart
     if stop_event is not None and stop_event.is_set():
         return blocked('service_stopping')

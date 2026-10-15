@@ -190,13 +190,13 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     return _report(results, pins, eligible, now, running, capacity)
 
 
-def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run_id=None):
+def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run_id=None, terminal=False):
     """Non-reserving finite inventory; selected existing work must bind its run.
 
     This does not release ownership or relax global ticket/iteration concurrency.
     A consumed slot is history, never fresh capacity, even after retirement.
     """
-    available, active = [], []
+    available, active, completed = [], [], []
     existing = assignments.rows(database)
     for slot in slots:
         profile = assignments.validate_profile(slot['stage'], slot['profile'])
@@ -218,6 +218,8 @@ def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run
         retired = any(row.get(k) for k in ('requirement_disposition', 'recovery_disposition', 'restart_disposition',
                                           'stuck_disposition', 'ownership_retirement'))
         retired = retired or assignments.delivered_ticket_receipt(database, row)[1] is not None
+        if not retired and runtime.get('status') == 'complete' and runtime.get('container_removed') is True:
+            completed.append({'stage': slot['stage'], 'assignment_id': row['assignment_id'], 'run_id': runtime.get('run_id')})
         if not retired and (not runtime or runtime.get('status') in {'preparing', 'running'}):
             require(assignments.identifier(row['assignment_id']) and
                     (not runtime or assignments.identifier(runtime.get('run_id'))),
@@ -226,7 +228,7 @@ def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run
                            'assignment_id': row['assignment_id'], 'run_id': runtime.get('run_id')})
     if assignment_id is not None:
         require(stage in assignments.ROLES and any(r['stage'] == stage and r['assignment_id'] == assignment_id and
-                r['run_id'] == run_id for r in active), 'Selected binding unavailable.', 'slot_binding_changed')
+                r['run_id'] == run_id for r in active + (completed if terminal else [])), 'Selected binding unavailable.', 'slot_binding_changed')
     elif stage is not None:
         require(stage in assignments.ROLES and any(r['stage'] == stage for r in available),
                 'No fresh selected stage slot.', 'slot_capacity_unavailable')
