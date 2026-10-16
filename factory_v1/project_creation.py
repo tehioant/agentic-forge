@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 
 from . import controls, repositories
 from .__main__ import read_iteration, register_iteration, validate_intake
@@ -53,8 +54,10 @@ class ProjectCreation:
 
     def guard_attachment(self, draft_id):
         existing = self.setup.read(draft_id)
-        if existing is not None:
+        if existing is not None and Path(self.setup.config['state']).exists():
             with connect(self.setup.config) as db:
+                if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='iterations'").fetchone() is None:
+                    return
                 item = read_iteration(db, existing['project'], existing['iteration'])
                 if item is not None:
                     self.setup.guard(db, item)
@@ -93,7 +96,7 @@ class ProjectCreation:
                 require(attachment['repository'] == repository and attachment['draft_revision'] == expected_revision and
                         attachment.get('repository_id') == record['repository_id'] and attachment.get('commit') == record['baseline']['commit'],
                         'Existing attachment conflicts with created repository/baseline.', 'scope_mismatch')
-            except (repositories.RepositoryError, IntakeError, OSError, ValueError) as error:
+            except (repositories.RepositoryError, IntakeError, OSError, ValueError, sqlite3.Error) as error:
                 record.update(status='blocked', blocker={'code': getattr(error, 'code', 'creation_unavailable'),
                     'operation': 'create-private', 'consequence': 'Creation progress retained; no worker dispatched.',
                     'next_decision': 'Choose another name in a new draft for a conflict; otherwise restore the exact approved prerequisite or reconcile the retained effect.'})

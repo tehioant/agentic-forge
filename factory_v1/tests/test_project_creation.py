@@ -44,7 +44,7 @@ class ProjectCreationTests(unittest.TestCase):
             return creator, draft, record, capability
 
         # Public native seam: precursor preparation mocked, actual T2 call/immutable inputs asserted.
-        for case in ('ready', 'paused', 'wrong-account', 'wrong-session'):
+        for case in ('ready', 'pre-attach-restart', 'paused', 'wrong-account', 'wrong-session'):
             with self.subTest(public=case), tempfile.TemporaryDirectory() as tmp:
                 creator, draft, record, _ = fixture(Path(tmp))
                 def prepared(draft, current, capability):
@@ -52,6 +52,12 @@ class ProjectCreationTests(unittest.TestCase):
                     creator.save(current)
                 if case == 'wrong-account':
                     creator.config['account'] = 'other'
+                if case == 'pre-attach-restart':
+                    creator.setup.save({'version': 1, 'draft_id': draft['draft_id'], 'draft_revision': 3,
+                        'repository': 'owner/product', 'project': 'project-' + draft['draft_id'], 'iteration': 'm1',
+                        'repository_id': 77, 'commit': 'b' * 40})
+                    Path(creator.setup.config['state']).unlink()
+                    creator.guard_attachment(draft['draft_id'])
                 creator.enrollment.correlated.return_value = (draft, draft['observations'][0])
                 ready = {'status': 'ready', 'blocker': None, 'repository_id': 77, 'commit': 'b' * 40,
                          'binding': {'session_id': 'native'}, 'transfer': {'assignment_id': 'actual-T2-result'}}
@@ -66,7 +72,7 @@ class ProjectCreationTests(unittest.TestCase):
                         prepare.assert_not_called(); attach.assert_not_called()
                         continue
                     result = json.loads(creator.tool({'repository': 'owner/product', 'expected_revision': 3}, session_id='native'))
-                    if case == 'ready':
+                    if case in ('ready', 'pre-attach-restart'):
                         self.assertEqual(result, ready)
                         attach.assert_called_once_with(draft['draft_id'], 3, 'owner/product', session_id='native')
                         checkpoint = creator.setup.read(draft['draft_id'])
