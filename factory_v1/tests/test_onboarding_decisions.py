@@ -203,16 +203,56 @@ class OnboardingDecisionTests(unittest.TestCase):
             with patch('factory_v1.onboarding_decisions.controls.require_active', side_effect=RepositoryError('iteration_paused', 'pause')):
                 with self.assertRaises(RepositoryError):
                     adapter.resume(draft_id, 'attach', session_id='session')
-            # Plugin registration unchanged; no approval selector or answer fields exposed.
-            ctx.get_config.side_effect = lambda key: {'enrollment': {}, 'onboarding_decisions': {'state': None}}.get(key)
+            # Optional producers share one setup object and register each native seam once.
             entry = Path(__file__).parents[2] / 'integrations/hermes-planning/__init__.py'
             spec = importlib.util.spec_from_file_location('decisions_plugin', entry)
             module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
-            with patch('factory_v1.conversation_enrollment.ConversationEnrollment', return_value=enrollment):
-                module.register(ctx)
-            self.assertEqual([c.args[0] for c in ctx.register_hook.call_args_list], ['post_gateway_admission', 'pre_llm_call'])
-            response_tool = next(c.kwargs for c in ctx.register_tool.call_args_list if c.kwargs['name'] == 'factory_project_setup_response')
-            self.assertEqual(response_tool['schema']['parameters']['properties'], {})
+            for has_native in (False, True):
+                for label, has_setup, has_decisions in (
+                    ('neither', False, False), ('setup-only', True, False),
+                    ('decisions-only', False, True), ('both', True, True),
+                ):
+                    with self.subTest(plugin=label, native=has_native):
+                        ctx.register_hook.reset_mock(); ctx.register_tool.reset_mock()
+                        for attribute in ('setup', 'decisions'):
+                            if hasattr(enrollment, attribute):
+                                delattr(enrollment, attribute)
+                        config = {'enrollment': {}, 'binding': {'approved': True} if has_native else None,
+                                  'project_setup': {} if has_setup else None,
+                                  'onboarding_decisions': {'state': None} if has_decisions else None}
+                        ctx.get_config.side_effect = config.get
+                        producer = object.__new__(ProjectSetup)
+                        producer.enrollment = enrollment
+                        native = Mock()
+                        native.register.return_value = native
+                        with patch('factory_v1.conversation_enrollment.ConversationEnrollment', return_value=enrollment), \
+                             patch('factory_v1.project_setup.ProjectSetup', return_value=producer) as constructor, \
+                             patch.object(module, 'ConversationBinding', return_value=native) as binding_constructor, \
+                             patch.object(module, 'GitHub'):
+                            returned = module.register(ctx)
+                        self.assertIs(returned, native if has_native else enrollment)
+                        self.assertIs(enrollment.bound_planning, config['binding'])
+                        self.assertEqual(binding_constructor.call_count, int(has_native))
+                        self.assertEqual(native.register.call_count, int(has_native))
+                        self.assertEqual(constructor.call_count, int(has_setup))
+                        if has_setup:
+                            constructor.assert_called_once_with(enrollment, {})
+                        self.assertIs(getattr(enrollment, 'setup', None), producer if has_setup else None)
+                        if has_decisions:
+                            self.assertIs(enrollment.decisions.setup, producer if has_setup else None)
+                        self.assertEqual([c.args[0] for c in ctx.register_hook.call_args_list],
+                                         ['post_gateway_admission', 'pre_llm_call'])
+                        tools = [c.kwargs['name'] for c in ctx.register_tool.call_args_list]
+                        expected = {'factory_project_draft_update'}
+                        if has_setup:
+                            expected.add('factory_project_attach')
+                        if has_decisions:
+                            expected.add('factory_project_setup_response')
+                            response_tool = next(c.kwargs for c in ctx.register_tool.call_args_list
+                                                 if c.kwargs['name'] == 'factory_project_setup_response')
+                            self.assertEqual(response_tool['schema']['parameters']['properties'], {})
+                        self.assertEqual(set(tools), expected)
+                        self.assertEqual(len(tools), len(expected))
             # T2 final API signatures: autospec denies accidental argument drift.
             setup = create_autospec(ProjectSetup, instance=True, spec_set=True)
             setup.read.return_value = None

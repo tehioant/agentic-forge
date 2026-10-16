@@ -21,6 +21,7 @@ def register(ctx):
             if setup_config is not None:
                 from factory_v1.project_setup import ProjectSetup
                 setup = ProjectSetup(enrollment, setup_config).register()
+                enrollment.setup = setup
             enrollment.decisions = OnboardingDecisions(enrollment, decisions_config, setup=setup).register()
     elif ctx.get_config('onboarding_decisions') is not None:
         raise ValueError('Onboarding decisions require trusted conversation enrollment.')
