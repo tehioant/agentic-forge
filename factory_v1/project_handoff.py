@@ -187,18 +187,21 @@ class ProjectHandoff:
         host = self.execution.inventory(draft, attached)
         native = self.route(draft_id)
         with connect(native.config) as database, repositories.state_lock(database):
+            require(self.native_project is not None, 'Explicit host ticket transport required.', 'approval_required')
+            from .project_native import TicketTransport
+            github = TicketTransport(self.native_project, draft_id, database, native)
             for _ in range(3):
                 require(not self.stop_event.is_set(), 'Project handoff is stopping.', 'service_stopping')
                 item, _ = native.current(database, native.config['session_id'])
                 work = item.get('ticket_work')
                 if work is None:
                     board = self.tracker.tracker_config(draft_id)
-                    tickets.synthesize(database, item, {'tracker': board, 'skill': host['ticket_skill']}, native.github)
+                    tickets.synthesize(database, item, {'tracker': board, 'skill': host['ticket_skill']}, github)
                 elif work.get('status') == 'synthesis_pending':
-                    service_dispatch.synthesize(database, item, {'synthesis_config': host['synthesis_config']}, native.github,
+                    service_dispatch.synthesize(database, item, {'synthesis_config': host['synthesis_config']}, github,
                                                 stop_event=self.stop_event)
                 elif not work.get('publication_complete'):
-                    tickets.publish(database, item, native.github)
+                    tickets.publish(database, item, github)
                 else:
                     break
             # Actual durable publication, not an executor return, admits activation.

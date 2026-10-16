@@ -51,11 +51,14 @@ owner/authority/readback and interruption-lane checks. It must preserve intentio
 pause/stop and all independent holds. This coordinator does not manufacture a pause
 or call controls resume. That adapter is outside this lane's source ownership.
 
-The concurrent native-helper implementation must be integrated and verified by the
-parent. This checkpoint consumes its fixed interface, not an absent callback. The
-helper's actual bound GitHub client must support the scoped ticket read/write route;
-the legacy setup binding alone is credential-blind and is not a ticket publisher.
-Static legacy configuration therefore does not prove fresh-project reachability.
+`after_publication` now selects the concrete host-only `TicketTransport` for all
+three ticket operations. The native planning client remains read-only. This route
+requires `project_native` and its reviewed credential reference plus the exact ready
+tracker attachment; legacy static/credential-blind bindings fail closed rather than
+borrowing ambient credentials. The focused publisher check exercises the actual
+request grammar, issue creation, membership and ready Status readback with mocked
+HTTP. Execution/admission prerequisites are independently mocked, not qualified by
+that check; this is not a connected onboarding or worker journey.
 
 First/next-ticket retirement, correction, reporting and wait reuse the existing
 service/continuation predicates. Their direct component checks establish those
