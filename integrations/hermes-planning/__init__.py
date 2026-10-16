@@ -32,7 +32,16 @@ def register(ctx):
         if ctx.get_config('onboarding_decisions') is not None:
             from factory_v1.onboarding_decisions import OnboardingDecisions
             decisions = OnboardingDecisions(enrollment, ctx.get_config('onboarding_decisions'), setup=setup)
-        return ProjectHandoff(enrollment, setup, creation, tracker, execution, decisions, handoff_config).register()
+        native_project = None
+        native_config = ctx.get_config('project_native')
+        if native_config is not None:
+            from importlib import import_module
+            NativeProject = import_module('factory_v1.project_native').NativeProject
+            if execution is None:
+                raise ValueError('Dynamic native publication requires execution preparation.')
+            native_project = NativeProject(enrollment, setup, execution, native_config)
+        return ProjectHandoff(enrollment, setup, creation, tracker, execution, decisions,
+                              handoff_config, native_project=native_project).register()
     if enrollment_config is not None:
         from factory_v1.conversation_enrollment import ConversationEnrollment
         enrollment = ConversationEnrollment(ctx, enrollment_config)

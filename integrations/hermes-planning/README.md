@@ -225,9 +225,14 @@ schemas and use `setup.route` for actual binding authority.
 
 See [project-handoff.md](../../docs/project-handoff.md) for the public adapter API,
 focused evidence scope and outstanding source gaps. **This checkpoint is not a
-claim of complete fresh-project automatic activation.** In particular T5's stable
-fresh-service phase API and per-project native authority selection must still be
-integrated; uncertain effects cannot be resolved by conversational approval.
+claim of complete fresh-project automatic activation.** T5 preplanning and actual
+ticket synthesis/publication are now called before execution registration. Optional
+`project_native` has exactly `root` and `capability_config`; the plugin constructs
+the real NativeProject helper and reuses its bound publisher/subscriber lifecycle.
+The concurrent helper must still be integrated by the parent. First registration
+still needs the narrow first-seal adapter documented in project-handoff.md; this
+coordinator never fabricates a pause or resumes intentional holds. Unknown effects
+use the exact producer's retained-effect readback, never conversational approval.
 
 ## Supervised initial S1 wakeup
 

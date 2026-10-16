@@ -13,6 +13,7 @@ from .assignments import digest
 from .controls import private
 from .conversation_binding import ConversationBinding
 from .planning import require, text
+from .repositories import RepositoryError
 from .sandbox_source import physical
 from .service import atomic, isolated_root
 
@@ -198,6 +199,8 @@ class ConversationEnrollment:
         """Retain product interpretation/questions in the currently admitted native turn; no authority granted."""
         with self.store.locked():
             draft, observed = self.correlated(session_id)
+            if draft is None:
+                raise RepositoryError('not_found', 'Retained admitted draft required.')
             require(draft['native'] is not None and draft['native']['session_id'] == session_id and
                     draft['native']['message_id'] == observed['message_id'] and draft['transfer'] is None,
                     'Load interview instructions in this actual native turn first.', 'execution_required')
@@ -218,8 +221,7 @@ class ConversationEnrollment:
             self.store.save(draft)
         if self.handoff is not None:
             outcome = self.handoff.advance(draft, session_id)
-            draft['handoff'] = outcome
-            return json.dumps(draft, sort_keys=True)
+            return json.dumps(dict(draft, handoff=outcome), sort_keys=True)
         return json.dumps(draft, sort_keys=True)
 
     def register(self):

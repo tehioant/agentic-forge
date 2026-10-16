@@ -112,6 +112,8 @@ class OnboardingDecisions:
         draft = self.store.read(draft_id)
         require(draft is not None and operation_id in draft.get('onboarding_decisions', {}),
                 'Exact retained setup operation required.', 'not_found')
+        if draft is None:
+            raise RepositoryError('not_found', 'Exact retained setup operation required.')
         return draft, draft['onboarding_decisions'][operation_id]
 
     def probe(self, draft_id, record, session_id):
@@ -253,6 +255,8 @@ class OnboardingDecisions:
             draft, record = self.current(draft_id, operation_id)
             record['attempt'] = None if result['status'] in {'blocked', 'not_started'} else result
             self.store.save(draft)
+        if result['status'] == 'complete' and self.producer is not None and 'producer' in record['operation']['scope']:
+            self.producer.producer_continue(draft_id, record['operation'], session_id)
         return {**result, 'resumed': True}
 
     def inbound(self, **event):
@@ -280,7 +284,22 @@ class OnboardingDecisions:
         require(self.setup is not None, 'Trusted setup readback required.', 'execution_uncertain')
         draft, record = self.current(draft_id, operation_id)
         scope = record['operation']['scope']
-        require('producer' not in scope, 'Producer-specific verified reconciliation required; never retry unknown effects.', 'execution_uncertain')
+        if 'producer' in scope:
+            require(not any(a['direction'] == 'reject' for a in record['responses'].values()),
+                    'Operator declined this operation.', 'approval_required')
+            require(self.producer is not None, 'Trusted producer readback required.', 'execution_uncertain')
+            # Re-enter the concrete producer's retained-effect resolver, never
+            # clear its unknown intent or synthesize a successful receipt.
+            result = self.producer.producer_resume(draft_id, record['operation'], draft['native']['session_id'])
+            require(result['status'] == 'complete', 'Producer effect remains unresolved.', 'execution_uncertain')
+            with self.store.locked():
+                draft, record = self.current(draft_id, operation_id)
+                record['attempt'] = result
+                self.store.save(draft)
+            self.producer.producer_continue(draft_id, record['operation'], draft['native']['session_id'])
+            return copy.deepcopy(record)
+        if self.setup is None:
+            raise RepositoryError('execution_uncertain', 'Trusted setup readback required.')
         journal = self.setup.read(draft_id)
         require(journal is not None and journal['status'] == 'ready' and
                 journal['repository'] == scope['repository'] and journal['draft_revision'] == scope['expected_revision'],
@@ -299,6 +318,8 @@ class OnboardingDecisions:
             return self.enrollment.context(session_id, **kwargs)
         messages, choices = [], []
         for key in actions:
+            if (actions[key].get('attempt') or {}).get('status') == 'complete':
+                continue
             current = self.status(draft['draft_id'], key, session_id=session_id)
             if current['ready'] and actions[key]['attempt'] is None and not draft.get('decision_input'):
                 self.resume(draft['draft_id'], key, session_id=session_id)
