@@ -13,6 +13,7 @@ from unittest.mock import Mock, create_autospec, patch
 from factory_v1 import attention
 from factory_v1.conversation_enrollment import ConversationEnrollment, DraftStore
 from factory_v1.onboarding_decisions import CAUSES, OnboardingDecisions
+from factory_v1.project_setup import ProjectSetup
 from factory_v1.repositories import RepositoryError
 
 
@@ -213,12 +214,7 @@ class OnboardingDecisionTests(unittest.TestCase):
             response_tool = next(c.kwargs for c in ctx.register_tool.call_args_list if c.kwargs['name'] == 'factory_project_setup_response')
             self.assertEqual(response_tool['schema']['parameters']['properties'], {})
             # T2 final API signatures: autospec denies accidental argument drift.
-            class SetupBoundary:
-                def capability(self, draft, repository): pass
-                def read(self, draft_id): pass
-                def attach(self, draft_id, expected_revision, repository, *, session_id): pass
-                def route(self, draft_id): pass
-            setup = create_autospec(SetupBoundary, instance=True, spec_set=True)
+            setup = create_autospec(ProjectSetup, instance=True, spec_set=True)
             setup.read.return_value = None
             setup.attach.return_value = {'status': 'ready'}
             enrollment.store.save(copy.deepcopy(base))
