@@ -88,6 +88,7 @@ class ConversationEnrollment:
         self.bound_planning = None
         self.store = DraftStore(config['root'])
         self.selected = skills.resolve_installed(config['skills'])
+        self.setup = None
 
     def identity(self, source, platform):
         require(isinstance(source, dict) and source.get('platform') == platform and
@@ -225,4 +226,11 @@ class ConversationEnrollment:
             schema={'name': 'factory_project_draft_update', 'description': self.update.__doc__,
                     'parameters': {'type': 'object', 'properties': properties, 'required': list(properties),
                                    'additionalProperties': False}})
+        try:
+            setup_config = self.ctx.get_config('project_setup')
+        except KeyError:  # Existing hosts may expose only the older option names.
+            setup_config = None
+        if isinstance(setup_config, dict):
+            from .project_setup import ProjectSetup
+            self.setup = ProjectSetup(self, setup_config).register()
         return self
