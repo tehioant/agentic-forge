@@ -11,6 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from factory_v1 import skills
+from factory_v1.assignments import digest
 from factory_v1.conversation_enrollment import ConversationEnrollment, PRODUCT_FIELDS
 from factory_v1.repositories import RepositoryError
 
@@ -127,7 +128,7 @@ class ConversationEnrollmentTests(unittest.TestCase):
                 'product': {'name': 'Atlas'}, 'pending_questions': ['Which first milestone?'],
                 'sufficient': False, 'rationale': 'Need scope.', 'transfer': None,
                 'native': {'session_id': 'native-session', 'task_id': 'task', 'turn_id': 'turn',
-                           'message_id': 'message-1', 'sources': self.selected}}
+                           'message_id': 'message-1', 'source_digest': digest(self.selected)}}
         complete = {k: 'Retained ' + k for k in PRODUCT_FIELDS}
         for label, fields, questions, sufficient in (
             ('complete-input', complete, [], True),

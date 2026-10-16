@@ -175,7 +175,7 @@ class ConversationEnrollment:
             require(selected == self.selected, 'Selected interview sources changed.', 'skill_blocked')
             instructions = [ConversationBinding.load(self, name, selected, session_id) for name in ('grill-me', 'grilling')]
             draft['native'] = {'session_id': session_id, 'task_id': task_id, 'turn_id': turn_id,
-                               'message_id': observed['message_id'], 'sources': selected}
+                               'message_id': observed['message_id'], 'source_digest': digest(selected)}
             self.store.save(draft)
             return {'context': '\n\n'.join([*instructions,
                 'This is repository-free project intake, not permission to onboard, spend, publish or code. '
@@ -196,7 +196,7 @@ class ConversationEnrollment:
             require(draft['native'] is not None and draft['native']['session_id'] == session_id and
                     draft['native']['message_id'] == observed['message_id'] and draft['transfer'] is None,
                     'Load interview instructions in this actual native turn first.', 'execution_required')
-            require(skills.resolve_installed(self.config['skills']) == draft['native']['sources'],
+            require(digest(skills.resolve_installed(self.config['skills'])) == draft['native']['source_digest'],
                     'Interview sources changed.', 'skill_blocked')
             require(isinstance(args, dict) and set(args) == {'expected_revision', 'product', 'pending_questions', 'sufficient', 'rationale'} and
                     type(args['expected_revision']) is int and args['expected_revision'] == draft['revision'] and
