@@ -1,5 +1,79 @@
 # Native originating-conversation planning
 
+## Repository-free conversation enrollment (#66)
+
+Optional host setting `enrollment` enables intake before any existing `binding`:
+
+```json
+{
+  "root": "/absolute/private/controller-drafts",
+  "operators": {"discord": ["actual-approved-user-id"]},
+  "skills": [
+    {"name": "grill-me", "path": "/approved/installed/grill-me/SKILL.md", "sha256": "existing-reviewed-pin"},
+    {"name": "grilling", "path": "/approved/installed/grilling/SKILL.md", "sha256": "existing-reviewed-pin"},
+    {"name": "to-spec", "path": "/approved/installed/to-spec/SKILL.md", "sha256": "existing-reviewed-pin"}
+  ]
+}
+```
+
+Paths and hashes above are explanatory placeholders, not a deployable approval.
+Use the existing exact installed paths/pins enforced by `skills.resolve_installed`;
+this feature cannot repin. The existing private mode-0700 root must be outside
+source and native profiles; draft JSON and lock files are mode 0600. It creates
+no product checkout, repository, iteration, board, allowance or service.
+
+`post_gateway_admission` records the exact host source/user/message/raw text,
+subject to the separate platform/operator policy and actual plugin profile.
+Every authorized nonempty message can provisionally retain intake observations;
+the existing native agent decides whether it is a project request/answer, not a
+keyword recognizer or new interview engine. Unrelated chat is not a decision.
+Blank/missing/unapproved identity refuses enrollment; display names never grant
+authority. Stable full origin + operator + host profile identifies the draft.
+Reconnect can change routing/native session IDs without creating another draft.
+
+`pre_llm_call` requires actually bound task-local ContextVars (no environment
+fallback), matching admitted routing key/message/source/principal, and actual
+native session/task/turn/sender. Plain user text or exact host-attributed Discord
+and Slack text must match the retained raw input. The hook dispatches the existing
+native `skill_view` and returns verified grill-me/grilling instructions into this
+same ongoing turn, together with retained product interpretation and questions.
+The agent recommends choices and asks only unresolved decision-changing questions.
+A loader result is not proof the model followed instructions or finished work.
+
+Public contracts for downstream T2/T6:
+
+- `DraftStore(root).read(draft_id) -> dict | None`: **host-only** independent
+  snapshot. `draft_id` is the SHA-256 digest of exact `origin`, `operator_id`,
+  `host_profile`. Snapshot retains `observations` (raw text, exact source,
+  message_id and routing key), `product`, `pending_questions`, `sufficient`,
+  model `rationale`, optimistic `revision`, latest native correlation and transfer.
+- Registered `factory_project_draft_update(args, *, session_id=host_value)`:
+  args are exactly `expected_revision`, `product` (nonempty string values for
+  name/intent/objectives/users/milestone/constraints/acceptance),
+  `pending_questions` (strings), Boolean `sufficient`, nonempty `rationale`.
+  Product fields merge; questions replace; revision increments. Sufficiency
+  needs all dimensions retained and no pending questions. Updates require the
+  current admitted message/native load and unchanged sources. There is no
+  model-supplied operator, origin, draft ID or authority. Old message/stale revision
+  and another shared-session speaker cannot overwrite. Raw observations are not
+  model-writable. Interpretations/sufficiency are model judgments, not approvals.
+- `DraftStore.transfer(draft_id, expected_revision, binding) -> dict`: **host-only**
+  T2 receipt association after T2 independently verifies real identities.
+  `binding` has exactly nonempty `project`, `iteration`, `assignment_id`,
+  `reference`. Requires sufficient current revision; same receipt is idempotent,
+  a different target refuses. This method does not verify repository/native
+  assignment existence, create them, or grant mutation/model authority. Consumers
+  must revalidate the receipt through existing onboarding/planning validators.
+- T6 can consume exact origin/principal/observations/questions but must keep
+  permission decisions in its existing scoped approval contracts. Starting or
+  completing this interview grants no repository, spending or execution rights.
+
+When both options are configured, the existing approved planning origin/session
+is excluded from enrollment and keeps its prior route. This is source-only and
+requires the documented native hooks/task-local context in the hosting runtime;
+missing correlation fails closed for draft writes even though host hook errors
+may fail open to ordinary chat. No live gateway/model execution is qualified.
+
 This opt-in plugin is source only, **not installed/enabled**. It requires
 `factory_v1` in the approved native Hermes runtime. No provider/profile/auth
 settings are changed by this change.
