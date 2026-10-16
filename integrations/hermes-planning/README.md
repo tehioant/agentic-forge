@@ -94,6 +94,87 @@ model context or tool output. Deployment must supply native sender/operator
 mapping, actual session ownership and a scoped GitHub capability. This code
 neither invents credentials nor authorizes a model call.
 
+## Existing repository setup (#67)
+
+Optional host `project_setup` is read by enrollment registration; no plugin
+entrypoint change or pre-created planning binding is required. Its exact keys:
+
+- `root`: existing private mode-0700 setup journal directory.
+- `workspace_root`: existing private mode-0700 product-checkout parent, disjoint
+  from journal, draft, controller state, source, profiles and capability directories.
+- `state`: absolute controller SQLite path under an existing mode-0700 parent.
+  May be fresh; setup uses registered intake's existing schema. Existing state is
+  preserved. **Do not call service.initialize/load before lawful per-project
+  readiness/configuration exists:** that prematurely binds supervised admission.
+- `capability_config`: explicitly selected existing private single-link mode-0600
+  host JSON with exactly `operator_id`, `repository`, `reference`, `api_base`,
+  `bearer`. Operator/repository must exactly match the admitted draft and explicit
+  choice; reference is separately approved setup authority, not interview consent.
+  Current checkout adapter supports `https://api.github.com` / GitHub HTTPS only.
+- `native_project_db`: null, or explicit existing private native Project DB path.
+  Only when selected, use supported `hermes_cli.projects_db.connect`,
+  `find_by_primary_path`, `create_project` and `get_project`. Create with the actual
+  checkout as primary folder and no board_slug; verify ID/folder after writes.
+  Existing unrelated Project settings and backlogs are never modified.
+
+Registered `factory_project_attach` accepts only `repository` (literal
+owner/repository) and `expected_revision`. Current authenticated admitted context
+supplies draft/principal/session, never model-provided internal identities. Only
+a sufficient current draft can attach. The host capability scopes repository
+metadata access and checkout; no ambient gh login, secrets in argv, publication,
+allowance, service activation, worker or creation permission is inferred.
+
+Public host API available as `enrollment.setup`:
+
+- `attach(draft_id, expected_revision, repository, *, session_id) -> snapshot`:
+  T3 can reuse this **after** independently reconciling approved repository
+  creation/baseline. Host-only IDs must come from enrollment, not product input.
+  Uses `validate_intake/register_iteration`, `repositories.onboard`, exact Git
+  clone/detached immutable checkout and `planning.plan`. Returns actual planning
+  assignment ID, deterministic per-draft project/initial iteration, verified
+  repository ID, workspace and native binding. No fabricated execution receipt.
+- `read(draft_id) -> snapshot | None`: private journal, safe of credentials.
+  T4/T5 consume `repository`, `repository_id`, `commit`, `checkout`, `project`,
+  `iteration`, `binding.state`, optional `native_project`, and `transfer`.
+  They extend existing tracker/readiness configuration through their own approved
+  operations; this ticket does not initialize a service or require execution
+  readiness in order to create planning. Existing source is never overwritten.
+- `route(draft_id) -> ConversationBinding`: freshly validates durable current
+  project/operator/origin/planning IDs and interruption state. T7 consumes this
+  dynamically and wires its same-turn context/tools/publication configuration;
+  no product user must prepare the binding. T2 creates no native execution or
+  review/approval proof, and does not yet dispatch or install T7's router.
+
+Journal checkpoints are atomic private JSON, serialized by the draft-store lock:
+selection -> repository identity/commit -> checkout intent **before** process I/O
+-> exact root/origin/HEAD readback -> optional native Project readback -> actual
+planning/registered-state readback -> binding -> `DraftStore.transfer` association.
+Raw draft observations/source are retained verbatim. Intake origin is only the
+existing exact Discord-thread five-field projection; unsupported or malformed
+origins block rather than normalizing displayed/raw inputs into authentication.
+Replay rechecks onboarding and checkout and uses idempotent intake/planning.
+A persisted checkout intent is never recloned, reset, cleaned or overwritten:
+a completed exact checkout is reused; missing/partial/different checkout remains
+blocked for host reconciliation of that exact intent. Lost native creation
+responses reconcile by exact primary folder; no native backlog is created.
+A crash before draft transfer can replay the ready checkpoint and associate it.
+Changing repository or selected revision refuses instead of substituting targets.
+
+T6 consumes `status: blocked`, `blocker.code`, `blocker.operation:
+attach-existing`, `consequence`, `next_decision`, and retained checkpoints. Codes
+include approval_required, github_blocked, repository_mismatch, baseline_required,
+checkout_blocked/workspace_mismatch, native_project_unavailable/mismatch,
+iteration_paused, setup_unavailable. A blocked result means **no worker dispatched**,
+not execution readiness. Restore exact capability/access or reconcile the known
+workspace effect, then retry the same attach; never blindly remove intent or
+clear pause/restart/revision/incident/readiness/spending holds. T6 approval is not
+implemented by this journal and cannot be synthesized from interview sufficiency.
+
+Focused tests seed minimal state and mock intake/onboarding/planning/native/Git
+boundaries independently. Adapter argv and source-contract mocks are not live Git,
+GitHub or installed-native qualification. Production external operations remain
+unrun here; capability installation and T7 routing are separately owned work.
+
 ## Same-origin route
 
 1. Documented native `pre_llm_call` supplies actual session/task/turn/sender,
