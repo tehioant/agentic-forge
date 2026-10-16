@@ -107,6 +107,11 @@ class ProjectHandoffTests(unittest.TestCase):
                     self.assertEqual(perform.call_count, int(receipt == 'consumed'))
                     if receipt == 'consumed':
                         self.assertEqual(perform.call_args.args[1], 'tracker')
+            owner.native_project = Mock()
+            owner.native_project.bind.side_effect = lambda native, draft_id: native
+            owner.native_project.resolve.return_value = config
+            transport_patch = patch('factory_v1.project_native.TicketTransport', return_value=Mock(base='https://api.github.com'))
+            transport_patch.start(); self.addCleanup(transport_patch.stop)
             published = {'ticket_work': {'status': 'published', 'publication_complete': True}}
             with (patch.object(owner, 'consume', return_value='consumed'),
                   patch.object(handoff, 'connect', side_effect=lambda _: nullcontext(Mock())),
@@ -168,6 +173,7 @@ class ProjectHandoffTests(unittest.TestCase):
                                                         'synthesis_config': '/host/synthesis.json'}
                     self.assertEqual(owner.after_publication(draft['draft_id'])['status'], 'registered')
                     boundary.assert_called_once()
+                    self.assertIsNot(boundary.call_args.args[2 if stage == 'publish' else 3], native.github)
                     native.current.side_effect = None
             helper = Mock()
             helper.bind.return_value = native

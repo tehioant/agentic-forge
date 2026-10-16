@@ -9,7 +9,7 @@ from .sandbox_source import physical
 
 FIELDS = {'operator_id', 'reference', 'routes'}
 ROUTE_FIELDS = {'repository', 'repository_id', 'private', 'parent', 'credential_config',
-                'profile_name', 'source_digest', 'allowance', 'input_envelope'}
+                'profile_name', 'source_digest', 'allowance', 'input_envelope', 'credential_reference'}
 
 
 def inventory(path):
@@ -21,7 +21,7 @@ def inventory(path):
                 repositories.valid_repository(row['repository']) and
                 type(row['repository_id']) is int and row['repository_id'] > 0 and
                 type(row['private']) is bool and assignments.commit(row['parent']) and
-                all(text(row[k]) for k in ('credential_config', 'profile_name', 'source_digest'))
+                all(text(row[k]) for k in ('credential_config', 'credential_reference', 'profile_name', 'source_digest'))
                 for row in selected['routes']) and
             len({row['repository'] for row in selected['routes']}) == len(selected['routes']),
             'Exact finite reviewed native routes required.', 'approval_required')
@@ -43,7 +43,7 @@ def publication_authority(config):
     require(isinstance(credential, dict) and set(credential) ==
             {'operator_id', 'repository', 'reference', 'api_base', 'bearer'} and
             credential['operator_id'] == selected['operator_id'] and credential['repository'] == row['repository'] and
-            text(credential['reference']) and text(credential['bearer']) and credential['api_base'] == config['api_base'] == 'https://api.github.com',
+            credential['reference'] == row['credential_reference'] and text(credential['bearer']) and credential['api_base'] == config['api_base'] == 'https://api.github.com',
             'Exact host-only repository credential required.', 'approval_required')
     github = repositories.GitHub(credential['api_base'], credential['bearer'], 10)
     prefix = '/repos/' + row['repository']
@@ -93,6 +93,130 @@ class NativeReader:
                 'Read outside exact native planning publication.', 'capability_blocked')
         github = repositories.GitHub(config['api_base'], config['bearer'], 10)
         return github.request(path)
+
+
+class TicketTransport:
+    """Host-only exact ticket protocol; never installed on the planning binding."""
+
+    def __init__(self, owner, draft_id, database, native):
+        self.owner, self.draft_id, self.database, self.native = owner, draft_id, database, native
+        self.paths = owner.resolve(draft_id)
+        self.config = readiness.load_config(self.paths['publication_config'])
+        self.credential_reference = readiness.load_config(self.config['credential_config'])['reference']
+        self.attached = owner.setup.read(draft_id)
+        self.tracker = owner.execution.tracker
+        self.record = self.tracker.read(draft_id)
+        require(self.record is not None and self.record['status'] == 'ready' and
+                self.record['binding'] == native.config == self.attached['binding'] and
+                self.record['repository_id'] == self.config['repository_id'] and
+                self.record['repository'] == self.config['repository'],
+                'Exact verified tracker attachment required.', 'scope_mismatch')
+        require(self.config['private'] is True, 'Ticket route requires the delegated private repository.', 'scope_mismatch')
+        self.base = self.config['api_base']
+
+    def request(self, path, body=None, method=None):
+        from . import ticket_github as gh, tickets
+        method = method or ('GET' if body is None else 'POST')
+        require(self.owner.resolve(self.draft_id) == self.paths and
+                readiness.load_config(self.paths['publication_config']) == self.config and
+                self.owner.setup.read(self.draft_id) == self.attached and
+                self.tracker.read(self.draft_id) == self.record and
+                readiness.load_config(self.config['credential_config'])['reference'] == self.credential_reference,
+                'Ticket host authority changed.', 'scope_mismatch')
+        _, github = publication_authority(self.config)
+        item, _ = self.native.current(self.database, self.native.config['session_id'])
+        require(item['repository'] == self.config['repository'] and
+                item['repository_onboarding']['metadata']['id'] == self.config['repository_id'] and
+                item['planning']['assignment_id'] == self.config['assignment_id'] and
+                item['planning']['status'] == 'complete' and item.get('handoff'),
+                'Current completed native handoff required.', 'scope_mismatch')
+        prefix = '/repos/' + item['repository']
+        board = self.record['identities']
+        work = item.get('ticket_work')
+        if work is not None:
+            require(work['request']['tracker'] == self.record['tracker'] and
+                    work['inputs']['handoff'] == item['handoff'] and
+                    work.get('board', board) == board,
+                    'Ticket assignment/board scope changed.', 'scope_mismatch')
+        # Capture envelopes from the existing protocol rather than maintaining a
+        # second GraphQL issuer. Capture aborts before any I/O or response parsing.
+        class Envelope(Exception):
+            pass
+        class Capture:
+            def request(self, route, payload=None, verb=None):
+                raise Envelope(route, payload, verb or ('GET' if payload is None else 'POST'))
+        def envelope(function, *args):
+            try:
+                function(Capture(), *args)
+            except Envelope as captured:
+                return captured.args
+            raise AssertionError('Ticket protocol did not issue a request')
+        allowed = []
+        if method == 'GET' and body is None:
+            reads = {prefix, '/user'}
+            handoff = item['handoff']
+            reads.add(prefix + '/git/commits/' + handoff['commit'])
+            reads.update(prefix + '/contents/' + ref['path'] + '?ref=' + handoff['commit']
+                         for ref in handoff['documents'].values())
+            import re
+            suffix = path[len(prefix):] if path.startswith(prefix) else ''
+            paged = re.fullmatch(r'/(?:issues|milestones)\?state=all&per_page=100&page=[1-9][0-9]*|/issues/[1-9][0-9]*/dependencies/blocked_by\?per_page=100&page=[1-9][0-9]*|/issues/[1-9][0-9]*', suffix)
+            require(path in reads or paged is not None, 'Read outside ticket scope.', 'capability_blocked')
+        else:
+            for function, args in ((gh.linked_projects, (item['repository'],)),
+                                   (gh.project_fields, (board['project_id'],)),
+                                   (gh.project_items, (board['project_id'],))):
+                route, payload, verb = envelope(function, *args)
+                if isinstance(body, dict) and isinstance(body.get('variables'), dict):
+                    cursor = body['variables'].get('cursor')
+                    if cursor is None or isinstance(cursor, str) and 0 < len(cursor) <= 1024:
+                        payload['variables']['cursor'] = cursor
+                        allowed.append((route, payload, verb))
+            # Writes require the existing durable publisher intent, exact body,
+            # verified issue identity/membership and current board schema.
+            mutation = path != '/graphql' or isinstance(body, dict) and body.get('query', '').startswith('mutation')
+            if mutation and work is not None and work.get('tickets') and work.get('execution'):
+                numbers = {k: v['number'] for k, v in work.get('published', {}).items()}
+                for ticket in work['tickets']:
+                    intent = work.get('intents', {}).get(ticket['key'], {})
+                    expected = tickets.body(item, ticket, numbers)
+                    payload = {'title': ticket['title'], 'body': expected, 'labels': [ticket['triage_label']],
+                               'milestone': board['milestone']['number']}
+                    if intent.get('identity') is None and intent.get('issue') == {'title': ticket['title'], 'body': expected}:
+                        allowed.append((prefix + '/issues', payload, 'POST'))
+                    identity = intent.get('identity')
+                    if identity is None:
+                        continue
+                    issue = gh.read_issue(github, item['repository'], identity['number'])
+                    require(all(issue[k] == v for k, v in identity.items()) and issue['body'] == expected and
+                            issue['title'] == ticket['title'] and issue['state'] == 'open' and
+                            gh.issue_scope(issue, board) == board['milestone']['id'],
+                            'Exact current publication issue changed.', 'scope_mismatch')
+                    for blocker in ticket['blockers']:
+                        blocker_id = work.get('published', {}).get(blocker, {}).get('id')
+                        if blocker_id in intent.get('dependencies', []) and blocker_id not in {d['id'] for d in gh.dependencies(github, item['repository'], issue['number'])}:
+                            allowed.append(envelope(gh.add_dependency, item['repository'], issue['number'], blocker_id))
+                    member = gh.membership(github, board, item['repository'], issue)
+                    if intent.get('membership') is True and member is None:
+                        allowed.append(envelope(gh.add_item, board['project_id'], issue['node_id']))
+                    option = board['status']['options'][work['request']['tracker']['statuses']['ready']]
+                    if member is not None and member['status'] is None and intent.get('status') == option:
+                        allowed.append(envelope(gh.set_field, board['project_id'], member['id'], board['status']['id'], option))
+            require((path, body, method) in allowed, 'Operation outside exact ticket protocol/intent.', 'capability_blocked')
+            if isinstance(body, dict) and (path != '/graphql' or body.get('query', '').startswith('mutation')):
+                require(work is not None and tickets.verified_board(work, github, item['repository'], item['iteration_id']) == board,
+                        'Verified publication board changed.', 'scope_mismatch')
+                from .project_tracker import TrackerHost
+                require(TrackerHost({'bearer': github.bearer}).board(board['project_id'])['public'] is False,
+                        'Ticket board must remain private.', 'scope_mismatch')
+                tickets.effect_check(self.database, item)
+                # Resolve host delegation again after the external scope reads.
+                require(self.owner.resolve(self.draft_id) == self.paths and
+                        self.owner.setup.read(self.draft_id) == self.attached and self.tracker.read(self.draft_id) == self.record and
+                        readiness.load_config(self.config['credential_config'])['reference'] == self.credential_reference,
+                        'Ticket authority changed before write.', 'scope_mismatch')
+                _, github = publication_authority(self.config)
+        return github.request(path, body, method)
 
 
 class NativeProject:
@@ -180,8 +304,8 @@ class NativeProject:
             old = self.routes.get(draft_id)
             if old is not None:
                 require(old.config == native.config and old.publication_config == paths['publication_config'] and
-                        ((completed and old.wakeup is None) or
-                         (old.wakeup is not None and not old.wakeup.stopped and old.wakeup.status != 'held')),
+                        ((completed and (old.wakeup is None or not old.wakeup.stopped)) or
+                         (not completed and old.wakeup is not None and not old.wakeup.stopped and old.wakeup.status != 'held')),
                         'Existing native subscriber stopped or changed; reconcile.', 'execution_uncertain')
                 native.github, native.publication_config, native.wakeup = old.github, old.publication_config, old.wakeup
                 return native
