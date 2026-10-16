@@ -168,7 +168,7 @@ class OnboardingDecisions:
             except ValueError as error:
                 raise RepositoryError('approval_required', 'Exact structured operator direction required.') from error
             require(isinstance(direction, dict) and set(direction) == {'operation', 'answers'} and
-                    direction['operation'] == record['operation'] and isinstance(direction['answers'], list) and
+                    digest(direction['operation']) == digest(record['operation']) and isinstance(direction['answers'], list) and
                     bool(direction['answers']), 'Response must bind exact operation/project/scope/ceiling.', 'scope_mismatch')
             answers = direction['answers']
             require(all(isinstance(a, dict) and text(a.get('decision_id')) for a in answers) and
@@ -177,7 +177,7 @@ class OnboardingDecisions:
             for answer in answers:
                 b = next((b for b in record['blockers'] if b['decision_id'] == answer.get('decision_id')), None)
                 require(b is not None and set(answer) == {'decision_id', 'scope', 'ceiling', 'direction'} and
-                        answer['scope'] == b['scope'] and type(answer['ceiling']) is int and
+                        digest(answer['scope']) == digest(b['scope']) and type(answer['ceiling']) is int and
                         answer['ceiling'] == b['ceiling'] and text(answer['direction']) and
                         answer['direction'].strip().lower() not in {'yes', 'ok', 'thanks', 'ack'} and b['cause'] != 'uncertain',
                         'Exact explicit decision required; uncertain effects need trusted reconciliation.', 'approval_required')
