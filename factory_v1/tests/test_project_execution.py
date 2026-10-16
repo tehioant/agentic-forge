@@ -15,7 +15,10 @@ from factory_v1.tests import test_readiness
 
 class ProjectExecutionTests(unittest.TestCase):
     def test_project_configuration_and_registration_invariants(self):
-        cases = ('ready', 'installation', 'no-deployment', 'policy', 'capacity', 'health', 'source-drift', 'replay-drift', 'consumed-home', 'active')
+        # Fresh preparation has no delivery anchor, standards or running unit.
+        self.assertTrue(callable(getattr(execution.ProjectExecution, 'prepare_planning', None)),
+                        'Missing public preplanning preparation')
+        cases = ('ready', 'installation', 'no-deployment', 'policy', 'capacity', 'health', 'source-drift', 'replay-drift', 'consumed-home', 'active', 'preplanning', 'managed', 'unpublished', 'start-denied')
         for case in cases:
             with self.subTest(case=case):
                 # Existing fixture seeds records and mocks external reads only;
@@ -79,9 +82,42 @@ class ProjectExecutionTests(unittest.TestCase):
                         db.execute('UPDATE model_grants SET remaining=0'); db.commit()
                     if case == 'source-drift':
                         source = Path(host['templates'][0]['skills'][0]['path']); source.write_text('unreviewed drift')
+                    managed = case in ('preplanning', 'managed', 'unpublished', 'start-denied')
+                    extra = {}
+                    inputs = {'handoff': {'commit': 'b' * 40, 'issue': {'number': 5}}}
+                    issue = {'number': 1, 'id': 10, 'node_id': 'I_1', 'body': 'Actual read-only fixture anchor'}
+                    if managed:
+                        native = root / 'caps/native.json'
+                        service.atomic(native, {})
+                        template = root / 'caps/service-template.json'
+                        service.atomic(template, {k: v for k, v in fixture.service.items() if k not in
+                            {'state', 'operator_id', 'project', 'iteration'}})
+                        units = root / 'units'; units.mkdir(mode=0o700)
+                        installation = root / 'caps/installation.json'
+                        service.atomic(installation, {'operator_id': 'operator', 'reference': 'reviewed-platform',
+                            'state_root': str(root / 'state'), 'workspace_root': str(root / 'workspaces'),
+                            'service_template': str(template), 'unit_directory': str(units),
+                            'actions': ['install'] if case == 'start-denied' else ['install', 'start']})
+                        extra['installation_config'] = str(installation)
+                        host = {k: v for k, v in host.items() if k in execution.PLATFORM_FIELDS}
+                        host['policy'].pop('acceptance')
+                        path.unlink()
+                        if case in ('preplanning', 'unpublished'):
+                            (workspace / 'AGENTS.md').unlink()
+                        else:
+                            ticket = {'key': 'first', 'blockers': [], 'references': [],
+                                'desired_behavior': 'Actual product change', 'acceptance_criteria': ['Focused check'],
+                                'triage_label': 'ready-for-agent'}
+                            fixture.item['planning']['status'] = 'complete'
+                            fixture.item['ticket_work'] = {'assignment_id': 'tickets-native', 'status': 'published',
+                                'publication_complete': True, 'tickets': [ticket], 'inputs': inputs,
+                                'published': {'first': {'number': 2, 'id': 20, 'node_id': 'I_2'}}}
+                            issue = {'number': 2, 'id': 20, 'node_id': 'I_2', 'state': 'open',
+                                'body': execution.tickets.body(fixture.item, ticket, {'first': 2})}
+                            db.execute('UPDATE iterations SET payload=?', (json.dumps(fixture.item),)); db.commit()
                     cap = root / 'caps/execution.json'
                     service.atomic(cap, host)
-                    component = execution.ProjectExecution(setup, tracker, {'root': str(root / 'execution'), 'capability_config': str(cap)})
+                    component = execution.ProjectExecution(setup, tracker, {'root': str(root / 'execution'), 'capability_config': str(cap), **extra})
                     paused = {'project': 'p', 'iteration': 'i', 'operator_id': 'operator', 'action': 'pause',
                         'state': 'completed', 'reference': 'intentional-pause', 'request_id': 'pause-1', 'history': [],
                         'cleanup': {}, 'checkpoint': {'iteration': {'project_id': 'p', 'iteration_id': 'i'}}}
@@ -96,14 +132,42 @@ class ProjectExecutionTests(unittest.TestCase):
                     original_grants = db.execute('SELECT * FROM model_grants').fetchall()
                     live = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '77'}
                     if case == 'installation': live['ActiveState'] = 'inactive'
-                    with patch.object(service, 'supervisor', return_value=live) as supervisor, \
+                    observed = [dict(live, ActiveState='inactive', MainPID='0'), None, live] if managed else None
+                    with patch.object(service, 'supervisor', side_effect=observed, return_value=live) as supervisor, \
+                         patch.object(service, 'install') as install, \
+                         patch.object(execution.tickets, 'pinned_inputs', return_value=inputs), \
                          patch.object(service, 'github_client', return_value=fixture.github), \
                          patch.object(execution.readiness, 'HostReaders', return_value=fixture.readers), \
                          patch('factory_v1.project_tracker.TrackerHost', return_value=SimpleNamespace(github=fixture.github)), \
                          patch.object(execution.tickets.gh, 'resolve_milestone', return_value=tracked['identities']['milestone']), \
-                         patch.object(execution.tickets.gh, 'read_issue', return_value={'number': 1, 'id': 10, 'node_id': 'I_1', 'body': 'Actual read-only fixture anchor'}):
-                        result = component.prepare(draft_id, 3) if case == 'active' else component.register(draft_id, 3)
-                        if case == 'active':
+                         patch.object(execution.tickets.gh, 'read_issue', return_value=issue):
+                        if case == 'preplanning':
+                            result = component.prepare_planning(draft_id, 3)
+                            self.assertEqual(result['status'], 'planning_prepared', result.get('blocker'))
+                            self.assertIsNone(readiness_gate.binding(db, 'p', 'i'))
+                            self.assertIsNone(service.load(str(path))['dispatch_config'])
+                            self.assertIsNone(service.load(str(path))['delivery_config'])
+                            supervisor.assert_not_called(); install.assert_not_called()
+                        elif case in ('managed', 'unpublished', 'start-denied'):
+                            result = component.register(draft_id, 3) if case == 'managed' else component.prepare(draft_id, 3)
+                            expected = {'managed': 'registered', 'unpublished': 'blocked', 'start-denied': 'blocked'}[case]
+                            self.assertEqual(result['status'], expected, result.get('blocker'))
+                            if case == 'managed':
+                                dispatch = execution.readiness.load_config(result['service']['dispatch_config'])
+                                self.assertEqual(dispatch['implementation']['issue']['number'], 2)
+                                self.assertEqual(dispatch['implementation']['spec_commit'], 'b' * 40)
+                                install.assert_called_once()
+                                self.assertEqual(supervisor.call_args_list[1].args[1], 'start')
+                                self.assertEqual(supervisor.call_args_list[1].kwargs['unit'], service.instance(result['service']))
+                            else:
+                                self.assertEqual(result['blocker']['code'], 'execution_publication_required' if case == 'unpublished'
+                                                 else 'execution_lifecycle_required')
+                                self.assertFalse(any(c.args[1] == 'start' for c in supervisor.call_args_list))
+                        else:
+                            result = component.prepare(draft_id, 3) if case == 'active' else component.register(draft_id, 3)
+                        if managed:
+                            pass
+                        elif case == 'active':
                             self.assertEqual(result['status'], 'prepared', result.get('blocker'))
                             tracker.tracker_config.assert_called_once_with(draft_id)
                             self.assertIsNone(service.load(str(path))['dispatch_config'])
@@ -143,7 +207,7 @@ class ProjectExecutionTests(unittest.TestCase):
                             if case == 'source-drift': self.assertEqual(result['blocker']['code'], 'skill_blocked')
                         self.assertEqual(control_path.read_bytes() if control_path.exists() else None, pause_bytes)
                         self.assertEqual(db.execute('SELECT * FROM model_grants').fetchall(), original_grants)
-                        self.assertTrue(all(call.args[1] == 'status' for call in supervisor.call_args_list))
+                        self.assertTrue(managed or all(call.args[1] == 'status' for call in supervisor.call_args_list))
                         self.assertNotIn('bearer', json.dumps(component.read(draft_id)))
                         self.assertEqual(store.read(draft_id), draft)
                     db.close()

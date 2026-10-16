@@ -74,7 +74,7 @@ def atomic(path, value):
         Path(temporary).unlink(missing_ok=True)
 
 
-def load(path):
+def load(path, *, register_binding=True):
     path = physical(path)
     controls.private(path)
     root = path.parent
@@ -95,7 +95,8 @@ def load(path):
         from .merge import controller_paths
         controller_paths(db, str(path))
         from .readiness_gate import register
-        register(db, path, config)
+        if register_binding:
+            register(db, path, config)
     return config
 
 
@@ -236,11 +237,22 @@ def unit_text(config):
             'Environment=PYTHONDONTWRITEBYTECODE=1\n\n[Install]\nWantedBy=default.target\n')
 
 
-def install(config, directory):
+def instance(config):
+    """Exact scope/state identity; no arbitrary instance names or shared unit."""
+    return 'agentic-forge-' + assignments.digest({k: config[k] for k in
+        ('state', 'operator_id', 'project', 'iteration')}) + '.service'
+
+
+def selected_unit(config, unit):
+    require(unit in (UNIT, instance(config)), 'Unit does not belong to this scope.', 'invalid_service')
+    return unit
+
+
+def install(config, directory, *, unit=UNIT):
     directory = physical(directory, directory=True)
     require(directory.stat().st_uid == os.getuid() and not directory.stat().st_mode & 0o022,
             'Operator-owned supervisor directory required.', 'invalid_service')
-    path = directory / UNIT
+    path = directory / selected_unit(config, unit)
     require(not os.path.lexists(path), 'Existing unit requires explicit operator reconciliation.', 'invalid_service')
     raw = unit_text(config)
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW, 0o600)
@@ -252,29 +264,31 @@ def install(config, directory):
     return path
 
 
-def supervisor(config, action):
+def supervisor(config, action, *, unit=UNIT):
+    selected_unit(config, unit)
     require(action in {'start', 'stop', 'restart', 'status'}, 'Unsupported supervisor action.', 'invalid_service')
-    result = subprocess.run(['systemctl', '--user', 'show', UNIT, '--property=FragmentPath', '--property=DropInPaths'],
+    result = subprocess.run(['systemctl', '--user', 'show', unit, '--property=FragmentPath', '--property=DropInPaths'],
                             check=True, capture_output=True, text=True, timeout=30)
     properties = dict(line.split('=', 1) for line in result.stdout.splitlines())
     require(set(properties) == {'FragmentPath', 'DropInPaths'} and not properties['DropInPaths'] and
             assignments.absolute(properties['FragmentPath']),
             'Missing unit or unreviewed supervisor overrides.', 'invalid_service')
+    selected = unit
     unit = physical(properties['FragmentPath'])
-    require(unit.name == UNIT and unit.stat().st_uid == os.getuid() and not unit.stat().st_mode & 0o022 and
+    require(unit.name == selected and unit.stat().st_uid == os.getuid() and not unit.stat().st_mode & 0o022 and
             unit.read_text() == unit_text(config), 'Installed source/config differs from selected unit.', 'invalid_service')
     if action == 'status':
-        result = subprocess.run(['systemctl', '--user', 'show', UNIT, '--property=ActiveState', '--property=SubState', '--property=MainPID'],
+        result = subprocess.run(['systemctl', '--user', 'show', selected, '--property=ActiveState', '--property=SubState', '--property=MainPID'],
                                 check=True, capture_output=True, text=True, timeout=30)
         return dict(line.split('=', 1) for line in result.stdout.splitlines())
     if action in {'stop', 'restart'}:
         with connect(config) as db:
             controls.request(db, *scope(config), 'emergency-stop', 'supervisor-' + action)
-    subprocess.run(['systemctl', '--user', action, UNIT], check=True, timeout=60)
+    subprocess.run(['systemctl', '--user', action, selected], check=True, timeout=60)
     return None
 
 
-def run(config, stop=None):
+def run(config, stop: threading.Event | None = None):
     stop = threading.Event() if stop is None else stop
     root = Path(config['state']).parent
     descriptor = os.open(root / 'service.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -287,7 +301,7 @@ def run(config, stop=None):
         github = github_client(config)
         run_id = uuid.uuid4().hex
         previous = None
-        signals = {s: signal.signal(s, lambda *_: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
+        signals = {s: signal.signal(s, lambda *_, stop=stop: stop.set()) for s in (signal.SIGTERM, signal.SIGINT)}
         try:
             startup(config, github)
             while not stop.is_set():
@@ -352,6 +366,7 @@ def main():
         elif args.command == 'readiness':
             try:
                 live = supervisor(config, 'status')
+                assert live is not None
                 running = live.get('ActiveState') == 'active' and live.get('SubState') == 'running' and int(live.get('MainPID', '0')) > 0
             except Exception:
                 running = None

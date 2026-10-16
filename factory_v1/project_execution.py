@@ -19,6 +19,8 @@ from .sandbox_source import physical
 INVENTORY_FIELDS = {'operator_id', 'repository', 'repository_id', 'draft_revision', 'reference',
                     'service_config', 'role_root', 'templates', 'planning_skills', 'ticket_skill',
                     'planning_config', 'synthesis_config', 'authorities', 'protection', 'policy'}
+PLATFORM_FIELDS = INVENTORY_FIELDS - {'operator_id', 'repository', 'repository_id', 'draft_revision', 'service_config'}
+INSTALLATION_FIELDS = {'operator_id', 'reference', 'state_root', 'workspace_root', 'service_template', 'unit_directory', 'actions'}
 POLICY_FIELDS = {'acceptance', 'verification_commands', 'merge', 'production', 'deployment'}
 ERRORS = (RepositoryError, IntakeError, OSError, ValueError, TypeError, KeyError,
           AttributeError, sqlite3.Error, subprocess.SubprocessError)
@@ -38,7 +40,7 @@ class ProjectExecution:
     """Host-only prepare/read/status/resume/register seam for T7 composition."""
 
     def __init__(self, setup, tracker, config):
-        require(isinstance(config, dict) and set(config) == {'root', 'capability_config'},
+        require(isinstance(config, dict) and set(config) in ({'root', 'capability_config'}, {'root', 'capability_config', 'installation_config'}),
                 'Private reviewed execution inventory required.', 'execution_capability_required')
         self.setup, self.tracker, self.config = setup, tracker, deepcopy(config)
         self.root = physical(config['root'], directory=True)
@@ -111,12 +113,22 @@ class ProjectExecution:
             selected = readiness.load_config(self.config['capability_config'])
         except (OSError, RepositoryError, ValueError) as error:
             raise RepositoryError('execution_capability_required', 'Restore the private reviewed host inventory.') from error
+        if 'installation_config' in self.config:
+            require(isinstance(selected, dict) and set(selected) == PLATFORM_FIELDS and
+                    set(selected['policy']) == POLICY_FIELDS - {'acceptance'},
+                    'Reviewed reusable platform inventory required.', 'execution_capability_required')
+            selected = dict(selected, operator_id=draft['operator_id'], repository=attached['repository'],
+                repository_id=attached['repository_id'], draft_revision=draft['revision'],
+                service_config=str(Path(attached['binding']['state']).parent / 'service.json'),
+                policy=dict(selected['policy'], acceptance=draft['product']['acceptance']))
+            self.installation(draft, attached)
         require(isinstance(selected, dict) and set(selected) == INVENTORY_FIELDS and
                 all(selected[k] == v for k, v in {
                     'operator_id': draft['operator_id'], 'repository': attached['repository'],
                     'repository_id': attached['repository_id'], 'draft_revision': draft['revision']}.items()) and
                 text(selected['reference']), 'Exact reviewed host execution scope required.', 'execution_capability_required')
         policy = selected['policy']
+        assert isinstance(policy, dict)
         require(isinstance(policy, dict) and set(policy) == POLICY_FIELDS and
                 policy['acceptance'] == draft['product']['acceptance'] and
                 policy['merge'] == policy['production'] == 'human-approved',
@@ -127,11 +139,130 @@ class ProjectExecution:
                 'Agreed finite test commands required.', 'execution_policy_required')
         return selected
 
-    def derive(self, draft, attached, board, tracked, host):
+    def installation(self, draft, attached):
+        selected = readiness.load_config(self.config['installation_config'])
+        require(isinstance(selected, dict) and set(selected) == INSTALLATION_FIELDS and
+                selected['operator_id'] == draft['operator_id'] and text(selected['reference']) and
+                isinstance(selected['actions'], list) and len(set(selected['actions'])) == len(selected['actions']) and
+                set(selected['actions']) <= {'install', 'start'},
+                'Exact reviewed platform lifecycle authority required.', 'execution_lifecycle_required')
+        state_root = physical(selected['state_root'], directory=True)
+        workspace_root = physical(selected['workspace_root'], directory=True)
+        controls.private(state_root, directory=True)
+        controls.private(workspace_root, directory=True)
+        require(Path(attached['binding']['state']).parent.is_relative_to(state_root) and
+                Path(attached['workspace']).is_relative_to(workspace_root) and
+                state_root != workspace_root and not state_root.is_relative_to(workspace_root) and
+                not workspace_root.is_relative_to(state_root),
+                'Attachment outside reviewed platform roots.', 'scope_mismatch')
+        return dict(selected, template_pin=assignments.digest(readiness.load_config(selected['service_template'])))
+
+    def managed_service(self, draft, attached, host):
+        authority = self.installation(draft, attached)
+        template = readiness.load_config(authority['service_template'])
+        require(isinstance(template, dict) and set(template) == service.FIELDS -
+                {'state', 'operator_id', 'project', 'iteration'} and
+                template['dispatch_config'] is None and template['readiness_config'] is None,
+                'Reviewed native service template required.', 'invalid_service')
+        config = dict(template, state=attached['binding']['state'], operator_id=draft['operator_id'],
+                      project=attached['project'], iteration=attached['iteration'], delivery_config=None)
+        path = Path(host['service_config'])
+        if not path.exists():
+            retain(path, config)
+        actual = service.load(str(path), register_binding=False)
+        require(all(actual[k] == v for k, v in config.items() if k not in
+                    {'delivery_config', 'dispatch_config', 'readiness_config'}),
+                'Managed service scope/template drift.', 'execution_inputs_changed')
+        return actual, authority, template
+
+    def prepare_planning(self, draft_id, expected_revision):
+        """Setup-only phase: no issue, AGENTS, health, running unit or worker required."""
+        record = self.read(draft_id) or {'version': 1, 'draft_id': draft_id,
+            'draft_revision': expected_revision, 'status': 'pending', 'blocker': None}
         try:
-            current = service.load(host['service_config'])
-            live = service.supervisor(current, 'status')
+            draft, attached, _, _ = self.context(draft_id, expected_revision)
+            with self.setup.enrollment.store.locked():
+                require(record['draft_revision'] == expected_revision and
+                        self.setup.enrollment.store.read(draft_id) == draft and self.setup.read(draft_id) == attached,
+                        'Preparation scope changed.', 'scope_mismatch')
+                host = self.inventory(draft, attached)
+                installation = self.installation(draft, attached) if 'installation_config' in self.config else None
+                pin = assignments.digest(host if installation is None else [host, installation])
+                require(record.get('inventory_pin', pin) == pin, 'Reviewed inputs changed.', 'execution_inputs_changed')
+                if installation is not None:
+                    current, _, _ = self.managed_service(draft, attached, host)
+                else:
+                    current = service.load(host['service_config'])
+                require(current['state'] == attached['binding']['state'] and
+                        all(current[k] == v for k, v in {'operator_id': draft['operator_id'],
+                            'project': attached['project'], 'iteration': attached['iteration']}.items()),
+                        'Planning service scope differs.', 'scope_mismatch')
+                # Loading/validating these host files is not skill execution.
+                readiness.load_config(host['planning_config'])
+                readiness.load_config(host['synthesis_config'])
+                record.update(inventory_pin=pin, service_config=host['service_config'], service=current,
+                    planning_config=host['planning_config'], synthesis_config=host['synthesis_config'],
+                    status='planning_prepared', phase='preplanning', blocker=None)
         except ERRORS as error:
+            self.block(record, error, 'prepare-planning')
+        self.save(record)
+        return deepcopy(record)
+
+    def published_seed(self, current, attached, github):
+        with service.connect(current) as db:
+            item = assignments.current(db, *service.scope(current), require_active=False)
+            work = item.get('ticket_work', {})
+            require(item.get('planning', {}).get('status') == 'complete' and
+                    work.get('publication_complete') is True and work.get('status') == 'published' and
+                    work.get('tickets') and work.get('published'),
+                    'Publish the actual specification and ticket batch before engineering preparation.', 'execution_publication_required')
+            inputs = tickets.pinned_inputs(db, item, assignments.ReadOnlyGitHub(github))
+            require(inputs == work['inputs'], 'Published requirement authority changed.', 'publication_mismatch')
+            first = work['tickets'][0]
+            identity = work['published'][first['key']]
+            issue = tickets.gh.read_issue(assignments.ReadOnlyGitHub(github), attached['repository'], identity['number'])
+            numbers = {k: v['number'] for k, v in work['published'].items()}
+            require(all(issue[k] == v for k, v in identity.items()) and issue['state'] == 'open' and
+                    issue['body'] == tickets.body(item, first, numbers),
+                    'First published ticket readback differs.', 'publication_mismatch')
+            return issue, inputs['handoff']['commit']
+
+    def derive(self, draft, attached, board, tracked, host):
+        issue = None
+        spec_commit = None
+        try:
+            managed = 'installation_config' in self.config
+            if managed:
+                current, authority, template = self.managed_service(draft, attached, host)
+                github = service.github_client(current)
+                issue, spec_commit = self.published_seed(current, attached, github)
+                contract = readiness.load_config(template['delivery_config'])
+                contract = dict(contract, operator_id=draft['operator_id'], repository=attached['repository'],
+                                repository_id=attached['repository_id'], issue=issue['number'])
+                delivery.validate_config(contract, draft['operator_id'])
+                delivery_path = Path(host['service_config']).parent / 'delivery.json'
+                retain(delivery_path, contract)
+                current['delivery_config'] = str(delivery_path)
+                unit = service.instance(current)
+                unit_path = physical(authority['unit_directory'], directory=True) / unit
+                if not unit_path.exists() and not unit_path.is_symlink():
+                    require('install' in authority['actions'], 'Platform installation not authorized.', 'execution_lifecycle_required')
+                    require(self.installation(draft, attached) == authority and self.inventory(draft, attached) == host,
+                            'Lifecycle authority changed.', 'execution_inputs_changed')
+                    service.install(current, authority['unit_directory'], unit=unit)
+                live = service.supervisor(current, 'status', unit=unit)
+                if live is not None and live.get('ActiveState') == 'inactive' and live.get('MainPID') == '0':
+                    require('start' in authority['actions'], 'Platform startup not authorized.', 'execution_lifecycle_required')
+                    require(self.installation(draft, attached) == authority and self.inventory(draft, attached) == host,
+                            'Startup authority changed.', 'execution_inputs_changed')
+                    service.supervisor(current, 'start', unit=unit)
+                    live = service.supervisor(current, 'status', unit=unit)
+            else:
+                current = service.load(host['service_config'])
+                live = service.supervisor(current, 'status')
+        except ERRORS as error:
+            if isinstance(error, RepositoryError):
+                raise
             raise RepositoryError('execution_installation_required',
                                   'Restore the existing scoped reviewed service installation.') from error
         require(current['state'] == attached['binding']['state'] and
@@ -189,14 +320,17 @@ class ProjectExecution:
         github = service.github_client(current)
         # A real delivery anchor supplies schema fields only. Continuation.request
         # re-reads each selected ticket, main and requirement authority before use.
-        issue = tickets.gh.read_issue(assignments.ReadOnlyGitHub(github), attached['repository'], contract['issue'])
+        if not managed:
+            issue = tickets.gh.read_issue(assignments.ReadOnlyGitHub(github), attached['repository'], contract['issue'])
+            spec_commit = attached['commit']
+        assert issue is not None and spec_commit is not None
         seed_slot = next(s for s in slots if s['stage'] == 'implementation')
         standards_path = physical(Path(attached['workspace']) / 'AGENTS.md')
         from .simplification import artifact
         seed = {**{k: deepcopy(seed_slot[k]) for k in ('stage', 'profile', 'skills', 'claim_id')},
                 'repository': attached['repository'], 'repository_id': attached['repository_id'],
                 'workspace': attached['workspace'], 'issue': {k: issue[k] for k in ('number', 'id', 'node_id')},
-                'spec_commit': attached['commit'], 'baseline': attached['commit'], 'candidate': None,
+                'spec_commit': spec_commit, 'baseline': attached['commit'], 'candidate': None,
                 'standards': [artifact('AGENTS.md', standards_path.read_text())], 'preceding': [],
                 'capabilities': ['read_workspace', 'scratch', 'model', 'write_workspace'], 'result_contract': assignments.CONTRACT}
         import hashlib
@@ -250,17 +384,20 @@ class ProjectExecution:
                 require(self.setup.enrollment.store.read(draft_id) == draft and self.setup.read(draft_id) == attached,
                         'Draft changed during tracker readback.', 'scope_mismatch')
                 host = self.inventory(draft, attached)
-                pin = assignments.digest(host)
+                installation = self.installation(draft, attached) if 'installation_config' in self.config else None
+                pin = assignments.digest(host if installation is None else [host, installation])
                 require(record.get('inventory_pin', pin) == pin, 'Reviewed inventory changed.', 'execution_inputs_changed')
                 record['inventory_pin'] = pin
+                record['phase'] = 'postpublication'
                 current, report = self.derive(draft, attached, board, tracked, host)
-                require(readiness.load_config(self.config['capability_config']) == host,
+                require(self.inventory(draft, attached) == host and (installation is None or
+                        self.installation(draft, attached) == installation),
                         'Host inventory changed during preparation.', 'execution_inputs_changed')
                 record.update(service_config=host['service_config'], service=current, readiness=report)
                 failed = {k: v for k, v in report['checks'].items() if k != 'controls' and v['state'] != 'ready'}
                 require(not failed, 'Inspect exact readiness checks; no missing authority is granted.',
                         next(iter(failed.values()))['code'] if failed else 'execution_readiness_blocked')
-                record.update(status='prepared', blocker=None)
+                record.update(status='prepared', phase='postpublication', blocker=None)
             except ERRORS as error:
                 self.block(record, error, 'prepare-execution')
             self.save(record)
@@ -280,7 +417,7 @@ class ProjectExecution:
         record.update(status='blocked', blocker={'code': code, 'operation': operation,
             'cause': cause, 'checks': failures,
             'scope': dict(scope, draft_id=record['draft_id'], draft_revision=record['draft_revision']),
-            'consequence': 'Preparation retained; no worker, model, service start or allowance reset.',
+            'consequence': 'Preparation retained; no engineering worker, model or allowance reset. Explicitly authorized scoped service lifecycle effects may have occurred.',
             'next_decision': (next(iter(failures.values()))['remediation'] if failures else
                               'Restore the exact reviewed host prerequisite; explicit controls resume remains separate.'),
             'reconciliation_required': code == 'execution_inputs_changed'})
@@ -292,12 +429,17 @@ class ProjectExecution:
             return record
         try:
             with self.setup.enrollment.store.locked():
-                host = readiness.load_config(self.config['capability_config'])
-                require(assignments.digest(host) == record['inventory_pin'], 'Host scope changed.', 'execution_inputs_changed')
+                draft = self.setup.enrollment.store.read(draft_id)
+                attached = self.setup.read(draft_id)
+                require(draft is not None and attached is not None and draft['revision'] == expected_revision,
+                        'Registration scope changed.', 'scope_mismatch')
+                host = self.inventory(draft, attached)
+                installation = self.installation(draft, attached) if 'installation_config' in self.config else None
+                require(assignments.digest(host if installation is None else [host, installation]) == record['inventory_pin'], 'Host scope changed.', 'execution_inputs_changed')
                 target, path = record['service'], Path(record['service_config'])
                 old = service.load(str(path))
-                require(all(old[k] == v for k, v in target.items() if k not in {'dispatch_config', 'readiness_config'}) and
-                        all(old[k] in (None, target[k]) for k in ('dispatch_config', 'readiness_config')),
+                require(all(old[k] == v for k, v in target.items() if k not in {'dispatch_config', 'readiness_config', 'delivery_config'}) and
+                        all(old[k] in (None, target[k]) for k in ('dispatch_config', 'readiness_config', 'delivery_config')),
                         'Existing service changed.', 'execution_inputs_changed')
                 with service.connect(target) as db:
                     controls.owner(db, *service.scope(target))
@@ -308,7 +450,8 @@ class ProjectExecution:
                         require(controls.blocked(db, *service.scope(target)[:2]),
                                 'Interruption changed before registration.', 'iteration_paused')
                         require(readiness.load_config(str(path)) == old and
-                                readiness.load_config(self.config['capability_config']) == host,
+                                self.inventory(draft, attached) == host and (installation is None or
+                                self.installation(draft, attached) == installation),
                                 'Registration inputs changed.', 'execution_inputs_changed')
                         service.atomic(path, target)
                 loaded = service.load(str(path))
@@ -339,4 +482,5 @@ class ProjectExecution:
     def status(self, draft_id):
         """Fresh readiness/preparation status; retained green never grants dispatch."""
         record = self.read(draft_id)
-        return None if record is None else self.prepare(draft_id, record['draft_revision'])
+        return None if record is None else (self.prepare_planning(draft_id, record['draft_revision'])
+            if record.get('phase') == 'preplanning' else self.prepare(draft_id, record['draft_revision']))
