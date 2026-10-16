@@ -204,7 +204,7 @@ class NativeProject:
             self.routes[draft_id] = native
             return native
         except Exception:
-            previous = self.routes.pop(draft_id, None)
+            previous = self.routes.get(draft_id)
             if previous is not None and previous.wakeup is not None:
                 previous.wakeup.stop()
             raise

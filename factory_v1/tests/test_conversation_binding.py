@@ -174,6 +174,8 @@ class ConversationBindingTests(unittest.TestCase):
             self.assertTrue(subscriber.stopped); self.assertTrue(subscriber.task.cancelled())
             subscriber.joined.wait.assert_called_with(2)
             metadata['private'] = True
+            with self.assertRaises(repositories.RepositoryError): owner.bind(self.binding, 'draft')
+            self.assertEqual(len(spawned), 1)
             owner.close(); owner.close()
             # Missing native lifecycle blocks, rather than manufacturing a loop/thread.
             missing = project_native.NativeProject(enrollment, setup, None, config)
