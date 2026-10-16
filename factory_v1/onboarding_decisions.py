@@ -1,13 +1,14 @@
 """Scoped setup direction in the admitted conversation; never an authority issuer."""
 import copy
 import json
+import re
 import sqlite3
 
 from . import attention, controls, spending
 from .assignments import digest
 from .conversation_enrollment import PRODUCT_FIELDS
 from .planning import require, text
-from .repositories import RepositoryError, unambiguous_fields
+from .repositories import RepositoryError
 
 CAUSES = {
     'product': ('A product answer is missing.', 'Answer the exact product question.'),
@@ -76,10 +77,10 @@ class OnboardingDecisions:
         if not blockers:
             return ''
         lines = ['Project setup is held; no worker is running for this setup operation.']
-        for b in blockers:
+        for number, b in enumerate(blockers, 1):
             cause, decision = CAUSES[b['cause']]
-            lines.append(f"{b['decision_id']}: {cause} {b['question']} {decision} "
-                         f"Scope: {json.dumps(b['scope'], sort_keys=True)}; ceiling: {b['ceiling']}.")
+            lines.append(f"{number}. {cause} {b['question']} {decision} "
+                         f"Maximum allowance: {b['ceiling']} units.")
         return '\n'.join(lines)
 
     def lifecycle(self, draft, record, action, request):
@@ -153,40 +154,41 @@ class OnboardingDecisions:
         message = self.message(record, pending)
         if not fresh['ready'] and not message:
             message = 'Project setup remains held. Direction is retained; actual host authority or reconciliation is still required. No worker was started.'
+        if any(a['direction'] == 'reject' for a in record['responses'].values()):
+            message = 'Project setup is held because you declined this choice. No worker was started; choose a new supported proposal to continue.'
         return {**fresh, 'responses': copy.deepcopy(record['responses']), 'message': message}
 
     def respond(self, args, *, session_id='', **kwargs):
-        """Record explicit raw operator direction; args select no identity or authority."""
-        require(isinstance(args, dict) and set(args) == {'operation_id'}, 'Only exact operation selector allowed.', 'scope_mismatch')
+        """Retain approve/reject choices from actual input for the current displayed prompt."""
+        require(isinstance(args, dict) and not args, 'No model-authored approval fields allowed.', 'scope_mismatch')
         with self.store.locked():
             draft, observed = self.enrollment.correlated(session_id)
-            _, record = self.current(draft['draft_id'], args['operation_id'])
-            raw = observed['text']
-            require(raw.startswith('forge-decision '), 'Explicit scoped direction required; chat is not approval.', 'approval_required')
-            try:
-                direction = json.loads(raw.removeprefix('forge-decision '), object_pairs_hook=unambiguous_fields)
-            except ValueError as error:
-                raise RepositoryError('approval_required', 'Exact structured operator direction required.') from error
-            require(isinstance(direction, dict) and set(direction) == {'operation', 'answers'} and
-                    digest(direction['operation']) == digest(record['operation']) and isinstance(direction['answers'], list) and
-                    bool(direction['answers']), 'Response must bind exact operation/project/scope/ceiling.', 'scope_mismatch')
-            answers = direction['answers']
-            require(all(isinstance(a, dict) and text(a.get('decision_id')) for a in answers) and
-                    len({a['decision_id'] for a in answers}) == len(answers),
-                    'Distinct responses required.', 'scope_mismatch')
-            for answer in answers:
-                b = next((b for b in record['blockers'] if b['decision_id'] == answer.get('decision_id')), None)
-                require(b is not None and set(answer) == {'decision_id', 'scope', 'ceiling', 'direction'} and
-                        digest(answer['scope']) == digest(b['scope']) and type(answer['ceiling']) is int and
-                        answer['ceiling'] == b['ceiling'] and text(answer['direction']) and
-                        answer['direction'].strip().lower() not in {'yes', 'ok', 'thanks', 'ack'} and b['cause'] != 'uncertain',
-                        'Exact explicit decision required; uncertain effects need trusted reconciliation.', 'approval_required')
-                previous = record['responses'].get(b['decision_id'])
-                response = {**answer, 'operator_id': draft['operator_id'], 'origin': draft['origin'],
-                            'reference': observed['message_id']}
-                require(previous in (None, response), 'Decision already answered differently.', 'decision_conflict')
-            for answer in answers:
-                b = next(b for b in record['blockers'] if b['decision_id'] == answer['decision_id'])
+            prompt = draft.get('decision_prompt')
+            require(prompt is not None and prompt['revision'] == draft['revision'] and
+                    draft.get('decision_input') == {'message_id': observed['message_id'], 'prompt': digest(prompt)},
+                    'Answer the current displayed choice; stale or unrelated input is not approval.', 'approval_required')
+            raw = observed['text'].strip().lower()
+            if len(prompt['choices']) == 1 and raw in {'approve', 'reject'}:
+                selected = [(1, raw)]
+            else:
+                parts = re.split(r'[,;\n]+', raw)
+                require(all(re.fullmatch(r'\s*[1-9][0-9]*\s+(approve|reject)\s*', p) for p in parts),
+                        'Reply approve/reject for one choice, or numbered choices such as 1 approve, 2 reject.', 'approval_required')
+                selected = [(int(p.split()[0]), p.split()[1]) for p in parts]
+            require(len({n for n, _ in selected}) == len(selected) and
+                    all(1 <= n <= len(prompt['choices']) for n, _ in selected), 'Distinct displayed choices required.', 'approval_required')
+            answers = []
+            for number, direction in selected:
+                choice = prompt['choices'][number - 1]
+                record = draft['onboarding_decisions'][choice['operation']['operation_id']]
+                b = choice['blocker']
+                require(digest(record['operation']) == digest(choice['operation']) and
+                        any(digest(b) == digest(current) for current in record['blockers']) and
+                        b['decision_id'] not in record['responses'] and b['cause'] != 'uncertain' and
+                        record['attempt'] is None, 'Choice changed or requires reconciliation.', 'approval_required')
+                answers.append((record, b, {'decision_id': b['decision_id'], 'scope': b['scope'],
+                    'ceiling': b['ceiling'], 'direction': direction}))
+            for record, b, answer in answers:
                 if record['notification'] is not None:
                     with sqlite3.connect(self.config['state']) as database:
                         item = attention.load_iteration(database, record['notification']['project'], record['notification']['iteration'])
@@ -196,14 +198,18 @@ class OnboardingDecisions:
                         'reference': observed['message_id'], 'response': json.dumps(answer, sort_keys=True)})
                 record['responses'][answer['decision_id']] = {**answer, 'operator_id': draft['operator_id'],
                     'origin': draft['origin'], 'reference': observed['message_id']}
-            draft['onboarding_decisions'][args['operation_id']] = record
+            draft['decision_prompt'] = None
+            draft['decision_input'] = None
             self.store.save(draft)
-        return json.dumps(self.resume(draft['draft_id'], args['operation_id'], session_id=session_id), sort_keys=True)
+        operations = dict.fromkeys(record['operation']['operation_id'] for record, _, _ in answers)
+        return json.dumps({'results': [self.resume(draft['draft_id'], key, session_id=session_id) for key in operations]}, sort_keys=True)
 
     def resume(self, draft_id, operation_id, *, session_id):
         """Retry only the same retained producer operation after fresh trusted revalidation."""
         draft, record = self.current(draft_id, operation_id)
         fresh = self.status(draft_id, operation_id, session_id=session_id)
+        if any(a['direction'] == 'reject' for a in record['responses'].values()):
+            return {**fresh, 'resumed': False, 'reason': 'operator_declined'}
         if not fresh['ready'] or record['attempt'] is not None:
             return {**fresh, 'resumed': False, 'reason': 'reconciliation_required' if record['attempt'] else fresh.get('reason', 'prerequisite_pending')}
         if record['notification'] is not None:
@@ -253,6 +259,9 @@ class OnboardingDecisions:
             previous = next((o for o in draft['observations'] if o['message_id'] == event['message_id']), None)
             require(previous is None or previous == observation, 'Repeated input changed.', 'scope_mismatch')
             if previous is None:
+                prompt = draft.get('decision_prompt')
+                draft['decision_input'] = ({'message_id': event['message_id'], 'prompt': digest(prompt)}
+                    if prompt is not None and prompt['anchor'] == draft['observations'][-1]['message_id'] else None)
                 draft['observations'].append(observation)
             self.store.save(draft)
         return None
@@ -274,23 +283,44 @@ class OnboardingDecisions:
         return copy.deepcopy(record)
 
     def context(self, session_id, **kwargs):
-        draft, _ = self.enrollment.correlated(session_id)
+        draft, observed = self.enrollment.correlated(session_id)
         actions = draft.get('onboarding_decisions', {})
         if not actions:
             return self.enrollment.context(session_id, **kwargs)
-        messages = []
+        messages, choices = [], []
         for key in actions:
             current = self.status(draft['draft_id'], key, session_id=session_id)
-            if current['ready'] and actions[key]['attempt'] is None:
+            if current['ready'] and actions[key]['attempt'] is None and not draft.get('decision_input'):
                 self.resume(draft['draft_id'], key, session_id=session_id)
             if current['message']:
-                messages.append(current['message'] + '\nExact operation: ' + json.dumps(actions[key]['operation'], sort_keys=True))
+                messages.append(current['message'])
+                choices.extend({'operation': copy.deepcopy(actions[key]['operation']), 'blocker': copy.deepcopy(b)}
+                    for b in actions[key]['blockers'] if b['decision_id'] in current['pending'] and
+                    b['decision_id'] not in actions[key]['responses'] and b['cause'] != 'uncertain' and actions[key]['attempt'] is None)
         if not messages:
             return None
-        return {'context': '\n\n'.join(messages) + '\nUse factory_project_setup_response only for actual operator input beginning '
-                'forge-decision followed by JSON {"operation": <exact operation>, "answers": '
-                '[{"decision_id": ..., "scope": ..., "ceiling": ..., "direction": <explicit instruction>}]}.'
-                ' Do not infer approval, invent this input or ask for private configuration edits.'}
+        with self.store.locked():
+            draft = self.store.read(draft['draft_id'])
+            prompt = draft.get('decision_prompt')
+            responding = prompt is not None and draft.get('decision_input') == {
+                'message_id': observed['message_id'], 'prompt': digest(prompt)}
+            if not responding:
+                prompt = {'anchor': observed['message_id'], 'revision': draft['revision'], 'choices': choices}
+                draft['decision_prompt'] = prompt
+                draft['decision_input'] = None
+                self.store.save(draft)
+        displayed = ['Project setup is held; no worker is running for this setup operation.']
+        for number, choice in enumerate(prompt['choices'], 1):
+            b = choice['blocker']
+            cause, decision = CAUSES[b['cause']]
+            displayed.append(f"{number}. For {choice['operation']['project']}: {cause} {b['question']} {decision} Maximum allowance for this choice: {b['ceiling']} units; total operation maximum: {choice['operation']['ceiling']} units.")
+        if not prompt['choices']:
+            displayed = messages
+        return {'context': '\n'.join(displayed) + '\nPresent these choices faithfully. Reply approve or reject for a single choice, '
+                'or numbered choices, for example 1 approve, 2 reject. Partial answers are retained. '
+                'Use factory_project_setup_response with no arguments only for that actual operator input. '
+                'These are directions, not host authority. Never infer approval from yes or unrelated chat. '
+                'For product choices explain the recommendation in the question; never request private configuration edits.'}
 
     def register(self):
         self.ctx.register_hook('post_gateway_admission', self.inbound)
@@ -301,7 +331,7 @@ class OnboardingDecisions:
                       'sufficient': {'type': 'boolean'}, 'rationale': {'type': 'string'}}
         for name, handler, props in (
             ('factory_project_draft_update', self.enrollment.update, properties),
-            ('factory_project_setup_response', self.respond, {'operation_id': {'type': 'string'}}),
+            ('factory_project_setup_response', self.respond, {}),
         ):
             self.ctx.register_tool(name=name, toolset='factory_planning', handler=handler,
                 schema={'name': name, 'description': handler.__doc__, 'parameters': {'type': 'object',

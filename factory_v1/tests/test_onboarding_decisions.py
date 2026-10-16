@@ -1,4 +1,4 @@
-"""Direct pending-action checks; native sender and producer authority are mocked."""
+"""Direct pending choices; no worker/setup journey or external effects."""
 from contextlib import contextmanager
 from contextvars import ContextVar
 import copy
@@ -8,7 +8,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 from factory_v1 import attention
 from factory_v1.conversation_enrollment import ConversationEnrollment, DraftStore
@@ -35,17 +35,18 @@ class OnboardingDecisionTests(unittest.TestCase):
                 'revision': 1, 'native': None, 'transfer': None}
             operation = {'operation_id': 'attach', 'project': 'atlas', 'scope': {'repository': 'owner/atlas'}, 'ceiling': 10}
             blockers = [{'decision_id': 'repository', 'cause': 'permission', 'scope': {'repository': 'owner/atlas'},
-                         'ceiling': 0, 'question': 'Attach this repository?'},
+                         'ceiling': 0, 'question': 'Attach owner/atlas to Atlas?'},
                         {'decision_id': 'budget', 'cause': 'allowance', 'scope': {'model': 'reviewed-model'},
-                         'ceiling': 10, 'question': 'Request ten units through the trusted route?'}]
+                         'ceiling': 10, 'question': 'Request ten units for the reviewed model through the trusted route?'}]
             ready = False
 
             def dispatch(name, args, **kwargs):
                 self.assertEqual(args, {'draft_id': draft_id, 'operation': operation})
                 self.assertEqual(kwargs, {'session_id': 'session'})
                 if name == 'factory_project_setup_status':
+                    retained = enrollment.store.read(draft_id)['onboarding_decisions']['attach']['blockers']
                     return json.dumps({'operation': operation, 'ready': ready,
-                                       'pending': [] if ready else ['repository', 'budget']})
+                                       'pending': [] if ready else [b['decision_id'] for b in retained]})
                 self.assertEqual(name, 'factory_project_setup_resume')
                 return json.dumps({'operation': operation, 'status': 'complete'})
 
@@ -62,16 +63,17 @@ class OnboardingDecisionTests(unittest.TestCase):
                     for var, token in reversed(tokens):
                         var.reset(token)
 
-            def seed(raw='pending'):
-                value = copy.deepcopy(base); value['observations'][0]['text'] = raw
-                enrollment.store.save(value)
-                adapter.request(draft_id, operation, blockers)
+            def seed(selected=None):
+                enrollment.store.save(copy.deepcopy(base))
+                adapter.request(draft_id, operation, blockers if selected is None else selected)
 
-            def raw(answers, op=None):
-                return 'forge-decision ' + json.dumps({'operation': operation if op is None else op, 'answers': answers})
+            def present(message_id='m1'):
+                with host(message_id=message_id):
+                    return adapter.context('session')['context']
 
-            answer = {'decision_id': 'repository', 'scope': blockers[0]['scope'], 'ceiling': 0,
-                      'direction': 'Approve attaching only owner/atlas.'}
+            def admit(raw, message_id='m2'):
+                adapter.inbound(source=source, platform='discord', session_key='key', message_id=message_id, text=raw)
+
             seed()
             retained = adapter.request(draft_id, operation, blockers)
             self.assertEqual(retained, adapter.request(draft_id, operation, blockers))
@@ -79,57 +81,98 @@ class OnboardingDecisionTests(unittest.TestCase):
                 adapter.request(draft_id, {**operation, 'scope': {'repository': 'other/repo'}}, blockers)
             for cause in CAUSES:
                 with self.subTest(message=cause):
-                    b = {**blockers[0], 'cause': cause}
-                    message = adapter.message({'blockers': [b]})
+                    message = adapter.message({'blockers': [{**blockers[0], 'cause': cause}]})
                     self.assertIn(CAUSES[cause][0], message)
                     self.assertIn(CAUSES[cause][1], message)
                     self.assertIn('held', message)
-            for label, supplied, host_changes in (
-                ('affirmative-chat', 'yes', {}),
-                ('acknowledgement', raw([{**answer, 'direction': ' OK '}]), {}),
-                ('other-project', raw([answer], {**operation, 'project': 'other'}), {}),
-                ('other-operation', raw([answer], {**operation, 'operation_id': 'other'}), {}),
-                ('scope', raw([{**answer, 'scope': {'repository': 'other/repo'}}]), {}),
-                ('ceiling', raw([{**answer, 'ceiling': 1}]), {}),
-                ('untrusted-speaker', raw([answer]), {'user_id': '99'}),
-                ('wrong-message', raw([answer]), {'message_id': 'unobserved'}),
+                    self.assertNotIn('decision_id', message)
+            for label, supplied, changes in (
+                ('affirmative-chat', 'yes', {}), ('ack', 'OK', {}),
+                ('unrelated', 'I approve the weather forecast', {}),
+                ('ambiguous-batch', 'approve', {}), ('duplicate', '1 approve, 1 reject', {}),
+                ('unknown-choice', '3 approve', {}), ('json', 'forge-decision {"answers": []}', {}),
+                ('speaker', '1 approve', {'user_id': '99'}),
+                ('wrong-message', '1 approve', {'message_id': 'unobserved'}),
             ):
                 with self.subTest(response=label):
-                    seed(supplied)
+                    seed(); present(); admit(supplied)
                     before = enrollment.store.read(draft_id)
-                    with host(**host_changes), self.assertRaises(RepositoryError):
-                        adapter.respond({'operation_id': 'attach'}, session_id='session')
+                    with host(message_id='m2', **changes) if 'message_id' not in changes else host(**changes):
+                        with self.assertRaises(RepositoryError):
+                            adapter.respond({}, session_id='session')
                     self.assertEqual(enrollment.store.read(draft_id), before)
-            seed(raw([answer]))
-            with host():
-                partial = json.loads(adapter.respond({'operation_id': 'attach'}, session_id='session'))
+            seed(); rendered = present()
+            self.assertIn('1. For atlas:', rendered)
+            self.assertIn('2. For atlas:', rendered)
+            self.assertNotIn('operation_id', rendered)
+            self.assertNotIn('forge-decision', rendered)
+            admit('1 approve')
+            with host(message_id='m2'):
+                # pre-LLM refresh must retain the exact displayed map for this answer.
+                self.assertEqual(present('m2'), rendered)
+                with self.assertRaises(RepositoryError):
+                    adapter.respond({'direction': 'approve'}, session_id='session')
+                partial = json.loads(adapter.respond({}, session_id='session'))['results'][0]
+                with self.assertRaises(RepositoryError):
+                    adapter.respond({}, session_id='session')  # consumed message cannot replay
             self.assertFalse(partial['resumed'])
             self.assertEqual(set(partial['responses']), {'repository'})
-            self.assertNotIn('repository: ', partial['message'])
-            self.assertIn('budget: ', partial['message'])
+            self.assertEqual(partial['responses']['repository']['scope'], blockers[0]['scope'])
+            self.assertEqual(partial['responses']['repository']['ceiling'], 0)
+            self.assertNotIn(blockers[0]['question'], partial['message'])
+            self.assertIn(blockers[1]['question'], partial['message'])
             self.assertFalse(any(c.args[0] == 'factory_project_setup_resume' for c in ctx.dispatch_tool.call_args_list))
             self.assertEqual(adapter.request(draft_id, operation, blockers)['responses'], partial['responses'])
-            ready = True  # Actual trusted producer read, never the conversational response.
+            present('m2'); admit('approve', 'm3')
+            with host(message_id='m3'):
+                second = json.loads(adapter.respond({}, session_id='session'))['results'][0]
+            self.assertEqual(set(second['responses']), {'repository', 'budget'})
+            self.assertFalse(second['resumed'])  # direction did not create allowance/access
+            ready = True
             result = adapter.resume(draft_id, 'attach', session_id='session')
             self.assertEqual(result['operation'], operation)
             self.assertTrue(result['resumed'])
-
             self.assertFalse(adapter.resume(draft_id, 'attach', session_id='session')['resumed'])
             self.assertEqual(sum(c.args[0] == 'factory_project_setup_resume' for c in ctx.dispatch_tool.call_args_list), 1)
-            with host():
-                self.assertIsNone(adapter.context('session'))  # successful setup is quiet
+            with host(message_id='m3'):
+                self.assertIsNone(adapter.context('session'))
             seed()
             with host():
-                self.assertIsNone(adapter.context('session'))  # approved authority: no repetitive question
-            self.assertEqual(sum(c.args[0] == 'factory_project_setup_resume' for c in ctx.dispatch_tool.call_args_list), 2)
+                self.assertIsNone(adapter.context('session'))  # approved host access reused quietly
             ready = False
-            seed()
-            uncertain = [{**blockers[0], 'cause': 'uncertain'}]
-            value = copy.deepcopy(base); value['observations'][0]['text'] = raw([answer])
-            enrollment.store.save(value); adapter.request(draft_id, operation, uncertain)
-            with host(), self.assertRaises(RepositoryError):
-                adapter.respond({'operation_id': 'attach'}, session_id='session')
-            # Existing exact-origin outbox/respond and unrelated holds, seeded directly.
+            seed(); present(); admit('1 approve; 2 reject')
+            ready = True  # Host restoration must not race ahead of a pending rejection.
+            calls_before = sum(c.args[0] == 'factory_project_setup_resume' for c in ctx.dispatch_tool.call_args_list)
+            with host(message_id='m2'):
+                adapter.context('session')
+                self.assertEqual(sum(c.args[0] == 'factory_project_setup_resume' for c in ctx.dispatch_tool.call_args_list), calls_before)
+                rejected = json.loads(adapter.respond({}, session_id='session'))['results'][0]
+            ready = True
+            self.assertEqual(adapter.resume(draft_id, 'attach', session_id='session')['reason'], 'operator_declined')
+            self.assertFalse(rejected['resumed'])
+            ready = False
+            for stale in ('no-prompt', 'intervening-chat', 'revision', 'operation', 'ceiling'):
+                seed(blockers[:1])
+                if stale != 'no-prompt':
+                    present()
+                if stale == 'intervening-chat':
+                    admit('unrelated message', 'middle')
+                admit('approve')
+                if stale in {'revision', 'operation', 'ceiling'}:
+                    value = enrollment.store.read(draft_id)
+                    if stale == 'revision':
+                        value['revision'] += 1
+                    elif stale == 'operation':
+                        value['onboarding_decisions']['attach']['operation']['scope'] = {'repository': 'other/repo'}
+                    else:
+                        value['onboarding_decisions']['attach']['blockers'][0]['ceiling'] = 1
+                    enrollment.store.save(value)
+                with self.subTest(stale=stale), host(message_id='m2'), self.assertRaises(RepositoryError):
+                    adapter.respond({}, session_id='session')
+            seed([{**blockers[0], 'cause': 'uncertain'}]); present(); admit('approve')
+            with host(message_id='m2'), self.assertRaises(RepositoryError):
+                adapter.respond({}, session_id='session')
+            # Existing exact-origin outbox/respond and independent pause, directly seeded.
             state = root / 'state.sqlite'
             origin = {k: source[k] for k in ('platform', 'chat_id', 'thread_id', 'parent_chat_id', 'scope_id')}
             item = {'project_id': 'atlas', 'iteration_id': 'm1', 'repository': 'owner/atlas', 'origin': origin,
@@ -142,15 +185,15 @@ class OnboardingDecisionTests(unittest.TestCase):
             adapter = OnboardingDecisions(enrollment, {'state': str(state)})
             enrollment.store.save(copy.deepcopy(base))
             n = {'project': 'atlas', 'iteration': 'm1', 'issue_number': 1, 'run_id': 'setup-run', 'evidence_ids': ['evidence']}
-            registered = adapter.request(draft_id, operation, blockers, notification=n)
+            adapter.request(draft_id, operation, blockers, notification=n)
             adapter.request(draft_id, operation, blockers, notification=n)
             with sqlite3.connect(state) as database:
                 records = attention.records(database, 'atlas', 'm1', item)
                 self.assertEqual(len(records), 2)
                 self.assertTrue(all(r['attempts'] == 0 and r['destination'] == origin for r in records))
-            value = enrollment.store.read(draft_id); value['observations'][0]['text'] = raw([answer]); enrollment.store.save(value)
-            with host():
-                adapter.respond({'operation_id': 'attach'}, session_id='session')
+            present(); admit('1 approve')
+            with host(message_id='m2'):
+                adapter.respond({}, session_id='session')
             with sqlite3.connect(state) as database:
                 records = attention.records(database, 'atlas', 'm1', item)
                 self.assertEqual(sum(r['decision_response'] is not None for r in records), 1)
@@ -159,7 +202,7 @@ class OnboardingDecisionTests(unittest.TestCase):
             with patch('factory_v1.onboarding_decisions.controls.require_active', side_effect=RepositoryError('iteration_paused', 'pause')):
                 with self.assertRaises(RepositoryError):
                     adapter.resume(draft_id, 'attach', session_id='session')
-            # Production plugin wiring replaces, rather than duplicates, enrollment hooks.
+            # Plugin registration unchanged; no approval selector or answer fields exposed.
             ctx.get_config.side_effect = lambda key: {'enrollment': {}, 'onboarding_decisions': {'state': None}}.get(key)
             entry = Path(__file__).parents[2] / 'integrations/hermes-planning/__init__.py'
             spec = importlib.util.spec_from_file_location('decisions_plugin', entry)
@@ -167,13 +210,18 @@ class OnboardingDecisionTests(unittest.TestCase):
             with patch('factory_v1.conversation_enrollment.ConversationEnrollment', return_value=enrollment):
                 module.register(ctx)
             self.assertEqual([c.args[0] for c in ctx.register_hook.call_args_list], ['post_gateway_admission', 'pre_llm_call'])
-            self.assertEqual({c.kwargs['name'] for c in ctx.register_tool.call_args_list},
-                             {'factory_project_draft_update', 'factory_project_setup_response'})
-            # Concrete T2 adapter: direct seeded action, mocked host access/attachment only.
-            enrollment.store.save(copy.deepcopy(base))
-            setup = Mock()
+            response_tool = next(c.kwargs for c in ctx.register_tool.call_args_list if c.kwargs['name'] == 'factory_project_setup_response')
+            self.assertEqual(response_tool['schema']['parameters']['properties'], {})
+            # T2 final API signatures: autospec denies accidental argument drift.
+            class SetupBoundary:
+                def capability(self, draft, repository): pass
+                def read(self, draft_id): pass
+                def attach(self, draft_id, expected_revision, repository, *, session_id): pass
+                def route(self, draft_id): pass
+            setup = create_autospec(SetupBoundary, instance=True, spec_set=True)
             setup.read.return_value = None
             setup.attach.return_value = {'status': 'ready'}
+            enrollment.store.save(copy.deepcopy(base))
             concrete = OnboardingDecisions(enrollment, {'state': None}, setup=setup)
             exact = {**operation, 'scope': {'repository': 'owner/atlas', 'expected_revision': 1}}
             concrete.request(draft_id, exact, blockers[:1])
@@ -181,3 +229,27 @@ class OnboardingDecisionTests(unittest.TestCase):
             self.assertEqual(setup.capability.call_args.args[0]['operator_id'], '42')
             self.assertEqual(setup.capability.call_args.args[1], 'owner/atlas')
             setup.attach.assert_called_once_with(draft_id, 1, 'owner/atlas', session_id='session')
+            self.assertFalse(concrete.resume(draft_id, 'attach', session_id='session')['resumed'])
+            setup.read.return_value = {'status': 'ready', 'repository': 'other/repo', 'draft_revision': 1}
+            with self.assertRaises(RepositoryError):
+                concrete.reconcile(draft_id, 'attach')
+            setup.read.return_value['repository'] = 'owner/atlas'
+            self.assertTrue(concrete.reconcile(draft_id, 'attach')['attempt']['reconciled'])
+            setup.route.assert_called_once_with(draft_id)
+            enrollment.store.save(copy.deepcopy(base))
+            setup.read.return_value = None
+            setup.attach.reset_mock()
+            setup.attach.side_effect = RuntimeError('lost response')
+            concrete.request(draft_id, exact, blockers[:1])
+            with self.assertRaises(RuntimeError):
+                concrete.resume(draft_id, 'attach', session_id='session')
+            self.assertEqual(enrollment.store.read(draft_id)['onboarding_decisions']['attach']['attempt'], {'state': 'uncertain'})
+            self.assertFalse(concrete.resume(draft_id, 'attach', session_id='session')['resumed'])
+            setup.attach.assert_called_once()
+            # Product decision is an understandable recommendation, not configuration work.
+            ready = False
+            seed([{**blockers[0], 'cause': 'product', 'question': 'Recommend a read-only first milestone. Use that scope?'}])
+            self.assertIn('Recommend a read-only first milestone', present())
+            admit('reject')
+            with host(message_id='m2'):
+                self.assertEqual(json.loads(adapter.respond({}, session_id='session'))['results'][0]['reason'], 'operator_declined')
