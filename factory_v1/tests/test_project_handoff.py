@@ -1,6 +1,9 @@
 """One-transition composition checks; no project/worker lifecycle precursors."""
 from contextlib import nullcontext
 import copy
+
+import sys
+from types import SimpleNamespace
 import importlib.util
 import json
 from pathlib import Path
@@ -50,6 +53,15 @@ class ProjectHandoffTests(unittest.TestCase):
             native = Mock(config={'session_id': 'session'})
             setup.route.return_value = native
             setup.attach.return_value = creation.create.return_value = {'status': 'ready'}
+            tracker.prepare.return_value = {'status': 'ready'}
+            execution.prepare_planning.return_value = {'status': 'planning_prepared'}
+            # Host task scheduling is the next external boundary, not an inline journey.
+            scheduled = []
+            def spawn(coroutine, **kwargs):
+                coroutine.close()
+                scheduled.append(kwargs['name'])
+                return Mock(done=lambda: True)
+            ctx.spawn_task.side_effect = spawn
             # Each case selects one actual setup public seam. Engineering cannot gate planning.
             for mode, repository in [('existing', 'selected/Atlas'), ('new', 'reviewed/atlas')]:
                 with self.subTest(setup=mode):
@@ -63,7 +75,8 @@ class ProjectHandoffTests(unittest.TestCase):
                     self.assertEqual(result['status'], 'planning')
                     selected = setup.attach if mode == 'existing' else creation.create
                     selected.assert_called_once_with(draft['draft_id'], 3, repository, session_id='session')
-                    execution.register.assert_not_called(); tracker.prepare.assert_not_called()
+                    execution.register.assert_not_called()
+                    execution.prepare_planning.assert_called_with(draft['draft_id'], 3)
             # Incomplete interview cannot select setup; exact target drift cannot replace a route.
             setup.attach.reset_mock()
             self.assertEqual(owner.advance({**draft, 'sufficient': False}, 'session'), {'status': 'interview'})
@@ -94,14 +107,17 @@ class ProjectHandoffTests(unittest.TestCase):
                     self.assertEqual(perform.call_count, int(receipt == 'consumed'))
                     if receipt == 'consumed':
                         self.assertEqual(perform.call_args.args[1], 'tracker')
-            # Seed the consumed handoff and ready tracker independently; execution is the next seam.
-            with patch.object(owner, 'consume', return_value='consumed'), \
-                 patch.object(owner, 'perform', side_effect=[{'status': 'ready'}, {'status': 'registered'}]) as perform:
+            published = {'ticket_work': {'status': 'published', 'publication_complete': True}}
+            with (patch.object(owner, 'consume', return_value='consumed'),
+                  patch.object(handoff, 'connect', side_effect=lambda _: nullcontext(Mock())),
+                  patch.object(handoff.repositories, 'state_lock', side_effect=lambda _: nullcontext()),
+                  patch.object(owner, 'perform', side_effect=[{'status': 'ready'}, {'status': 'registered'}]) as perform):
+                native.current.return_value = (published, {})
                 self.assertEqual(owner.after_publication(draft['draft_id'])['status'], 'registered')
                 self.assertEqual([c.args[1] for c in perform.call_args_list], ['tracker', 'execution'])
             # Native publication handler really invokes the continuation adapter, not an absent callback.
             with patch.object(owner, 'route', return_value=native), \
-                 patch.object(owner, 'after_publication') as after, \
+                 patch.object(owner, 'schedule') as after, \
                  patch.object(handoff, 'native_context', return_value={'platform': 'discord'}), \
                  patch.object(enrollment, 'identity', return_value=({}, draft['draft_id'])):
                 native.publish.return_value = 'real HOST publication result'
@@ -115,7 +131,7 @@ class ProjectHandoffTests(unittest.TestCase):
                 supervise.assert_called_once_with(connected.return_value.__enter__.return_value,
                     native.current.return_value[0], config['wakeup_config'], native.github)
             # Producer routing cases are independent persisted requests, not an onboarding journey.
-            for producer in ('setup', 'create', 'tracker', 'execution'):
+            for producer in ('setup', 'create', 'tracker', 'planning', 'execution'):
                 with self.subTest(producer=producer):
                     enrollment.store.save(copy.deepcopy(draft))
                     operation = owner.operation(draft, producer, 'reviewed/atlas')
@@ -124,39 +140,69 @@ class ProjectHandoffTests(unittest.TestCase):
                     decisions.producer = owner
                     with patch.object(handoff.readiness, 'load_config', return_value={
                             'repository': 'reviewed/atlas', 'operator_id': '42'}), \
-                         patch.object(owner, 'perform', return_value={'status': 'ready'}) as perform:
+                         patch.object(owner, 'perform', return_value={'status': 'ready'}) as perform, \
+                         patch.object(owner, 'producer_continue') as continuation:
+                        component = {'setup': setup, 'create': creation, 'tracker': tracker, 'planning': execution, 'execution': execution}[producer]
+                        component.read.return_value = {'draft_id': draft['draft_id'], 'draft_revision': 3, 'status': 'ready',
+                                                       'phase': 'postpublication'}
                         self.assertTrue(decisions.status(draft['draft_id'], operation['operation_id'], session_id='session')['ready'])
                         self.assertTrue(decisions.resume(draft['draft_id'], operation['operation_id'], session_id='session')['resumed'])
                         self.assertEqual(perform.call_args.args[1], producer)
+                        continuation.assert_called_once_with(draft['draft_id'], operation, 'session')
                         self.assertFalse(decisions.resume(draft['draft_id'], operation['operation_id'], session_id='session')['resumed'])
-            # Ticket transitions are separate minimal records; no synthesis/publication precursor executes.
-            from factory_v1 import service_dispatch as dispatch
-            service = {'state': '/host/state.sqlite', 'operator_id': '42', 'project': 'p',
-                       'iteration': 'm1', 'dispatch_config': '/host/dispatch.json'}
-            dispatch_config: dict[str, Any] = {k: None for k in dispatch.FIELDS}
-            dispatch_config.update(operator_id='42', project='p', iteration='m1', reference='approved',
-                                   roles={}, launchers={}, tickets={'approved': 'tracker'})
-            for stage, work, seam in (
-                ('synthesize', None, 'tickets.synthesize'),
-                ('execute-synthesis', {'status': 'synthesis_pending'}, 'synthesize'),
-                ('publish-tickets', {'status': 'synthesized'}, 'tickets.publish'),
+            setup.read.return_value = {'repository': 'selected/Atlas', 'binding': {'session_id': 'session'}}
+            # Independent phase records call the actual coordinator, not service.tick.
+            for stage, seed, seam in (
+                ('request', {}, 'tickets.synthesize'),
+                ('execute', {'ticket_work': {'status': 'synthesis_pending'}}, 'service_dispatch.synthesize'),
+                ('publish', {'ticket_work': {'status': 'synthesized'}}, 'tickets.publish'),
             ):
-                with self.subTest(ticket_stage=stage):
-                    item = {'planning': {'status': 'complete'}}
-                    if work is not None:
-                        item['ticket_work'] = work
-                    with patch('factory_v1.service.connect', side_effect=lambda _: nullcontext(Mock())), \
-                         patch('factory_v1.readiness_gate.check'), \
-                         patch.object(dispatch, 'state_lock', side_effect=lambda _: nullcontext()), \
-                         patch.object(dispatch.merge, 'controller_paths'), \
-                         patch.object(dispatch.publication, 'read_json', return_value=dispatch_config), \
-                         patch.object(dispatch.assignments, 'current', side_effect=lambda *a, **k: copy.deepcopy(item)), \
-                         patch.object(dispatch.assignments, 'rows', return_value=[]), \
-                         patch.object(dispatch.controls, 'require_active'), \
-                         patch('factory_v1.restart.before_dispatch'), \
-                         patch('factory_v1.service_dispatch.' + seam) as next_boundary:
-                        self.assertEqual(dispatch.tick(service, Mock())['stage'], stage)
-                        next_boundary.assert_called_once()
+                with (self.subTest(ticket_phase=stage),
+                      patch.object(owner, 'consume', return_value='consumed'),
+                      patch.object(owner, 'perform', side_effect=[{'status': 'ready'}, {'status': 'registered'}]),
+                      patch.object(handoff, 'connect', side_effect=lambda _: nullcontext(Mock())),
+                      patch.object(handoff.repositories, 'state_lock', side_effect=lambda _: nullcontext()),
+                      patch('factory_v1.project_handoff.' + seam) as boundary):
+                    native.current.side_effect = [(seed, {}), (published, {}), (published, {})]
+                    execution.inventory.return_value = {'ticket_skill': {'path': '/installed/to-tickets'},
+                                                        'synthesis_config': '/host/synthesis.json'}
+                    self.assertEqual(owner.after_publication(draft['draft_id'])['status'], 'registered')
+                    boundary.assert_called_once()
+                    native.current.side_effect = None
+            helper = Mock()
+            helper.bind.return_value = native
+            helper.resolve.return_value = config
+            owner.native_project = helper
+            self.assertIs(owner.route(draft['draft_id']), native)
+            helper.bind.assert_called_once_with(native, draft['draft_id'])
+            owner.native_project = None
+            for producer in ('setup', 'create', 'tracker'):
+                with self.subTest(continuation=producer), patch.object(owner, 'advance') as advance:
+                    operation = owner.operation(draft, producer, 'reviewed/atlas')
+                    owner.producer_continue(draft['draft_id'], operation, 'session')
+                    advance.assert_called_once()
+            for producer in ('setup', 'create', 'tracker', 'planning', 'execution'):
+                enrollment.store.save(copy.deepcopy(draft))
+                operation = owner.operation(draft, producer, 'reviewed/atlas')
+                owner.blocked(draft, producer, 'reviewed/atlas', {'status': 'blocked',
+                    'blocker': {'reconciliation_required': True}})
+                with (self.subTest(reconcile=producer),
+                      patch.object(owner, 'producer_resume', return_value={'operation': operation, 'status': 'complete'}) as resume,
+                      patch.object(owner, 'producer_continue') as continuation):
+                    decisions.reconcile(draft['draft_id'], operation['operation_id'])
+                    resume.assert_called_once_with(draft['draft_id'], operation, 'session')
+                    continuation.assert_called_once()
+            # Execute only the host-task seam; downstream operation is independent.
+            with patch.object(owner, 'after_publication', return_value={'status': 'planning-pending'}) as after:
+                def run_task(coroutine, **kwargs):
+                    with self.assertRaises(StopIteration) as completed:
+                        coroutine.send(None)
+                    self.assertEqual(completed.exception.value, {'status': 'planning-pending'})
+                    return Mock(done=lambda: True)
+                ctx.spawn_task.side_effect = run_task
+                owner.schedule(draft['draft_id'])
+                after.assert_called_once_with(draft['draft_id'])
+            ctx.spawn_task.side_effect = spawn
             # Real registration schemas, one hook owner, same producer identities with optional decisions.
             entry = Path(__file__).parents[2] / 'integrations/hermes-planning/__init__.py'
             spec = importlib.util.spec_from_file_location('handoff_plugin', entry)
@@ -187,3 +233,14 @@ class ProjectHandoffTests(unittest.TestCase):
                     self.assertEqual(len(tools), len(set(tools)))
                     self.assertIn('factory_planning_publish', tools)
                     self.assertIn('factory_project_draft_update', tools)
+            helper_constructor = Mock(return_value=helper)
+            options['project_native'] = {'root': '/host/native', 'capability_config': '/host/native-policy.json'}
+            with (patch.dict(sys.modules, {'factory_v1.project_native': SimpleNamespace(NativeProject=helper_constructor)}),
+                  patch('factory_v1.conversation_enrollment.ConversationEnrollment', return_value=enrollment),
+                  patch('factory_v1.project_setup.ProjectSetup', return_value=setup),
+                  patch('factory_v1.project_creation.ProjectCreation', return_value=creation),
+                  patch('factory_v1.project_tracker.ProjectTracker', return_value=tracker),
+                  patch('factory_v1.project_execution.ProjectExecution', return_value=execution)):
+                registered = plugin.register(ctx)
+            helper_constructor.assert_called_once_with(enrollment, setup, execution, options['project_native'])
+            self.assertIs(registered.native_project, helper)
