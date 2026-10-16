@@ -841,9 +841,47 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
         adapter.call.assert_not_called()
         self.assertEqual(self.db.execute('SELECT status,actual_units FROM model_operations').fetchone(), ('failed', 0))
 
-    def test_policy_selection_requires_pause_and_never_resumes(self):
+    def test_policy_selection_requires_pause_and_never_resumes(self: Any):
         EnforcedReadinessTests.setUp(self)
         with self.assertRaises(repositories.RepositoryError): readiness_gate.seal(self.db, Path(self.service_path))
+        # A host-prepared adapter must not become a reseal bypass, and must
+        # reread durable holds/configuration inside its own final lane.
+        restore = self.snapshot()
+        dispatch = {**{k: self.service[k] for k in ('operator_id', 'project', 'iteration')},
+            'reference': 'host-fixture', 'implementation': {'stage': 'implementation'}, 'roles': {},
+            'launchers': {}, 'tickets': None, 'synthesis_config': None, 'review_config': None,
+            'publication_config': None, 'merge_config': None}
+        for fault in ('ready', 'previouspolicy', 'pause', 'latehold', 'drift'):
+            with self.subTest(initial_seal=fault):
+                restore()
+                self.service['dispatch_config'] = self.file('initial-dispatch.json', dispatch)
+                service.atomic(Path(self.service_path), self.service)
+                self.db.execute('UPDATE supervised_readiness SET policy=NULL'); self.db.commit()
+                value = readiness_gate.policy(self.service, self.config, self.db)
+                if fault == 'previouspolicy':
+                    self.db.execute('UPDATE supervised_readiness SET policy=?', ('previous-policy',)); self.db.commit()
+                def validate():
+                    if fault == 'pause':
+                        # Inside the lane: seed durable control, never reenter flock.
+                        controls.write(self.db, {'project': 'p', 'iteration': 'i', 'operator_id': 'operator',
+                            'action': 'pause', 'state': 'completed', 'reference': 'late-pause', 'request_id': 'pause',
+                            'history': [], 'cleanup': {}, 'checkpoint': {'iteration': self.item}})
+                    if fault == 'latehold':
+                        self.item['stuck_work'] = {'diagnosis': {'status': 'held', 'affected': [1]}}; self.save()
+                    if fault == 'drift':
+                        changed = deepcopy(self.config); changed['reference'] = 'changed'
+                        service.atomic(Path(self.service['readiness_config']), changed)
+                if fault == 'ready':
+                    readiness_gate.seal(self.db, Path(self.service_path), initial=(value, validate))
+                    self.assertEqual(readiness_gate.binding(self.db, 'p', 'i'), (self.service_path, value))
+                    readiness_gate.seal(self.db, Path(self.service_path), initial=(value, validate))
+                else:
+                    with self.assertRaises(repositories.RepositoryError):
+                        readiness_gate.seal(self.db, Path(self.service_path), initial=(value, validate))
+                    bound = readiness_gate.binding(self.db, 'p', 'i')
+                    assert bound is not None
+                    self.assertEqual(bound[1], 'previous-policy' if fault == 'previouspolicy' else None)
+        restore()
         controls.request(self.db, 'p', 'i', 'operator', 'pause', 'select-policy')
         readiness_gate.seal(self.db, Path(self.service_path))
         self.assertTrue(controls.blocked(self.db, 'p', 'i'))

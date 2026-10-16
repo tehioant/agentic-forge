@@ -393,7 +393,10 @@ class ProjectExecution:
                 require(self.inventory(draft, attached) == host and (installation is None or
                         self.installation(draft, attached) == installation),
                         'Host inventory changed during preparation.', 'execution_inputs_changed')
-                record.update(service_config=host['service_config'], service=current, readiness=report)
+                selected = readiness.load_config(current['readiness_config'])
+                with service.connect(current) as db:
+                    policy_pin = readiness_gate.policy(current, selected, db)
+                record.update(service_config=host['service_config'], service=current, readiness=report, policy_pin=policy_pin)
                 failed = {k: v for k, v in report['checks'].items() if k != 'controls' and v['state'] != 'ready'}
                 require(not failed, 'Inspect exact readiness checks; no missing authority is granted.',
                         next(iter(failed.values()))['code'] if failed else 'execution_readiness_blocked')
@@ -441,33 +444,52 @@ class ProjectExecution:
                 require(all(old[k] == v for k, v in target.items() if k not in {'dispatch_config', 'readiness_config', 'delivery_config'}) and
                         all(old[k] in (None, target[k]) for k in ('dispatch_config', 'readiness_config', 'delivery_config')),
                         'Existing service changed.', 'execution_inputs_changed')
+                selected = readiness.load_config(target['readiness_config'])
+                tracked = self.tracker.read(draft_id)
+                expected_service = old
+
+                def validate_initial():
+                    require(self.read(draft_id) == record and
+                            self.setup.enrollment.store.read(draft_id) == draft and
+                            self.setup.read(draft_id) == attached and self.tracker.read(draft_id) == tracked and
+                            self.inventory(draft, attached) == host and (installation is None or
+                            self.installation(draft, attached) == installation) and
+                            service.load(str(path), register_binding=False) == expected_service,
+                            'Initial registration authority changed.', 'execution_inputs_changed')
+
                 with service.connect(target) as db:
                     controls.owner(db, *service.scope(target))
-                    require(controls.blocked(db, *service.scope(target)[:2]),
-                            'Pause before binding service policy; preparation never pauses or resumes for you.', 'iteration_paused')
+                    value = readiness_gate.policy(target, selected, db)
+                    require(value == record['policy_pin'], 'Prepared policy bytes changed.', 'execution_inputs_changed')
+                    initial = None if controls.blocked(db, *service.scope(target)[:2]) else (value, validate_initial)
                     # Short local interruption lane; no supervisor/model/external I/O.
                     with controls.lane(db, *service.scope(target)[:2]):
-                        require(controls.blocked(db, *service.scope(target)[:2]),
-                                'Interruption changed before registration.', 'iteration_paused')
+                        controls.owner(db, *service.scope(target))
+                        if initial is None:
+                            require(controls.blocked(db, *service.scope(target)[:2]),
+                                    'Interruption changed before registration.', 'iteration_paused')
                         require(readiness.load_config(str(path)) == old and
                                 self.inventory(draft, attached) == host and (installation is None or
                                 self.installation(draft, attached) == installation),
                                 'Registration inputs changed.', 'execution_inputs_changed')
+                        if initial is not None:
+                            readiness_gate.initial_policy(db, path, target, value, validate_initial)
                         service.atomic(path, target)
+                        expected_service = target
                 loaded = service.load(str(path))
                 require(loaded == target, 'Service selection readback differs.', 'execution_inputs_changed')
                 with service.connect(target) as db:
                     binding = readiness_gate.binding(db, target['project'], target['iteration'])
                     require(binding is not None, 'Service registration missing.', 'execution_installation_required')
                     assert binding is not None
-                    if binding[1] is None:
-                        readiness_gate.seal(db, path)
+                    if initial is not None or binding[1] is None:
+                        readiness_gate.seal(db, path, initial=initial)
                     else:
-                        selected = readiness.load_config(target['readiness_config'])
                         require(binding[1] == readiness_gate.policy(target, selected, db),
                                 'Sealed inputs changed; no automatic reselection.', 'execution_inputs_changed')
                     final_binding = readiness_gate.binding(db, target['project'], target['iteration'])
-                    require(final_binding is not None and final_binding[0] == str(path),
+                    require(final_binding == (str(path), value) and
+                            service.load(str(path), register_binding=False) == target,
                             'Service binding readback differs.', 'execution_installation_required')
                 record.update(status='registered', blocker=None)
         except ERRORS as error:

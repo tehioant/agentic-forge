@@ -19,6 +19,7 @@ class ProjectExecutionTests(unittest.TestCase):
         self.assertTrue(callable(getattr(execution.ProjectExecution, 'prepare_planning', None)),
                         'Missing public preplanning preparation')
         cases = ('ready', 'installation', 'no-deployment', 'policy', 'capacity', 'health', 'source-drift', 'replay-drift', 'consumed-home', 'active', 'preplanning', 'managed', 'unpublished', 'start-denied')
+        cases += tuple('initial-' + fault for fault in ('ready', 'unsealed', 'drift', 'pause', 'latehold', 'previouspolicy', 'home', 'modelop', 'owner'))
         for case in cases:
             with self.subTest(case=case):
                 # Existing fixture seeds records and mocks external reads only;
@@ -124,11 +125,81 @@ class ProjectExecutionTests(unittest.TestCase):
                     control_root, control_path = controls.paths(db, 'p', 'i')
                     assert control_root is not None and control_path is not None
                     control_root.mkdir(mode=0o700)
-                    if case != 'active':
+                    if case != 'active' and not case.startswith('initial-'):
                         controls.write(db, paused)
                     pause_bytes = control_path.read_bytes() if control_path.exists() else None
                     consumed = root / 'roles' / ('forge-' + assignments.digest([draft_id, 'implementation', 0])[:32])
                     if case == 'consumed-home': consumed.mkdir(mode=0o700)
+                    if case.startswith('initial-'):
+                        # Direct persisted preparation; do not execute derive/planning/publication.
+                        for column in ('operation_id TEXT', 'reservation INTEGER', 'actual_units INTEGER'):
+                            db.execute('ALTER TABLE model_operations ADD COLUMN ' + column)
+                        db.commit()
+                        target = dict(fixture.service,
+                            dispatch_config=fixture.file('dispatch.json', {
+                                **{k: fixture.service[k] for k in ('operator_id', 'project', 'iteration')},
+                                'reference': 'reviewed-host-fixture', 'implementation': {'stage': 'implementation'},
+                                'roles': {}, 'launchers': {}, 'tickets': None, 'synthesis_config': None,
+                                'review_config': None, 'publication_config': None, 'merge_config': None}),
+                            readiness_config=fixture.file('selected.json', fixture.config))
+                        seed = {'version': 1, 'draft_id': draft_id, 'draft_revision': 3, 'status': 'prepared',
+                            'service': target, 'service_config': str(path), 'inventory_pin': assignments.digest(host)}
+                        seed['policy_pin'] = readiness_gate.policy(target, fixture.config, db)
+                        def prepared(*_):
+                            component.save(seed)
+                            return deepcopy(seed)
+                        before_grants = db.execute('SELECT * FROM model_grants').fetchall()
+                        if case == 'initial-unsealed': service.load(str(path))
+                        if case == 'initial-previouspolicy':
+                            service.load(str(path))
+                            db.execute('UPDATE supervised_readiness SET policy=?', ('old-policy',)); db.commit()
+                        if case == 'initial-home': Path(fixture.config['slots'][0]['profile']['home']).mkdir()
+                        if case == 'initial-modelop':
+                            db.execute("INSERT INTO model_operations(project,iteration,status) VALUES ('p','i','complete')"); db.commit()
+                        real_seal, real_lane = readiness_gate.seal, controls.lane
+                        def seal_with_late_hold(database, selected_path, **kwargs):
+                            if case == 'initial-latehold':
+                                fresh = json.loads(database.execute('SELECT payload FROM iterations').fetchone()[0])
+                                fresh['restart_reconciliation'] = {'status': 'blocked', 'observations': {},
+                                    'blockers': [{'boundary': 'tracker', 'code': 'scope_mismatch'}]}
+                                database.execute('UPDATE iterations SET payload=?', (json.dumps(fresh),)); database.commit()
+                            return real_seal(database, selected_path, **kwargs)
+                        from contextlib import contextmanager
+                        @contextmanager
+                        def entry_lane(database, project, iteration):
+                            if case == 'initial-pause': controls.write(database, paused)
+                            if case == 'initial-drift':
+                                changed = deepcopy(host); changed['reference'] = 'changed-host'
+                                service.atomic(cap, changed)
+                            if case == 'initial-owner':
+                                fresh = deepcopy(fixture.item); fresh['approval']['operator_id'] = 'another'
+                                database.execute('UPDATE iterations SET payload=?', (json.dumps(fresh),)); database.commit()
+                            with real_lane(database, project, iteration): yield
+                        with patch.object(component, 'prepare', side_effect=prepared), \
+                             patch.object(controls, 'lane', side_effect=entry_lane), \
+                             patch.object(readiness_gate, 'seal', side_effect=seal_with_late_hold):
+                            result = component.register(draft_id, 3)
+                            if case in ('initial-ready', 'initial-unsealed'):
+                                self.assertEqual(result['status'], 'registered', result.get('blocker'))
+                                bound = readiness_gate.binding(db, 'p', 'i')
+                                self.assertEqual(bound, (str(path), readiness_gate.policy(target, fixture.config, db)))
+                                self.assertEqual(service.load(str(path), register_binding=False), target)
+                                # Lost response/exact replay: retain precisely the same sealed policy.
+                                self.assertEqual(component.register(draft_id, 3)['status'], 'registered')
+                                self.assertEqual(readiness_gate.binding(db, 'p', 'i'), bound)
+                            else:
+                                self.assertEqual(result['status'], 'blocked', result)
+                                bound = readiness_gate.binding(db, 'p', 'i')
+                                assert bound is not None
+                                self.assertEqual(bound[1], 'old-policy' if case == 'initial-previouspolicy' else None)
+                                if case == 'initial-latehold':
+                                    self.assertEqual(json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0])
+                                                     ['restart_reconciliation']['status'], 'blocked')
+                                else: self.assertEqual(service.load(str(path), register_binding=False), fixture.service)
+                            self.assertEqual(db.execute('SELECT * FROM model_grants').fetchall(), before_grants)
+                            self.assertEqual(controls.blocked(db, 'p', 'i'), case == 'initial-pause')
+                        db.close()
+                        continue
                     original_grants = db.execute('SELECT * FROM model_grants').fetchall()
                     live = {'ActiveState': 'active', 'SubState': 'running', 'MainPID': '77'}
                     if case == 'installation': live['ActiveState'] = 'inactive'
