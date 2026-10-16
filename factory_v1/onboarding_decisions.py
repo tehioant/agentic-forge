@@ -1,4 +1,5 @@
 """Scoped setup direction in the admitted conversation; never an authority issuer."""
+from typing import Any
 import copy
 import json
 import re
@@ -30,6 +31,7 @@ class OnboardingDecisions:
         self.enrollment, self.store, self.ctx = enrollment, enrollment.store, enrollment.ctx
         self.config = copy.deepcopy(config)
         self.setup = setup
+        self.producer: Any = None
 
     def request(self, draft_id, operation, blockers, *, notification=None):
         """Host-only: retain immutable exact operation and independently scoped blockers.
@@ -114,6 +116,11 @@ class OnboardingDecisions:
 
     def probe(self, draft_id, record, session_id):
         """Fixed trusted producer route; direction never substitutes for host authority."""
+        if self.producer is not None and 'producer' in record['operation']['scope']:
+            ready = (not any(b['cause'] == 'uncertain' for b in record['blockers']) and
+                     self.producer.producer_status(draft_id, record['operation'], session_id))
+            return {'operation': record['operation'], 'ready': ready,
+                    'pending': [] if ready else [b['decision_id'] for b in record['blockers']]}
         if self.setup is not None:
             draft = self.store.read(draft_id)
             scope = record['operation']['scope']
@@ -229,7 +236,9 @@ class OnboardingDecisions:
             record['attempt'] = {'state': 'uncertain'}
             self.store.save(draft)
         # The producer MUST re-read its exact real authority and preserve all holds at admission.
-        if self.setup is not None:
+        if self.producer is not None and 'producer' in record['operation']['scope']:
+            result = self.producer.producer_resume(draft_id, record['operation'], session_id)
+        elif self.setup is not None:
             scope = record['operation']['scope']
             outcome = self.setup.attach(draft_id, scope['expected_revision'], scope['repository'], session_id=session_id)
             result = {'operation': record['operation'], 'status': 'complete' if outcome['status'] == 'ready' else 'uncertain',
@@ -271,6 +280,7 @@ class OnboardingDecisions:
         require(self.setup is not None, 'Trusted setup readback required.', 'execution_uncertain')
         draft, record = self.current(draft_id, operation_id)
         scope = record['operation']['scope']
+        require('producer' not in scope, 'Producer-specific verified reconciliation required; never retry unknown effects.', 'execution_uncertain')
         journal = self.setup.read(draft_id)
         require(journal is not None and journal['status'] == 'ready' and
                 journal['repository'] == scope['repository'] and journal['draft_revision'] == scope['expected_revision'],
@@ -326,7 +336,7 @@ class OnboardingDecisions:
         self.ctx.register_hook('post_gateway_admission', self.inbound)
         self.ctx.register_hook('pre_llm_call', self.context)
         properties = {'expected_revision': {'type': 'integer'},
-                      'product': {'type': 'object', 'properties': {k: {'type': 'string'} for k in PRODUCT_FIELDS}, 'additionalProperties': False},
+                      'product': {'type': 'object', 'properties': {k: {'type': 'string'} for k in (*PRODUCT_FIELDS, 'repository', 'repository_mode')}, 'additionalProperties': False},
                       'pending_questions': {'type': 'array', 'items': {'type': 'string'}},
                       'sufficient': {'type': 'boolean'}, 'rationale': {'type': 'string'}}
         for name, handler, props in (

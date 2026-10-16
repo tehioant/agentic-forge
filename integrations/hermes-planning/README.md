@@ -213,6 +213,22 @@ unrun here; capability installation and T7 routing are separately owned work.
    remains compatible for non-native assignments. A successful publish call
    completes the durable handoff, so the existing scheduler can select synthesis.
 
+## Automatic conversational composition checkpoint
+
+`project_handoff` opts into one enrollment/setup/creation/tracker/execution/decision
+owner; static `binding` cannot also be configured. Its exact host settings are
+`publication_config` and `wakeup_config` (private absolute paths or explicit null).
+The user provides product answers and a literal existing repository choice, not
+configuration or stage-advance commands. The same `ProjectSetup` instance owns
+creation, tracker and execution dependencies. Native tools preserve the original
+schemas and use `setup.route` for actual binding authority.
+
+See [project-handoff.md](../../docs/project-handoff.md) for the public adapter API,
+focused evidence scope and outstanding source gaps. **This checkpoint is not a
+claim of complete fresh-project automatic activation.** In particular T5's stable
+fresh-service phase API and per-project native authority selection must still be
+integrated; uncertain effects cannot be resolved by conversational approval.
+
 ## Supervised initial S1 wakeup
 
 The service dispatch JSON optionally supplies `planning_config`; plugin settings

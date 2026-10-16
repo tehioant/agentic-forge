@@ -217,6 +217,7 @@ class OnboardingDecisionTests(unittest.TestCase):
                         for attribute in ('setup', 'decisions'):
                             if hasattr(enrollment, attribute):
                                 delattr(enrollment, attribute)
+                        enrollment.setup = None
                         config = {'enrollment': {}, 'binding': {'approved': True} if has_native else None,
                                   'project_setup': {} if has_setup else None,
                                   'onboarding_decisions': {'state': None} if has_decisions else None}

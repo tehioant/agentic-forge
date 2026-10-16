@@ -1,4 +1,5 @@
 """Repository-free intake in the admitted native conversation, without execution grants."""
+from typing import Any
 import copy
 from contextlib import contextmanager
 from contextvars import copy_context
@@ -85,10 +86,11 @@ class ConversationEnrollment:
                     for platform, users in config['operators'].items()) and text(ctx.profile_name),
                 'Separate host platform/operator policy and private draft root required.', 'approval_required')
         self.ctx, self.config = ctx, copy.deepcopy(config)
-        self.bound_planning = None
+        self.bound_planning: Any = None
         self.store = DraftStore(config['root'])
         self.selected = skills.resolve_installed(config['skills'])
         self.setup = None
+        self.handoff: Any = None
 
     def identity(self, source, platform):
         require(isinstance(source, dict) and source.get('platform') == platform and
@@ -182,7 +184,9 @@ class ConversationEnrollment:
                 'This is repository-free project intake, not permission to onboard, spend, publish or code. '
                 'Only if the actual user requests a project or answers its interview, follow the selected interview '
                 'skills in this turn. Extract already supplied name, intent, objectives, users, finite milestone, '
-                'constraints and acceptance into product fields. Recommend defaults; ask only unresolved '
+                'constraints and acceptance into product fields. Preserve any exact operator-selected repository '
+                'in repository with repository_mode existing; new products use repository_mode new and '
+                'the reviewed private default account. Never invent an existing target. Recommend defaults; ask only unresolved '
                 'decision-changing questions. Do not ask answered questions. Silence, acknowledgements and '
                 'unrelated chat do not resolve decisions. Preserve the raw observations verbatim. '
                 'Use factory_project_draft_update to retain your product interpretation and pending questions '
@@ -201,7 +205,7 @@ class ConversationEnrollment:
                     'Interview sources changed.', 'skill_blocked')
             require(isinstance(args, dict) and set(args) == {'expected_revision', 'product', 'pending_questions', 'sufficient', 'rationale'} and
                     type(args['expected_revision']) is int and args['expected_revision'] == draft['revision'] and
-                    isinstance(args['product'], dict) and set(args['product']) <= set(PRODUCT_FIELDS) and
+                    isinstance(args['product'], dict) and set(args['product']) <= set(PRODUCT_FIELDS) | {'repository', 'repository_mode'} and
                     all(text(v) for v in args['product'].values()) and isinstance(args['pending_questions'], list) and
                     all(text(q) for q in args['pending_questions']) and type(args['sufficient']) is bool and text(args['rationale']) and
                     (not args['sufficient'] or not args['pending_questions']),
@@ -212,13 +216,17 @@ class ConversationEnrollment:
             draft.update(pending_questions=copy.deepcopy(args['pending_questions']), sufficient=args['sufficient'],
                          rationale=args['rationale'], revision=draft['revision'] + 1)
             self.store.save(draft)
+        if self.handoff is not None:
+            outcome = self.handoff.advance(draft, session_id)
+            draft['handoff'] = outcome
             return json.dumps(draft, sort_keys=True)
+        return json.dumps(draft, sort_keys=True)
 
     def register(self):
         self.ctx.register_hook('post_gateway_admission', self.inbound)
         self.ctx.register_hook('pre_llm_call', self.context)
         properties = {'expected_revision': {'type': 'integer'},
-                      'product': {'type': 'object', 'properties': {k: {'type': 'string'} for k in PRODUCT_FIELDS},
+                      'product': {'type': 'object', 'properties': {k: {'type': 'string'} for k in (*PRODUCT_FIELDS, 'repository', 'repository_mode')},
                                   'additionalProperties': False},
                       'pending_questions': {'type': 'array', 'items': {'type': 'string'}},
                       'sufficient': {'type': 'boolean'}, 'rationale': {'type': 'string'}}
@@ -230,7 +238,7 @@ class ConversationEnrollment:
             setup_config = self.ctx.get_config('project_setup')
         except KeyError:  # Existing hosts may expose only the older option names.
             setup_config = None
-        if isinstance(setup_config, dict):
+        if isinstance(setup_config, dict) and self.setup is None:
             from .project_setup import ProjectSetup
             self.setup = ProjectSetup(self, setup_config).register()
         return self
