@@ -268,11 +268,21 @@ class ProjectExecution:
 
     def block(self, record, error, operation):
         code = getattr(error, 'code', 'execution_platform_unavailable')
+        failures = {k: v for k, v in record.get('readiness', {}).get('checks', {}).items()
+                    if k != 'controls' and v['state'] == 'blocked'}
+        selected = record.get('service', {})
+        scope = {k: selected[k] for k in ('project', 'iteration', 'operator_id') if k in selected}
+        cause = 'platform'
+        if 'capacity' in code or code.startswith('spending'):
+            cause = 'capacity'
+        elif 'capability' in code or 'approval' in code or code.startswith('github'):
+            cause = 'permission'
         record.update(status='blocked', blocker={'code': code, 'operation': operation,
-            'cause': 'capacity' if 'capacity' in code else 'permission' if 'capability' in code or 'approval' in code else 'platform',
-            'scope': {'draft_id': record['draft_id'], 'draft_revision': record['draft_revision']},
+            'cause': cause, 'checks': failures,
+            'scope': dict(scope, draft_id=record['draft_id'], draft_revision=record['draft_revision']),
             'consequence': 'Preparation retained; no worker, model, service start or allowance reset.',
-            'next_decision': 'Restore the exact reviewed host prerequisite; explicit controls resume remains separate.',
+            'next_decision': (next(iter(failures.values()))['remediation'] if failures else
+                              'Restore the exact reviewed host prerequisite; explicit controls resume remains separate.'),
             'reconciliation_required': code == 'execution_inputs_changed'})
 
     def register(self, draft_id, expected_revision):
