@@ -11,7 +11,19 @@ def register(ctx):
         from factory_v1.conversation_enrollment import ConversationEnrollment
         enrollment = ConversationEnrollment(ctx, enrollment_config)
         enrollment.bound_planning = binding
-        enrollment.register()
+        decisions_config = ctx.get_config('onboarding_decisions')
+        if decisions_config is None:
+            enrollment.register()
+        else:
+            from factory_v1.onboarding_decisions import OnboardingDecisions
+            setup = None
+            setup_config = ctx.get_config('project_setup')
+            if setup_config is not None:
+                from factory_v1.project_setup import ProjectSetup
+                setup = ProjectSetup(enrollment, setup_config)
+            enrollment.decisions = OnboardingDecisions(enrollment, decisions_config, setup=setup).register()
+    elif ctx.get_config('onboarding_decisions') is not None:
+        raise ValueError('Onboarding decisions require trusted conversation enrollment.')
     if binding is None:
         if enrollment is None:
             raise ValueError('Configure enrollment or an existing approved planning binding.')
