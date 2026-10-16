@@ -1,0 +1,309 @@
+"""Scoped setup direction in the admitted conversation; never an authority issuer."""
+import copy
+import json
+import sqlite3
+
+from . import attention, controls, spending
+from .assignments import digest
+from .conversation_enrollment import PRODUCT_FIELDS
+from .planning import require, text
+from .repositories import RepositoryError, unambiguous_fields
+
+CAUSES = {
+    'product': ('A product answer is missing.', 'Answer the exact product question.'),
+    'platform': ('The approved platform setup is unavailable.', 'Wait for platform access to be restored, or defer this operation.'),
+    'permission': ('The required permission is unavailable.', 'Approve only this exact scope, or decline; host access must still be verified.'),
+    'allowance': ('The existing allowance does not cover this operation.', 'Defer, or request an exact bounded allowance through the trusted spending route.'),
+    'unsupported': ('This integration is not supported.', 'Choose a supported alternative or defer; no fallback was selected.'),
+    'uncertain': ('The previous effect is uncertain.', 'Reconcile the retained effect through its trusted readback; do not resend.'),
+}
+
+
+class OnboardingDecisions:
+    """Host request/status/resume APIs and a raw, correlated native response tool."""
+
+    def __init__(self, enrollment, config, setup=None):
+        require(isinstance(config, dict) and set(config) == {'state'} and
+                (config['state'] is None or (isinstance(config['state'], str) and config['state'].startswith('/'))),
+                'Explicit controller state or repository-free mode required.', 'invalid_context')
+        self.enrollment, self.store, self.ctx = enrollment, enrollment.store, enrollment.ctx
+        self.config = copy.deepcopy(config)
+        self.setup = setup
+
+    def request(self, draft_id, operation, blockers, *, notification=None):
+        """Host-only: retain immutable exact operation and independently scoped blockers.
+
+        operation: operation_id/project/scope/ceiling. blockers: decision_id/cause/scope/ceiling/question.
+        notification: existing attention event metadata (project/iteration/issue_number/run_id/evidence_ids).
+        Empty blockers are quiet; this API neither proves readiness nor executes setup.
+        """
+        require(isinstance(operation, dict) and set(operation) == {'operation_id', 'project', 'scope', 'ceiling'} and
+                attention.identifier(operation['operation_id']) and text(operation['project']) and
+                isinstance(operation['scope'], dict) and bool(operation['scope']) and
+                type(operation['ceiling']) is int and operation['ceiling'] >= 0,
+                'Exact immutable setup operation required.', 'scope_mismatch')
+        require(isinstance(blockers, list) and all(isinstance(b, dict) and
+                set(b) == {'decision_id', 'cause', 'scope', 'ceiling', 'question'} and
+                attention.identifier(b['decision_id']) and b['cause'] in CAUSES and
+                isinstance(b['scope'], dict) and bool(b['scope']) and type(b['ceiling']) is int and
+                0 <= b['ceiling'] <= operation['ceiling'] and text(b['question']) for b in blockers) and
+                len({b['decision_id'] for b in blockers}) == len(blockers),
+                'Distinct exact bounded setup decisions required.', 'scope_mismatch')
+        if notification is not None:
+            require(isinstance(notification, dict) and set(notification) ==
+                    {'project', 'iteration', 'issue_number', 'run_id', 'evidence_ids'} and self.config['state'] is not None,
+                    'Existing registered notification context required.', 'scope_mismatch')
+        with self.store.locked():
+            draft = self.store.read(draft_id)
+            require(draft is not None, 'Retained admitted draft required.', 'not_found')
+            actions = draft.setdefault('onboarding_decisions', {})
+            key = operation['operation_id']
+            record = {'operation': copy.deepcopy(operation), 'blockers': copy.deepcopy(blockers),
+                      'notification': copy.deepcopy(notification), 'responses': {}, 'attempt': None}
+            old = actions.get(key)
+            if old is not None:
+                require(all(old[k] == record[k] for k in ('operation', 'blockers', 'notification')),
+                        'Retained operation cannot be rebound.', 'scope_mismatch')
+                record = old
+            else:
+                actions[key] = record
+                self.store.save(draft)
+        self.notify(draft, record)
+        return copy.deepcopy(record)
+
+    def message(self, record, pending=None):
+        blockers = record['blockers'] if pending is None else pending
+        if not blockers:
+            return ''
+        lines = ['Project setup is held; no worker is running for this setup operation.']
+        for b in blockers:
+            cause, decision = CAUSES[b['cause']]
+            lines.append(f"{b['decision_id']}: {cause} {b['question']} {decision} "
+                         f"Scope: {json.dumps(b['scope'], sort_keys=True)}; ceiling: {b['ceiling']}.")
+        return '\n'.join(lines)
+
+    def lifecycle(self, draft, record, action, request):
+        n = record['notification']
+        require(n is not None and self.config['state'] is not None, 'Registered attention context required.', 'not_found')
+        with sqlite3.connect(self.config['state']) as database:
+            item = attention.load_iteration(database, n['project'], n['iteration'])
+            require(item.get('approval', {}).get('operator_id') == draft['operator_id'] and
+                    all(draft['origin'].get(k) == v for k, v in item['origin'].items()),
+                    'Registered owner/origin differs from admitted draft.', 'scope_mismatch')
+            return attention.lifecycle(database, n['project'], n['iteration'], draft['operator_id'], action, request)
+
+    def event(self, record, blocker):
+        return 'setup-' + digest([record['operation'], blocker])[:48]
+
+    def notify(self, draft, record):
+        if record['notification'] is None:
+            return  # Immediate questions use the existing native turn, not a new transport.
+        n = record['notification']
+        for b in record['blockers']:
+            self.lifecycle(draft, record, 'attention', {
+                'event_id': self.event(record, b), 'kind': 'decision', 'decision_id': self.event(record, b),
+                'message': self.message(record, [b]), 'issue_number': n['issue_number'],
+                'run_id': n['run_id'], 'evidence_ids': n['evidence_ids']})
+
+    def current(self, draft_id, operation_id):
+        draft = self.store.read(draft_id)
+        require(draft is not None and operation_id in draft.get('onboarding_decisions', {}),
+                'Exact retained setup operation required.', 'not_found')
+        return draft, draft['onboarding_decisions'][operation_id]
+
+    def probe(self, draft_id, record, session_id):
+        """Fixed trusted producer route; direction never substitutes for host authority."""
+        if self.setup is not None:
+            draft = self.store.read(draft_id)
+            scope = record['operation']['scope']
+            require(set(scope) == {'repository', 'expected_revision'} and
+                    scope['expected_revision'] == draft['revision'],
+                    'Exact retained repository attachment revision required.', 'scope_mismatch')
+            try:
+                self.setup.capability(draft, scope['repository'])
+            except (RepositoryError, OSError, ValueError):
+                return {'operation': record['operation'], 'ready': False,
+                        'pending': [b['decision_id'] for b in record['blockers']], 'reason': 'setup_authority_unavailable'}
+            journal = self.setup.read(draft_id)
+            if journal is not None:
+                require(journal['repository'] == scope['repository'] and journal['draft_revision'] == scope['expected_revision'],
+                        'Retained setup target differs.', 'scope_mismatch')
+            pending = [b['decision_id'] for b in record['blockers'] if b['cause'] != 'permission' or
+                       b['scope'] != {'repository': scope['repository']}]
+            return {'operation': record['operation'], 'ready': not pending, 'pending': pending}
+        args = {'draft_id': draft_id, 'operation': record['operation']}
+        try:
+            result = json.loads(self.ctx.dispatch_tool('factory_project_setup_status', args, session_id=session_id))
+        except (ValueError, TypeError, KeyError, RuntimeError, RepositoryError):
+            return {'ready': False, 'pending': [b['decision_id'] for b in record['blockers']],
+                    'reason': 'setup_authority_unavailable'}
+        require(isinstance(result, dict) and result.get('operation') == record['operation'] and
+                type(result.get('ready')) is bool and isinstance(result.get('pending'), list) and
+                set(result['pending']) <= {b['decision_id'] for b in record['blockers']} and
+                (not result['ready'] or not result['pending']),
+                'Exact fresh setup status required.', 'scope_mismatch')
+        return result
+
+    def status(self, draft_id, operation_id, *, session_id):
+        """Read actual producer authority, not cached conversational approvals."""
+        draft, record = self.current(draft_id, operation_id)
+        fresh = self.probe(draft_id, record, session_id)
+        pending = [b for b in record['blockers'] if b['decision_id'] in fresh['pending'] and
+                   b['decision_id'] not in record['responses']]
+        message = self.message(record, pending)
+        if not fresh['ready'] and not message:
+            message = 'Project setup remains held. Direction is retained; actual host authority or reconciliation is still required. No worker was started.'
+        return {**fresh, 'responses': copy.deepcopy(record['responses']), 'message': message}
+
+    def respond(self, args, *, session_id='', **kwargs):
+        """Record explicit raw operator direction; args select no identity or authority."""
+        require(isinstance(args, dict) and set(args) == {'operation_id'}, 'Only exact operation selector allowed.', 'scope_mismatch')
+        with self.store.locked():
+            draft, observed = self.enrollment.correlated(session_id)
+            _, record = self.current(draft['draft_id'], args['operation_id'])
+            raw = observed['text']
+            require(raw.startswith('forge-decision '), 'Explicit scoped direction required; chat is not approval.', 'approval_required')
+            try:
+                direction = json.loads(raw.removeprefix('forge-decision '), object_pairs_hook=unambiguous_fields)
+            except ValueError as error:
+                raise RepositoryError('approval_required', 'Exact structured operator direction required.') from error
+            require(isinstance(direction, dict) and set(direction) == {'operation', 'answers'} and
+                    digest(direction['operation']) == digest(record['operation']) and isinstance(direction['answers'], list) and
+                    bool(direction['answers']), 'Response must bind exact operation/project/scope/ceiling.', 'scope_mismatch')
+            answers = direction['answers']
+            require(all(isinstance(a, dict) and text(a.get('decision_id')) for a in answers) and
+                    len({a['decision_id'] for a in answers}) == len(answers),
+                    'Distinct responses required.', 'scope_mismatch')
+            for answer in answers:
+                b = next((b for b in record['blockers'] if b['decision_id'] == answer.get('decision_id')), None)
+                require(b is not None and set(answer) == {'decision_id', 'scope', 'ceiling', 'direction'} and
+                        digest(answer['scope']) == digest(b['scope']) and type(answer['ceiling']) is int and
+                        answer['ceiling'] == b['ceiling'] and text(answer['direction']) and
+                        answer['direction'].strip().lower() not in {'yes', 'ok', 'thanks', 'ack'} and b['cause'] != 'uncertain',
+                        'Exact explicit decision required; uncertain effects need trusted reconciliation.', 'approval_required')
+                previous = record['responses'].get(b['decision_id'])
+                response = {**answer, 'operator_id': draft['operator_id'], 'origin': draft['origin'],
+                            'reference': observed['message_id']}
+                require(previous in (None, response), 'Decision already answered differently.', 'decision_conflict')
+            for answer in answers:
+                b = next(b for b in record['blockers'] if b['decision_id'] == answer['decision_id'])
+                if record['notification'] is not None:
+                    with sqlite3.connect(self.config['state']) as database:
+                        item = attention.load_iteration(database, record['notification']['project'], record['notification']['iteration'])
+                    self.lifecycle(draft, record, 'respond', {
+                        'event_id': self.event(record, b), 'decision_id': self.event(record, b),
+                        'operator_id': draft['operator_id'], 'origin': item['origin'],
+                        'reference': observed['message_id'], 'response': json.dumps(answer, sort_keys=True)})
+                record['responses'][answer['decision_id']] = {**answer, 'operator_id': draft['operator_id'],
+                    'origin': draft['origin'], 'reference': observed['message_id']}
+            draft['onboarding_decisions'][args['operation_id']] = record
+            self.store.save(draft)
+        return json.dumps(self.resume(draft['draft_id'], args['operation_id'], session_id=session_id), sort_keys=True)
+
+    def resume(self, draft_id, operation_id, *, session_id):
+        """Retry only the same retained producer operation after fresh trusted revalidation."""
+        draft, record = self.current(draft_id, operation_id)
+        fresh = self.status(draft_id, operation_id, session_id=session_id)
+        if not fresh['ready'] or record['attempt'] is not None:
+            return {**fresh, 'resumed': False, 'reason': 'reconciliation_required' if record['attempt'] else fresh.get('reason', 'prerequisite_pending')}
+        if record['notification'] is not None:
+            n = record['notification']
+            with sqlite3.connect(self.config['state']) as database:
+                controls.require_active(database, n['project'], n['iteration'])
+                item = attention.load_iteration(database, n['project'], n['iteration'])
+                require(item.get('status') == 'active' and not item.get('model_access', {}).get('status') == 'blocked',
+                        'Independent pause or spending hold remains.', 'iteration_paused')
+                model = record['operation']['scope'].get('model_operation')
+                if model is not None:
+                    spending.admission_preview(database, (n['project'], n['iteration'], model['provider'],
+                        model['model'], model['operation']), reserve=record['operation']['ceiling'], allowance_only=False)
+        with self.store.locked():
+            draft, record = self.current(draft_id, operation_id)
+            require(record['attempt'] is None, 'Reconcile the retained setup attempt.', 'execution_uncertain')
+            record['attempt'] = {'state': 'uncertain'}
+            self.store.save(draft)
+        # The producer MUST re-read its exact real authority and preserve all holds at admission.
+        if self.setup is not None:
+            scope = record['operation']['scope']
+            outcome = self.setup.attach(draft_id, scope['expected_revision'], scope['repository'], session_id=session_id)
+            result = {'operation': record['operation'], 'status': 'complete' if outcome['status'] == 'ready' else 'uncertain',
+                      'setup_status': outcome['status']}
+        else:
+            result = json.loads(self.ctx.dispatch_tool('factory_project_setup_resume',
+                {'draft_id': draft_id, 'operation': record['operation']}, session_id=session_id))
+        require(isinstance(result, dict) and result.get('operation') == record['operation'] and
+                result.get('status') in {'complete', 'blocked', 'not_started', 'uncertain'},
+                'Exact producer outcome required; reconcile before retry.', 'execution_uncertain')
+        with self.store.locked():
+            draft, record = self.current(draft_id, operation_id)
+            record['attempt'] = None if result['status'] in {'blocked', 'not_started'} else result
+            self.store.save(draft)
+        return {**result, 'resumed': True}
+
+    def inbound(self, **event):
+        identity, draft_id = self.enrollment.identity(event['source'], event['platform'])
+        draft = self.store.read(draft_id)
+        if draft is None or not draft.get('onboarding_decisions'):
+            return self.enrollment.inbound(**event)
+        require(all(text(event.get(k)) for k in ('session_key', 'message_id', 'text')),
+                'Actual admitted input required.', 'scope_mismatch')
+        with self.store.locked():
+            draft = self.store.read(draft_id)
+            observation = {k: copy.deepcopy(event[k]) for k in ('session_key', 'message_id', 'text', 'source')}
+            previous = next((o for o in draft['observations'] if o['message_id'] == event['message_id']), None)
+            require(previous is None or previous == observation, 'Repeated input changed.', 'scope_mismatch')
+            if previous is None:
+                draft['observations'].append(observation)
+            self.store.save(draft)
+        return None
+
+    def reconcile(self, draft_id, operation_id):
+        """Host-only concrete setup readback; never accept a conversational attestation."""
+        require(self.setup is not None, 'Trusted setup readback required.', 'execution_uncertain')
+        draft, record = self.current(draft_id, operation_id)
+        scope = record['operation']['scope']
+        journal = self.setup.read(draft_id)
+        require(journal is not None and journal['status'] == 'ready' and
+                journal['repository'] == scope['repository'] and journal['draft_revision'] == scope['expected_revision'],
+                'Exact completed setup readback required.', 'execution_uncertain')
+        self.setup.route(draft_id)
+        with self.store.locked():
+            draft, record = self.current(draft_id, operation_id)
+            record['attempt'] = {'operation': record['operation'], 'status': 'complete', 'reconciled': True}
+            self.store.save(draft)
+        return copy.deepcopy(record)
+
+    def context(self, session_id, **kwargs):
+        draft, _ = self.enrollment.correlated(session_id)
+        actions = draft.get('onboarding_decisions', {})
+        if not actions:
+            return self.enrollment.context(session_id, **kwargs)
+        messages = []
+        for key in actions:
+            current = self.status(draft['draft_id'], key, session_id=session_id)
+            if current['ready'] and actions[key]['attempt'] is None:
+                self.resume(draft['draft_id'], key, session_id=session_id)
+            if current['message']:
+                messages.append(current['message'] + '\nExact operation: ' + json.dumps(actions[key]['operation'], sort_keys=True))
+        if not messages:
+            return None
+        return {'context': '\n\n'.join(messages) + '\nUse factory_project_setup_response only for actual operator input beginning '
+                'forge-decision followed by JSON {"operation": <exact operation>, "answers": '
+                '[{"decision_id": ..., "scope": ..., "ceiling": ..., "direction": <explicit instruction>}]}.'
+                ' Do not infer approval, invent this input or ask for private configuration edits.'}
+
+    def register(self):
+        self.ctx.register_hook('post_gateway_admission', self.inbound)
+        self.ctx.register_hook('pre_llm_call', self.context)
+        properties = {'expected_revision': {'type': 'integer'},
+                      'product': {'type': 'object', 'properties': {k: {'type': 'string'} for k in PRODUCT_FIELDS}, 'additionalProperties': False},
+                      'pending_questions': {'type': 'array', 'items': {'type': 'string'}},
+                      'sufficient': {'type': 'boolean'}, 'rationale': {'type': 'string'}}
+        for name, handler, props in (
+            ('factory_project_draft_update', self.enrollment.update, properties),
+            ('factory_project_setup_response', self.respond, {'operation_id': {'type': 'string'}}),
+        ):
+            self.ctx.register_tool(name=name, toolset='factory_planning', handler=handler,
+                schema={'name': name, 'description': handler.__doc__, 'parameters': {'type': 'object',
+                    'properties': props, 'required': list(props), 'additionalProperties': False}})
+        return self
