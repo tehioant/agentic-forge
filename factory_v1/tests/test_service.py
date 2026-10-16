@@ -63,6 +63,29 @@ class ServiceTests(unittest.TestCase):
         target.mkdir(mode=0o700)
         with patch.object(service.subprocess, 'run') as run:
             unit = service.install(self.config, target)
+        # Scope instances use the same native installer/validator, never a
+        # caller-selected unit belonging to another controller.
+        scoped = service.instance(self.config)
+        with patch.object(service.subprocess, 'run'):
+            selected = service.install(self.config, target, unit=scoped)
+        self.assertNotEqual(selected, unit)
+        other = dict(self.config, project='other')
+        with patch.object(service.subprocess, 'run') as denied:
+            with self.assertRaises(RepositoryError):
+                service.supervisor(other, 'start', unit=scoped)
+            denied.assert_not_called()
+        with patch.object(service.subprocess, 'run', side_effect=[
+            Mock(stdout='FragmentPath=' + str(unit) + '\nDropInPaths=\n')]) as denied:
+            with self.assertRaises(RepositoryError):
+                service.supervisor(self.config, 'start', unit=scoped)
+            self.assertEqual(denied.call_count, 1)
+        with patch.object(service.subprocess, 'run', side_effect=[
+            Mock(stdout='FragmentPath=' + str(selected) + '\nDropInPaths=\n'),
+            Mock(stdout='ActiveState=inactive\nSubState=dead\nMainPID=0\n')]) as observed:
+            result = service.supervisor(self.config, 'status', unit=scoped)
+            assert result is not None
+            self.assertEqual(result['MainPID'], '0')
+            self.assertTrue(all(call.args[0][3] == scoped for call in observed.call_args_list))
         text = unit.read_text()
         for directive in ('KillMode=control-group', 'Restart=on-failure', '-m factory_v1.service'):
             self.assertIn(directive, text)

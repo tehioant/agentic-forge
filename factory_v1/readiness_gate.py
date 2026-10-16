@@ -84,20 +84,71 @@ def policy(config, selected, database):
                                'grant_columns': grant_columns, 'grants': grants})
 
 
-def seal(database, path):
+def initial_policy(database, path, config, value, validate):
+    """Host-prepared first selection only; exact sealed replay grants no new authority."""
+    from . import bugs, diagnosis, recovery, requirements, service_dispatch
+    validate()
+    project, iteration, operator = config['project'], config['iteration'], config['operator_id']
+    require(config['state'] == database.execute('PRAGMA database_list').fetchone()[2],
+            'Exact persistent initial state required.', 'readiness_binding_changed')
+    controls.owner(database, project, iteration, operator)
+    controls.require_active(database, project, iteration)
+    controls.resume_scope(database, project, iteration)
+    current = binding(database, project, iteration)
+    require(current is None or (current[0] == str(path) and current[1] in (None, value)),
+            'Initial selection cannot replace a previous policy.', 'readiness_inputs_changed')
+    selected = readiness.load_config(config['readiness_config'])
+    dispatch = service_dispatch.validate(readiness.load_config(config['dispatch_config']), config)
+    require(all(selected[k] == config[k] == dispatch[k] for k in ('project', 'iteration', 'operator_id')) and
+            policy(config, selected, database) == value,
+            'Exact prepared initial selection changed.', 'readiness_inputs_changed')
+    item = assignments.current(database, project, iteration, operator, require_active=False)
+    require(item['status'] == 'active' and item.get('execution_allowed') is False and
+            not item.get('reservation') and not item.get('main_incident') and
+            not recovery.pending_registration(item) and not requirements.held_numbers(item) and
+            not diagnosis.held_numbers(item) and not bugs.held_numbers(item) and not recovery.held_numbers(item),
+            'Independent holds prevent initial policy admission.', 'readiness_blocked')
+    ownership(database, config, None)
+    require(not any((row['ticket_scope']['project'], row['ticket_scope']['iteration']) == (project, iteration)
+                    for row in assignments.rows(database)),
+            'Engineering assignments already exist.', 'readiness_blocked')
+    tables = {row[0] for row in database.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    require('model_operations' not in tables or not database.execute(
+        'SELECT 1 FROM model_operations WHERE project=? AND iteration=? LIMIT 1', (project, iteration)).fetchone(),
+        'Engineering model operations already exist.', 'readiness_blocked')
+    require(all(not Path(slot['profile']['home']).exists() and not Path(slot['profile']['home']).is_symlink()
+                for slot in selected['slots']), 'Initial role homes already consumed.', 'slot_capacity_unavailable')
+    require(not controls.snapshot(database, project, iteration)['brokers'],
+            'Existing broker ownership prevents initial selection.', 'readiness_blocked')
+
+
+def seal(database, path, *, initial=None):
     """Explicit operator selection pins existing local policy; it grants no capability."""
     config, selected = configuration(path)
     controls.owner(database, config['project'], config['iteration'], config['operator_id'])
     current = binding(database, config['project'], config['iteration'])
     require(current is not None and current[0] == str(path), 'Registered service required.', 'readiness_binding_changed')
-    require(controls.blocked(database, config['project'], config['iteration']),
-            'Pause before selecting readiness inputs.', 'iteration_paused')
+    assert current is not None
     value = policy(config, selected, database)
     with controls.lane(database, config['project'], config['iteration']):
-        require(policy(config, selected, database) == value, 'Inputs changed during selection.', 'readiness_inputs_changed')
-        database.execute('UPDATE supervised_readiness SET policy=? WHERE project=? AND iteration=?',
-                         (value, config['project'], config['iteration']))
-        database.commit()
+        controls.owner(database, config['project'], config['iteration'], config['operator_id'])
+        require(configuration(path) == (config, selected) and
+                binding(database, config['project'], config['iteration']) == current and
+                policy(config, selected, database) == value,
+                'Inputs changed during selection.', 'readiness_inputs_changed')
+        if initial is None:
+            require(controls.blocked(database, config['project'], config['iteration']),
+                    'Pause before selecting readiness inputs.', 'iteration_paused')
+        else:
+            expected, validate = initial
+            require(value == expected, 'Prepared policy changed.', 'readiness_inputs_changed')
+            initial_policy(database, path, config, expected, validate)
+        if current[1] != value:
+            database.execute('UPDATE supervised_readiness SET policy=? WHERE project=? AND iteration=?',
+                             (value, config['project'], config['iteration']))
+            database.commit()
+        require(binding(database, config['project'], config['iteration']) == (str(path), value),
+                'Policy seal readback differs.', 'readiness_binding_changed')
 
 
 def snapshot(database, project, iteration):

@@ -90,6 +90,207 @@ class ConversationBindingTests(unittest.TestCase):
         self.ctx.register_hook.assert_called_once_with('pre_llm_call', self.binding.context)
         self.assertEqual([c.kwargs['name'] for c in self.ctx.register_tool.call_args_list],
                          ['factory_planning_sufficient', 'factory_planning_publish', 'factory_planning_complete'])
+        # Direct host inventory/lifecycle component: no interview, publication or worker chain.
+        import concurrent.futures
+        import time
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from factory_v1 import assignments, planning_publication, project_native, service
+        root = self.fixture.root
+        roots = {}
+        for name in ('native', 'drafts', 'setup', 'workspaces', 'credentials'):
+            roots[name] = root / name
+            roots[name].mkdir(mode=0o700)
+        import tempfile
+        native_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(native_directory.cleanup)
+        Path(native_directory.name).chmod(0o700)
+        roots['native'] = Path(native_directory.name)
+        credential = roots['credentials'] / 'github.json'
+        service.atomic(credential, {'operator_id': '42', 'repository': self.item['repository'],
+            'reference': 'reviewed-host', 'api_base': 'https://api.github.com', 'bearer': 'fixture-only-secret'})
+        route = {'repository': self.item['repository'], 'repository_id': 123, 'private': True, 'parent': 'a' * 40,
+            'credential_config': str(credential), 'credential_reference': 'reviewed-host', 'profile_name': 'native-profile',
+            'source_digest': assignments.digest({'skills': self.selected, 'adaptation': planning.INSTRUCTIONS}),
+            'allowance': {'reference': 'original-finite-approval', 'provider_route': 'reviewed-provider',
+                          'model': 'fixture-model', 'expires_at': int(time.time()) + 600, 'max_wakeups': 1},
+            'input_envelope': {'kind': 'plain'}}
+        inventory = {'operator_id': '42', 'reference': 'reviewed-delegation', 'routes': [route]}
+        selector = roots['credentials'] / 'native.json'
+        service.atomic(selector, inventory)
+        transfer = {'assignment_id': 'origin-assignment'}
+        draft = {'draft_id': 'draft', 'operator_id': '42', 'revision': 1, 'sufficient': True, 'pending_questions': [],
+                 'native': {'session_id': 'native-origin'}, 'origin': self.config['origin'], 'transfer': transfer}
+        attached = {'status': 'ready', 'draft_revision': 1, 'repository': self.item['repository'], 'repository_id': 123,
+                    'commit': 'a' * 40, 'binding': self.config, 'project': 'product', 'iteration': 'm1', 'transfer': transfer}
+        store = SimpleNamespace(root=roots['drafts'], path=lambda identity: roots['drafts'] / identity,
+                                read=lambda identity: copy.deepcopy(draft), locked=nullcontext)
+        enrollment = SimpleNamespace(store=store)
+        setup = SimpleNamespace(root=roots['setup'], workspaces=roots['workspaces'], config={'state': self.config['state']},
+                                read=lambda identity: copy.deepcopy(attached), route=lambda identity: self.binding)
+        self.item['repository_onboarding']['metadata']['private'] = True
+        self.fixture.persist()
+        self.ctx.profile_name = 'native-profile'; self.ctx.get_config.return_value = 'reviewed-provider'
+        metadata = {'id': 123, 'full_name': self.item['repository'], 'name': 'product',
+                    'owner': {'login': 'example'}, 'private': True}
+        host = Mock(base='https://api.github.com')
+        host.request.side_effect = lambda path: copy.deepcopy({'sha': 'a' * 40} if path.endswith('/commits/HEAD') else metadata)
+        spawned = []
+        def spawn(coro, **kwargs):
+            spawned.append(coro); coro.close()
+            return concurrent.futures.Future()
+        self.ctx.spawn_task.side_effect = spawn
+        config = {'root': str(roots['native']), 'capability_config': str(selector)}
+        with patch.object(project_native.repositories, 'GitHub', return_value=host):
+            owner = project_native.NativeProject(enrollment, setup, None, config)
+            paths = owner.resolve('draft')
+            publisher = planning_publication.configuration(paths['publication_config'], '42')
+            self.assertEqual(publisher['bearer'], 'fixture-only-secret')
+            self.assertEqual(json.loads(Path(paths['wakeup_config']).read_text())['allowance'], route['allowance'])
+            self.assertTrue(all('fixture-only-secret' not in p.read_text() for p in roots['native'].rglob('*.json')))
+            self.assertIs(owner.bind(self.binding, 'draft'), self.binding)
+            subscriber = self.binding.wakeup
+            assert subscriber is not None
+            subscriber.joined = Mock(); subscriber.joined.wait.return_value = True
+            self.assertIs(owner.bind(self.binding, 'draft').wakeup, subscriber)
+            self.assertEqual(len(spawned), 1)
+            self.ctx.on_unload.assert_called_once_with(subscriber.stop)
+            for path, body, method in (('/user', None, None), ('/repos/example/product/issues/7', {}, 'POST'),
+                                       ('/repos/example/product/contents/private?ref=' + 'a' * 40, None, None)):
+                with self.subTest(route=path), self.assertRaises(repositories.RepositoryError):
+                    self.binding.github.request(path, body, method)
+            original = copy.deepcopy(inventory)
+            for field, value in (('repository_id', 999), ('private', False), ('parent', 'b' * 40),
+                                  ('source_digest', '0' * 64), ('profile_name', 'wrong-profile'),
+                                  ('input_envelope', {'kind': 'arbitrary'}),
+                                  ('allowance', {**route['allowance'], 'expires_at': 1}),
+                                  ('allowance', {**route['allowance'], 'max_wakeups': 2})) :
+                inventory['routes'][0][field] = value; service.atomic(selector, inventory)
+                with self.subTest(drift=field), self.assertRaises(repositories.RepositoryError): owner.resolve('draft')
+                service.atomic(selector, original); inventory = copy.deepcopy(original)
+            metadata['private'] = False
+            with self.assertRaises(repositories.RepositoryError): self.binding.ctx.get_config('provider_route')
+            with self.assertRaises(repositories.RepositoryError): owner.bind(self.binding, 'draft')
+            self.assertTrue(subscriber.stopped); self.assertTrue(subscriber.task.cancelled())
+            subscriber.joined.wait.assert_called_with(2)
+            metadata['private'] = True
+            with self.assertRaises(repositories.RepositoryError): owner.bind(self.binding, 'draft')
+            self.assertEqual(len(spawned), 1)
+            owner.close(); owner.close()
+            # Missing native lifecycle blocks, rather than manufacturing a loop/thread.
+            missing = project_native.NativeProject(enrollment, setup, None, config)
+            self.ctx.spawn_task = None
+            with self.assertRaises(repositories.RepositoryError) as error: missing.bind(self.binding, 'draft')
+            self.assertEqual(error.exception.code, 'native_lifecycle_unavailable')
+            # Completed original work can bind read-only with the original expired grant;
+            # only supervise's actual execution/publication receipt may consume it.
+            self.ctx.spawn_task = Mock(side_effect=spawn)
+            self.binding.ctx = self.ctx
+            self.item['planning']['status'] = 'complete'; self.fixture.persist()
+            # Use a separate explicit delegated route claim for this direct fixture.
+            for path in roots['native'].rglob('*.json'): path.unlink()
+            original['routes'][0]['allowance']['expires_at'] = 1; service.atomic(selector, original)
+            completed = project_native.NativeProject(enrollment, setup, None, config)
+            self.assertIs(completed.bind(self.binding, 'draft'), self.binding)
+            self.assertIsNone(self.binding.wakeup); self.ctx.spawn_task.assert_not_called()
+            self.fixture.stack.close()
+            # Actual publisher plus concrete transport, seeded state; HTTP only is simulated.
+            from factory_v1 import ticket_github as gh, tickets
+            scope = {'commit': 'b' * 40, 'documents': {}, 'issue': {'number': 1}}
+            board = {'project_id': 'P', 'status': {'id': 'S', 'options': {'Todo': 'T', 'In Progress': 'A', 'Done': 'D'}},
+                     'milestone': {'id': 10, 'number': 1, 'title': 'm1'}}
+            tracker_config = {'project_id': 'P', 'status_field': 'Status',
+                              'statuses': {'ready': 'Todo', 'active': 'In Progress', 'done': 'Done'}, 'triage_label': 'triage'}
+            ticket = {'key': 'one', 'title': 'Scoped ticket', 'desired_behavior': 'Publish exact ticket',
+                      'acceptance_criteria': ['Exact readback'], 'references': [], 'blockers': [], 'triage_label': 'triage'}
+            self.item['handoff'] = scope
+            work = {'assignment_id': 'tickets', 'request': {'tracker': tracker_config, 'skill': {}}, 'inputs': {'handoff': scope},
+                    'tickets': [ticket], 'execution': {'verified': True}, 'status': 'synthesized'}
+            self.item['ticket_work'] = work
+            tracker = Mock()
+            tracker.read.return_value = {'status': 'ready', 'binding': self.config, 'repository': self.item['repository'],
+                'repository_id': 123, 'identities': board, 'tracker': tracker_config}
+            patch.object(completed, 'execution', Mock(tracker=tracker)).start()
+            original_current = self.binding.current
+            self.binding.current = Mock(return_value=(self.item, self.selected))
+            issues, members, dependencies = [], [], []
+            def connection(nodes): return {'nodes': nodes, 'pageInfo': {'hasNextPage': False}}
+            def http(path, body=None, method=None):
+                if path.endswith('/commits/HEAD'): return {'sha': 'a' * 40}
+                if path == '/repos/example/product': return copy.deepcopy(metadata)
+                if path.endswith('/issues') and body is not None:
+                    issue = {**body, 'number': 7, 'id': 77, 'node_id': 'I7', 'state': 'open',
+                        'repository_url': 'https://api.github.com/repos/example/product',
+                        'html_url': 'https://github.com/example/product/issues/7', 'labels': [{'name': 'triage'}],
+                        'milestone': {**board['milestone'], 'state': 'open'}}
+                    issues.append(issue); return copy.deepcopy(issue)
+                if '/issues?state=' in path: return copy.deepcopy(issues)
+                if path.endswith('/issues/7'): return copy.deepcopy(issues[0])
+                if path.endswith('/issues/8'): return copy.deepcopy(issues[1])
+                if path.endswith('/issues/7/dependencies/blocked_by') and body is not None:
+                    self.assertEqual(body, {'issue_id': 88})
+                    dependencies.append(copy.deepcopy(issues[1]))
+                    return copy.deepcopy(issues[1])
+                if '/dependencies/' in path: return copy.deepcopy(dependencies)
+                if '/milestones?' in path: return [{**board['milestone'], 'state': 'open'}]
+                query = (body or {}).get('query', '')
+                if 'query LinkedProjects' in query: return {'data': {'repository': {'projectsV2': connection([{'id': 'P', 'closed': False}])}}}
+                if 'query ProjectFields' in query: return {'data': {'node': {'id': 'P', 'fields': connection([
+                    {'id': 'S', 'name': 'Status', 'options': [{'id': v, 'name': k} for k,v in board['status']['options'].items()]}])}}}
+                if 'query ProjectItems' in query: return {'data': {'node': {'id': 'P', 'items': connection(copy.deepcopy(members))}}}
+                if 'query TrackerBoard' in query: return {'data': {'node': {'id': 'P', 'number': 1, 'public': False, 'closed': False}}}
+                if 'mutation AddTicket' in query:
+                    members.append({'id': 'M7', 'content': {'id': 'I7', 'number': 7, 'repository': {'nameWithOwner': 'example/product'}},
+                                    'fieldValues': connection([])})
+                    return {'data': {'addProjectV2ItemById': {'item': {'id': 'M7'}}}}
+                if 'mutation TicketField' in query:
+                    members[0]['fieldValues'] = connection([{'optionId': 'T', 'field': {'id': 'S'}}])
+                    return {'data': {'updateProjectV2ItemFieldValue': {'projectV2Item': {'id': 'M7'}}}}
+                raise AssertionError((path, body, method))
+            host.bearer = 'fixture-only-secret'; host.request.side_effect = http
+            with (patch.object(tickets, 'reload_locked', side_effect=lambda db, item: item),
+                  patch.object(tickets, 'active'), patch.object(tickets, 'skill'),
+                  patch.object(tickets, 'pinned_inputs', return_value=work['inputs']),
+                  patch.object(tickets, 'publication_blocked', side_effect=lambda db,item,error,**kw: (_ for _ in ()).throw(error)),
+                  patch.object(tickets, 'checkpoint'), patch.object(tickets, 'effect_checkpoint'),
+                  patch.object(tickets, 'effect_check'), patch.object(tickets, 'frontier', side_effect=lambda db,item,api,**kw:item),
+                  patch('factory_v1.effect_resolution.bound', return_value=None)):
+                transport = project_native.TicketTransport(completed, 'draft', self.fixture.database, self.binding)
+                tickets.publish(self.fixture.database, self.item, transport)
+                self.assertTrue(work['publication_complete'])
+                self.assertEqual(len(issues), 1)
+                observed_member = gh.membership(transport, board, 'example/product', issues[0])
+                assert observed_member is not None
+                self.assertEqual(observed_member['status'], 'T')
+                # Seed a separate admitted blocker intent; exercise only the real
+                # direct dependency client, not synthesis or another publisher.
+                blocker = dict(issues[0], number=8, id=88, node_id='I8',
+                               html_url='https://github.com/example/product/issues/8')
+                issues.append(blocker)
+                ticket['blockers'] = ['prior']
+                work['published']['prior'] = {'number': 8, 'id': 88, 'node_id': 'I8'}
+                issues[0]['body'] = tickets.body(self.item, ticket, {'one': 7, 'prior': 8})
+                work['intents']['one']['dependencies'] = [88]
+                gh.add_dependency(transport, 'example/product', 7, 88)
+                self.assertEqual([d['id'] for d in gh.dependencies(transport, 'example/product', 7)], [88])
+                for path, payload, verb in [('/repos/other/product/issues', {'title': 'bad'}, 'POST'),
+                        ('/graphql', {'query': 'mutation { deleteProjectV2 }', 'variables': {}}, 'POST'),
+                        ('/repos/example/product/issues/7', {'state': 'closed'}, 'PATCH')]:
+                    with self.subTest(denied=path), self.assertRaises(repositories.RepositoryError):
+                        transport.request(path, payload, verb)
+                for field, value in (('id', 999), ('private', False)):
+                    previous = metadata[field]; metadata[field] = value
+                    with self.subTest(authority=field), self.assertRaises(repositories.RepositoryError):
+                        gh.add_item(transport, 'P', 'I7')
+                    metadata[field] = previous
+                changed = copy.deepcopy(original); changed['routes'][0]['credential_reference'] = 'drift'
+                service.atomic(selector, changed)
+                with self.assertRaises(repositories.RepositoryError):
+                    gh.add_item(transport, 'P', 'I7')
+                service.atomic(selector, original)
+            self.binding.current = original_current
+            completed.close()
+
 
     def test_supplied_publication_pointers_cannot_substitute_native_host_execution(self):
         from factory_v1.tests.test_planning import PlanningTests
