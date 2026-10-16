@@ -39,17 +39,17 @@ receipt. Rejection remains a hold. Completed requests no longer hide the native
 planning context on later turns. Holds, deadlines, budgets and attempts remain owned
 by their existing producers.
 
-## Remaining source boundaries
+## Integrated admission boundaries
 
-**First seal is still missing a lawful automatic admission adapter.** Existing
-`ProjectExecution.register` requires `controls.blocked` before updating the service;
-`readiness_gate.seal` independently requires pause. A fresh active project therefore
-cannot register automatically. The minimal required correction is an explicitly
-scoped first-registration lane in both existing guards, limited to an unsealed,
-unregistered initial policy and the exact reviewed prepared selection, with fresh
-owner/authority/readback and interruption-lane checks. It must preserve intentional
-pause/stop and all independent holds. This coordinator does not manufacture a pause
-or call controls resume. That adapter is outside this lane's source ownership.
+`ProjectExecution.prepare` retains the prospective immutable `policy_pin` before
+registration. `register` and `readiness_gate.seal` share the narrow
+`initial_policy` admission for an active, execution-disabled first selection: the
+service may be unregistered or registered-unsealed, or replay the exact same seal.
+Both guards revalidate prepared host/draft/tracker/service authority, owner and
+policy inside the interruption lane. Independent holds, intentional pause/stop,
+engineering assignments/model history, consumed role homes and broker ownership
+remain refusals. Existing policy changes still require pause; this adapter neither
+manufactures pause nor resumes controls or renews authority.
 
 `after_publication` now selects the concrete host-only `TicketTransport` for all
 three ticket operations. The native planning client remains read-only. This route
@@ -62,7 +62,7 @@ that check; this is not a connected onboarding or worker journey.
 
 First/next-ticket retirement, correction, reporting and wait reuse the existing
 service/continuation predicates. Their direct component checks establish those
-contracts, not connected reachability through the unresolved first-seal boundary.
+contracts, not connected native onboarding qualification.
 No whole simulated journey, live model/network/service/container, native activation,
 publication, tracker update or deployment verification is performed here. Independent
 Standards/Spec review and stable-helper integration remain parent-owned.

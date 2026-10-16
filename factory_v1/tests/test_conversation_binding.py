@@ -213,7 +213,7 @@ class ConversationBindingTests(unittest.TestCase):
             patch.object(completed, 'execution', Mock(tracker=tracker)).start()
             original_current = self.binding.current
             self.binding.current = Mock(return_value=(self.item, self.selected))
-            issues, members = [], []
+            issues, members, dependencies = [], [], []
             def connection(nodes): return {'nodes': nodes, 'pageInfo': {'hasNextPage': False}}
             def http(path, body=None, method=None):
                 if path.endswith('/commits/HEAD'): return {'sha': 'a' * 40}
@@ -226,7 +226,12 @@ class ConversationBindingTests(unittest.TestCase):
                     issues.append(issue); return copy.deepcopy(issue)
                 if '/issues?state=' in path: return copy.deepcopy(issues)
                 if path.endswith('/issues/7'): return copy.deepcopy(issues[0])
-                if '/dependencies/' in path: return []
+                if path.endswith('/issues/8'): return copy.deepcopy(issues[1])
+                if path.endswith('/issues/7/dependencies/blocked_by') and body is not None:
+                    self.assertEqual(body, {'issue_id': 88})
+                    dependencies.append(copy.deepcopy(issues[1]))
+                    return copy.deepcopy(issues[1])
+                if '/dependencies/' in path: return copy.deepcopy(dependencies)
                 if '/milestones?' in path: return [{**board['milestone'], 'state': 'open'}]
                 query = (body or {}).get('query', '')
                 if 'query LinkedProjects' in query: return {'data': {'repository': {'projectsV2': connection([{'id': 'P', 'closed': False}])}}}
@@ -257,6 +262,17 @@ class ConversationBindingTests(unittest.TestCase):
                 observed_member = gh.membership(transport, board, 'example/product', issues[0])
                 assert observed_member is not None
                 self.assertEqual(observed_member['status'], 'T')
+                # Seed a separate admitted blocker intent; exercise only the real
+                # direct dependency client, not synthesis or another publisher.
+                blocker = dict(issues[0], number=8, id=88, node_id='I8',
+                               html_url='https://github.com/example/product/issues/8')
+                issues.append(blocker)
+                ticket['blockers'] = ['prior']
+                work['published']['prior'] = {'number': 8, 'id': 88, 'node_id': 'I8'}
+                issues[0]['body'] = tickets.body(self.item, ticket, {'one': 7, 'prior': 8})
+                work['intents']['one']['dependencies'] = [88]
+                gh.add_dependency(transport, 'example/product', 7, 88)
+                self.assertEqual([d['id'] for d in gh.dependencies(transport, 'example/product', 7)], [88])
                 for path, payload, verb in [('/repos/other/product/issues', {'title': 'bad'}, 'POST'),
                         ('/graphql', {'query': 'mutation { deleteProjectV2 }', 'variables': {}}, 'POST'),
                         ('/repos/example/product/issues/7', {'state': 'closed'}, 'PATCH')]:
