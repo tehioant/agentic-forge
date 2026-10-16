@@ -229,8 +229,8 @@ claim of complete fresh-project automatic activation.** T5 preplanning and actua
 ticket synthesis/publication are now called before execution registration. Optional
 `project_native` has exactly `root` and `capability_config`; the plugin constructs
 the real NativeProject helper and reuses its bound publisher/subscriber lifecycle.
-The concurrent helper must still be integrated by the parent. First registration
-still needs the narrow first-seal adapter documented in project-handoff.md; this
+The integrated helper owns scoped native transport. First registration uses the
+host-prepared first-seal adapter documented in project-handoff.md; this
 coordinator never fabricates a pause or resumes intentional holds. Unknown effects
 use the exact producer's retained-effect readback, never conversational approval.
 

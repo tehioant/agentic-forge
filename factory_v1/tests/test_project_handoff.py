@@ -24,6 +24,35 @@ from factory_v1.repositories import RepositoryError
 
 class ProjectHandoffTests(unittest.TestCase):
     def test_conversational_composition_transitions(self):
+        for profile in ('', 'approved-profile'):
+            with self.subTest(profile=profile), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary); (root / 'drafts').mkdir(mode=0o700)
+                enrolled = object.__new__(ConversationEnrollment)
+                enrolled.ctx = Mock(profile_name='approved-profile')
+                enrolled.store = DraftStore(root / 'drafts')
+                enrolled.config = {'operators': {'discord': ['42']}}
+                source = dict(platform='discord', chat_id='channel', chat_type='group', thread_id='thread',
+                              scope_id='guild', parent_chat_id='parent', profile=profile, user_id='42')
+                identity, draft_id = enrolled.identity(source, 'discord')
+                enrolled.store.save(dict(identity, draft_id=draft_id, transfer={'assignment_id': 'native'}))
+                native = Mock(config={'session_id': 'session'})
+                route = Mock(return_value=native)
+                coordinator = handoff.ProjectHandoff(enrolled, SimpleNamespace(route=route), None, None, None, None,
+                    {'publication_config': None, 'wakeup_config': None})
+                with patch.object(handoff, 'native_context', return_value=source):
+                    self.assertIs(coordinator.context('session'), native.context.return_value)
+                    self.assertIs(coordinator.native_tool('sufficient', {}, session_id='session'), native.sufficient.return_value)
+                    self.assertTrue(all(c.args == (draft_id,) for c in route.call_args_list))
+                for key, value in (('profile', 'wrong'), ('user_id', 'wrong'), ('chat_id', 'other'), ('thread_id', 'other')):
+                    with self.subTest(drift=key), patch.object(handoff, 'native_context', return_value=dict(source, **{key: value})):
+                        route.reset_mock()
+                        with self.assertRaises(RepositoryError): coordinator.context('session')
+                        route.assert_not_called()
+                # Correlated sibling uses the same full source projection, including profile.
+                admitted = dict(identity, draft_id=draft_id, observations=[{'message_id': 'm', 'session_key': 'k'}])
+                enrolled.store.save(admitted)
+                with patch('factory_v1.conversation_enrollment.native_context', return_value=dict(source, id='s', key='k', message_id='m')):
+                    self.assertEqual(enrolled.correlated('s')[0]['draft_id'], draft_id)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             drafts = root / 'drafts'; drafts.mkdir(mode=0o700)

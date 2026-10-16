@@ -14,6 +14,33 @@ from factory_v1.project_setup import ProjectSetup
 from factory_v1.repositories import RepositoryError
 
 
+class BaselineAPI:
+    """Contents API transport fixture: two ordinary commits, no Git/process calls."""
+
+    def __init__(self):
+        self.files, self.commits, self.puts = {}, {}, []
+        self.head = None
+
+    def request(self, path, body=None, method=None):
+        if '/branches?' in path:
+            return [] if self.head is None else [{'name': 'main'}]
+        if '/commits/' in path:
+            return self.commits[self.head if path.endswith('/HEAD') else path.rsplit('/', 1)[1]]
+        name = path.split('/contents/')[1].split('?')[0]
+        if method == 'PUT':
+            assert name not in self.files
+            content = base64.b64decode(body['content'])
+            blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content, usedforsecurity=False).hexdigest()
+            sha = ('b' if self.head is None else 'c') * 40
+            self.commits[sha] = {'sha': sha, 'parents': [] if self.head is None else [{'sha': self.head}],
+                'commit': {'message': body['message']}, 'files': [{'filename': name, 'sha': blob, 'status': 'added'}]}
+            self.files[name] = {'type': 'file', 'path': name, 'sha': blob, 'encoding': 'base64', 'content': body['content']}
+            self.head = sha
+            self.puts.append(name)
+            return {'commit': {'sha': sha}, 'content': {'sha': blob}}
+        return self.files.get(name)
+
+
 class ProjectCreationTests(unittest.TestCase):
     def test_private_creation_baseline_and_reconciliation(self):
         def fixture(root):
@@ -126,6 +153,10 @@ class ProjectCreationTests(unittest.TestCase):
                         creator.prepare(draft, record, capability)
                         self.assertEqual(record['repository_id'], 77)
                         baseline.assert_called_once()
+                        if case == 'create':
+                            github.request.side_effect = lambda path, *a, **kw: {'login': 'owner'} if path == '/user' else metadata
+                            creator.prepare(draft, record, capability)
+                            self.assertEqual(baseline.call_count, 2)
                     else:
                         with self.assertRaises(RepositoryError) as error:
                             creator.prepare(draft, record, capability)
@@ -141,6 +172,42 @@ class ProjectCreationTests(unittest.TestCase):
                     self.assertEqual(retained['repository_onboarding']['metadata']['id'], 77)
                 if case in ('lost-create', 'denied'):
                     self.assertEqual(retained['repository_onboarding']['status'], 'pending' if case == 'lost-create' else 'blocked')
+                if case == 'collision':
+                    self.assertTrue(record['no_creation_effect'])
+
+        # Real new-attempt registration: old active intake must not strand the rename as paused.
+        for case in ('new-attempt', 'old-paused', 'old-uncertain'):
+            with self.subTest(intake=case), tempfile.TemporaryDirectory() as tmp:
+                creator, draft, previous, capability = fixture(Path(tmp))
+                record = dict(previous, repository='owner/available', draft_revision=5, iteration='m1-r5',
+                    marker=previous['marker'] + ':r5', history=[previous])
+                prior = {'project_id': previous['project'], 'iteration_id': 'm1', 'repository': 'owner/product',
+                         'status': 'paused' if case == 'old-paused' else 'active'}
+                if case == 'old-uncertain': prior['repository_onboarding'] = {'status': 'pending'}
+                state = Path(creator.config['state'])
+                with sqlite3.connect(state) as db:
+                    db.execute('CREATE TABLE iterations(project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
+                    db.execute('INSERT INTO iterations VALUES(?,?,?)', (previous['project'], 'm1', json.dumps(prior)))
+                state.chmod(0o600)
+                github = Mock(base=capability['api_base'])
+                metadata = {'id': 88, 'full_name': 'owner/available', 'name': 'available', 'owner': {'login': 'owner'},
+                            'private': True, 'description': record['marker']}
+                responses = [None, {'login': 'owner'}, metadata, metadata]
+                github.request.side_effect = lambda *a, **kw: responses.pop(0)
+                with patch.object(creation.repositories, 'GitHub', return_value=github), patch.object(creator, 'baseline') as baseline:
+                    if case == 'new-attempt':
+                        creator.prepare(draft, record, capability)
+                        baseline.assert_called_once()
+                    else:
+                        with self.assertRaises(RepositoryError) as refused: creator.prepare(draft, record, capability)
+                        self.assertEqual(refused.exception.code, 'iteration_paused' if case == 'old-paused' else 'scope_mismatch')
+                        github.request.assert_not_called(); baseline.assert_not_called()
+                with sqlite3.connect(state) as db:
+                    saved = creation.read_iteration(db, previous['project'], 'm1')
+                    self.assertEqual(saved['status'], 'superseded-no-effect' if case == 'new-attempt' else prior['status'])
+                    current = creation.read_iteration(db, previous['project'], 'm1-r5')
+                    if case == 'new-attempt': self.assertEqual(current['status'], 'active')
+                    else: self.assertIsNone(current)
 
         # Baseline initialization/read-only recovery, no intake/onboarding/checkout executed.
         for case in ('initialize', 'replay', 'lost-put', 'unknown-put', 'nonempty', 'commit-drift', 'content-drift', 'pause'):
@@ -152,7 +219,7 @@ class ProjectCreationTests(unittest.TestCase):
                 if case in ('replay', 'lost-put', 'unknown-put', 'commit-drift', 'content-drift'):
                     record['baseline_intent'] = intent
                 if case == 'replay':
-                    record['baseline'] = {'commit': 'b' * 40, 'path': 'README.md', 'blob': blob}
+                    record['readme_baseline'] = {'commit': 'b' * 40, 'path': 'README.md', 'blob': blob}
                 if case == 'commit-drift':
                     record['baseline_returned_commit'] = 'c' * 40
                 def api(path, body=None, method=None):
@@ -166,7 +233,7 @@ class ProjectCreationTests(unittest.TestCase):
                         self.assertEqual(saved['baseline_intent'], intent)
                         self.assertEqual(body, {'message': intent['message'], 'content': base64.b64encode(content).decode()})
                         return {'commit': {'sha': 'b' * 40}, 'content': {'sha': blob}}
-                    if path.endswith('/commits/HEAD'):
+                    if '/commits/' in path:
                         if case == 'unknown-put':
                             raise RepositoryError('github_blocked', 'Empty target still uncertain', 409)
                         return {'sha': 'b' * 40, 'parents': [], 'commit': {'message': intent['message']},
@@ -177,10 +244,82 @@ class ProjectCreationTests(unittest.TestCase):
                 github = Mock(); github.request.side_effect = api
                 guard = Mock(side_effect=RepositoryError('iteration_paused', 'Paused') if case == 'pause' else None)
                 if case in ('initialize', 'replay', 'lost-put'):
-                    creator.baseline(record, draft, github, guard)
-                    self.assertEqual(record['baseline'], {'commit': 'b' * 40, 'path': 'README.md', 'blob': blob})
+                    creator.readme_baseline(record, draft, github, guard)
+                    self.assertEqual(record['readme_baseline'], {'commit': 'b' * 40, 'path': 'README.md', 'blob': blob})
                 else:
                     with self.assertRaises(RepositoryError):
-                        creator.baseline(record, draft, github, guard)
+                        creator.readme_baseline(record, draft, github, guard)
                 puts = [c for c in github.request.call_args_list if c.kwargs.get('method') == 'PUT']
                 self.assertEqual(len(puts), int(case == 'initialize'))
+
+        # Actual baseline producer; recovery never resends either admitted write.
+        for case in ('ready', 'lost-standards', 'unknown-standards', 'standards-content', 'standards-parent', 'late-pause'):
+            with self.subTest(standards=case), tempfile.TemporaryDirectory() as tmp:
+                creator, draft, record, _ = fixture(Path(tmp))
+                api = BaselineAPI()
+                request = api.request
+                def transport(path, body=None, method=None):
+                    if method == 'PUT' and path.endswith('/AGENTS.md') and case in ('lost-standards', 'unknown-standards'):
+                        if case == 'lost-standards': request(path, body, method)
+                        raise RepositoryError('baseline_uncertain', 'Lost response')
+                    return request(path, body, method)
+                guard = Mock(side_effect=[None, RepositoryError('iteration_paused', 'Paused')] if case == 'late-pause' else None)
+                github = Mock(request=Mock(side_effect=transport))
+                if case in ('lost-standards', 'unknown-standards', 'late-pause'):
+                    with self.assertRaises(RepositoryError): creator.baseline(record, draft, github, guard)
+                    if case == 'late-pause':
+                        self.assertNotIn('standards_intent', record)
+                        self.assertEqual(api.puts, ['README.md'])
+                        continue
+                    github.request.side_effect = request
+                else:
+                    creator.baseline(record, draft, github, guard)
+                before = list(api.puts)
+                if case == 'standards-content': api.files['AGENTS.md']['content'] = base64.b64encode(b'changed').decode()
+                if case == 'standards-parent': api.commits[api.head]['parents'] = []
+                if case in ('unknown-standards', 'standards-content', 'standards-parent'):
+                    with self.assertRaises(RepositoryError): creator.baseline(record, draft, github, Mock())
+                else:
+                    creator.baseline(record, draft, github, Mock())
+                    self.assertEqual(record['baseline']['commit'], 'c' * 40)
+                    self.assertEqual(base64.b64decode(api.files['README.md']['content']), b'# Atlas\n\nBuild agreed Atlas\n')
+                    self.assertEqual(base64.b64decode(api.files['AGENTS.md']['content']).decode(), creation.INITIAL_STANDARDS)
+                self.assertEqual(api.puts, before)
+
+        # Same-origin renamed input: preserve predecessor, never supersede uncertain/created work.
+        for case in ('rename', 'no-approval', 'unknown', 'created', 'baseline', 'attached', 'wrong-choice', 'stale'):
+            with self.subTest(rename=case), tempfile.TemporaryDirectory() as tmp:
+                creator, draft, record, capability = fixture(Path(tmp))
+                record.update(no_creation_effect=True, status='blocked', blocker={'code': 'repository_collision'})
+                prior = {'repository': record['repository']}
+                if case == 'unknown': prior['repository_onboarding'] = {'status': 'pending'}
+                if case == 'created': record['repository_id'] = 77
+                if case == 'baseline': record['baseline_intent'] = {'path': 'README.md'}
+                state = Path(creator.config['state'])
+                with sqlite3.connect(state) as db:
+                    db.execute('CREATE TABLE iterations(project_id TEXT, iteration_id TEXT, payload TEXT, PRIMARY KEY(project_id, iteration_id))')
+                    db.execute('INSERT INTO iterations VALUES(?,?,?)', (record['project'], record['iteration'], json.dumps(prior)))
+                creator.save(record)
+                if case == 'attached': creator.setup.save({'draft_id': draft['draft_id']})
+                draft.update(revision=3 if case == 'stale' else 5, product={'name': 'Available', 'repository_mode': 'new'})
+                if case == 'wrong-choice': draft['product']['name'] = 'Other'
+                creator.enrollment.store.save(draft)
+                if case != 'no-approval':
+                    capability['repository'] = 'owner/available'
+                    Path(creator.setup.config['capability_config']).write_text(json.dumps(capability))
+                def prepared(draft, current, capability):
+                    current.update(repository_id=88, baseline={'commit': 'd' * 40})
+                    creator.save(current)
+                with patch.object(creator, 'prepare', side_effect=prepared) as prepare, patch.object(creator.setup, 'attach', return_value={'status': 'ready', 'blocker': None}) as attach:
+                    if case == 'rename':
+                        self.assertEqual(creator.create(draft['draft_id'], 5, 'owner/available', session_id='native')['status'], 'ready')
+                        saved = creator.read(draft['draft_id'])
+                        self.assertEqual(saved['history'], [record])
+                        self.assertEqual(saved['iteration'], 'm1-r5')
+                        self.assertEqual(saved['repository'], 'owner/available')
+                    else:
+                        with self.assertRaises(RepositoryError): creator.create(draft['draft_id'], draft['revision'], 'owner/available', session_id='native')
+                        prepare.assert_not_called(); attach.assert_not_called()
+                        self.assertEqual(creator.read(draft['draft_id']), record)
+                with sqlite3.connect(state) as db:
+                    self.assertEqual(json.loads(db.execute('SELECT payload FROM iterations').fetchone()[0]), prior)

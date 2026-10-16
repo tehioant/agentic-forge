@@ -11,6 +11,9 @@ from unittest.mock import Mock, patch
 from factory_v1 import assignments, controls, project_execution as execution, readiness_gate, service
 from factory_v1.conversation_enrollment import DraftStore
 from factory_v1.tests import test_readiness
+from factory_v1.project_creation import ProjectCreation
+from factory_v1.tests.test_project_creation import BaselineAPI
+import base64
 
 
 class ProjectExecutionTests(unittest.TestCase):
@@ -32,7 +35,19 @@ class ProjectExecutionTests(unittest.TestCase):
                         (root / name).mkdir(mode=0o700)
                     workspace = root / 'workspaces/product'
                     workspace.mkdir(mode=0o700)
-                    (workspace / 'AGENTS.md').write_text('Meaningful focused unit checks; human-controlled delivery.')
+                    # Real minimal baseline producer feeds the existing standards reader.
+                    # Only Contents API I/O is simulated; no repository/setup lifecycle runs.
+                    if case == 'managed':
+                        baseline_api = BaselineAPI()
+                        creator = object.__new__(ProjectCreation)
+                        creator.save = Mock()
+                        baseline_record = {'repository': 'owner/product', 'marker': 'fixture-baseline'}
+                        creator.baseline(baseline_record, {'product': {'name': 'Product'},
+                            'observations': [{'text': 'Agreed product'}]}, baseline_api, Mock())
+                        for name, file in baseline_api.files.items():
+                            (workspace / name).write_bytes(base64.b64decode(file['content']))
+                    else:
+                        (workspace / 'AGENTS.md').write_text('Meaningful focused unit checks; human-controlled delivery.')
                     state = root / 'state/controller.sqlite'
                     db = sqlite3.connect(state)
                     fixture.db.backup(db)

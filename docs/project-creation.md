@@ -9,7 +9,7 @@ creator = ProjectCreation(enrollment.setup, {
     'root': '/private/creation',
     'state': '/private/creation/history.sqlite',
     'account': 'selected-github-login',
-    'reference': 'reviewed-exact-target-create-and-readme-approval',
+    'reference': 'reviewed-exact-target-create-and-baseline-approval',
 }).register()
 result = creator.create(draft_id, expected_revision, 'selected-github-login/product',
                         session_id=actual_native_session)
@@ -17,7 +17,7 @@ result = creator.create(draft_id, expected_revision, 'selected-github-login/prod
 
 The host provisions a private, separate creation directory and reviewed exact
 repository capability through the existing `ProjectSetup` configuration. The
-reference must authorize private creation **and** the deterministic README
+reference must authorize private creation **and** deterministic README/AGENTS
 initialization, and must equal the capability reference. No secret, grant file,
 initial commit, internal project ID or receipt is requested from the product user.
 No broader grant, visibility change, paid fallback or application code is created.
@@ -38,8 +38,11 @@ a creator does not dispatch a worker or install a second workflow controller.
 Existing `repositories.onboard` performs `/user` identity selection, durable
 new-product intent, private `/user/repos` creation, immutable returned-ID pinning
 and independent exact-name/private/marker readback. A preexisting name is a
-`repository_collision`, never adopted. Choose a different name through a new
-correlated draft, not by mutating an already-committed intent. Lost responses
+`repository_collision`, never adopted. A current correlated renamed-product answer
+can supersede only a proven no-effect collision, with fresh exact-target host
+approval and no attachment, baseline or creation intent. The old journal is archived
+and its intake retained as superseded-no-effect; the new attempt has a versioned
+iteration and marker. Unknown or created effects cannot be superseded. Lost responses
 reuse the retained creation attempt and exact marker; absent or contradictory
 effects stay held and are not blindly retried.
 
@@ -52,7 +55,7 @@ paths retain their own ordinary pause/restart guards; an already-registered T2
 attachment hold is checked before creation and initialization. Private creation
 state is not a worker dispatch binding.
 
-Minimal baseline: a single `README.md` with the agreed name and original retained
+Minimal baseline: `README.md` with the agreed name and original retained
 request. On a verified empty repository only, GitHub Contents API `PUT` creates
 it with base64 content, no update SHA, explicit deterministic commit message and
 no author impersonation. There is no forced push, existing-content update or
@@ -61,6 +64,13 @@ commit is pinned before readback. The initial commit must have no parents, the
 exact marker message and exactly the expected README blob, whose bytes are read
 back at the immutable commit. A lost PUT response is reconciled from those same
 checks without another PUT; missing/changed content or HEAD remains held.
+A second independently intent-bound Contents API PUT creates deterministic
+product-local `AGENTS.md`: agreed-scope work, focused mocked tests, no private
+controller configuration in source, and human-controlled merge/production. It
+copies no shared skills/configuration and grants no execution authority. Its exact
+parent must be the verified README commit; message, sole added blob and immutable
+bytes are read back before attachment to the final commit. Each uncertain write
+is reconciled read-only, never resent; this is not an atomic multifile commit.
 
 T2's attachment journal is seeded with the verified immutable repository ID and
 baseline commit before calling `ProjectSetup.attach`, preventing attachment to a

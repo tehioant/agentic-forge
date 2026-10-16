@@ -4,7 +4,7 @@ import re
 import threading
 
 from . import assignments, planning_wakeup, readiness, repositories, service_dispatch, tickets
-from .conversation_enrollment import native_context
+from .conversation_enrollment import ORIGIN_FIELDS, native_context
 from .planning import require
 from .service import connect
 
@@ -142,8 +142,7 @@ class ProjectHandoff:
 
     def context(self, session_id, **kwargs):
         host = native_context()
-        source = {k: host.get(k, '') for k in (
-            'platform', 'chat_id', 'chat_type', 'thread_id', 'scope_id', 'parent_chat_id', 'user_id')}
+        source = {k: host.get(k, '') for k in (*ORIGIN_FIELDS, 'user_id')}
         _, identity = self.enrollment.identity(source, host.get('platform'))
         draft = self.enrollment.store.read(identity)
         require(draft is not None, 'Admitted project input required.', 'scope_mismatch')
@@ -162,8 +161,7 @@ class ProjectHandoff:
 
     def native_tool(self, name, args, *, session_id='', **kwargs):
         host = native_context()
-        source = {k: host.get(k, '') for k in (
-            'platform', 'chat_id', 'chat_type', 'thread_id', 'scope_id', 'parent_chat_id', 'user_id')}
+        source = {k: host.get(k, '') for k in (*ORIGIN_FIELDS, 'user_id')}
         _, identity = self.enrollment.identity(source, host.get('platform'))
         result = getattr(self.route(identity), name)(args, session_id=session_id, **kwargs)
         if name in {'publish', 'complete'}:
