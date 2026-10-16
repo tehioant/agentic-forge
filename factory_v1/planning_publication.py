@@ -19,8 +19,15 @@ def configuration(path, operator):
         config = publication.read_json(source)
         fields = {'operator_id', 'reference', 'repository', 'repository_id', 'private', 'api_base',
                   'bearer', 'assignment_id', 'session_id', 'parent'}
-        require(isinstance(config, dict) and set(config) == fields and config['operator_id'] == operator and
-                all(text(config[k]) for k in fields - {'repository_id', 'private'}) and
+        delegated = fields - {'bearer'} | {'credential_config', 'delegation_config', 'delegation_pin'}
+        require(isinstance(config, dict) and set(config) in (fields, delegated),
+                'Exact private publication schema required.', 'approval_required')
+        if set(config) == delegated:
+            from .project_native import publication_authority
+            bearer, _ = publication_authority(config)
+            config = dict(config, bearer=bearer)
+        require(config['operator_id'] == operator and
+                all(text(config[k]) for k in set(config) - {'repository_id', 'private'}) and
                 publication.valid_repository(config['repository']) and type(config['repository_id']) is int and
                 config['repository_id'] > 0 and type(config['private']) is bool and assignments.commit(config['parent']),
                 'Exact approved planning publication identity required.', 'approval_required')

@@ -90,6 +90,109 @@ class ConversationBindingTests(unittest.TestCase):
         self.ctx.register_hook.assert_called_once_with('pre_llm_call', self.binding.context)
         self.assertEqual([c.kwargs['name'] for c in self.ctx.register_tool.call_args_list],
                          ['factory_planning_sufficient', 'factory_planning_publish', 'factory_planning_complete'])
+        # Direct host inventory/lifecycle component: no interview, publication or worker chain.
+        import concurrent.futures
+        import time
+        from contextlib import nullcontext
+        from types import SimpleNamespace
+        from factory_v1 import assignments, planning_publication, project_native, service
+        root = self.fixture.root
+        roots = {}
+        for name in ('native', 'drafts', 'setup', 'workspaces', 'credentials'):
+            roots[name] = root / name
+            roots[name].mkdir(mode=0o700)
+        import tempfile
+        native_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(native_directory.cleanup)
+        Path(native_directory.name).chmod(0o700)
+        roots['native'] = Path(native_directory.name)
+        credential = roots['credentials'] / 'github.json'
+        service.atomic(credential, {'operator_id': '42', 'repository': self.item['repository'],
+            'reference': 'reviewed-host', 'api_base': 'https://api.github.com', 'bearer': 'fixture-only-secret'})
+        route = {'repository': self.item['repository'], 'repository_id': 123, 'private': True, 'parent': 'a' * 40,
+            'credential_config': str(credential), 'profile_name': 'native-profile',
+            'source_digest': assignments.digest({'skills': self.selected, 'adaptation': planning.INSTRUCTIONS}),
+            'allowance': {'reference': 'original-finite-approval', 'provider_route': 'reviewed-provider',
+                          'model': 'fixture-model', 'expires_at': int(time.time()) + 600, 'max_wakeups': 1},
+            'input_envelope': {'kind': 'plain'}}
+        inventory = {'operator_id': '42', 'reference': 'reviewed-delegation', 'routes': [route]}
+        selector = roots['credentials'] / 'native.json'
+        service.atomic(selector, inventory)
+        transfer = {'assignment_id': 'origin-assignment'}
+        draft = {'draft_id': 'draft', 'operator_id': '42', 'revision': 1, 'sufficient': True, 'pending_questions': [],
+                 'native': {'session_id': 'native-origin'}, 'origin': self.config['origin'], 'transfer': transfer}
+        attached = {'status': 'ready', 'draft_revision': 1, 'repository': self.item['repository'], 'repository_id': 123,
+                    'commit': 'a' * 40, 'binding': self.config, 'project': 'product', 'iteration': 'm1', 'transfer': transfer}
+        store = SimpleNamespace(root=roots['drafts'], path=lambda identity: roots['drafts'] / identity,
+                                read=lambda identity: copy.deepcopy(draft), locked=nullcontext)
+        enrollment = SimpleNamespace(store=store)
+        setup = SimpleNamespace(root=roots['setup'], workspaces=roots['workspaces'], config={'state': self.config['state']},
+                                read=lambda identity: copy.deepcopy(attached), route=lambda identity: self.binding)
+        self.item['repository_onboarding']['metadata']['private'] = True
+        self.fixture.persist()
+        self.ctx.profile_name = 'native-profile'; self.ctx.get_config.return_value = 'reviewed-provider'
+        metadata = {'id': 123, 'full_name': self.item['repository'], 'name': 'product',
+                    'owner': {'login': 'example'}, 'private': True}
+        host = Mock(base='https://api.github.com')
+        host.request.side_effect = lambda path: copy.deepcopy({'sha': 'a' * 40} if path.endswith('/commits/HEAD') else metadata)
+        spawned = []
+        def spawn(coro, **kwargs):
+            spawned.append(coro); coro.close()
+            return concurrent.futures.Future()
+        self.ctx.spawn_task.side_effect = spawn
+        config = {'root': str(roots['native']), 'capability_config': str(selector)}
+        with patch.object(project_native.repositories, 'GitHub', return_value=host):
+            owner = project_native.NativeProject(enrollment, setup, None, config)
+            paths = owner.resolve('draft')
+            publisher = planning_publication.configuration(paths['publication_config'], '42')
+            self.assertEqual(publisher['bearer'], 'fixture-only-secret')
+            self.assertEqual(json.loads(Path(paths['wakeup_config']).read_text())['allowance'], route['allowance'])
+            self.assertTrue(all('fixture-only-secret' not in p.read_text() for p in roots['native'].rglob('*.json')))
+            self.assertIs(owner.bind(self.binding, 'draft'), self.binding)
+            subscriber = self.binding.wakeup
+            assert subscriber is not None
+            subscriber.joined = Mock(); subscriber.joined.wait.return_value = True
+            self.assertIs(owner.bind(self.binding, 'draft').wakeup, subscriber)
+            self.assertEqual(len(spawned), 1)
+            self.ctx.on_unload.assert_called_once_with(subscriber.stop)
+            for path, body, method in (('/user', None, None), ('/repos/example/product/issues/7', {}, 'POST'),
+                                       ('/repos/example/product/contents/private?ref=' + 'a' * 40, None, None)):
+                with self.subTest(route=path), self.assertRaises(repositories.RepositoryError):
+                    self.binding.github.request(path, body, method)
+            original = copy.deepcopy(inventory)
+            for field, value in (('repository_id', 999), ('private', False), ('parent', 'b' * 40),
+                                  ('source_digest', '0' * 64), ('profile_name', 'wrong-profile'),
+                                  ('input_envelope', {'kind': 'arbitrary'}),
+                                  ('allowance', {**route['allowance'], 'expires_at': 1}),
+                                  ('allowance', {**route['allowance'], 'max_wakeups': 2})) :
+                inventory['routes'][0][field] = value; service.atomic(selector, inventory)
+                with self.subTest(drift=field), self.assertRaises(repositories.RepositoryError): owner.resolve('draft')
+                service.atomic(selector, original); inventory = copy.deepcopy(original)
+            metadata['private'] = False
+            with self.assertRaises(repositories.RepositoryError): self.binding.ctx.get_config('provider_route')
+            with self.assertRaises(repositories.RepositoryError): owner.bind(self.binding, 'draft')
+            self.assertTrue(subscriber.stopped); self.assertTrue(subscriber.task.cancelled())
+            subscriber.joined.wait.assert_called_with(2)
+            metadata['private'] = True
+            owner.close(); owner.close()
+            # Missing native lifecycle blocks, rather than manufacturing a loop/thread.
+            missing = project_native.NativeProject(enrollment, setup, None, config)
+            self.ctx.spawn_task = None
+            with self.assertRaises(repositories.RepositoryError) as error: missing.bind(self.binding, 'draft')
+            self.assertEqual(error.exception.code, 'native_lifecycle_unavailable')
+            # Completed original work can bind read-only with the original expired grant;
+            # only supervise's actual execution/publication receipt may consume it.
+            self.ctx.spawn_task = Mock(side_effect=spawn)
+            self.binding.ctx = self.ctx
+            self.item['planning']['status'] = 'complete'; self.fixture.persist()
+            # Use a separate explicit delegated route claim for this direct fixture.
+            for path in roots['native'].rglob('*.json'): path.unlink()
+            original['routes'][0]['allowance']['expires_at'] = 1; service.atomic(selector, original)
+            completed = project_native.NativeProject(enrollment, setup, None, config)
+            self.assertIs(completed.bind(self.binding, 'draft'), self.binding)
+            self.assertIsNone(self.binding.wakeup); self.ctx.spawn_task.assert_not_called()
+            completed.close()
+
 
     def test_supplied_publication_pointers_cannot_substitute_native_host_execution(self):
         from factory_v1.tests.test_planning import PlanningTests
