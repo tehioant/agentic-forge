@@ -62,6 +62,24 @@ def reload_locked(database, item):
 
 
 NEXT_ADAPTATION = 'factory-next-interview-v1:same-product;explicit-input;preserve-round-gates;automatic-synthesis;host-publication'
+NEXT_INSTRUCTIONS = INSTRUCTIONS + ('\nContinue this SAME product from ALL continuation.previous_specs and the explicit input. '
+    'Preserve any explicit round-completion gate; no synthesis before actual answers. '
+    'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
+    'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
+    'Publish new updated-spec pointers, never overwrite the preceding milestone.')
+
+
+def instructions(item):
+    """Select the exact adaptation; durable successor lineage is checked separately."""
+    if item.get('previous_iteration'):
+        context = item.get('planning', {}).get('continuation', {})
+        require(context.get('adaptation') == NEXT_ADAPTATION and
+                context.get('input') == item['previous_iteration'].get('input'),
+                'Exact continuation adaptation and input required.', 'skill_blocked')
+        return NEXT_INSTRUCTIONS
+    require(not item.get('planning', {}).get('continuation'),
+            'Continuation requires its completed predecessor.', 'skill_blocked')
+    return INSTRUCTIONS
 
 
 def assign(item, request, skills):
@@ -108,7 +126,10 @@ def plan(database, item, request):
     if item.get('reservation'):
         item['reservation']['status'] = 'invalidated'
     transition(item, 'planning_pending')
-    checkpoint(database, item)
+    from .readiness_gate import initial_planning_assignment
+    if previous is None:
+        initial_planning_assignment(database, item)
+    checkpoint(database, item, bootstrap=previous is None)
     return item
 
 
@@ -128,9 +149,12 @@ def validate_documents(docs):
                 for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
 
 
-def checkpoint(database, item, *, resolution=None, operation='work'):
+def checkpoint(database, item, *, resolution=None, operation='work', bootstrap=False):
     from .controls import admission
-    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation=operation):
+    selection = {'planning_bootstrap': item} if bootstrap else None
+    if bootstrap:
+        operation = 'planning-bootstrap'
+    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation=operation, selection=selection):
         require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
         save_iteration(database, item)
         database.commit()

@@ -212,7 +212,7 @@ def delivered_ticket_proof(database, item, delivered, authority, lineage=None):
         assert a is not None
         runtime = a.get('runtime')
         require((runtime is None and not a.get('submitted_result') and
-                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a))) or
+                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a) or bugs.released_claim(database, a))) or
                 (isinstance(runtime, dict) and runtime.get('status') in {'complete', 'stopped', 'failed'} and
                  runtime.get('container_removed') is True and runtime.get('error') != 'stop_unconfirmed'),
                 'Every launched lineage worker needs verified terminal cleanup.', 'cleanup_required')
@@ -261,7 +261,9 @@ def ticket_claims(database, scope):
     from .requirements import released_claim as revised_claim
     from .recovery import released_claim as recovery_claim
     from .restart import released_claim as recovered_claim
+    from .bugs import released_claim as bug_claim
     existing = [old for old in rows(database) if old['handoff']['stage'] != 'diagnosis' and
+                not bug_claim(database, old) and
                 not released_claim(database, old) and not revised_claim(database, old) and
                 not completed_iteration_claim(database, old) and not delivered_ticket_claim(database, old) and
                 not recovery_claim(database, old) and
@@ -280,7 +282,15 @@ def claims(database, request, scope, assignment_id):
     from .restart import released_claim as recovered_claim
     from .recovery import released_claim as recovery_claim
     from .diagnosis import released_claim as directed_claim
+    from .bugs import released_claim as bug_claim
     for old in existing:
+        if old.get('bug_disposition'):
+            require(old['assignment_id'] != assignment_id and old['claim_id'] != request['claim_id'] and
+                    old['handoff']['profile']['name'] != request['profile']['name'] and
+                    old['handoff']['profile']['home'] != request['profile']['home'],
+                    'Bug-rescoped attempts and profiles are historical; use a fresh handoff.', 'claim_conflict')
+            if bug_claim(database, old):
+                continue
         if delivered_ticket_receipt(database, old)[1] is not None:
             require(old['assignment_id'] != assignment_id and old['claim_id'] != request['claim_id'],
                     'Delivered attempts require fresh claims and assignments.', 'claim_conflict')
@@ -503,6 +513,7 @@ def inspect(database, project, iteration, operator, assignment_id):
     require(assignment is not None and assignment['ticket_scope']['project'] == project and
             assignment['ticket_scope']['iteration'] == iteration, 'Exact assignment identity not found.', 'not_found')
     assert assignment is not None
+    require(not assignment.get('bug_disposition'), 'Bug-rescoped work requires a fresh handoff.', 'stale_assignment')
     from .requirements import authority, held_numbers
     number = assignment['ticket_scope']['issue_number']
     require(not assignment.get('requirement_disposition') and number not in held_numbers(item),
@@ -517,6 +528,7 @@ def inspect(database, project, iteration, operator, assignment_id):
 
 
 def require_result_active(assignment):
+    require(not assignment.get('bug_disposition'), 'Bug-rescoped evidence is historical.', 'stale_assignment')
     require(not assignment.get('recovery_disposition'), 'Ordinary work parked for main recovery.', 'main_frozen')
     require(not assignment.get('restart_disposition'), 'Recovered attempt is historical; prepare a fresh scoped claim.', 'stale_assignment')
     require(not assignment.get('requirement_disposition'), 'Obsolete work cannot admit results or merge.', 'requirements_held')

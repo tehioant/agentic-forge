@@ -519,6 +519,30 @@ class PublicationComponentTests(unittest.TestCase):
         namespace = dict(vars(publication))
         exec(compile(source, '<commit-message-guard-probe>', 'exec'), namespace)
         namespace['verify_commit'](api, self.plan, self.config)
+        # A later controlled readiness intent permits replay, never an arbitrary draft bypass.
+        pr = self.read_prs()[0]
+        pr.update(draft=False, node_id='PR_exact20')
+        title, body = pr['title'], pr['body']
+        ready = {'status': 'pending', 'pr_number': pr['number'], 'node_id': pr['node_id'],
+                 'head': self.plan['candidate'], 'authority': {k: self.config[k] for k in ('repository', 'repository_id', 'branch', 'base')}}
+        for defect in ('exact', 'absent', 'head', 'node', 'number', 'repository'):
+            with self.subTest(ready_replay=defect):
+                binding = copy.deepcopy(ready)
+                if defect in ('head', 'node', 'number'):
+                    binding[{'node': 'node_id', 'number': 'pr_number'}.get(defect, defect)] = 'wrong'
+                if defect == 'repository':
+                    binding['authority']['repository'] = 'other/product'
+                if defect == 'exact':
+                    publication.verify_pr(pr, self.config, self.plan, title, body, binding)
+                else:
+                    with self.assertRaises(RepositoryError):
+                        publication.verify_pr(pr, self.config, self.plan, title, body, None if defect == 'absent' else binding)
+        self.prs[0].update(draft=False, node_id='PR_exact20')
+        self.assignment = self.stored()
+        self.assignment['pr_readiness'] = ready
+        self.persist()
+        self.assertEqual(self.publish(), result)
+        self.assertEqual(self.writes(), writes)
 
 
     def test_commit_readback_blocks_followup_matrix(self):
@@ -584,6 +608,18 @@ class PublicationComponentTests(unittest.TestCase):
         self.assertEqual(sum(c[1] == '/pulls' for c in self.writes()), 1)
 
     def test_private_host_authority_and_mount_exclusion_matrix(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        # Public plan-only consumes the exact authorization without publication effects.
+        with closing(sqlite3.connect(self.state)) as db:
+            result = consumer_matrix(self, db, self.config_path, 'publication', lambda: publication.publish(
+                db, 'product', 'm1', '42', self.assignment['assignment_id'], self.config_path, plan_only=True))
+            self.assertEqual(result['status'], 'plan_only')
+        self.assertEqual(self.writes(), [])
+        # The remaining legacy immutable-policy cases use their original fixture.
+        with closing(sqlite3.connect(self.state)) as db:
+            db.execute('DROP TABLE supervised_readiness')
+            db.commit()
+        self.calls.clear()
         before = self.state.read_bytes()
         self.config_path.chmod(0o644)
         self.refuse('approval_required')

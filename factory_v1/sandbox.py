@@ -12,7 +12,7 @@ import threading
 import tempfile
 import time
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from . import assignments, review, spending
@@ -20,7 +20,7 @@ from .planning import require
 from .repositories import RepositoryError, state_lock
 from .sandbox_guard import process_identity
 from .sandbox_checks import verify_checks
-from .sandbox_policy import Docker, command, load_config, retain_logs, verify
+from .sandbox_policy import Docker, command, load_config, retain_logs, verify, verify_storage
 from .sandbox_source import manifest, physical, snapshot
 
 TOOLS = {'terminal', 'process_manage', 'read_file', 'write_file', 'patch', 'search_files'}
@@ -204,9 +204,19 @@ def finalize_result(state, project, iteration, operator, assignment_id, run_id, 
     # Stuckness and diagnosis retain a red loop; neither claims a verified fix.
     assert assignment is not None
     result = check_worker_evidence(assignment, root, selected_inputs)
+    @contextmanager
+    def admit_checks():
+        with closing(sqlite3.connect(state)) as database, state_lock(database):
+            current = correlated(database, project, iteration, operator, assignment_id, run_id)
+            require(current['runtime']['status'] == 'running', 'Stopped run cannot start independent checks.', 'cancelled')
+            assignments.current(database, project, iteration, operator)
+            with admission(database, project, iteration, operation='effect',
+                    selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path}):
+                yield
+
     checks_verified = (False if (result.get('status') == 'stuck' and assignment['handoff']['stage'] in
                                  {'implementation', 'corrections', 'repair'}) or assignment['handoff']['stage'] == 'diagnosis'
-                       else verify_checks(root, config, runtime, deadline))
+                       else verify_checks(root, config, runtime, deadline, admit=admit_checks))
     with closing(sqlite3.connect(state)) as database, state_lock(database):
         assignment = correlated(database, project, iteration, operator, assignment_id, run_id)
         result = check_worker_evidence(assignment, root, selected_inputs)
@@ -231,11 +241,15 @@ def finalize_result(state, project, iteration, operator, assignment_id, run_id, 
 def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, root, runtime, stop, docker, guard, broker, broker_errors, capability, signals, status, error_code, config_path):
     from .readiness_gate import check
     stop.set()
+    diagnostics_error = None
     try:
         docker.remove(runtime['container'])
     except (RepositoryError, OSError):
         error_code, status = 'stop_unconfirmed', 'unconfirmed'
-    (root / 'guard-finish').touch()
+    try:
+        (root / 'guard-finish').touch()
+    except OSError:
+        diagnostics_error = 'artifacts_unavailable'
     if guard:
         try:
             guard.wait(timeout=35)
@@ -268,6 +282,8 @@ def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, 
                 status, error_code = 'failed', error.code
         assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                      container_removed=status != 'unconfirmed', recoverable=status != 'complete')
+        if diagnostics_error:
+            assignment['runtime']['diagnostics_error'] = diagnostics_error
         save(database, assignment)
     return assignment
 
@@ -417,6 +433,7 @@ def launch(state, project, iteration, operator, assignment_id, config_path, gith
         require(not stop.is_set() and not (root / 'stop').exists(), 'Attempt cancelled before worker start.', 'cancelled')
         with closing(sqlite3.connect(state)) as database, state_lock(database):
             check(database, project, iteration, selection={'assignment_id': assignment_id, 'run_id': run_id, 'launcher': config_path})
+            verify_storage(config, mounts)
             docker.call('start', runtime['container'])
         deadline = time.monotonic() + config['limits']['seconds']
         status, error_code = wait_for_worker(state, project, iteration, operator, assignment_id, run_id,
@@ -451,6 +468,7 @@ def owned_assignment(database, project, iteration, operator, assignment_id):
     assignment = next((row for row in assignments.rows(database) if row['assignment_id'] == assignment_id), None)
     require(assignment is not None and assignment['ticket_scope']['project'] == project and
             assignment['ticket_scope']['iteration'] == iteration, 'Exact assignment ownership required.', 'not_found')
+    assert assignment is not None
     return assignment
 
 
@@ -459,15 +477,31 @@ def stop_assignment(database, project, iteration, operator, assignment_id):
         assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         runtime = assignment.get('runtime')
         require(runtime is not None, 'Assignment has no running attempt.', 'not_found')
-        root = physical(runtime['artifacts'], directory=True)
-        (root / 'stop').touch()
-    docker = Docker()
-    retain_logs(docker, runtime['container'], root)
-    docker.remove(runtime['container'])
+        assert runtime is not None
+        root = None
+        diagnostics_error = None
+        try:
+            root = physical(runtime['artifacts'], directory=True)
+            (root / 'stop').touch()
+        except (RepositoryError, OSError):
+            diagnostics_error = 'artifacts_unavailable'
+    removed = False
+    try:
+        docker = Docker()
+        if root is not None:
+            retain_logs(docker, runtime['container'], root)
+        docker.remove(runtime['container'])
+        removed = True
+    except (RepositoryError, OSError):
+        pass  # Persist uncertainty; never retire ownership based on a marker.
     with state_lock(database):
         assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         require(assignment['runtime']['run_id'] == runtime['run_id'], 'Run changed during stop.', 'run_conflict')
-        assignment['runtime'].update(status='stopped', error='cancelled', container_removed=True, recoverable=True)
+        assignment['runtime'].update(status='stopped' if removed else 'unconfirmed',
+                                     error='cancelled' if removed else 'stop_unconfirmed',
+                                     container_removed=removed, recoverable=True)
+        if diagnostics_error:
+            assignment['runtime']['diagnostics_error'] = diagnostics_error
         save(database, assignment)
     return assignment
 
@@ -477,11 +511,13 @@ def reconcile(database, project, iteration, operator, assignment_id):
         assignment = owned_assignment(database, project, iteration, operator, assignment_id)
         runtime = assignment.get('runtime')
         require(runtime is not None, 'Assignment has no attempt to reconcile.', 'not_found')
+        assert runtime is not None
         from .sandbox_guard import same_process
         require(not same_process(process_identity(runtime['controller_pid']), runtime['controller_start']),
                 'Live controller still owns this attempt; stop it instead.', 'run_conflict')
     result = stop_assignment(database, project, iteration, operator, assignment_id)
-    result['runtime']['error'] = 'controller_lost'
+    if result['runtime']['container_removed'] is True:
+        result['runtime']['error'] = 'controller_lost'
     with state_lock(database):
         save(database, result)
     return result

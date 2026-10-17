@@ -89,8 +89,10 @@ def sync_blocks(database, item, record, github, release=False):
     rows = {r['number']: r for r in observed['ticket_work']['frontier']['items']}
     other = {n for r in observed.get('stuck_work', {}).values() if r is not record and
              r['pins'] != record['pins'] and r['status'] != 'released' for n in r['affected']}
+    from .requirements import held_numbers as revision_holds
+    other |= revision_holds(observed)
+    from .tracker_holds import option, representation, represented_role
     board = observed['ticket_work']['board']
-    statuses = observed['ticket_work']['request']['tracker']['statuses']
     for number in record['affected']:
         row = rows.get(number)
         require(row is not None and row['issue_state'] == 'open' and
@@ -102,18 +104,36 @@ def sync_blocks(database, item, record, github, release=False):
                 'Affected requirements changed; stale direction cannot release revised scope.', 'scope_mismatch')
     for number in record['affected']:
         row = rows[number]
+        fresh = tickets.frontier(database, observed, github)
+        current = next((r for r in fresh['ticket_work']['frontier']['items'] if r['number'] == number), None)
+        require(current == row, 'Affected membership, scope or progress changed before mutation.', 'publication_mismatch')
         target = record['previous_statuses'][str(number)] if release and number not in other else 'blocked'
         # A retry is eligible work, not an automatically active implementation.
         if target == 'active':
             target = 'ready'
-        if row['status'] != target:
+        desired = option(observed['ticket_work'], board, target)
+        # Refresh exact identity, body and membership after every preceding read
+        # and before the final scoped effect guard, including on retry release.
+        issue = tickets.gh.read_issue(github, item['repository'], number)
+        require(issue.get('state') == 'open' and issue.get('id') == row['id'] and issue.get('node_id') == row['node_id'] and
+                hashlib.sha256(issue['body'].encode()).hexdigest() == record['issues'][str(number)]['body_sha256'],
+                'Affected requirements changed during status synchronization.', 'scope_mismatch')
+        represented = represented_role(observed['ticket_work'], target)
+        if release:
+            require(row['status'] in {'blocked', represented} or
+                    representation(observed['ticket_work']) == 'native-active-with-durable-hold' and row['status'] == 'active',
+                    'Independent progress cannot be overwritten by diagnosis release.', 'publication_mismatch')
+        if row['status'] != represented:
+            tickets.effect_check(database, observed)
             tickets.gh.set_field(github, board['project_id'], row['membership_id'], board['status']['id'],
-                                 board['status']['options'][statuses[target]])
+                                 desired)
         readback = tickets.frontier(database, observed, github)
         exact = next(r for r in readback['ticket_work']['frontier']['items'] if r['number'] == number)
-        require(exact['status'] == target and exact['issue_state'] == 'open',
+        require(exact['status'] == represented and exact['issue_state'] == 'open' and
+                all(exact[k] == row[k] for k in ('id', 'node_id', 'membership_id')),
                 'Exact blocked/retry status did not read back.', 'publication_mismatch')
         observed = readback
+    observed['stuck_work'][record['pins']['stuck_assignment']]['hold_representation'] = representation(observed['ticket_work'])
     return observed
 
 
@@ -337,7 +357,10 @@ def authorization(database, path, operator, axis):
     root = physical(axis['runtime']['artifacts'], directory=True)
     require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
             'Private host execution envelope required.', 'execution_required')
-    config = simplification.object_json(path.read_text(), 'invalid_diagnosis')
+    from .readiness_gate import runtime_receipt
+    scope = axis['ticket_scope']
+    config = runtime_receipt(database, scope['project'], scope['iteration'], 'diagnosis', str(path))
+    assert config is not None
     require(set(config) == {'operator_id', 'execution_reference', 'diagnosis'} and config['operator_id'] == operator and
             text(config['execution_reference']) and config['diagnosis'] == execution_binding(axis),
             'Independent host verification must bind the exact debug execution.', 'execution_required')

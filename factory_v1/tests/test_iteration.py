@@ -111,6 +111,26 @@ class IterationComponents(unittest.TestCase):
                 self.complete()
         self.assertNotIn('completion', self.stored())
         self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
+        for applicability in ('configured', 'not-applicable'):
+            with self.subTest(deployment_applicability=applicability):
+                self.db.execute('DELETE FROM notifications')
+                self.item = context()
+                self.store()
+                config = dict(self.saved['config'], deployment_applicability=applicability)
+                health = dict(self.health)
+                if applicability == 'not-applicable':
+                    health['deployment'] = {'applicability': applicability, 'contract_sha256': 'e' * 64}
+                with patch.object(delivery, 'monitor_state', return_value=dict(self.saved, config=config)), \
+                        patch.object(delivery, 'observe', return_value=health):
+                    report = self.complete()
+                self.assertEqual(report['report']['delivery'], health)
+                message = attention.records(self.db, 'product', 'm1', self.stored())[0]['event']['message']
+                self.assertIn(SHA, message)
+                self.assertIn('Deferred issues: []. Pending decisions: [].', message)
+                if applicability == 'not-applicable':
+                    self.assertIn('Deployment not applicable; exact-main CI and acceptance verified', message)
+                else:
+                    self.assertIn('Deployment 9', message)
 
     def test_required_scope_and_tracker_guards_matrix(self):
         cases = [('field', (field, value)) for field, value in [('status', 'blocked'), ('status', 'ready'), ('status', 'deferred'), ('issue_state', 'open'), ('held', True), ('contract_valid', False), ('state_reason', 'not_planned')]]
@@ -360,6 +380,51 @@ class ContinuationComponents(unittest.TestCase):
 
 
 
+    def test_supervised_continuation_atomic_scope_and_successor_fence(self):
+        from factory_v1 import controls, readiness, readiness_gate
+        self.item['repository_onboarding']['api_base'] = 'https://api.github.com'
+        with self.db:
+            save_iteration(self.db, self.item)
+            self.db.execute('CREATE TABLE supervised_readiness (project TEXT, iteration TEXT, service TEXT, policy TEXT, PRIMARY KEY(project,iteration))')
+            self.db.execute('INSERT INTO supervised_readiness VALUES (?,?,?,?)', ('product', 'm1', '/approved/service.json', 'sealed'))
+            self.db.execute('CREATE TABLE model_grants (project TEXT, iteration TEXT, grant_id TEXT, remaining INTEGER)')
+            self.db.execute('INSERT INTO model_grants VALUES (?,?,?,?)', ('product', 'm1', 'predecessor-only-grant', 10))
+        config = {'project': 'product', 'iteration': 'm1', 'operator_id': '42',
+                  'state': str(self.root / 'state.sqlite')}
+        report = {'checks': {k: {'state': 'ready'} for k in ('scope', 'stages', 'notification')}}
+        with patch.object(readiness_gate, 'configuration', return_value=(config, {})), \
+                patch.object(readiness_gate, 'policy', return_value='sealed'), \
+                patch.object(readiness, 'collect', return_value=report), \
+                patch('factory_v1.service.github_client', return_value=Mock()):
+            with self.assertRaises(RepositoryError):
+                readiness_gate.check(self.db, 'product', 'm1')
+            before = copy.deepcopy(self.item)
+            def last_read_pause(*args, **kwargs):
+                controls.request(self.db, 'product', 'm1', '42', 'pause', 'continuation-last-read')
+                return report
+            with patch.object(readiness, 'collect', side_effect=last_read_pause):
+                with self.assertRaises(RepositoryError): self.start()
+            self.assertTrue(controls.blocked(self.db, 'product', 'm1'))
+            self.assertIsNone(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m2'").fetchone())
+            # Restore the independent no-control fixture for the atomic crash case.
+            controls.paths(self.db, 'product', 'm1')[1].unlink()
+            with patch.object(readiness_gate, 'inherit_supervision', side_effect=RuntimeError('atomic crash')):
+                with self.assertRaises(RuntimeError): self.start()
+            self.assertIsNone(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m2'").fetchone())
+            self.assertEqual(json.loads(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m1'").fetchone()[0]), before)
+            result = self.start()
+            self.assertEqual(result['status'], 'active')
+            self.assertEqual(readiness_gate.binding(self.db, 'product', 'm2'), ('', None))
+            self.assertEqual(self.db.execute('SELECT * FROM model_grants').fetchall(),
+                             [('product', 'm1', 'predecessor-only-grant', 10)])
+            self.assertEqual(self.start(), result)
+            with self.assertRaises(RepositoryError): readiness_gate.check(self.db, 'product', 'm1')
+        # The new row cannot acquire ordinary work through an unsupervised window.
+        with self.assertRaises((RepositoryError, OSError)):
+            readiness_gate.check(self.db, 'product', 'm2')
+        readiness_gate.register(self.db, '/approved/successor.json', {**config, 'iteration': 'm2'})
+        self.assertEqual(readiness_gate.binding(self.db, 'product', 'm2'), ('/approved/successor.json', None))
+
     def evidence(self, item, sufficient=True):
         selected = item['planning']['skills']
         continuation = item['planning']['continuation']
@@ -484,7 +549,7 @@ class FocusedInvariantMatrices(unittest.TestCase):
         f.setUp()
         self.addCleanup(f.doCleanups)
         f.observed['items'].append(work_row(2))
-        f.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
+        f.mocks['merge.load_config'].side_effect = lambda path, operator, *, database, project, iteration: {'issue': 1 if path == 'one.json' else 2}
 
         def delivered(database, item, row, *args):
             return dict(f.delivered, issue=dict(f.delivered['issue'], number=row['number']))

@@ -74,7 +74,7 @@ def scope(item, config):
             binding.get('operator_id') == native.get('operator_id') and
             binding.get('reference') == native.get('binding_reference') and
             native.get('sources') == selected == work['skills'] and
-            native.get('adaptation') == work['instructions'] == planning.INSTRUCTIONS and
+            native.get('adaptation') == work['instructions'] == planning.instructions(item) and
             config['source_digest'] == assignments.digest({'skills': selected, 'adaptation': work['instructions']}) and
             native.get('observations') and text(native.get('run_id')) and
             text(native.get('task_id')) and text(native.get('turn_id')),
@@ -259,8 +259,12 @@ class NativeWakeup:
                 'Wrong native profile or binding.', 'scope_mismatch')
         with connect(self.binding.config) as database, mailbox_lock(database):
             item, _ = self.binding.current(database, self.binding.config['session_id'])
-            identity = scope(item, config)
             request = item['planning'].get('native_wakeup')
+            if not item['planning'].get('native_execution') and request is None:
+                self.status = 'waiting_input'
+                return
+            identity = scope(item, config)
+            self.status = 'enqueue_unknown' if request is not None and request.get('status') == 'enqueue_unknown' else 'idle'
             if request is None or request.get('cancelled') or request.get('status') != 'requested':
                 return
             require(request.get('config_path') == self.path and all(request.get(k) == v for k, v in identity.items()) and
@@ -294,8 +298,12 @@ class NativeWakeup:
             while not self.stopped:
                 try:
                     self.step()
+                    if self.status == 'enqueue_unknown':
+                        self.status = 'held'
+                        return
                 except RepositoryError as error:
-                    if error.code == 'mailbox_busy':
+                    if error.code in {'mailbox_busy', 'iteration_paused'}:
+                        self.status = 'waiting'
                         await asyncio.sleep(1)
                         continue
                     self.status = 'held'

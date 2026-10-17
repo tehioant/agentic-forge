@@ -16,7 +16,10 @@ Every operation uses the existing state lock and durable SQLite record. `inspect
    affected issue identities/bodies and exact old revision pins. Material changes include
    all transitive dependents from the authoritative native blocking graph. The hold and
    evidence invalidation commit atomically **before** board changes. Open or delivered
-   affected issues become open/Blocked with exact readbacks. Obsolete assignments,
+   affected issues become open/Blocked with exact readbacks. Native three-status boards
+   instead show In Progress plus an explicit durable hold (`hold_representation`); this
+   is not a claim that a nonexistent Blocked option was written. Held rows do not count
+   as active engineering ownership and cannot satisfy completed prerequisites. Obsolete assignments,
    candidate/skill/review/check/completion evidence remain historical, never admissible.
    Only terminal, confirmed-cleaned old attempts release their claims; live/unconfirmed
    ownership is not stolen. Independent work retains its old authority only after explicit
@@ -142,13 +145,29 @@ supply that trust. There is **no bundled production adapter or default model fal
 The CLI exposes **no manual synthesis-artifact completion command** for revisions. A
 missing/unapproved/changed adapter or skill refuses before execution. An admitted failed,
 malformed or interrupted synthesis attempt remains uncertain and cannot automatically
-retry, reset allowance, infer success or publish. Restore/reconcile the exact trusted
+retry, reset allowance, infer success or publish. If the original complete output already
+exists in `execution_receipts`, the same resynthesis command can consume it without
+invoking that stage again: the admitted attempt's exact input digest and complete host
+capability (including independent provenance reference) must match, and executing-context
+loads/result evidence and current admission are revalidated. Raw output without its
+original admitted attempt, missing output, changed authority or invalid evidence stays held.
+Restore/reconcile the exact trusted
 capability/attempt before any separately authorized repair; this slice does not invent an
 uncertain-execution retry policy. Publication intents precede ref/spec/ticket writes;
 lost responses reconcile exact readbacks, and absent effects stay uncertain rather than
 blindly creating duplicates. Unknown commit outcomes likewise require investigation.
 
 ## Minor clarification and merge safety
+
+Controlled bug-blocker edits use a separate `bug_disposition`, not a product-direction
+revision or a rewrite of existing handoffs. Before editing affected pinned bodies, every
+retained worker needs terminal verified cleanup. Exact old claims and reservations are
+parked with the bug assignment, issue, body intent, original handoff/revision and cleanup
+identity. Historical handoffs, results and profiles cannot be reused; subsequent work needs
+a fresh claim/profile and handoff against the current body after its blocker is complete.
+Restart checks the controlled edit lineage and still refuses unrelated identity/body drift.
+Diagnosis block/retry status mutations use fresh scope/progress observations and final
+scoped effect admission; independently held work and operator interruption remain held.
 
 `kind: minor` records the authenticated clarification and explicit validity receipts
 without changing authoritative specs/tickets, statuses or existing revision pins. It is a

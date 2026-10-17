@@ -7,11 +7,11 @@ from pathlib import Path
 
 from .planning import require
 from .repositories import RepositoryError
-from .sandbox_policy import Docker, command, retain_logs, verify
+from .sandbox_policy import Docker, command, retain_logs, verify, verify_storage
 from .sandbox_source import manifest
 
 
-def verify_checks(root, config, runtime, deadline):
+def verify_checks(root, config, runtime, deadline, *, admit):
     commands = config.get('verification_commands', [])
     if not commands:
         return False
@@ -41,16 +41,22 @@ def verify_checks(root, config, runtime, deadline):
     argv = command(check_config, name, mounts)
     (checks / 'launch-command.json').write_text(json.dumps(argv))
     try:
-        require(not (root / 'stop').exists(), 'Attempt cancelled before independent checks.', 'cancelled')
-        docker.call(*argv)
+        with admit():
+            require(not (root / 'stop').exists(), 'Attempt cancelled before independent checks.', 'cancelled')
+            require(time.monotonic() < deadline, 'Independent checks reached attempt deadline.', 'time_limit')
+            docker.call(*argv)
         inspection = docker.inspect(name)
         verify(inspection, check_config, name, image_id, mounts)
         (checks / 'container-inspection.json').write_text(json.dumps(inspection))
-        require(not (root / 'stop').exists(), 'Attempt cancelled before check start.', 'cancelled')
-        docker.call('start', name)
-        while True:
-            require(not (root / 'stop').exists(), 'Attempt cancelled during checks.', 'cancelled')
+        with admit():
+            require(not (root / 'stop').exists(), 'Attempt cancelled before check start.', 'cancelled')
             require(time.monotonic() < deadline, 'Independent checks reached attempt deadline.', 'time_limit')
+            verify_storage(check_config, mounts)
+            docker.call('start', name)
+        while True:
+            with admit():
+                require(not (root / 'stop').exists(), 'Attempt cancelled during checks.', 'cancelled')
+                require(time.monotonic() < deadline, 'Independent checks reached attempt deadline.', 'time_limit')
             observed = docker.inspect(name)
             if observed is None:
                 raise RepositoryError('verification_failed', 'Independent check container disappeared.')
@@ -74,10 +80,11 @@ def verify_checks(root, config, runtime, deadline):
                 for expected, record in zip(commands, records)),
                 'Independent check record does not match controller-admitted commands.', 'verification_failed')
         require(manifest(workspace) == candidate, 'Candidate changed during independent checks.', 'invalid_result')
-        require(not (root / 'stop').exists(), 'Attempt cancelled before accepting checks.', 'cancelled')
-        (root / 'controller-checks.json').write_text(json.dumps(
-            {'run_id': runtime['run_id'], 'candidate': candidate, 'records': records,
-             'provenance': 'controller_admitted_read_only_sandbox_checks'}))
+        with admit():
+            require(not (root / 'stop').exists(), 'Attempt cancelled before accepting checks.', 'cancelled')
+            (root / 'controller-checks.json').write_text(json.dumps(
+                {'run_id': runtime['run_id'], 'candidate': candidate, 'records': records,
+                 'provenance': 'controller_admitted_read_only_sandbox_checks'}))
         return True
     except RepositoryError:
         if (root / 'stop').exists():

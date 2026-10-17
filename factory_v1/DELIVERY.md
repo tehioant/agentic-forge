@@ -5,6 +5,25 @@ operations. They use Python, SQLite, the existing state lock and durable attenti
 outbox; polling does not launch Hermes or use an LLM. No repair worker, deployment,
 GitHub mutation, public listener or live message is launched by these commands.
 
+## Explicit non-deployment projects
+
+A CLI/library project must still configure delivery; omission is not N/A. Add
+`"deployment_applicability": "not-applicable"`, set `environment` and
+`contract.health_url` to JSON `null`, and map each `contract.acceptance` criterion
+to a positive workflow ID present in `required_workflows`, for example
+`{"cli-smoke": 11}`. Keep the immutable agreement `reference`/`revision`, all
+app-bound `required_checks`, and all `required_workflows`. Each selected workflow
+must complete successfully on exact current main; pending, missing, failed or
+wrong-head CI/acceptance remains unhealthy/unknown and blocks supervision.
+No health endpoint or Deployment is queried in this explicit branch. Evidence
+records deployment as `not-applicable` with the contract digest, never a fabricated
+deployment ID. Monitoring, recovery clearance and completion use the same pinned
+observation. Configuration cannot switch applicability inside a running iteration.
+
+An absent discriminator preserves the existing configured-deployment schema;
+`"deployment_applicability": "configured"` makes that choice explicit. Both retain
+all existing latest-deployment, exact-head health and failure/unknown guards.
+
 ## Configure the product contract explicitly
 
 The operator/controller must resolve the environment, required CI/CD workflows,

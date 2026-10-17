@@ -132,8 +132,21 @@ issue identity/body, immutable spec documents and specification issue, revision,
 installed inputs/native chain, current independent acceptance, protection, exact
 app-bound branch checks and baseline. Main must still equal the reviewed baseline.
 PR must be non-draft, open, unmerged, mergeable and `mergeable_state=clean`.
-#14 intentionally publishes a **draft**; making it ready through an independently
-scoped trusted path remains a prerequisite, not permission for this CLI to mutate readiness.
+Publication initially produces a **draft**. After exact independent reviews,
+candidate checks, protection, current requirement publication and final scoped
+admission, `merge-candidate` retains a separate exact PR/node/head/host-authority
+readiness intent, then invokes only `markPullRequestReadyForReview` for that node.
+It rereads the fixed PR/head and records readiness only when draft is false.
+The operation returns `ready`, without a merge intent or merge PUT; the next
+service tick must freshly pass every ordinary non-draft/clean merge gate.
+GraphQL readiness has no expected-head parameter, so pre/post head checks detect
+concurrent head drift and block progression; the subsequent merge remains SHA-bound.
+Lost responses reconcile from exact readback. Pending intent plus a still-draft PR
+is uncertain and is never blindly resent. Publication replay accepts a ready PR
+only with the correlated local readiness intent; it never converts it back to draft.
+The earlier `prepared` checkpoint has not reached the transport and may resume
+through all guards. A pre-transport refusal records that known-no-effect state;
+it does not downgrade an uncertain attempted mutation into permission to retry.
 
 Ordinary candidates also require passing required checks on baseline main. Failed
 or unknown main checks refuse ordinary admission. A durable iteration `main_incident`

@@ -1,4 +1,6 @@
 """Trusted discovered-bug synthesis and scoped, reconciled GitHub tracking only."""
+import hashlib
+import json
 import re
 import uuid
 
@@ -310,6 +312,100 @@ def edges(database, item, work, github, number, expected, *, resolution=None):
             'Exact native bug edges did not read back.', 'publication_mismatch')
 
 
+def cleanup_verified(assignment):
+    runtime = assignment.get('runtime')
+    return (runtime is None and not assignment.get('submitted_result') or
+            isinstance(runtime, dict) and runtime.get('status') in {'complete', 'failed', 'stopped'} and
+            runtime.get('container_removed') is True and runtime.get('error') != 'stop_unconfirmed')
+
+
+def released_claim(database, assignment):
+    """Only the exact parked handoff/bug intent releases historical ownership."""
+    from . import assignments
+    disposition = assignment.get('bug_disposition')
+    if not isinstance(disposition, dict) or not cleanup_verified(assignment):
+        return False
+    scope = assignment['ticket_scope']
+    row = database.execute('SELECT payload FROM iterations WHERE project_id=? AND iteration_id=?',
+                           (scope['project'], scope['iteration'])).fetchone()
+    item = json.loads(row[0]) if row else {}
+    work = next((w for w in [*item.get('bug_work', {}).values(), *item.get('bug_work_history', [])]
+                 if w['assignment_id'] == disposition.get('bug_assignment')), None)
+    if work is None:
+        return False
+    intent = work.get('affected_intents', {}).get(str(scope['issue_number']))
+    original = next((o['issue'] for o in work['candidates'] if o['issue']['number'] == scope['issue_number']), None)
+    return bool(intent and scope['repository'] == item['repository'] and
+        original and scope['issue_id'] == original['id'] and
+        all(assignment['handoff']['issue'][k] == original[k] for k in ('number', 'id', 'node_id')) and
+        scope['issue_number'] in work['bug']['affected'] and
+        disposition == work.get('parked_assignments', {}).get(assignment['assignment_id']) and
+        disposition.get('bug_issue') == work.get('identity') and
+        disposition.get('handoff_digest') == assignment['handoff_digest'] == assignments.digest(assignment['handoff']) and
+        disposition.get('revision') == assignment['revision'] and
+        disposition.get('claim_id') == assignment['claim_id'] and
+        disposition.get('cleanup') == cleanup_pin(assignment) and
+        assignment['handoff']['issue']['body_sha256'] == hashlib.sha256(intent['before'].encode()).hexdigest() and
+        disposition.get('body_sha256') == hashlib.sha256(intent['body'].encode()).hexdigest())
+
+
+def cleanup_pin(assignment):
+    runtime = assignment.get('runtime')
+    return None if runtime is None else {k: runtime.get(k) for k in
+        ('run_id', 'container', 'status', 'container_removed', 'error')}
+
+
+def rescope_body_matches(item, assignment, issue):
+    """Follow only correlated controller blocker edits, never repin old evidence."""
+    pin = assignment['bug_disposition']['body_sha256']
+    actual = hashlib.sha256(issue['body'].encode()).hexdigest()
+    edits = {}
+    for work in [*item.get('bug_work', {}).values(), *item.get('bug_work_history', [])]:
+        for number, intent in work.get('affected_intents', {}).items():
+            if str(issue['number']) != number:
+                continue
+            original = next((o['issue'] for o in work['candidates'] if str(o['issue']['number']) == number), None)
+            if original and all(original[k] == issue[k] for k in ('number', 'id', 'node_id')):
+                edits[hashlib.sha256(intent['before'].encode()).hexdigest()] = hashlib.sha256(intent['body'].encode()).hexdigest()
+    seen = set()
+    while pin != actual and pin in edits and pin not in seen:
+        seen.add(pin)
+        pin = edits[pin]
+    return pin == actual
+
+
+def park_affected(database, item, work, number, intent, *, resolution=None):
+    from . import assignments, controls
+    original = next(o['issue'] for o in work['candidates'] if o['issue']['number'] == number)
+    scoped = [a for a in assignments.rows(database) if
+               (a['ticket_scope']['project'], a['ticket_scope']['iteration'], a['ticket_scope']['issue_number']) ==
+               (item['project_id'], item['iteration_id'], number)]
+    require(all(cleanup_verified(a) for a in scoped),
+            'Reconcile every affected worker cleanup before bug rescope.', 'cleanup_required')
+    related = [a for a in scoped if not a.get('bug_disposition') and
+               not a.get('requirement_disposition') and not a.get('recovery_disposition') and not a.get('stuck_disposition')]
+    for assignment in related:
+        require(assignment['ticket_scope']['repository'] == item['repository'] and
+                assignment['ticket_scope']['issue_id'] == original['id'] and
+                all(assignment['handoff']['issue'][k] == original[k] for k in ('number', 'id', 'node_id')) and
+                assignment['handoff']['issue']['body_sha256'] == hashlib.sha256(intent['before'].encode()).hexdigest() and
+                assignments.digest(assignment['handoff']) == assignment['handoff_digest'],
+                'Affected claim does not bind the original issue body.', 'scope_mismatch')
+    with controls.admission(database, item['project_id'], item['iteration_id'], operation='effect', resolution=resolution):
+        for assignment in related:
+            disposition = {'bug_assignment': work['assignment_id'], 'bug_issue': work['identity'],
+                'handoff_digest': assignment['handoff_digest'], 'revision': assignment['revision'],
+                'claim_id': assignment['claim_id'], 'cleanup': cleanup_pin(assignment),
+                'body_sha256': hashlib.sha256(intent['body'].encode()).hexdigest()}
+            work.setdefault('parked_assignments', {})[assignment['assignment_id']] = disposition
+            assignment['bug_disposition'] = disposition
+            database.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
+                (json.dumps(assignment, sort_keys=True), assignment['assignment_id']))
+        if item.get('reservation', {}).get('issue_number') == number:
+            item.setdefault('reservation_history', []).append(item.pop('reservation'))
+        tickets.checkpoint(database, item)
+
+
 def affected_edges(database, item, work, github, issue, *, resolution=None):
     for number in work['bug']['affected']:
         original = next(o for o in work['candidates'] if o['issue']['number'] == number)
@@ -329,13 +425,13 @@ def affected_edges(database, item, work, github, issue, *, resolution=None):
             replacement = newline + newline.join('- #' + str(n) for n in expected_numbers) + newline * 2
             target = dependent['body'][:start] + replacement + dependent['body'][end:]
             intents[key] = {'before': dependent['body'], 'body': target}
-            tickets.effect_checkpoint(database, item, resolution=resolution)
         intent = intents[key]
         require(tickets.external_contract({**dependent, 'body': intent['body']}, work.get('scoped_inputs', {}).get(key, work['inputs'])) and
                 set(re.findall(r'#([1-9][0-9]*)', sections(intent['body']).get('Blocked by', ''))) ==
                 {str(n) for n in expected_numbers},
                 'Affected text intent does not contain the exact desired blockers.', 'publication_mismatch')
         require(dependent['body'] in {intent['before'], intent['body']}, 'Affected body conflicts with scoped edge update.', 'publication_mismatch')
+        park_affected(database, item, work, number, intent, resolution=resolution)
         if dependent['body'] != intent['body']:
             tickets.active(item, database, resolution=resolution)
             tickets.effect_check(database, item, resolution=resolution)

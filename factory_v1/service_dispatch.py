@@ -98,6 +98,10 @@ def select(item, rows, config):
     wait = pending(child)
     if wait:
         return wait
+    route = simplification.findings_route(child)
+    if route:
+        # Legacy fixed envelopes have no fresh corrective slots; explicitly escalate.
+        return 'simplification-direction', child['assignment_id']
     axes = {}
     for axis in ('review-standards', 'review-spec'):
         found = unique(rows, lambda row: row['handoff']['stage'] == axis and
@@ -301,6 +305,9 @@ def tick(service, github, *, stop_event=None):
                 simplification.prepare(database, *scope(service), {'implementation_assignment': target, **role}, github)
             else:
                 review.prepare(database, *scope(service), {'candidate_assignment': target, 'axis': action, **role}, github)
+        elif action == 'simplification-direction':
+            simplification.request_findings_direction(database, *scope(service), target)
+            return blocked('simplification_operator_revision_required')
         elif action == 'launch':
             assignment = assignments.inspect(database, *scope(service), target)
             stage = assignment['handoff']['stage']
@@ -327,7 +334,8 @@ def tick(service, github, *, stop_event=None):
             else:
                 if config['merge_config'] is None:
                     return blocked('merge_authority_unavailable')
-                authority = merge.load_config(config['merge_config'], service['operator_id'])
+                authority = merge.load_config(config['merge_config'], service['operator_id'], database=database,
+                                              project=service['project'], iteration=service['iteration'])
                 require(authority['candidate_assignment'] == candidate['assignment_id'],
                         'Merge authority targets a different candidate.', 'scope_mismatch')
                 journal = candidate.get('merge', {})
@@ -394,9 +402,19 @@ def continuation_tick(service, github, *, stop_event=None):
             context = {}
         else:
             ancestor = next(r for r in rows if r['assignment_id'] == target)
-            context = {'assignment_id': target} if stage == 'launch' else {'request': {
-                **ancestor['handoff'], 'stage': 'diagnosis' if stage in {
-                    'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'} else stage}}
+            if stage == 'launch':
+                context = {'assignment_id': target}
+            else:
+                restart_request = {**ancestor['handoff']}
+                if stage in {'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'}:
+                    restart_request['stage'] = 'diagnosis'
+                elif stage == 'simplification-corrections':
+                    restart_request['stage'] = 'corrections'
+                elif stage == 'simplification-direction':
+                    restart_request['stage'] = 'simplify'
+                else:
+                    restart_request['stage'] = stage
+                context = {'request': restart_request}
         if recovery.active(item):
             restart.require_reconciled(database, *scope(service)[:2], allow_recovery=True)
         restart.before_dispatch(database, *scope(service), github, force=True, **context)

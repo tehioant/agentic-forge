@@ -105,14 +105,25 @@ def run_stage(database, item, record, stage, config, work):
                 'Retained synthesis inputs changed.', 'stale_requirements')
         tickets.validate_execution(work, retained['evidence'], retained['result'])
         return retained['result']
-    require(stage not in record.get('attempts', {}), 'Uncertain synthesis must reconcile; no automatic repeated usage.', 'execution_uncertain')
-    record.setdefault('attempts', {})[stage] = {'input_digest': tickets.digest(work), 'capability': config}
-    requirements.checkpoint(database, item)
-    produced = invoke(config, work,
-        cancelled=lambda: controls.blocked(database, item['project_id'], item['iteration_id']),
-        admission=lambda: controls.admission(database, item['project_id'], item['iteration_id']))
-    record.setdefault('execution_receipts', {})[stage] = produced
-    requirements.checkpoint(database, item, receipt=True)
+    attempt = record.get('attempts', {}).get(stage)
+    if attempt is not None:
+        require(attempt == {'input_digest': tickets.digest(work), 'capability': config},
+                'Original revision attempt inputs or host provenance authority changed.', 'execution_uncertain')
+        produced = record.get('execution_receipts', {}).get(stage)
+        require(isinstance(produced, dict) and set(produced) == {'result', 'execution'},
+                'Uncertain synthesis has no complete original receipt; never repeat execution.', 'execution_uncertain')
+    else:
+        require(stage not in record.get('execution_receipts', {}),
+                'A raw receipt without an admitted attempt is not execution authority.', 'execution_uncertain')
+        record.setdefault('attempts', {})[stage] = {'input_digest': tickets.digest(work), 'capability': config}
+        requirements.checkpoint(database, item)
+        produced = invoke(config, work,
+            cancelled=lambda: controls.blocked(database, item['project_id'], item['iteration_id']),
+            admission=lambda: controls.admission(database, item['project_id'], item['iteration_id']))
+        record.setdefault('execution_receipts', {})[stage] = produced
+        requirements.checkpoint(database, item, receipt=True)
+    # Reconsume only the original output under the original independently approved
+    # capability. Storage itself grants neither provenance nor fresh execution.
     evidence = tickets.validate_execution(work, produced['execution'], produced['result'])
     record.setdefault('executions', {})[stage] = {'result': produced['result'], 'evidence': evidence,
         'source': work['skill'], 'dependencies': work['skill']['dependencies'],

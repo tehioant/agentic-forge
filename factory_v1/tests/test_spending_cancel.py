@@ -195,6 +195,68 @@ class SpendingCancellationTests(unittest.TestCase):
                 self.assert_no_admission()
 
 
+    def test_final_authorization_revocation_never_forwards(self):
+        from factory_v1 import controls
+        seed = self.state.read_bytes()
+        for boundary in ('valid', 'stop', 'deadline', 'grant-expiry', 'pause', 'readiness-pause'):
+            with self.subTest(boundary=boundary):
+                self.state.write_bytes(seed)
+                clock = {'wall': 100, 'mono': 100}
+                stop = threading.Event()
+                adapter = Mock(reservation=1, payload_fields={'input'})
+                authorizations = []
+                with closing(sqlite3.connect(self.state)) as db:
+                    _, marker = controls.paths(db, 'product', 'm1')
+                    if marker is not None:
+                        marker.unlink(missing_ok=True)
+                    with db:
+                        db.execute('UPDATE model_grants SET expires=105')
+                    def revoke():
+                        if boundary == 'stop':
+                            stop.set()
+                        elif boundary == 'deadline':
+                            clock['mono'] = 111
+                        elif boundary == 'grant-expiry':
+                            clock['wall'] = 106
+                        elif boundary in {'pause', 'readiness-pause'}:
+                            controls.request(db, 'product', 'm1', '42', 'pause', 'labeled late admission pause')
+                    def authorize(database):
+                        authorizations.append(True)
+                        if len(authorizations) == 2 and boundary != 'readiness-pause':
+                            revoke()
+                    def outbound(payload):
+                        # The transport must not retain the interruption lane.
+                        import fcntl
+                        root, _ = controls.paths(db, 'product', 'm1')
+                        assert root is not None
+                        with (root / 'lock').open() as lock:
+                            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        return 1, {'label': 'mock response'}
+                    adapter.call.side_effect = outbound
+                    from factory_v1 import readiness_gate
+                    observed = readiness_gate.observe
+                    def observe(*args, **kwargs):
+                        result = observed(*args, **kwargs)
+                        if boundary == 'readiness-pause' and len(authorizations) == 2:
+                            revoke()
+                        return result
+                    with patch.object(spending.time, 'time', side_effect=lambda: clock['wall']), \
+                            patch.object(spending.time, 'monotonic', side_effect=lambda: clock['mono']), \
+                            patch.object(readiness_gate, 'observe', side_effect=observe):
+                        if boundary == 'valid':
+                            self.assertEqual(spending.execute_controlled(db, self.scope, 'late-operation', {'input': 'fixture'}, 1,
+                                adapter=adapter, deadline=110, stop_event=stop, admission_check=authorize)['status'], 'complete')
+                        else:
+                            with self.assertRaises(spending.SpendingError) as refused:
+                                spending.execute_controlled(db, self.scope, 'late-operation', {'input': 'fixture'}, 1,
+                                    adapter=adapter, deadline=110, stop_event=stop, admission_check=authorize)
+                            self.assertEqual(refused.exception.code, 'iteration_paused' if 'pause' in boundary else 'capability_exhausted')
+                    self.assertEqual(authorizations, [True, True])
+                    self.assertEqual(db.execute('SELECT status,actual_units FROM model_operations').fetchall(),
+                                     [('complete', 1)] if boundary == 'valid' else [('failed', 0)])
+                    self.assertEqual(db.execute('SELECT remaining FROM model_grants').fetchone()[0], 1 if boundary == 'valid' else 2)
+                    self.assertEqual(adapter.call.call_count, 1 if boundary == 'valid' else 0)
+
     def after_lock(self, deadline=False):
         adapter = Mock(reservation=1, payload_fields={'input'})
         lock = spending.state_lock

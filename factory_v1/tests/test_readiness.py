@@ -80,6 +80,8 @@ class ReadinessTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        from factory_v1.tests.test_sandbox import bounded_storage_observation
+        self.stack.enter_context(patch.object(sandbox_policy, 'storage_observation', bounded_storage_observation))
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.db = sqlite3.connect(self.root / 'state.sqlite')
         self.addCleanup(self.db.close)
@@ -353,6 +355,8 @@ class CoreReadinessTests(SupervisedFixture, unittest.TestCase):
 
 
 class ConsolidatedReadinessTests(CoreReadinessTests):
+    config: dict[str, Any]
+
     # Fixtures remain public for sibling focused components; each invariant picks
     # its smallest fixture explicitly rather than initializing a host for API rows.
     def setUp(self):
@@ -399,9 +403,14 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
     def test_collector_preserves_exact_private_repository_and_board(self):
         ReadinessTests.setUp(self)
         restore = self.snapshot()
-        for fault in ('projects', 'private', 'id', 'field', 'option', 'provider'):
+        cases = [('projects', 'github_authority'), ('private', 'repository'), ('id', 'repository'),
+                 ('field', 'board'), ('option', 'board'), ('provider', 'repository')]
+        cases += [(fault, 'stages') for fault in
+                  ('bytes', 'review-bytes', 'dependency', 'stage-provider', 'collision', 'missing-stage')]
+        cases += [('health', 'delivery'), ('delivery-id', 'delivery'), ('origin', 'notification'),
+                  ('scope', 'scope'), ('allowance', 'spending')]
+        for fault, family in cases:
             with self.subTest(fault=fault):
-                restore()
                 try:
                     if fault == 'projects': self.write_authority['operations'].remove('projects')
                     if fault == 'private': self.repository['private'] = False
@@ -409,41 +418,13 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
                     if fault == 'field': self.board['status']['id'] = 'REPLACED'
                     if fault == 'option': self.board['status']['options']['Todo'] = 'REPLACED'
                     if fault == 'provider': self.github.request.side_effect = RuntimeError('sensitive arbitrary provider error')
-                    result = self.collect()
-                    family = {'projects': 'github_authority', 'field': 'board', 'option': 'board'}.get(fault, 'repository')
-                    self.assertEqual(result['checks'][family]['state'], 'blocked')
-                    if fault == 'provider': self.assertNotIn('sensitive', json.dumps(result))
-                finally: restore()
-
-    def test_collector_requires_complete_pinned_subscription_stage_inventory(self):
-        ReadinessTests.setUp(self)
-        baseline = deepcopy(self.config)
-        for mutation in ('bytes', 'review-bytes', 'dependency', 'provider', 'collision', 'missing-stage'):
-            with self.subTest(mutation=mutation):
-                self.config = deepcopy(baseline); slot = self.config['slots'][0]
-                source = Path(slot['skills'][0]['path']); source_raw = source.read_bytes()
-                review = Path(role_skills.SELECTED['code-review'][0]); review_raw = review.read_bytes()
-                if mutation == 'bytes': Path(slot['skills'][0]['path']).write_text('drift')
-                if mutation == 'review-bytes':
-                    Path(role_skills.SELECTED['code-review'][0]).write_text('drift')
-                if mutation == 'dependency': slot['skills'][0]['dependencies'] = ['invented']
-                if mutation == 'provider': slot['profile']['provider'] = 'paid-fallback'
-                if mutation == 'collision':
-                    self.config['slots'][1]['profile']['name'] = slot['profile']['name']
-                if mutation == 'missing-stage': self.config['slots'].pop()
-                self.assertEqual(self.collect()['checks']['stages']['state'], 'blocked')
-                if mutation == 'bytes': source.write_bytes(source_raw)
-                if mutation == 'review-bytes':
-                    review.write_bytes(review_raw)
-
-    def test_collector_refuses_delivery_origin_scope_and_allowance_drift(self):
-        ReadinessTests.setUp(self)
-        restore = self.snapshot()
-        for fault, family in (('health', 'delivery'), ('delivery-id', 'delivery'),
-                              ('origin', 'notification'), ('scope', 'scope'), ('allowance', 'spending')):
-            with self.subTest(fault=fault):
-                restore()
-                try:
+                    slot = self.config['slots'][0]
+                    if fault == 'bytes': Path(slot['skills'][0]['path']).write_text('drift')
+                    if fault == 'review-bytes': Path(role_skills.SELECTED['code-review'][0]).write_text('drift')
+                    if fault == 'dependency': slot['skills'][0]['dependencies'] = ['invented']
+                    if fault == 'stage-provider': slot['profile']['provider'] = 'paid-fallback'
+                    if fault == 'collision': self.config['slots'][1]['profile']['name'] = slot['profile']['name']
+                    if fault == 'missing-stage': self.config['slots'].pop()
                     if fault == 'health': self.health['sha'] = 'b'*40
                     if fault == 'delivery-id':
                         self.delivery_config['repository_id'] = 8; self.file('delivery.json', self.delivery_config)
@@ -453,6 +434,7 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
                     result = self.collect()
                     if fault == 'scope': self.assertEqual(set(result['checks']), {'scope'})
                     else: self.assertEqual(result['checks'][family]['state'], 'blocked')
+                    if fault == 'provider': self.assertNotIn('sensitive', json.dumps(result))
                 finally: restore()
 
     def test_paused_inventory_changes_neither_authority_nor_budget_admission(self):
@@ -804,6 +786,68 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
         self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
         with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
         self.assertEqual(caught.exception.code, 'readiness_blocked')
+        # Issued receipts are mutable only under an immutable, explicitly selected
+        # verifier/path/scope policy. Exact consumer checks remain separate.
+        paths = [str(self.root / name) for name in ('future-review.json', 'next-review.json')]
+        verifier = self.root / 'receipt-verifier'
+        verifier.write_bytes(b'explicit trusted verifier fixture'); verifier.chmod(0o700)
+        self.config['runtime_receipts'] = {'scope': readiness_gate.scope_identity(self.item),
+            'verifier': {'path': str(verifier), 'sha256': sha(verifier.read_bytes())},
+            'receipts': {'review': {path: {'axis': 'both', 'repository_id': 7} for path in paths}}}
+        self.service['dispatch_config'] = self.file('receipt-dispatch.json', {'continuation': {'authorities': {'review': paths}}})
+        self.file('readiness.json', self.config); self.file('service.json', self.service)
+        sealed = readiness_gate.policy(self.service, self.config, self.db)
+        self.db.execute('UPDATE supervised_readiness SET policy=?', (sealed,)); self.db.commit()
+        def consume(path, **kwargs):
+            return readiness_gate.runtime_receipt(self.db, 'p', 'i', 'review', path, **kwargs)
+        self.assertIsNone(consume(paths[0], missing_ok=True))
+        def independently_verified(argv, **kwargs):
+            self.assertEqual(argv, [str(verifier)])
+            request = json.loads(kwargs['input'])
+            self.assertEqual(request['scope'], self.config['runtime_receipts']['scope'])
+            self.assertEqual(request['constraints'], {'axis': 'both', 'repository_id': 7})
+            self.assertEqual(request['sha256'], sha(Path(request['path']).read_bytes()))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({'verified': request}).encode())
+        with patch('factory_v1.readiness_receipts.subprocess.run', side_effect=independently_verified) as verify:
+            for path in paths:
+                Path(path).write_text(json.dumps({'operator_id': 'operator', 'exact_run': path})); Path(path).chmod(0o600)
+                self.assertEqual(readiness_gate.policy(self.service, self.config, self.db), sealed)
+                self.assertEqual(consume(path)['exact_run'], path)
+                self.assertEqual(consume(path)['exact_run'], path)
+            with self.assertRaises(repositories.RepositoryError):
+                readiness_gate.runtime_receipt(self.db, 'p', 'i', 'merge', paths[0])
+            self.assertEqual(verify.call_count, 4)  # no cached-verification consumption
+            self.assertEqual(self.admit(operation='effect'), 'admitted')
+            self.assertEqual(verify.call_count, 6)
+            accepted = Path(paths[1]).read_bytes()
+            authority = self.readers.github_authority.side_effect
+            def late_receipt_change(*args):
+                result = authority(*args)
+                Path(paths[1]).write_text('{"operator_id":"operator","exact_run":"late-change"}')
+                return result
+            with patch.object(self.readers.github_authority, 'side_effect', late_receipt_change):
+                with self.assertRaises(repositories.RepositoryError): self.admit(operation='effect')
+            Path(paths[1]).write_bytes(accepted)
+            Path(paths[1]).unlink()
+            with self.assertRaises(repositories.RepositoryError): consume(paths[1], missing_ok=True)
+            Path(paths[1]).write_bytes(accepted); Path(paths[1]).chmod(0o600)
+            Path(paths[0]).write_text(json.dumps({'operator_id': 'operator', 'exact_run': 'replacement'}))
+            with self.assertRaisesRegex(repositories.RepositoryError, 'immutable'): consume(paths[0])
+            # Trusted verifier refusal cannot be replaced by path/private-file checks.
+            verify.side_effect = None; verify.return_value = SimpleNamespace(returncode=0, stdout=b'{}')
+            with self.assertRaises(repositories.RepositoryError): consume(paths[1])
+        for field in ('scope', 'constraints', 'path', 'verifier'):
+            changed = deepcopy(self.config)
+            if field == 'scope': changed['runtime_receipts']['scope'] = '0' * 64
+            elif field == 'constraints': changed['runtime_receipts']['receipts']['review'][paths[0]]['axis'] = 'none'
+            elif field == 'path': changed['runtime_receipts']['receipts']['review'][str(self.root / 'unapproved.json')] = {'axis': 'both'}
+            else: changed['runtime_receipts']['verifier']['sha256'] = '0' * 64
+            with self.subTest(field=field):
+                try: changed_policy = readiness_gate.policy(self.service, changed, self.db)
+                except repositories.RepositoryError: pass
+                else: self.assertNotEqual(changed_policy, sealed)
+        verifier.write_bytes(b'drifted verifier')
+        with self.assertRaises(repositories.RepositoryError): consume(paths[1])
 
     def test_real_model_admission_preserves_allowance_quota_and_final_no_forward(self):
         EnforcedReadinessTests.setUp(self)

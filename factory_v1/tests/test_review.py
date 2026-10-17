@@ -201,6 +201,8 @@ class ReviewComponentTests(unittest.TestCase):
                                    'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
         self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps({
             'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+            'repository': 'example/product',
+            'repository_onboarding': {'metadata': {'id': 123}, 'api_base': 'https://api.github.com'},
             'approval': {'operator_id': '42', 'reference': 'local review fixture'}})))
         root = self.root / 'candidate'
         root.mkdir(mode=0o700)
@@ -300,6 +302,12 @@ class ReviewComponentTests(unittest.TestCase):
         return review.evaluate(self.database, 'product', 'm1', '42', self.request, self.github, config)
 
     def test_review_host_authority_cases(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        with component_case(ReviewComponentTests) as case:
+            path = case.authorization()
+            feedback = consumer_matrix(case, case.database, path, 'review', lambda: case.evaluate(path))
+            self.assertEqual(feedback['status'], 'accepted')
+            self.assertTrue(feedback['advance_allowed'])
         cases = [('absent', None), ('durable', None), ('public', 'approval_required'),
                  ('pin', 'execution_required'), ('mounted', 'approval_required'), ('saved-drift', 'execution_required')]
         for mode, code in cases:
@@ -505,7 +513,8 @@ class ReviewComponentTests(unittest.TestCase):
     def test_review_candidate_admission_cases(self):
         cases = [('valid', None), ('raw-newline', 'candidate_unverified'), ('baseline', 'candidate_unverified'),
                  ('command', 'candidate_unverified'), ('outcome', 'candidate_unverified'),
-                 ('checks', 'candidate_unverified'), ('findings', 'candidate_unverified'), ('correction', 'stale_review')]
+                 ('checks', 'candidate_unverified'), ('findings', 'candidate_unverified'), ('correction', 'stale_review'),
+                 ('reverted-correction', 'candidate_unverified'), ('new-correction', None)]
         for mode, code in cases:
             with self.subTest(mode=mode), candidate_case() as case:
                 receipt = case.e.root / 'controller-checks.json'
@@ -529,6 +538,11 @@ class ReviewComponentTests(unittest.TestCase):
                     changes = {'outcome': {'outcome': 'findings'}, 'checks': {'checks_verified': False},
                                'findings': {'findings': ['unresolved']}}
                     row['simplification_result'].update(changes[mode])
+                elif mode in {'reverted-correction', 'new-correction'}:
+                    row['handoff']['simplification']['implementation_assignment'] = '7' * 64
+                    row['handoff_digest'] = assignments.digest(row['handoff'])
+                    case.store({'assignment_id': '7' * 64, 'handoff': {'stage': 'corrections', 'corrections': {'pins': {
+                        'candidate_assignment': '8' * 64, 'tree_sha256': row['runtime']['candidate_sha256'] if mode == 'reverted-correction' else '0' * 64}}}})
                 elif mode == 'correction':
                     case.store({'assignment_id': '6' * 64, 'ticket_scope': copy.deepcopy(row['ticket_scope']),
                         'handoff': {'corrections': {'pins': case.pins}},
@@ -585,6 +599,13 @@ class ReviewComponentTests(unittest.TestCase):
         (destination / 'workspace').mkdir()
         pins = {'baseline': baseline}
         review.copy_candidate(self.database, 'product', 'm1', '42', {'handoff': {'review': contract}}, destination, pins)
+        self.assertEqual(review.manifest(destination / 'workspace'), source)
+        # Direct staging of an explicitly retained findings-correction contract.
+        self.candidate['simplification_result'].update(outcome='findings', findings=[{
+            'kind': 'correctness', 'path': 'hello.py', 'evidence': 'retained local finding', 'proposal': 'correct'}])
+        self.store(self.candidate)
+        corrective = {'source': 'simplification', 'pins': review.pins(prior, source, baseline)}
+        review.copy_candidate(self.database, 'product', 'm1', '42', {'handoff': {'corrections': corrective}}, destination, pins)
         self.assertEqual(review.manifest(destination / 'workspace'), source)
 
     def test_shared_execution_fingerprints_refuse_unbounded_symlink_or_missing_response(self):

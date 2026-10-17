@@ -47,7 +47,8 @@ def required_items(item, observed, github):
 
 def delivered_item(database, item, row, config_path, operator, github, main):
     """Recheck original execution/reviews and external integration, not journal booleans."""
-    config = merge.load_config(config_path, operator)
+    config = merge.load_config(config_path, operator, database=database,
+                               project=item['project_id'], iteration=item['iteration_id'])
     require(config['issue'] == row['number'] and config['base'] == 'main' and
             config['repository'] == item['repository'] and
             config['repository_id'] == item['repository_onboarding']['metadata']['id'] and
@@ -117,7 +118,8 @@ def complete(database, project, iteration, operator, request, github):
     require(saved['latest']['status'] == 'healthy', 'Unknown delivery is not completion.', 'iteration_incomplete')
     observed = frontier(database, item, github)
     required, deferred, scoped_issues = required_items(item, observed, github)
-    configs = {merge.load_config(p, operator)['issue']: p for p in request['merge_configs']}
+    configs = {merge.load_config(p, operator, database=database, project=project, iteration=iteration)['issue']: p
+               for p in request['merge_configs']}
     require(len(configs) == len(request['merge_configs']) and set(configs) == {r['number'] for r in required},
             'Cover every required item exactly; caller cannot select a subset.', 'iteration_incomplete')
     decisions = pending_decisions(database, item)
@@ -164,7 +166,10 @@ def complete(database, project, iteration, operator, request, github):
             database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
             lines = [f"Iteration {iteration} delivered for {item['repository']} ({report['verification']}). Report {identity}."]
             lines += [f"#{r['issue']['number']} {r['issue']['url']} PR {r['pr']['url']} commit {r['integration']['integrated']}" for r in delivered]
-            lines += [f"Deployment {health['deployment']['id']} at {health['main']}: healthy. Deferred issues: {deferred}. Pending decisions: {decisions}.",
+            acceptance = (f"Deployment {health['deployment']['id']} at {health['main']}: healthy."
+                          if delivery.deployment_applies(saved['config']) else
+                          f"Deployment not applicable; exact-main CI and acceptance verified at {health['main']}.")
+            lines += [f"{acceptance} Deferred issues: {deferred}. Pending decisions: {decisions}.",
                       f"Retained bug discoveries: {len(bug_records)}. Inspect the durable completion report for scope/evidence.", report['invitation']]
             message = '\n'.join(lines)
             attention.enqueue(database, item, {'event_id': completion['event_id'], 'kind': 'completion',
@@ -198,13 +203,9 @@ def continuation_inputs(item):
     return {'previous_spec': next(iter(specs.values())), 'previous_specs': specs, 'input_loads': loads}
 
 
-def next_iteration(database, project, iteration, operator, request):
-    """Authenticated later operator input is the only continuation admission."""
-    from . import planning
-    from .skills import resolve_installed
-    database.execute('BEGIN IMMEDIATE')
-    item = delivery.context(database, project, iteration, operator)
-    controls.require_active(database, project, iteration)
+def validate_continuation(database, item, operator, request):
+    """Revalidate the exact completed invitation and authenticated later input."""
+    iteration = item['iteration_id']
     fields = {'iteration_id', 'event_id', 'operator_id', 'origin', 'reference', 'message_id', 'input', 'skills'}
     require(isinstance(request, dict) and set(request) == fields and request['operator_id'] == operator and
             request['origin'] == item['origin'] and text(request['reference']) and text(request['input']) and
@@ -224,6 +225,43 @@ def next_iteration(database, project, iteration, operator, request):
             int(request['message_id']) > int(record['receipt']['message_id']) and
             request['reference'] != record['receipt']['reference'],
             'Verify exact-origin report delivery, then retain a distinct later operator message.', 'delivery_required')
+    return completion
+
+
+def validate_successor(database, item):
+    """Recheck the completed predecessor, delivered invitation and exact successor."""
+    from . import planning
+    previous = item.get('previous_iteration')
+    require(isinstance(previous, dict) and set(previous) == {'iteration_id', 'completion', 'input'} and
+            previous['iteration_id'] != item['iteration_id'],
+            'Exact successor lineage required.', 'scope_mismatch')
+    operator = item['approval']['operator_id']
+    predecessor = assignments.current(database, item['project_id'], previous['iteration_id'], operator, require_active=False)
+    request = previous['input']
+    completion = validate_continuation(database, predecessor, operator, request)
+    work = item.get('planning', {})
+    require(previous['completion'] == completion and request['iteration_id'] == item['iteration_id'] and
+            predecessor.get('next_iteration') == {'iteration_id': item['iteration_id'], 'request': request} and
+            all(item[k] == predecessor[k] for k in ('project_id', 'repository', 'origin', 'repository_onboarding')) and
+            item.get('idea') == request['input'] and
+            item['approval'] == {'operator_id': operator, 'reference': request['reference']} and
+            work.get('revision') == 1 and work.get('origin') == item['origin'] and
+            work.get('request') == {'origin': item['origin'], 'expected_revision': 0, 'skills': request['skills']} and
+            work.get('continuation') == {**continuation_inputs(predecessor), 'input': request,
+                'adaptation': planning.NEXT_ADAPTATION,
+                'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}} and
+            work.get('instructions') == planning.instructions(item),
+            'Completed predecessor or successor input/adaptation changed.', 'scope_mismatch')
+
+
+def next_iteration(database, project, iteration, operator, request):
+    """Authenticated later operator input is the only continuation admission."""
+    from . import planning, readiness_gate
+    from .skills import resolve_installed
+    database.execute('BEGIN IMMEDIATE')
+    item = delivery.context(database, project, iteration, operator)
+    controls.require_active(database, project, iteration)
+    completion = validate_continuation(database, item, operator, request)
     if item.get('next_iteration'):
         require(item['next_iteration']['request'] == request, 'Continuation input cannot be rebound.', 'iteration_conflict')
         result = delivery.context(database, project, request['iteration_id'], operator)
@@ -244,14 +282,12 @@ def next_iteration(database, project, iteration, operator, request):
     result['planning']['continuation'] = {**continuation_inputs(item), 'input': request,
                                        'adaptation': planning.NEXT_ADAPTATION,
                                        'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}}
-    result['planning']['instructions'] += ('\nContinue this SAME product from ALL continuation.previous_specs and the explicit input. '
-        'Preserve any explicit round-completion gate; no synthesis before actual answers. '
-        'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
-        'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
-        'Publish new updated-spec pointers, never overwrite the preceding milestone.')
-    with controls.admission(database, project, iteration):
+    result['planning']['instructions'] = planning.NEXT_INSTRUCTIONS
+    with controls.admission(database, project, iteration, operation='continuation',
+                            selection={'continuation': request, 'predecessor': assignments.digest(item)}):
         delivery.inherit_monitor(database, item, result, operator)
         database.execute('INSERT INTO iterations VALUES (?, ?, ?)', (project, result['iteration_id'], json.dumps(result)))
+        readiness_gate.inherit_supervision(database, item, result)
         item['next_iteration'] = {'iteration_id': result['iteration_id'], 'request': request}
         save_iteration(database, item)
         database.commit()

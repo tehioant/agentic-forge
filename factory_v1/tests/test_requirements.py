@@ -161,6 +161,23 @@ class RequirementChangeTests(unittest.TestCase):
 
 
     def test_requirement_status_restore(self):
+        native = test_tickets.FrontierFixture(self, native=True)
+        native_record = revision_record(native, (10, 11))
+        native_record['blocks_verified'] = False
+        native.item['requirement_changes'] = {'durable-notes': native_record}
+        native.persist()
+        requirements.sync_blocks(native.database, native.item, native_record, native.github)
+        self.assertEqual([native.members[n]['fields']['STATUS'] for n in (10, 11, 12)], ['In Progress', 'In Progress', 'Todo'])
+        self.assertTrue(native.stored()['requirement_changes']['durable-notes']['blocks_verified'])
+        self.assertEqual(native_record['hold_representation'], 'native-active-with-durable-hold')
+        self.assertEqual(requirements.held_numbers(native.stored()), {10, 11})
+        held_frontier = tickets.frontier(native.database, native.item, native.github)['ticket_work']['frontier']
+        self.assertEqual(held_frontier['active'], [])
+        self.assertEqual(held_frontier['eligible'], [12])
+        requirements.sync_blocks(native.database, native.item, native_record, native.github, release=True)
+        self.assertEqual([native.members[n]['fields']['STATUS'] for n in (10, 11, 12)], ['Todo', 'Todo', 'Todo'])
+        # Restore this method's independent legacy transport fixture.
+        native.stack.close()
         variants = [(prior, 'Blocked', 'open', True, expected, None) for prior, expected in
                     (('blocked', 'Blocked'), ('deferred', 'Deferred'), ('done', 'Blocked'), ('active', 'Ready'), ('ready', 'Ready'))]
         variants += [('ready', 'Deferred', 'open', True, 'Deferred', 'publication_mismatch'),
@@ -318,7 +335,7 @@ class RequirementChangeTests(unittest.TestCase):
                         else:
                             with self.assertRaises(repositories.RepositoryError) as caught:
                                 requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work)
-                            self.assertEqual(caught.exception.code, 'execution_uncertain' if replay else 'execution_evidence_required')
+                            self.assertEqual(caught.exception.code, 'execution_evidence_required')
                     invoke.assert_called_once()
                     stored = self.fixture.stored()['requirement_changes']['durable-notes']
                     if valid:
@@ -331,6 +348,24 @@ class RequirementChangeTests(unittest.TestCase):
 
 
     def test_requirement_stage_receipt_admission_2(self):
+        for fault in ('capability', 'input', 'missing-receipt', 'missing-attempt', 'result', 'loads'):
+            with self.subTest(retained_fault=fault):
+                record, work, produced = self.stage()
+                config = {'execution_reference': 'fixture original provenance'}
+                record['attempts'] = {'to-spec': {'input_digest': tickets.digest(work), 'capability': config}}
+                record['execution_receipts'] = {'to-spec': produced}
+                if fault == 'capability': config = {'execution_reference': 'replacement is not original authority'}
+                if fault == 'input': record['attempts']['to-spec']['input_digest'] = 'f' * 64
+                if fault == 'missing-receipt': record['execution_receipts'] = {}
+                if fault == 'missing-attempt': record['attempts'] = {}
+                if fault == 'result': produced['result']['one'] += 'unadmitted change'
+                if fault == 'loads': produced['execution']['loads'] = []
+                self.fixture.persist(); before = self.fixture.stored()
+                with patch.object(requirement_execution, 'invoke', side_effect=AssertionError('Never retry uncertain usage')) as invoke:
+                    with self.assertRaises(repositories.RepositoryError):
+                        requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work)
+                    invoke.assert_not_called()
+                self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
         class FaultConnection(sqlite3.Connection):
             fail_control_read = False
             def execute(connection, sql, *args):
@@ -365,6 +400,14 @@ class RequirementChangeTests(unittest.TestCase):
                 external.assert_called_once()
                 if fault == 'pause':
                     self.assertTrue(controls.blocked(database, 'product', 'm1'))
+                    with patch('factory_v1.restart.reconcile', return_value={'status': 'ready'}):
+                        controls.resume(database, 'product', 'm1', '42', 'fixture explicit resume', self.github)
+                fresh = self.fixture.stored()
+                retained = fresh['requirement_changes']['durable-notes']
+                with patch.object(requirement_execution, 'invoke', side_effect=AssertionError('Never repeat original execution')):
+                    self.assertEqual(requirement_execution.run_stage(database, fresh, retained, 'to-spec',
+                        {'execution_reference': 'fixture host receipt'}, work), produced['result'])
+                self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['executions']['to-spec']['evidence'], produced['execution'])
         self.addCleanup(database.close)
 
 

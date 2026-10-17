@@ -184,6 +184,49 @@ class DeliveryComponentTests(unittest.TestCase):
         with closing(sqlite3.connect(self.state)) as db:
             return db.execute('SELECT * FROM ' + table).fetchall()
 
+    def test_explicit_non_deployment_acceptance_and_persistence_matrix(self):
+        self.config.update(deployment_applicability='not-applicable', environment=None)
+        self.config['contract'].update(health_url=None, acceptance={'cli-acceptance': 11})
+        self.assertEqual(delivery.validate_config(self.config, '42'), self.config)
+        for change in ({'deployment_applicability': 'unknown'}, {'deployment_applicability': []}, {'environment': 'invented'},
+                       {'contract': {**self.config['contract'], 'health_url': 'https://example.com/health'}},
+                       {'contract': {**self.config['contract'], 'acceptance': {'not-verified': True}}},
+                       {'contract': {**self.config['contract'], 'acceptance': {'not-required': 12}}}):
+            with self.subTest(change=change), self.assertRaises(delivery.RepositoryError):
+                delivery.validate_config({**self.config, **change}, '42')
+        sampled = self.sample()
+        self.assertEqual(sampled['evidence']['status'], 'healthy')
+        self.assertEqual(sampled['evidence']['deployment']['applicability'], 'not-applicable')
+        self.assertEqual(self.inspect()['monitor']['config'], self.config)
+        from factory_v1 import service
+        self.write_config()
+        scoped_service = {'state': str(self.state), 'project': 'product', 'iteration': 'm1', 'operator_id': '42',
+                          'delivery_config': str(self.config_path), 'dispatch_config': '/private/dispatch', 'transport_config': None}
+        with mock.patch.object(service, 'inspect_readiness', return_value={'iteration_runnable': True}), \
+             mock.patch.object(service, 'dispatch', return_value={'status': 'component-dispatch'}) as dispatch, \
+             mock.patch('factory_v1.merge.controller_paths'):
+            self.assertEqual(service.cycle(scoped_service, mock.Mock())['status'], 'component-dispatch')
+            dispatch.assert_called_once()
+        self.assertFalse(any('/deployments' in path or path == '/health' for path in self.target.calls))
+        for field in ('checks', 'workflows', 'deployment', 'health'):
+            forged = copy.deepcopy(sampled['evidence'])
+            forged[field] = [] if field in ('checks', 'workflows') else None
+            with self.subTest(tamper=field), self.assertRaises(delivery.RepositoryError):
+                delivery.validate_evidence(json.dumps(forged), assignments.digest(forged), self.config)
+        for field in ('check_conclusion', 'workflow_conclusion'):
+            setattr(self.target, field, 'failure')
+            self.assertEqual(delivery.observe(self.config)['status'], 'failed')
+            setattr(self.target, field, 'success')
+        self.target.github_outage = True
+        self.assertEqual(delivery.observe(self.config)['status'], 'unknown')
+        self.target.github_outage = False
+        self.config = configuration('http://127.0.0.1:8765')
+        self.target.health_outage = True
+        self.assertEqual(delivery.observe(self.config)['status'], 'unknown')
+        with self.assertRaises(delivery.RepositoryError) as refused:
+            self.sample()
+        self.assertEqual(refused.exception.code, 'delivery_conflict')
+
     def test_incident_lifecycle_and_exact_clearance_matrix(self):
         from factory_v1 import __main__ as cli
         from factory_v1.errors import IntakeError

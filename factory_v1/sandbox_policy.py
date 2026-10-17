@@ -19,6 +19,42 @@ LIMITS = {'seconds': (1, 3600), 'max_calls': (1, 1000), 'memory_mb': (256, 8192)
           'cpus': (0.1, 8), 'pids': (16, 512), 'scratch_mb': (16, 1024)}
 
 
+def storage_observation(root):
+    """Read kernel mount identities and filesystem capacity, not operator attestations."""
+    mounts = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        fields, filesystem = line.split(' - ', 1)
+        values = fields.split()
+        def decode(value):
+            import re
+            return re.sub(r'\\([0-7]{3})', lambda match: chr(int(match[1], 8)), value)
+        mounts.append((Path(decode(values[4])), filesystem.split()[0], decode(values[3]), values[2]))
+    return mounts, os.statvfs(root)
+
+
+def verify_storage(config, mounts=None):
+    """Require a dedicated bounded tmpfs for ALL retained attempt storage."""
+    try:
+        root = physical(config['artifacts_root'], directory=True)
+        observed, capacity = storage_observation(root)
+        backing = [entry for entry in observed if entry[0] == root]
+        device = root.stat().st_dev
+        require(len(backing) == 1 and backing[0][1:] == ('tmpfs', '/', f'{os.major(device)}:{os.minor(device)}') and
+                not any(path != root and path.is_relative_to(root) for path, *_ in observed),
+                'Artifacts root must be a dedicated tmpfs mount without nested mounts.', 'storage_unbounded')
+        ceiling = config['limits']['scratch_mb'] * 1024 * 1024
+        require(0 < capacity.f_blocks * capacity.f_frsize <= ceiling and
+                0 < capacity.f_files <= ceiling // 4096,
+                'Artifact tmpfs must enforce scratch_mb bytes and at most scratch_mb*256 inodes.', 'storage_unbounded')
+        for source, writable in (mounts or {}).values():
+            if writable:
+                path = physical(source, directory=True)
+                require(path.is_relative_to(root) and path.stat().st_dev == device,
+                        'Every writable bind must use the bounded artifact filesystem.', 'storage_unbounded')
+    except (OSError, ValueError, TypeError, IndexError) as error:
+        raise RepositoryError('storage_unbounded', 'Unable to independently verify bounded artifact storage.') from error
+
+
 def load_config(path):
     try:
         path = physical(path)
@@ -44,6 +80,7 @@ def load_config(path):
         root = physical(config['artifacts_root'], directory=True)
         require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
                 'Artifacts root must be private and controller-owned.', 'invalid_launcher')
+        verify_storage(config)
         socket_path = Path(config['subscription_socket'])
         require(socket_path.is_absolute() and not any(p.is_symlink() for p in (socket_path, *socket_path.parents)),
                 'Subscription route must be an exact physical Unix socket.', 'invalid_launcher')
@@ -58,7 +95,12 @@ class Docker:
         if binary is None:
             raise RepositoryError('isolation_unavailable', 'Docker is required for whole-process isolation.')
         self.binary = binary
-        self.env = {key: os.environ[key] for key in ('PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR') if key in os.environ}
+        host = os.environ.get('DOCKER_HOST', 'unix:///var/run/docker.sock')
+        require(host.startswith('unix:///') and os.environ.get('DOCKER_CONTEXT', 'default') == 'default',
+                'Bounded bind storage requires the local host Docker daemon, not a remote context.', 'storage_unbounded')
+        self.env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_RUNTIME_DIR') if key in os.environ}
+        # Explicit DOCKER_HOST overrides a remotely selected context in ~/.docker.
+        self.env['DOCKER_HOST'] = host
 
     def call(self, *args, optional=False, timeout=30):
         try:
@@ -131,6 +173,7 @@ def mount_args(mounts):
 
 
 def command(config, name, mounts):
+    verify_storage(config, mounts)
     limit = config['limits']
     writable = mounts['/workspace'][1]
     env = {'HOME': '/scratch/home', 'HERMES_HOME': '/scratch/home/.hermes', 'TMPDIR': '/scratch/tmp',

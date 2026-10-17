@@ -47,55 +47,39 @@ class ReportPolicyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'invalid_result')
 
     def test_diagnosis_report_shape_and_identity_cases(self):
-        cases = [('valid', {}, None)]
-        cases += [('missing-' + field, {}, field) for field in sorted(diagnosis.REPORT_FIELDS)]
-        cases += [(name, change, None) for name, change in [
+        cases = [('valid', {}, None, True)]
+        cases += [('missing-' + field, {}, field, False) for field in sorted(diagnosis.REPORT_FIELDS)]
+        cases += [(name, change, None, False) for name, change in [
             ('contract', {'contract': 'made-up'}), ('pin', {'pins': {**self.pins, 'tree_sha256': '0' * 64}}),
             ('adaptation', {'adaptation': 'write-fix'}), ('extra', {'accepted_fix': True}),
             ('attempts-empty', {'attempted_repairs': []}), ('findings-empty', {'findings': []}),
             ('uncertainty-empty', {'cause_or_uncertainty': ''}), ('commands-type', {'commands': None}),
             ('blockers-type', {'blockers': 'missing'}), ('attempt-type', {'attempted_repairs': [None]})]]
-        for name, change, omitted in cases:
-            with self.subTest(case=name):
-                report = copy.deepcopy(self.report)
-                report.update(change)
-                if omitted is not None:
-                    del report[omitted]
-                if name == 'valid':
-                    self.validate(report)
-                else:
-                    self.reject(report)
-
-
-
-    def test_diagnosis_feedback_loop_cases(self):
         unavailable = {'feedback_loop': None, 'hypotheses': [], 'blockers': ['Missing environment / HITL template']}
-        cases = [('unavailable', unavailable, True),
-                 ('unexplained', {**unavailable, 'blockers': []}, False),
-                 ('unsupported-theory', {**unavailable, 'hypotheses': self.report['hypotheses']}, False)]
-        cases += [(name, change, False) for name, change in [
+        cases += [('unavailable', unavailable, None, True),
+                  ('unexplained', {**unavailable, 'blockers': []}, None, False),
+                  ('unsupported-theory', {**unavailable, 'hypotheses': self.report['hypotheses']}, None, False)]
+        cases += [(name, change, None, False) for name, change in [
             ('commands-empty', {'commands': []}), ('invented-command', {'commands': [{'command': 'invented', 'result': 'pass'}]}),
             ('invented-result', {'feedback_loop': {**self.report['feedback_loop'], 'result': 'invented green'}}),
             ('empty-symptom', {'feedback_loop': {**self.report['feedback_loop'], 'symptom': ''}}),
             ('missing-symptom', {'feedback_loop': self.command}), ('missing-hypotheses', {'hypotheses': []})]]
-        cases += [('hypothesis-' + str(i), {'hypotheses': [value]}, False) for i, value in enumerate((
+        cases += [('hypothesis-' + str(i), {'hypotheses': [value]}, None, False) for i, value in enumerate((
             {'hypothesis': 'theory'}, {'hypothesis': 'theory', 'prediction': '', 'evidence': 'none'}, 'theory'))]
-        for name, change, accepted in cases:
+        cases += [(name, change, None, False) for name, change in [
+            ('unknown-recommendation', {'recommendation': 'accept-fix'}), ('directions-empty', {'directions': []}),
+            ('directions-duplicate', {'directions': self.report['directions'] * 2}),
+            ('direction-schema', {'directions': [{'id': 'retry', 'direction': 'relax requirements'}]})]]
+        for name, change, omitted, accepted in cases:
             with self.subTest(case=name):
                 report = copy.deepcopy(self.report)
                 report.update(copy.deepcopy(change))
+                if omitted is not None:
+                    del report[omitted]
                 if accepted:
                     self.validate(report)
                 else:
                     self.reject(report)
-
-
-
-    def test_recommendation_names_one_unique_direction_not_approval(self):
-        for change in ({'recommendation': 'accept-fix'}, {'directions': []},
-                       {'directions': self.report['directions'] * 2},
-                       {'directions': [{'id': 'retry', 'direction': 'relax requirements'}]}):
-            self.reject({**self.report, **change})
 
 
     def test_malformed_duplicate_and_oversized_report_json_refuse(self):
@@ -324,6 +308,7 @@ class DiagnosisComponentTests(unittest.TestCase):
                                    'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
         self.item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
             'repository': 'example/product', 'approval': {'operator_id': '42', 'reference': 'Local diagnosis fixture'},
+            'repository_onboarding': {'metadata': {'id': 123}, 'api_base': 'https://api.github.com'},
             'ticket_work': {'board': {'project_id': 'BOARD', 'status': {'id': 'STATUS', 'options': {'Ready': 'READY', 'Blocked': 'BLOCKED'}}},
                             'request': {'tracker': {'statuses': {'ready': 'Ready', 'blocked': 'Blocked'}}}}}
         self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
@@ -347,7 +332,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         return observed
 
     def read_issue(self, github, repository, number):
-        return {'body': 'Local issue ' + str(number)}
+        return {'body': 'Local issue ' + str(number), 'state': 'open', 'id': 100+number, 'node_id': 'ISSUE'+str(number)}
 
     def change_status(self, github, project, member, field, value):
         row = next(r for r in self.rows if r['membership_id'] == member)
@@ -375,7 +360,7 @@ class DiagnosisComponentTests(unittest.TestCase):
             'issues': {str(n): {'id': 100+n, 'node_id': 'ISSUE'+str(n),
                 'body_sha256': diagnosis.hashlib.sha256(('Local issue '+str(n)).encode()).hexdigest()} for n in (10, 11, 13)},
             'previous_statuses': {str(n): 'ready' for n in (10, 11, 13)},
-            'retired_assignments': [self.prior['assignment_id']], 'blocks_verified': True,
+            'retired_assignments': [self.prior['assignment_id']], 'blocks_verified': True, 'hold_representation': 'blocked-option',
             'diagnosis_assignment': None, 'event_id': None, 'applied_response': None}
         self.prior['stuck_disposition'] = 'held'
         self.store(self.prior)
@@ -773,6 +758,13 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertEqual(self.set_field.call_count, 0)
 
     def test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        with component_case(DiagnosisComponentTests) as case:
+            _, axis = case.completed_inputs()
+            path, config = case.host_grant(axis)
+            self.assertEqual(consumer_matrix(case, case.database, path, 'diagnosis',
+                lambda: diagnosis.authorization(case.database, path, '42', axis)), config)
+            self.assertEqual(case.set_field.call_count, 0)
         _, axis = self.completed_inputs()
         request = {'stuck_assignment': self.prior['assignment_id']}
         path, config = self.host_grant(axis)

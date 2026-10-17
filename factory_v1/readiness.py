@@ -39,7 +39,7 @@ def load_config(path):
                       object_pairs_hook=repositories.unambiguous_fields)
 
 
-def collect(database, service, config, github, *, readers=None, running=None, now=None):
+def collect(database, service, config, github, *, readers=None, running=None, now=None, planning_bootstrap=None):
     """Inspect exact registered inputs without claims, reservations, execution or sends.
 
     running is a separately observed liveness fact, not readiness or permission.
@@ -66,7 +66,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
             return None
 
     def scope_check():
-        require(isinstance(config, dict) and set(config) == FIELDS and
+        require(isinstance(config, dict) and FIELDS <= set(config) <= FIELDS | {'runtime_receipts'} and
                 all(assignments.identifier(config[k]) and config[k] == service[k]
                     for k in ('operator_id', 'project', 'iteration')) and planning.text(config['reference']),
                 'Exact scoped configuration required.', 'invalid_readiness')
@@ -155,7 +155,8 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     def execution():
         require(stages is not None, 'Installed sources required.', 'skill_blocked')
         synthesis = requirement_execution.configuration(database, config['synthesis_config'], config['operator_id'])
-        pin = readers.execution_support(deepcopy(scope), tuple(['grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES]))
+        arguments = {} if planning_bootstrap is None else {'planning_bootstrap': planning_bootstrap}
+        pin = readers.execution_support(deepcopy(scope), tuple(['grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES]), **arguments)
         require(assignments.sha(pin), 'Independent capacity/verifier support required.', 'execution_required')
         return {'synthesis': synthesis, 'support': pin}
     check('execution', 'Verify native planning, host synthesis, engineering executors and independent evidence verifiers without running skills.', execution)
@@ -172,7 +173,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
         require(observation['status'] == 'healthy', 'Configured health unknown or failed.', 'delivery_unknown')
         pins['delivery'] = assignments.digest({'config': contract, 'protection': protected})
         return {'config': contract, 'protection': protected, 'observation': observation}
-    check('delivery', 'Restore exact main protection/check/workflow/deployment-health contract; no-deployment contracts are currently unsupported.', health)
+    check('delivery', 'Restore the exact main protection/check/workflow contract and configured deployment health or explicit no-deployment applicability.', health)
 
     def notification():
         validate_origin(item['origin'])
@@ -215,7 +216,7 @@ def slot_capacity(database, slots, scope, *, stage=None, assignment_id=None, run
                 all(row['ticket_scope'].get(k) == scope[k] for k in ('project', 'iteration', 'repository', 'repository_id')),
                 'Exact historical slot binding required.', 'slot_binding_changed')
         runtime = row.get('runtime') or {}
-        retired = any(row.get(k) for k in ('requirement_disposition', 'recovery_disposition', 'restart_disposition',
+        retired = any(row.get(k) for k in ('bug_disposition', 'requirement_disposition', 'recovery_disposition', 'restart_disposition',
                                           'stuck_disposition', 'ownership_retirement'))
         retired = retired or assignments.delivered_ticket_receipt(database, row)[1] is not None
         if not retired and runtime.get('status') == 'complete' and runtime.get('container_removed') is True:

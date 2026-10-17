@@ -32,7 +32,7 @@ class ResolutionCheckpointTests(unittest.TestCase):
 
     def test_candidate_late_holds_at_intent_receipt_and_success(self):
         for boundary in ('intent', 'write', 'receipt', 'success'):
-            for field, resolving in product(('stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause',
+            for field, resolving in product(('bug_disposition', 'stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause',
                                              'execution_trust', 'result_disposition', 'runtime_status', 'runtime_removed', 'runtime_pin'), (False, True)):
                 with self.subTest(boundary=boundary, field=field, resolving=resolving):
                     f = self.fixture(fixtures.CandidateResolutionTests)
@@ -92,7 +92,8 @@ class ResolutionCheckpointTests(unittest.TestCase):
 
     def test_ticket_and_bug_late_holds_preserve_fresh_item_and_only_admitted_receipts(self):
         for cls in (fixtures.TicketResolutionTests, fixtures.BugResolutionTests):
-            for boundary in ('intent', 'receipt', 'success'):
+            boundaries = ('intent', 'receipt', 'affected-ownership', 'success') if cls is fixtures.BugResolutionTests else ('intent', 'receipt', 'success')
+            for boundary in boundaries:
                 for hold in ('restart', 'requirements', 'recovery', 'diagnosis', 'pause'):
                     with self.subTest(cls=cls.__name__, boundary=boundary, hold=hold):
                         f = self.fixture(cls)
@@ -104,11 +105,13 @@ class ResolutionCheckpointTests(unittest.TestCase):
                         def read(*args):
                             nonlocal injected, writes_at_hold
                             result = original(*args)
-                            # Receipt boundary is the first read after the admitted membership write;
-                            # success boundary is the verified final field read.
+                            # Keep the post-field ownership admission covered separately;
+                            # final success follows the affected issue's verified observation.
                             at_boundary = (boundary == 'intent' and result is None or
                                            boundary == 'receipt' and result is not None and f.f.add_item.called or
-                                           boundary == 'success' and f.f.set_field.called)
+                                           boundary == 'affected-ownership' and f.f.set_field.called or
+                                           boundary == 'success' and f.f.set_field.called and
+                                           (not is_bug or args[-1]['number'] == 10))
                             if at_boundary and injected is None:
                                 item = f.f.stored()
                                 if hold == 'pause':

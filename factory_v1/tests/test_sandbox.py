@@ -22,10 +22,17 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, sandbox, sandbox_guard, sandbox_source
+from factory_v1 import assignments, sandbox, sandbox_guard, sandbox_source, sandbox_policy
 from factory_v1.repositories import RepositoryError
-from factory_v1.sandbox_policy import Docker, IMAGE, PYTHON, command, load_config, verify
+from factory_v1.sandbox_policy import Docker, IMAGE, PYTHON, command, load_config, verify, storage_observation
 from factory_v1.tests import test_assignments
+
+
+def bounded_storage_observation(root):
+    """Explicit kernel boundary fixture, not an actual mount/quota qualification."""
+    device = root.stat().st_dev
+    return ([(root, 'tmpfs', '/', f'{os.major(device)}:{os.minor(device)}')],
+            SimpleNamespace(f_blocks=4096, f_frsize=4096, f_files=4096))
 
 
 def launcher_config(root):
@@ -89,6 +96,7 @@ def write_worker_evidence(root, assignment, inputs=()):
 class LauncherFixture:
     """Only the real launcher, artifact validators and durable result guards execute."""
     def __init__(self, case):
+        case.enterContext(patch.object(sandbox_policy, 'storage_observation', side_effect=bounded_storage_observation))
         temporary = tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR'))
         case.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
@@ -322,6 +330,61 @@ class SandboxComponentTests(unittest.TestCase):
                 self.assertNotIn('runtime', self.fixture.stored())
                 self.assertEqual(self.fixture.state.read_bytes(), untouched)
 
+
+    def test_writable_storage_kernel_contract_matrix(self):
+        fixture = self.fixture
+        cfg = json.loads(fixture.config.read_text())
+        root = fixture.artifacts
+        for directory in ('workspace', 'scratch', 'inputs'):
+            (root / directory).mkdir()
+        mounts = {'/' + name: (str(root / name), name != 'inputs') for name in ('workspace', 'scratch', 'inputs')}
+        device = root.stat().st_dev
+        mountinfo = f'41 1 {os.major(device)}:{os.minor(device)} / {root} rw - tmpfs tmpfs rw\n'
+        read_text = Path.read_text
+        for defect in ('valid', 'disk', 'absent', 'bind-subdirectory', 'device', 'nested', 'bytes', 'inodes', 'zero-inodes', 'outside', 'unreadable'):
+            with self.subTest(defect=defect), ExitStack() as mocks:
+                text = mountinfo
+                capacity = SimpleNamespace(f_blocks=4096, f_frsize=4096, f_files=4096)
+                selected_mounts = copy.deepcopy(mounts)
+                if defect == 'disk':
+                    text = text.replace('- tmpfs tmpfs', '- ext4 /dev/fixture')
+                elif defect == 'absent':
+                    text = ''
+                elif defect == 'bind-subdirectory':
+                    text = text.replace(' / ', ' /shared ')
+                elif defect == 'device':
+                    text = text.replace(f'{os.major(device)}:{os.minor(device)}', '999:999')
+                elif defect == 'nested':
+                    text += f'42 41 999:999 / {root}/scratch rw - ext4 /dev/fixture rw\n'
+                elif defect == 'bytes':
+                    capacity.f_blocks = cfg['limits']['scratch_mb'] * 256 + 1
+                elif defect == 'inodes':
+                    capacity.f_files = cfg['limits']['scratch_mb'] * 256 + 1
+                elif defect == 'zero-inodes':
+                    capacity.f_files = 0
+                elif defect == 'outside':
+                    selected_mounts['/workspace'] = (str(fixture.source), True)
+                def kernel_text(path, *args, **kwargs):
+                    if path == Path('/proc/self/mountinfo'):
+                        if defect == 'unreadable':
+                            raise PermissionError('labeled kernel observation refusal')
+                        return text
+                    return read_text(path, *args, **kwargs)
+                mocks.enter_context(patch.object(sandbox_policy, 'storage_observation', wraps=storage_observation))
+                mocks.enter_context(patch.object(Path, 'read_text', kernel_text))
+                mocks.enter_context(patch.object(sandbox_policy.os, 'statvfs', return_value=capacity))
+                if defect == 'valid':
+                    self.assertEqual(load_config(fixture.config), cfg)
+                    argv = command(cfg, 'fixture', selected_mounts)
+                    self.assertIn('--mount', argv)
+                    verify(container_inspection(cfg, 'fixture', selected_mounts), cfg, 'fixture', 'fixture-image-id', selected_mounts)
+                else:
+                    if defect != 'outside':
+                        self.refusal('storage_unbounded', lambda: load_config(fixture.config))
+                    self.refusal('storage_unbounded', lambda: command(cfg, 'fixture', selected_mounts))
+                    self.refusal('storage_unbounded', lambda: verify(container_inspection(cfg, 'fixture', selected_mounts),
+                        cfg, 'fixture', 'fixture-image-id', selected_mounts))
+                self.assertNotIn('runtime', fixture.stored())
 
     def test_controller_scope_admission_cases(self):
         for target in ('config', 'artifacts', 'state', 'state-alias'):

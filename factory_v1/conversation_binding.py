@@ -33,8 +33,11 @@ class ConversationBinding:
                 'The native binding does not match the planning origin.', 'scope_mismatch')
         from .controls import require_active
         require_active(database, item['project_id'], item['iteration_id'])
+        if item.get('previous_iteration'):
+            from .iteration import validate_successor
+            validate_successor(database, item)
         selected = skills.resolve_installed(item['planning']['request']['skills'])
-        require(selected == item['planning']['skills'] and item['planning']['instructions'] == planning.INSTRUCTIONS,
+        require(selected == item['planning']['skills'] and item['planning']['instructions'] == planning.instructions(item),
                 'Planning sources or approved adaptation changed.', 'skill_blocked')
         return item, selected
 
@@ -60,6 +63,7 @@ class ConversationBinding:
             if work['status'] == 'complete':
                 return None
             native = work.get('native_execution')
+            first_observation = native is None
             from .planning_wakeup import TAG, observe_wakeup, configuration, scope
             wakeup = isinstance(user_message, str) and TAG in user_message
             if wakeup:
@@ -104,7 +108,7 @@ class ConversationBinding:
                         native['loads'].append(name)
             work['native_binding'] = {'assignment_id': work['assignment_id'], 'session_id': session_id,
                                       'reference': self.config['reference']}
-            planning.checkpoint(database, item)
+            planning.checkpoint(database, item, bootstrap=first_observation and native is not None)
             if self.loaded.get('assignment_id') != work['assignment_id']:
                 self.loaded = {'assignment_id': work['assignment_id'], 'session_id': session_id, 'sufficient': False}
             return {'context': '\n\n'.join([work['instructions'], *instructions,

@@ -317,6 +317,47 @@ class PlanningWakeupTests(unittest.TestCase):
 
 
     def test_lifecycle_unavailable_is_explicit_and_unload_cancels_owned_task(self):
+        # Drive the coroutine with an immediate sleep seam: no event loop/socketpair.
+        for hold in ('iteration_paused', 'scope_mismatch', 'execution_uncertain'):
+            native = wakeup.NativeWakeup(self.binding, str(self.path))
+            calls = []
+            def step():
+                calls.append(True)
+                if len(calls) == 1:
+                    raise repositories.RepositoryError(hold, 'fixture hold')
+                native.status = 'idle'
+            async def tick(delay):
+                self.ctx.inject_message.assert_not_called()
+                self.assertFalse(native.joined.is_set())
+                if len(calls) >= 2: native.stopped = True
+            with patch.object(native, 'step', side_effect=step), patch.object(wakeup.asyncio, 'sleep', side_effect=tick):
+                operation = native.run()
+                with self.assertRaises(StopIteration): operation.send(None)
+            self.assertTrue(native.joined.is_set())
+            self.assertEqual(len(calls), 2 if hold == 'iteration_paused' else 1)
+            self.assertEqual(native.status, 'stopped' if hold == 'iteration_paused' else 'held')
+        # Actual paused/current-reader path observes a fresh external resume on
+        # the next tick and stays idle without injecting a synthetic answer.
+        self.item['status'] = 'paused'; self.fixture.persist()
+        native = wakeup.NativeWakeup(self.binding, str(self.path))
+        ticks = []
+        async def resume_tick(delay):
+            ticks.append(native.status)
+            self.assertFalse(native.joined.is_set())
+            self.ctx.inject_message.assert_not_called()
+            if len(ticks) == 1:
+                self.item['status'] = 'active'; self.fixture.persist()
+            else:
+                native.stopped = True
+        with patch.object(wakeup.asyncio, 'sleep', side_effect=resume_tick):
+            operation = native.run()
+            with self.assertRaises(StopIteration): operation.send(None)
+        self.assertEqual(ticks, ['waiting', 'idle'])
+        self.assertTrue(native.joined.is_set())
+        # A genuinely missing first observation is quiet, not terminal scope drift.
+        self.item['planning'].pop('native_execution'); self.fixture.persist()
+        self.native.step()
+        self.assertEqual(self.native.status, 'waiting_input')
         self.ctx.spawn_task.side_effect = RuntimeError('no running loop')
         self.native.start()
         self.assertEqual(self.native.status, 'native_lifecycle_unavailable')

@@ -58,6 +58,7 @@ class SelectionComponents(unittest.TestCase):
         waiting = dict(item(), status='waiting-for-operator', completion={'report_id': 'report'})
         cases = (
             ('retired-root', retired, [row('old')], frontier(), c.action('implementation', 2)),
+            ('bug-rescoped-root', item(), [dict(row('old'), bug_disposition={'status': 'parked'})], frontier(), c.action('implementation', 2)),
             ('held-frontier', retired, [row('old')], held, c.action('implementation', 3)),
             ('foreign-active', retired, [], foreign, {'stage': 'blocked'}),
             ('unregistered', incident, [row()], frontier(), c.action('blocked', 'registered_repair_required')),
@@ -107,8 +108,10 @@ class CapacityComponents(unittest.TestCase):
 
     def test_literal_capacity_and_launcher_limits_matrix(self):
         from factory_v1.model_access import SUBSCRIPTION_SCOPE
+        from factory_v1.tests.test_sandbox import bounded_storage_observation
         provider, model, operation = SUBSCRIPTION_SCOPE
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                c.sandbox_policy, 'storage_observation', side_effect=bounded_storage_observation):
             root = Path(directory)
             artifacts = root / 'artifacts'
             artifacts.mkdir(mode=0o700)
@@ -182,8 +185,8 @@ class CapacityComponents(unittest.TestCase):
                 github.request.return_value = {'ref': 'refs/heads/main', 'object': {'type': 'commit', 'sha': 'c' * 40}}
                 with patch.object(c.tickets.gh, 'read_issue', return_value={'number': 2, 'id': 20, 'node_id': 'I_2', 'body': 'fresh body'}), \
                      patch.object(c.requirements, 'authority', return_value={'spec': {'commit': 'd' * 40}}), \
-                     patch.object(c.merge, 'controller_paths'), patch.object(c.merge, 'private_file', side_effect=lambda p: p), \
-                     patch.object(c.publication, 'read_json', side_effect=lambda p: values[p]):
+                     patch.object(c.merge, 'controller_paths'), \
+                     patch('factory_v1.readiness_gate.runtime_receipt', side_effect=lambda db, project, iteration, kind, path, **kw: values[path]):
                     bounded = c.request(conf, item(), 2, self.slot('fresh'), github)
                     with self.assertRaises(RepositoryError) if expected is None else nullcontext():
                         self.assertEqual(c.authority(Mock(), conf, 'review', lambda v: v.get('axes') == ['correct']), expected)
@@ -226,6 +229,67 @@ class ExecutionComponents(unittest.TestCase):
                         apply.assert_not_called()
                     else:
                         self.assertEqual(apply.call_args.args[4], {'stuck_assignment': 'root', 'event_id': 'event'})
+
+        from factory_v1.tests.test_simplification import LocalStageEvidence
+        for kind in ('correctness', 'behavior', 'out-of-scope'):
+            with self.subTest(simplifier_finding=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                e = LocalStageEvidence(root)
+                finding = {'kind': kind, 'path': 'hello.py', 'evidence': 'Bounded local finding', 'proposal': 'Correct or revise scope'}
+                e.assignment['simplification_result'] = c.simplification.validate_result(e.assignment,
+                    e.result(e.report(outcome='findings', findings=[finding])))
+                for key in assignments.REQUEST_FIELDS:
+                    e.assignment['handoff'].setdefault(key, None)
+                e.assignment['handoff'].update(stage='simplify', repository='example/product', repository_id=7,
+                    workspace=str(root / 'workspace'), standards=[], profile={'name': 'simple', 'home': str(root / 'profile')})
+                e.assignment['handoff']['issue'].update(number=10, id=110, node_id='I_10')
+                e.assignment['handoff']['simplification']['implementation_assignment'] = 'root'
+                e.assignment['ticket_scope'].update(project='p', iteration='m1', repository='example/product', repository_id=7)
+                e.seal_handoff()
+                saved = item()
+                saved['correlation'] = {'project_id': 'p', 'iteration_id': 'm1', 'stage': 'intake_registered',
+                    'control_run_id': 'control-1', 'evidence_id': 'intake-1', 'worker_run_id': None}
+                saved['origin'] = {'platform': 'discord', 'chat_id': '123', 'thread_id': '123', 'parent_chat_id': '122', 'scope_id': '121'}
+                db = sqlite3.connect(root / 'state.sqlite')
+                self.addCleanup(db.close)
+                db.execute('CREATE TABLE iterations (project_id TEXT, iteration_id TEXT, payload TEXT)')
+                db.execute('CREATE TABLE notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
+                db.execute('INSERT INTO iterations VALUES (?,?,?)', ('p', 'm1', json.dumps(saved)))
+                db.commit()
+                rows = [row(), e.assignment]
+                selected = c.select(saved, rows, frontier())
+                self.assertEqual(selected['stage'], 'simplification-corrections' if kind == 'correctness' else 'simplification-direction')
+                slot = {'profile': {'name': 'fresh-fix'}, 'skills': [], 'claim_id': 'fix', 'launcher': '/private/launcher'}
+                prepared = []
+                def admit(database, project, iteration, operator, request, github, dry_run=False):
+                    contract = c.review.corrections_handoff(database, project, iteration, operator, request, github)
+                    self.assertEqual(contract['source'], 'simplification')
+                    self.assertEqual(contract['findings'], [finding])
+                    self.assertEqual(contract['pins']['candidate_assignment'], e.assignment['assignment_id'])
+                    self.assertEqual(contract['rerun_required'], ['implementation-checks', 'simplify', 'Standards', 'Spec'])
+                    prepared.append(request)
+                    return contract
+                with patch.object(assignments, 'inspect', return_value=e.assignment), patch.object(assignments, 'rows', return_value=rows), \
+                     patch.object(c, 'slot_for', return_value=slot), patch.object(c.merge, 'controller_paths'), \
+                     patch.object(assignments, 'prepare', autospec=True, side_effect=admit):
+                    with self.assertRaises(RepositoryError) as refused:
+                        c.review.candidate(db, 'p', 'm1', '42', e.assignment['assignment_id'])
+                    self.assertEqual(refused.exception.code, 'candidate_unverified')
+                    result = c.execute(db, ('p', 'm1', '42'), config(), saved, rows, selected, Mock())
+                    if kind == 'correctness':
+                        self.assertEqual(len(prepared), 1)
+                        self.assertEqual(prepared[0]['stage'], 'corrections')
+                    else:
+                        self.assertEqual(result['result']['status'], 'waiting')
+                        records = c.attention.records(db, 'p', 'm1', saved)
+                        self.assertEqual(len(records), 1)
+                        self.assertEqual(records[0]['event']['kind'], 'decision')
+                        self.assertEqual(records[0]['destination'], saved['origin'])
+                        self.assertTrue(records[0]['event']['evidence_ids'])
+                        self.assertEqual(prepared, [])
+                        # Re-polling creates no duplicate decision or execution authority.
+                        c.execute(db, ('p', 'm1', '42'), config(), saved, rows, selected, Mock())
+                        self.assertEqual(len(c.attention.records(db, 'p', 'm1', saved)), 1)
 
 
 

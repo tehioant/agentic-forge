@@ -112,7 +112,7 @@ def select(item, rows, observed):
             return action('direction', identity, event_id=record['event_id'])
         return action('request-direction', identity, diagnosis=debug['assignment_id'])
     active_rows = [r for r in rows if not any(r.get(k) for k in
-                   ('requirement_disposition', 'recovery_disposition', 'restart_disposition')) and
+                   ('requirement_disposition', 'recovery_disposition', 'restart_disposition', 'bug_disposition')) and
                    r.get('stuck_disposition') not in {'held', 'superseded'} and
                    r['assignment_id'] not in {identity for v in item.get('delivered_ticket_retirements', {}).values()
                                               for identity in v['proof']['lineage']}]
@@ -153,6 +153,9 @@ def select(item, rows, observed):
         waiting = pending(simplified)
         if waiting:
             return waiting
+        route = simplification.findings_route(simplified)
+        if route:
+            return action(route, simplified['assignment_id'])
         axes = {}
         for stage in ('review-standards', 'review-spec'):
             axis = one([r for r in active_rows if r['handoff']['stage'] == stage and r['handoff'].get(
@@ -228,10 +231,13 @@ def request(config, item, number, slot, github):
 
 def authority(database, config, kind, predicate):
     """Select an exact host-owned authority, never materialize one from reports."""
+    from .readiness_gate import runtime_receipt
     matches = []
     for path in config['continuation']['authorities'][kind]:
+        value = runtime_receipt(database, config['project'], config['iteration'], kind, path, missing_ok=True)
+        if value is None:
+            continue  # Only an approved, never-issued future slot may be absent.
         merge.controller_paths(database, path)
-        value = publication.read_json(merge.private_file(path))
         if value.get('operator_id') == config['operator_id'] and predicate(value):
             matches.append(path)
     require(len(matches) == 1, 'Missing, stale or ambiguous exact ' + kind + ' authority.', kind + '_authority_unavailable')
@@ -294,7 +300,7 @@ def launcher_for(database, config, row):
 def prepare_action(database, scope, config, item, rows, selected, github):
     stage, target = selected['stage'], selected['target']
     commands = None
-    if stage in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
+    if stage in {'simplify', 'review-standards', 'review-spec', 'corrections', 'simplification-corrections'}:
         prior = next(r for r in rows if r['assignment_id'] == target)
         contract = prior['handoff'].get('simplification') or prior['handoff'].get('corrections')
         if contract:
@@ -302,7 +308,7 @@ def prepare_action(database, scope, config, item, rows, selected, github):
         else:
             _, _, receipt = simplification.check_receipt(Path(prior['runtime']['artifacts']), prior['runtime'])
             commands = [r['command'] for r in receipt['records']]
-    slot = selected.get('slot') or slot_for(config, rows, stage, commands)
+    slot = selected.get('slot') or slot_for(config, rows, 'corrections' if stage == 'simplification-corrections' else stage, commands)
     merge.controller_paths(database, slot['launcher'])
     if stage in {'implementation', 'repair'}:
         bounded = selected.get('request') or request(config, item, target, slot, github)
@@ -314,6 +320,9 @@ def prepare_action(database, scope, config, item, rows, selected, github):
         return review.prepare(database, *scope, {'candidate_assignment': target, 'axis': stage, **role(slot)}, github)
     if stage == 'corrections':
         return review.prepare_corrections(database, *scope, {**selected['axes'], **role(slot)}, github)
+    if stage == 'simplification-corrections':
+        return review.prepare_findings_corrections(database, scope[0], scope[1], scope[2],
+                                                  {'candidate_assignment': target, **role(slot)}, github)
     if stage == 'diagnosis':
         return diagnosis.prepare(database, *scope, {'stuck_assignment': target, **role(slot)}, github)
     require(False, 'Unsupported continuation preparation.', 'invalid_dispatch')
@@ -343,8 +352,11 @@ def retire_delivered(database, scope, config, item, rows, github):
 def execute(database, scope, config, item, rows, selected, github):
     """Caller holds state_lock. Return outside-lock operations to the existing tick."""
     stage, target = selected['stage'], selected['target']
-    if stage in assignments.ROLES:
+    if stage in assignments.ROLES or stage == 'simplification-corrections':
         prepare_action(database, scope, config, item, rows, selected, github)
+    elif stage == 'simplification-direction':
+        simplification.request_findings_direction(database, scope[0], scope[1], scope[2], target)
+        return {'result': {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['simplification_operator_revision_required']}}
     elif stage == 'launch':
         row = next(r for r in rows if r['assignment_id'] == target)
         return {'launch': (target, launcher_for(database, config, row))}

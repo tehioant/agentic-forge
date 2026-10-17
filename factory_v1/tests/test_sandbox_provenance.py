@@ -7,7 +7,7 @@ from collections.abc import Callable
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from factory_v1 import assignments, sandbox, sandbox_checks
+from factory_v1 import assignments, sandbox, sandbox_checks, controls
 from factory_v1.repositories import RepositoryError
 from factory_v1.sandbox_policy import load_config
 from factory_v1.tests import test_sandbox
@@ -16,7 +16,7 @@ from factory_v1.tests import test_sandbox
 class CheckFixture:
     def __init__(self, case):
         self.launcher = test_sandbox.LauncherFixture(case)
-        self.root = self.launcher.root / 'check-run'
+        self.root = self.launcher.artifacts / 'check-run'
         self.root.mkdir(mode=0o700)
         (self.root / 'workspace').mkdir()
         (self.root / 'workspace/hello.py').write_text('labeled candidate\n')
@@ -43,7 +43,8 @@ class CheckFixture:
     def verify(self, deadline=103):
         with patch.object(sandbox_checks, 'Docker', return_value=self.docker), \
                 patch.object(sandbox_checks.time, 'monotonic', return_value=100):
-            return sandbox_checks.verify_checks(self.root, self.config, self.runtime, deadline)
+            return sandbox_checks.verify_checks(self.root, self.config, self.runtime, deadline,
+                admit=lambda: controls.admission(self.launcher.db, 'product', 'm1', operation='effect'))
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -147,7 +148,7 @@ class ProvenanceTests(unittest.TestCase):
         return result, store, records
 
     def test_finalization_controller_check_wiring_cases(self):
-        for exit_code in (0, 3):
+        for exit_code in (0, 3, 'pause'):
             with self.subTest(exit_code=exit_code):
                 fixture = self.fixture if exit_code == 0 else test_sandbox.LauncherFixture(self)
                 component = test_sandbox.FinalizationFixture(self, fixture)
@@ -170,10 +171,17 @@ class ProvenanceTests(unittest.TestCase):
                     mocks.enter_context(patch.object(sandbox_checks.time, 'monotonic', return_value=100))
                     mocks.enter_context(patch.object(sandbox, 'verify_checks', verifier))
                     mocks.enter_context(patch.object(assignments, 'store_result', store))
+                    if exit_code == 'pause':
+                        evidence = sandbox.check_worker_evidence
+                        def paused_evidence(*args):
+                            result = evidence(*args)
+                            controls.request(fixture.db, 'product', 'm1', '42', 'pause', 'labeled last evidence read pause')
+                            return result
+                        mocks.enter_context(patch.object(sandbox, 'check_worker_evidence', side_effect=paused_evidence))
                 if exit_code:
                     with self.assertRaises(RepositoryError) as error:
                         component.finalize(setup=setup)
-                    self.assertEqual(error.exception.code, 'verification_failed')
+                    self.assertEqual(error.exception.code, 'iteration_paused' if exit_code == 'pause' else 'verification_failed')
                     result = fixture.stored()
                 else:
                     result = component.finalize(setup=setup)
@@ -183,11 +191,14 @@ class ProvenanceTests(unittest.TestCase):
                 verifier.assert_called_once()
                 docker.remove.assert_called_once_with(result['runtime']['container'])
                 self.assertEqual([call.args[0] for call in docker.call.call_args_list],
-                                 ['create', 'start', 'logs'] if exit_code else ['create', 'start', 'logs', 'logs'])
+                                 ['logs'] if exit_code == 'pause' else ['create', 'start', 'logs'] if exit_code else ['create', 'start', 'logs', 'logs'])
                 if exit_code:
                     self.assertNotIn('submitted_result', result)
                     self.assertNotIn('result_disposition', result)
                     self.assertNotIn('checks_sha256', result['runtime'])
+                    if exit_code == 'pause':
+                        self.assertNotIn('create', [call.args[0] for call in docker.call.call_args_list])
+                        self.assertNotIn('start', [call.args[0] for call in docker.call.call_args_list])
                     for name in ('scratch/result.json', 'checks/container.log', 'worker-container.log'):
                         self.assertTrue((root / name).exists())
                     self.assertFalse((root / 'controller-checks.json').exists())
@@ -222,16 +233,51 @@ class ProvenanceTests(unittest.TestCase):
         check.docker.remove.assert_called_once()
 
     def test_controller_check_cancellation_checkpoints(self):
-        rows = (('start', None), ('logs', None), ('disappear', None),
+        rows = (('pause-before-create', None), ('pause-before-start', None), ('pause-wait', None), ('pause-receipt', None),
+                ('start', None), ('logs', None), ('disappear', None),
                 ('start', signal.SIGTERM), ('start', signal.SIGINT))
         for boundary, number in rows:
             with self.subTest(boundary=boundary, signal=number):
                 check = CheckFixture(self)
+                if boundary.startswith('pause-'):
+                    injected = []
+                    def pause():
+                        if not injected:
+                            controls.request(check.launcher.db, 'product', 'm1', '42', 'pause', 'labeled independent-check interruption')
+                            injected.append(True)
+                    inspections = []
+                    def inspect(name):
+                        inspections.append(name)
+                        if len(inspections) == 1:
+                            if boundary == 'pause-before-start':
+                                pause()
+                            return test_sandbox.container_inspection(check.config, name, check.mounts)
+                        if boundary == 'pause-wait':
+                            pause()
+                            return {'State': {'Running': True}}
+                        return {'State': {'Running': False, 'ExitCode': 0}}
+                    check.docker.inspect.side_effect = inspect
+                    check.boundary = lambda command: pause() if command == 'logs' and boundary == 'pause-receipt' else None
+                    if boundary == 'pause-before-create':
+                        pause()
+                    with patch.object(sandbox_checks.time, 'sleep'), self.assertRaises(RepositoryError) as error:
+                        check.verify()
+                    self.assertEqual(error.exception.code, 'iteration_paused')
+                    self.assertTrue(injected)
+                    operations = [call.args[0] for call in check.docker.call.call_args_list]
+                    if boundary == 'pause-before-create':
+                        self.assertNotIn('create', operations)
+                    if boundary in {'pause-before-create', 'pause-before-start'}:
+                        self.assertNotIn('start', operations)
+                    self.assertFalse((check.root / 'controller-checks.json').exists())
+                    check.docker.remove.assert_called_once()
+                    continue
                 component = None
                 if number is not None:
                     fixture = self.fixture if number == signal.SIGTERM else test_sandbox.LauncherFixture(self)
                     component = test_sandbox.FinalizationFixture(self, fixture)
                     check.root, check.runtime = component.root, component.runtime
+                    check.config['artifacts_root'] = component.config['artifacts_root']
                     check.mounts = {'/workspace': (str(check.root / 'workspace'), False),
                                     '/scratch': (str(check.root / 'checks/scratch'), True),
                                     '/inputs': (str(check.root / 'checks/inputs'), False)}
@@ -287,6 +333,7 @@ class ProvenanceTests(unittest.TestCase):
         check = CheckFixture(self)
         check.root = component.root
         check.runtime = component.runtime
+        check.config['artifacts_root'] = component.config['artifacts_root']
         check.mounts = {'/workspace': (str(check.root / 'workspace'), False),
                         '/scratch': (str(check.root / 'checks/scratch'), True),
                         '/inputs': (str(check.root / 'checks/inputs'), False)}
@@ -295,7 +342,8 @@ class ProvenanceTests(unittest.TestCase):
         with patch.object(sandbox_checks, 'Docker', return_value=check.docker), \
                 patch.object(sandbox_checks.time, 'monotonic', return_value=100), \
                 self.assertRaises(RepositoryError) as error:
-            sandbox.verify_checks(component.root, check.config, component.runtime, 103)
+            sandbox.verify_checks(component.root, check.config, component.runtime, 103,
+                admit=lambda: controls.admission(self.fixture.db, 'product', 'm1', operation='effect'))
         self.assertEqual(error.exception.code, 'cancelled')
         self.assertTrue(component.stop.is_set())
         self.assertTrue((component.root / 'stop').exists())

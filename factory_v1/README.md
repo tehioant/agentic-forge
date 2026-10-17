@@ -45,7 +45,7 @@ boundary](../docs/fresh-independent-review.md).
 
 ## Candidate publication (#14)
 
-`publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes only a fixed candidate branch and draft PR; it never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
+`publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes a fixed candidate branch and draft PR. The separately gated merge lifecycle can mark that exact reviewed PR ready with durable intent/readback before a later merge attempt; publication alone never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
 
 ## Gated merge and integrated delivery (#17)
 
@@ -66,7 +66,10 @@ fixtures and baseline CI do not satisfy them.
 
 `observe-delivery`, bounded `watch-delivery` and `inspect-delivery` observe exact
 main checks/workflows and an explicitly configured, pinned deployment/acceptance
-contract. Failed **or unknown** delivery atomically records a correlated incident,
+contract, including explicit `deployment_applicability: "not-applicable"` for
+CI-only projects. N/A still requires pinned exact-main checks, required workflows
+and workflow-backed acceptance criteria; omission is unknown, not N/A. Failed **or
+unknown** delivery atomically records a correlated incident,
 freezes ordinary merges and enqueues durable exact-origin attention. The merge
 boundary re-observes installed health before mutation; exact gated recovery scope
 remains eligible. Routine health is silent. No production URL, deployment, repair
@@ -550,7 +553,10 @@ gates, not permissions granted by this interface.
 Only the trusted operator/controller supplies `--launcher-config`. It is a
 controller-owned mode-0600 regular JSON file outside the assignment workspace,
 with these fields and optional `verification_commands` (the artifact root must already exist, be mode 0700,
-and belong to the controller):
+and belong to the controller). It must also be a **dedicated tmpfs mount root**,
+with a kernel-enforced byte capacity no larger than `scratch_mb` MiB and a finite
+inode capacity no larger than `scratch_mb * 256`. Ordinary host directories and
+binds of shared tmpfs subdirectories are refused with `storage_unbounded`:
 
 ```json
 {
@@ -576,6 +582,34 @@ inspected digest. The launcher checks image identity, the known original image
 entrypoint/working directory and its declared volume; it deliberately bypasses
 that root-oriented bootstrap with the image's Python running the immutable worker
 harness. The entire `AIAgent` runs inside the container, not just its terminal.
+
+Before runtime activation, an administrator must provision that private tmpfs
+with explicit `size` and `nr_inodes` limits (for the example: at most 128 MiB and
+32768 inodes), controller ownership and mode 0700. This is an independently
+validated prerequisite, not a JSON quota attestation: the controller reads Linux
+`/proc/self/mountinfo` and `statvfs`, rejects nested mounts, and verifies that every
+writable bind remains under that same filesystem. It rechecks at command creation,
+container inspection and immediately before start, for engineering **and** check
+containers. No mount is created automatically and no new privilege is granted.
+The aggregate filesystem ceiling covers source snapshots, writable workspace,
+scratch/home, controller evidence and concurrent/retained attempts sharing that
+root, so each attempt is bounded at least as strictly as `scratch_mb`. Retention
+must leave room for later attempts; use separate provisioned roots for independent
+project capacity. Docker's separate `/opt/data` and `/tmp` tmpfs limits remain in
+force. A writable-layer size option would not bound these host binds.
+The trusted Docker daemon must share the controller host's mount view: remote
+TCP/SSH routes and nondefault `DOCKER_CONTEXT` are refused, and an explicit local
+Unix `DOCKER_HOST` overrides any ambient selected context. A containerized/private-
+mount controller must not be deployed with a different daemon mount view; that
+platform arrangement is not supported or qualified by these component checks.
+
+Tmpfs evidence is volatile across unmount/reboot. Export needed evidence through
+the trusted controller's separately managed retention policy before removal; do
+not replace the runtime backing with an unbounded disk directory. Missing evidence
+after restart is a fail-closed reconciliation prerequisite, not accepted execution.
+Controller SQLite/control state and upstream credentials must remain outside the
+worker-writable artifact filesystem. Component tests mock kernel observations;
+actual mount/quota/exhaustion qualification has not been performed.
 
 ```bash
 python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
@@ -604,6 +638,9 @@ PID/start identity and TTL; controller death removes the actual container and
 retains logs. Stop and reconciliation read back container absence; an unavailable
 Docker daemon is **not** treated as proof of removal. Claims remain held, including
 failed, stopped and stale runs: retry/release/scheduling are not introduced here.
+Artifact-root, stop-marker and diagnostic-write failures cannot skip mandatory
+removal. Stop/reconcile persist verified absence or `unconfirmed/stop_unconfirmed`;
+marker failure is retained separately as `diagnostics_error=artifacts_unavailable`.
 
 Launch consumes only the persisted handoff and rechecks operator/iteration,
 spending allowance, frontier, exact ticket body/IDs, spec/input revisions, skills
@@ -640,6 +677,12 @@ their original 32 KB default); counts/TTL and the approved allowance remain
 mandatory. Pending upstream work gets SSE keepalives, not fabricated model output.
 Only actual approved completed response items are forwarded. No paid fallback.
 The state lock is released during upstream I/O.
+After slow authorization callbacks, a final short scoped interruption admission
+rechecks stop, TTL and grant expiry. Refusal before forwarding releases the exact
+reservation as failed/zero; interruption after forwarding remains uncertain.
+Independent check creation/start, cooperative wait and receipt admission use the
+owning iteration's scoped admission too; ordinary pause is not just a stop marker.
+Cleanup and truthful logs of already-admitted work remain possible while paused.
 
 The harness probes shell/file/mount/network denials before constructing the agent,
 loads every selected pinned skill/support/input using actual executing-process
@@ -684,16 +727,12 @@ unattested and all review/merge/close authority stays disabled. See
 [the production contract and smallest live harness](../docs/fresh-simplification.md)
 for request/result schemas, exact revision hashing and remaining proof limits.
 
-Default CI tests exercise the public lifecycle using **labeled deterministic
-Docker, model and tracker fixtures**, plus real local HTTP/UDS protocol seams.
-They cover pinned source, packed objects/config exclusion, fresh homes, scoped
-permissions, admission/large request bounds, forbidden upstream tools, launch
-replay, pause, cancellation/controller death, read-only review, bad mounts and
-malformed/forged artifacts. They do **not** establish live container, approved
-model or GitHub acceptance. A real pinned image `docker create` inspection has
-been checked, but real Hermes/model/tool denial journeys remain a separate live
-acceptance obligation; retain exact run artifact handles rather than claiming
-fixture output proves isolation or delivery.
+Current CI uses unit tests and small focused components with mocked Docker,
+model, tracker and process boundaries. The canonical runner blocks actual socket,
+process and signal execution. Retained legacy journey helpers are historical;
+they are not the active verification contract. See the current verification
+section below. Component results establish their checked predicates, not native
+container enforcement, approved model execution or live GitHub delivery.
 
 ## Attention delivery (#15)
 
@@ -846,14 +885,35 @@ sandbox implementation does not merge, close #15 or call any worker GitHub route
 
 ## Verification and honest boundary
 
+Run the current policy-compliant suite from the repository root:
+
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s factory_v1/tests -v
-PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_v1
+mise run test
+mise exec -- python -m compileall -q factory_v1
 ```
 
-Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
+The suite discovers every test once, refuses duplicate identities, and enforces a
+500-method ceiling without filtering. Unit and focused component fixtures use
+explicit durable records and mock external boundaries; complete simulated worker/
+controller journeys, real network/services/containers and E2E checks are not part
+of routine CI. The execution guard supplements source/fixture review: it does not
+by itself prove that mocked setup is a small component.
 
-Verification is **operator-selected mock-only** in the existing credential-blind whole-process sandbox: network access and GitHub broker routes are denied; no host credentials, spending or fallback are authorized. No disposable live repository or board is required for this verification. Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**, and passing them does not establish live compatibility. Ticket controls and model spending admission remain separate capabilities; neither starts workers or supplies merge or deployment execution. This controller implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher or merge service, and changes no existing gate. Attention delivery is the scoped supported Hermes CLI adapter described above, verified mock-only under the #15 amendment. Controlled integration remains host-owned; functional ticket requirements, including the linked board and exact readback, remain unchanged.
+The controller implements deterministic scheduling, scoped worker launch,
+simplification, separate Standards/Spec review, publication, merge, integrated
+verification and delivery observation. Source availability does not mean those
+capabilities are installed, authorized or enabled. Exact private host execution
+and candidate authorizations remain prerequisites; the service does not manufacture
+trusted provenance from worker reports. Supplying an authorization can be automated
+only by an independently approved host verifier, not by this documentation.
+
+Passing tests do not prove conversation authentication, effective GitHub permissions,
+native worker confinement, actual model execution, production health or notification
+delivery. Historical slice acceptance descriptions below and in linked documents
+retain their original evidence scope; use current configuration contracts and
+candidate-bound receipts rather than treating old fixture/live claims as current
+installation observations. [SERVICE.md](SERVICE.md) is the service entry point;
+[READINESS.md](READINESS.md) describes execution prerequisites and refusal states.
 
 ## Tickets (#8): selected to-tickets → controlled publication → frontier → one reservation
 

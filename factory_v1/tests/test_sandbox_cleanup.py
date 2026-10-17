@@ -2,6 +2,7 @@
 No Docker/model acceptance claims, source mutation, commits or permission changes.
 """
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -35,6 +36,19 @@ class CleanupErrorTests(unittest.TestCase):
         self.database.commit()
 
     def test_docker_exec_errors_structured_matrix(self):
+        for host, context, admitted in (('unix:///var/run/docker.sock', 'default', True),
+                                         ('tcp://remote:2375', 'default', False),
+                                         ('ssh://remote', 'default', False),
+                                         ('unix:///run/user/1000/docker.sock', 'remote', False)):
+            with self.subTest(host=host, context=context), patch.dict(os.environ, {'DOCKER_HOST': host, 'DOCKER_CONTEXT': context}), \
+                    patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
+                if admitted:
+                    self.assertEqual(Docker().env['DOCKER_HOST'], host)
+                    self.assertNotIn('DOCKER_CONTEXT', Docker().env)
+                else:
+                    with self.assertRaises(RepositoryError) as refusal:
+                        Docker()
+                    self.assertEqual(refusal.exception.code, 'storage_unbounded')
         with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
             docker = Docker()
         for operation, args, kwargs, error in (
@@ -51,7 +65,8 @@ class CleanupErrorTests(unittest.TestCase):
         from factory_v1 import controls
         baseline = deepcopy(self.assignment)
         cases = [('emergency', defect) for defect in ('kill', 'inspect', 'logs', 'artifact', 'remove')]
-        cases += [('assignment', defect) for defect in ('logs', 'artifact')]
+        cases += [(adapter, defect) for adapter in ('assignment', 'reconcile')
+                  for defect in ('logs', 'artifact', 'marker', 'root', 'remove', 'marker-remove')]
         for adapter, defect in cases:
             with self.subTest(adapter=adapter, defect=defect), ExitStack() as stack:
                 assignment = deepcopy(baseline)
@@ -74,26 +89,42 @@ class CleanupErrorTests(unittest.TestCase):
                 docker.inspect.return_value = {'State': {'Running': False}}
                 if defect == 'inspect':
                     docker.inspect.side_effect = RepositoryError('container_unavailable', 'LABELED inspect failure')
-                if defect == 'remove':
+                if defect in {'remove', 'marker-remove'}:
                     docker.remove.side_effect = RepositoryError('stop_unconfirmed', 'LABELED removal failure')
                 if defect == 'artifact':
                     stack.enter_context(patch.object(Path, 'write_bytes', side_effect=PermissionError('injected log write refusal')))
+                if defect in {'marker', 'marker-remove'}:
+                    touch = Path.touch
+                    def marker_touch(path, *args, **kwargs):
+                        if path == self.root / 'stop':
+                            raise OSError(28, 'labeled full artifact filesystem')
+                        return touch(path, *args, **kwargs)
+                    stack.enter_context(patch.object(Path, 'touch', marker_touch))
+                if defect == 'root':
+                    stack.enter_context(patch.object(sandbox, 'physical', side_effect=RepositoryError('unsafe_path', 'labeled missing root')))
                 stack.enter_context(patch('factory_v1.sandbox_guard.process_identity', return_value=None))
+                stack.enter_context(patch.object(sandbox, 'process_identity', return_value=None))
                 stack.enter_context(patch('factory_v1.sandbox_policy.Docker', return_value=docker))
                 stack.enter_context(patch('factory_v1.sandbox.Docker', return_value=docker))
                 if adapter == 'emergency':
                     result = controls.request(self.database, 'p', 'i', 42, 'emergency-stop', 'LABELED cleanup failure matrix')
                     outcome = result['cleanup']['a']
                 else:
-                    result = sandbox.stop_assignment(self.database, 'p', 'i', 42, 'a')
+                    result = (sandbox.reconcile if adapter == 'reconcile' else sandbox.stop_assignment)(self.database, 'p', 'i', 42, 'a')
                     self.assertIsNotNone(result)
                     outcome = result['runtime']
-                    self.assertEqual(outcome['status'], 'stopped')
+                    self.assertEqual(outcome['status'], 'unconfirmed' if 'remove' in defect else 'stopped')
+                    self.assertEqual(outcome['error'], 'stop_unconfirmed' if 'remove' in defect else
+                                     'controller_lost' if adapter == 'reconcile' else 'cancelled')
+                    stored = json.loads(self.database.execute('SELECT payload FROM role_assignments').fetchone()[0])
+                    self.assertEqual(stored['runtime'], outcome)
+                    if defect in {'marker', 'root', 'marker-remove'}:
+                        self.assertEqual(outcome['diagnostics_error'], 'artifacts_unavailable')
                     if defect == 'artifact':
                         self.assertEqual(json.loads((self.root / 'container-log-error.json').read_text())['type'], 'PermissionError')
-                self.assertTrue((self.root / 'stop').exists())
+                self.assertEqual((self.root / 'stop').exists(), defect not in {'marker', 'root', 'marker-remove'})
                 docker.remove.assert_called_once_with('fixture')
-                self.assertEqual(outcome['container_removed'], defect != 'remove')
+                self.assertEqual(outcome['container_removed'], 'remove' not in defect)
                 if adapter == 'emergency':
                     self.assertIn('kill', calls)
                     self.assertEqual(calls[0], 'kill')
@@ -126,21 +157,29 @@ class CleanupErrorTests(unittest.TestCase):
 
     def test_launch_cleanup_unconfirmed_matrix(self):
         import threading
-        for failure in (FileNotFoundError('injected Docker disappearance during cleanup'),
+        for failure in (None, FileNotFoundError('injected Docker disappearance during cleanup'),
                         RepositoryError('stop_unconfirmed', 'injected uncertain removal')):
-            with self.subTest(failure=type(failure).__name__):
+            with self.subTest(failure=type(failure).__name__), ExitStack() as stack:
+                stack.enter_context(patch.object(Path, 'touch', side_effect=OSError(28, 'labeled guard-finish ENOSPC')))
+                restored = stack.enter_context(patch.object(sandbox.signal, 'signal'))
+                guard, broker = Mock(), Mock()
+                broker.is_alive.return_value = False
                 with self.database:
                     self.database.execute('UPDATE role_assignments SET payload=?', (json.dumps(self.assignment),))
                 docker = Mock()
                 docker.remove.side_effect = failure
                 runtime = self.assignment['runtime']
                 result = sandbox.cleanup_attempt(str(self.state), 'p', 'i', 42, 'a', 'r', self.root,
-                    runtime, threading.Event(), docker, None, None, [], None, {},
+                    runtime, threading.Event(), docker, guard, broker, [], None, {2: 'previous-handler'},
                     'failed', 'source_blocked', str(self.root / 'config.json'))
                 docker.remove.assert_called_once_with('fixture')
-                self.assertEqual(result['runtime']['status'], 'unconfirmed')
-                self.assertEqual(result['runtime']['error'], 'stop_unconfirmed')
-                self.assertFalse(result['runtime']['container_removed'])
+                guard.wait.assert_called_once_with(timeout=35)
+                broker.join.assert_called_once_with(timeout=1)
+                restored.assert_called_once_with(2, 'previous-handler')
+                self.assertEqual(result['runtime']['status'], 'unconfirmed' if failure else 'failed')
+                self.assertEqual(result['runtime']['error'], 'stop_unconfirmed' if failure else 'source_blocked')
+                self.assertEqual(result['runtime']['container_removed'], failure is None)
+                self.assertEqual(result['runtime']['diagnostics_error'], 'artifacts_unavailable')
 
 
 

@@ -483,6 +483,65 @@ class MergeComponentTests(unittest.TestCase):
     def mutations(self, method=None):
         return [c for c in self.calls if c[0] == method] if method else [c for c in self.calls if c[0] != 'GET']
 
+    def test_controlled_ready_intent_readback_and_replay_matrix(self):
+        original = copy.deepcopy(self.pr)
+        for case in ('ready', 'lost-response', 'unknown', 'replay-ready', 'replay-draft', 'prepared-draft', 'head-drift', 'late-pause'):
+            with self.subTest(case=case):
+                self.pr = {**copy.deepcopy(original), 'draft': case != 'replay-ready', 'node_id': 'PR_exact20'}
+                self.store(copy.deepcopy(self.candidate))
+                self.calls.clear()
+                authority = {k: v for k, v in self.config.items() if k != 'bearer'}
+                if case.startswith('replay') or case == 'prepared-draft':
+                    saved = self.stored()
+                    saved['pr_readiness'] = {'status': 'prepared' if case == 'prepared-draft' else 'pending', 'authority': authority, 'pr_number': 20,
+                                            'node_id': 'PR_exact20', 'head': self.config['head']}
+                    self.store(saved)
+                writes = []
+                external = self.external
+                def boundary(path, body=None, method=None):
+                    if path != '/graphql':
+                        return external(path, body, method)
+                    writes.append(copy.deepcopy(body))
+                    self.assertEqual(self.stored()['pr_readiness']['status'], 'pending')
+                    self.assertNotIn('merge', self.stored())
+                    self.assertEqual(body, {'query': merge.READY_MUTATION, 'variables': {'input': {
+                        'pullRequestId': 'PR_exact20', 'clientMutationId': 'factory-ready-' + self.config['head']}}})
+                    if case != 'unknown':
+                        self.pr['draft'] = False
+                    if case == 'head-drift':
+                        self.pr['head']['sha'] = '9' * 40
+                    if case == 'lost-response':
+                        raise RepositoryError('transport_error', 'lost ready response')
+                    return {'ignored': 'not admission authority'}
+                self.api.github.request = Mock(side_effect=boundary)
+                if case == 'late-pause':
+                    self.boundary_change = lambda n: controls.request(self.db, 'product', 'm1', '42', 'pause', 'final ready read')
+                try:
+                    if case in ('unknown', 'replay-draft', 'head-drift', 'late-pause'):
+                        with self.assertRaises(RepositoryError):
+                            self.lifecycle()
+                        self.assertNotIn('merge', self.stored())
+                        self.assertEqual(len(writes), 0 if case in ('replay-draft', 'late-pause') else 1)
+                    elif case == 'replay-ready':
+                        # Reconcile at the direct seam; a replay is not a second ready write.
+                        self.assertFalse(merge.ready_candidate(self.db, ('product', 'm1', '42'), self.stored(),
+                            self.api, self.config, self.pr, Mock()))
+                        self.assertEqual(writes, [])
+                        self.assertEqual(self.stored()['pr_readiness']['status'], 'ready')
+                    else:
+                        self.assertEqual(self.lifecycle()['status'], 'ready')
+                        self.assertEqual(self.stored()['pr_readiness']['status'], 'ready')
+                        self.assertNotIn('merge', self.stored())
+                        self.assertEqual(len(writes), 1)
+                    self.assertEqual(self.mutations('PUT'), [])
+                finally:
+                    self.boundary_change = None
+                    _, marker = controls.paths(self.db, 'product', 'm1')
+                    if marker is not None:
+                        marker.unlink(missing_ok=True)
+                with self.assertRaises(RepositoryError):
+                    self.api.request('/graphql', {'query': 'unrelated mutation'}, 'POST')
+
     def test_intent_precedes_effect_and_lost_merge_autoclose_reopens_truthfully(self):
         self.auto_close = self.drop_merge = self.drop_state = True
         journal = self.lifecycle()
@@ -802,6 +861,18 @@ class MergeComponentTests(unittest.TestCase):
                 self.assertNotIn('main_incident', assignments.current(self.db, 'product', 'm1', '42'))
 
     def test_controller_config_private_scope_and_fixed_intent(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        preflight = consumer_matrix(self, self.db, self.config_path, 'merge', lambda: self.lifecycle('merge-preflight'))
+        self.assertFalse(preflight['merge_allowed'])
+        self.assertEqual(self.mutations(), [])
+        self.db.execute('DROP TABLE supervised_readiness')
+        self.db.commit()
+        self.calls.clear()
+        parked = {**self.candidate, 'bug_disposition': {'status': 'parked'}}
+        self.store(parked)
+        self.assertEqual(merge.inspect_merge(self.db, 'product', 'm1', '42', parked['assignment_id'])['bug_disposition'],
+                         parked['bug_disposition'])
+        self.store(self.candidate)
         self.config_path.chmod(0o644)
         with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
         self.assertEqual(refusal.exception.code, 'execution_required')

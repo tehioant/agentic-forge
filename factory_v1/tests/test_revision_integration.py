@@ -456,7 +456,12 @@ class RevisionIntegrationTests(unittest.TestCase):
             self.assertIn('SIMULATED revision direction', receipt['result']['provenance.md'])
             self.assertEqual(receipt['execution']['run_id'], 'SIMULATED-to-spec')
             self.resume()
-            self.refused(self.execute, 'execution_uncertain')
+            # Consume only the retained stage, not a second synthesis stage.
+            fresh = self.read()
+            record = fresh['requirement_changes']['durable-notes']
+            config, work = invoke.call_args.args
+            self.assertEqual(synthesis.run_stage(self.database, fresh, record, 'to-spec', config, work), receipt['result'])
+            self.assertEqual(self.read()['requirement_changes']['durable-notes']['executions']['to-spec']['evidence'], receipt['execution'])
             invoke.assert_called_once()
 
     def test_malformed_control_before_revision_blob_write_has_zero_mutations(self):

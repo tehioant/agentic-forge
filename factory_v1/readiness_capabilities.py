@@ -105,7 +105,7 @@ class HostReaders:
         return assignments.digest({'scope': scope, 'principal': principal, 'oauth_scopes': sorted(scopes),
                                    'operations': sorted(operations), 'route': 'direct-classic-oauth'})
 
-    def execution_support(self, scope, stages):
+    def execution_support(self, scope, stages, *, planning_bootstrap=None):
         if set(stages) != {'grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES}:
             deny('execution_source_unavailable')
         path = self.service.get('dispatch_config')
@@ -123,7 +123,11 @@ class HostReaders:
         # require a coordinator request or fabricate one just to inspect support.
         approval = planning_wakeup.configuration(dispatch['planning_config'],
             new_execution=item.get('planning', {}).get('status') != 'complete')
-        identity = planning_wakeup.scope(item, approval)
+        if planning_bootstrap is not None:
+            from .readiness_gate import bootstrap_identity
+            identity = bootstrap_identity(self.database, self.service, self.config, planning_bootstrap, approval)
+        else:
+            identity = planning_wakeup.scope(item, approval)
         state = self.database.execute('PRAGMA database_list').fetchone()[2]
         if approval['binding'].get('state') != state or approval['binding'].get('operator_id') != scope['operator_id']:
             deny('native_planning_unavailable')
