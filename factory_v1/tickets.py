@@ -578,7 +578,8 @@ def frontier(database, item, github, *, resolution=None):
     def completed(number):
         row = rows.get(number)
         # Unknown/out-of-scope blockers cannot be asserted delivered.
-        return row is not None and number not in holds and row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done'
+        return (row is not None and row['contract_valid'] and not row['held'] and number not in holds and
+                row['issue_state'] == 'closed' and row['state_reason'] == 'completed' and row['status'] == 'done')
     from .diagnosis import held_numbers
     from .requirements import held_numbers as requirement_holds
     from .bugs import held_numbers as bug_holds

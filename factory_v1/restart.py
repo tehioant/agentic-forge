@@ -299,7 +299,9 @@ def ownership(database, item):
     from .requirements import released_claim as revised
     from .diagnosis import released_claim as directed
     from .recovery import released_claim as repaired
+    from .bugs import released_claim as bug_parked
     active = [a for a in assignments.rows(database) if not revised(database, a) and not directed(database, a) and
+              not bug_parked(database, a) and
               not released_claim(a) and not assignments.completed_iteration_claim(database, a) and
               not assignments.delivered_ticket_claim(database, a) and not repaired(database, a)]
     profiles, homes, ticket_scopes = set(), set(), set()
@@ -418,6 +420,21 @@ def reconcile(database, project, iteration, operator, github, *, recover=None):
         if not observe(identity + ':scope', scope):
             continue
         observe(identity + ':worker', lambda a=a: worker(a))
+        from .bugs import released_claim as bug_parked
+        if a.get('bug_disposition'):
+            def bug_scope(a=a):
+                require(bug_parked(database, a), 'Bug rescope or cleanup correlation changed.', 'scope_mismatch')
+                issue = tickets.gh.read_issue(api, item['repository'], a['handoff']['issue']['number'])
+                require(all(issue[k] == a['handoff']['issue'][k] for k in ('number', 'id', 'node_id')) and
+                        hashlib.sha256(issue['body'].encode()).hexdigest() == a['bug_disposition']['body_sha256'],
+                        'Exact controlled bug-rescoped issue changed.', 'scope_mismatch')
+                return a['bug_disposition']
+            observe(identity + ':bug-rescope', bug_scope)
+            observe(identity + ':workspace', lambda a=a: workspace(a, api))
+            observe(identity + ':publication', lambda a=a: candidate(a, api))
+            observe(identity + ':merge', lambda a=a: integration(a, api))
+            publication.save(database, a)
+            continue
         from .recovery import released_claim as repaired
         if repaired(database, a):
             # Registration retired the claim, not cleanup proof. Preserve the

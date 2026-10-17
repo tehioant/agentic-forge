@@ -161,6 +161,20 @@ class RequirementChangeTests(unittest.TestCase):
 
 
     def test_requirement_status_restore(self):
+        native = test_tickets.FrontierFixture(self, native=True)
+        native_record = revision_record(native, (10, 11))
+        native_record['blocks_verified'] = False
+        native.item['requirement_changes'] = {'durable-notes': native_record}
+        native.persist()
+        requirements.sync_blocks(native.database, native.item, native_record, native.github)
+        self.assertEqual([native.members[n]['fields']['STATUS'] for n in (10, 11, 12)], ['In Progress', 'In Progress', 'Todo'])
+        self.assertTrue(native.stored()['requirement_changes']['durable-notes']['blocks_verified'])
+        self.assertEqual(native_record['hold_representation'], 'native-active-with-durable-hold')
+        self.assertEqual(requirements.held_numbers(native.stored()), {10, 11})
+        requirements.sync_blocks(native.database, native.item, native_record, native.github, release=True)
+        self.assertEqual([native.members[n]['fields']['STATUS'] for n in (10, 11, 12)], ['Todo', 'Todo', 'Todo'])
+        # Restore this method's independent legacy transport fixture.
+        native.stack.close()
         variants = [(prior, 'Blocked', 'open', True, expected, None) for prior, expected in
                     (('blocked', 'Blocked'), ('deferred', 'Deferred'), ('done', 'Blocked'), ('active', 'Ready'), ('ready', 'Ready'))]
         variants += [('ready', 'Deferred', 'open', True, 'Deferred', 'publication_mismatch'),
@@ -318,7 +332,7 @@ class RequirementChangeTests(unittest.TestCase):
                         else:
                             with self.assertRaises(repositories.RepositoryError) as caught:
                                 requirement_execution.run_stage(self.database, self.item, record, 'to-spec', config, work)
-                            self.assertEqual(caught.exception.code, 'execution_uncertain' if replay else 'execution_evidence_required')
+                            self.assertEqual(caught.exception.code, 'execution_evidence_required')
                     invoke.assert_called_once()
                     stored = self.fixture.stored()['requirement_changes']['durable-notes']
                     if valid:
@@ -365,6 +379,14 @@ class RequirementChangeTests(unittest.TestCase):
                 external.assert_called_once()
                 if fault == 'pause':
                     self.assertTrue(controls.blocked(database, 'product', 'm1'))
+                    with patch('factory_v1.restart.reconcile', return_value={'status': 'ready'}):
+                        controls.resume(database, 'product', 'm1', '42', 'fixture explicit resume', self.github)
+                fresh = self.fixture.stored()
+                retained = fresh['requirement_changes']['durable-notes']
+                with patch.object(requirement_execution, 'invoke', side_effect=AssertionError('Never repeat original execution')):
+                    self.assertEqual(requirement_execution.run_stage(database, fresh, retained, 'to-spec',
+                        {'execution_reference': 'fixture host receipt'}, work), produced['result'])
+                self.assertEqual(self.fixture.stored()['requirement_changes']['durable-notes']['executions']['to-spec']['evidence'], produced['execution'])
         self.addCleanup(database.close)
 
 

@@ -10,10 +10,61 @@ from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
-from factory_v1 import assignments, diagnosis, tickets
+from factory_v1 import assignments, controls, diagnosis, repositories, requirements, tickets
+from factory_v1.tests.test_tickets import FrontierFixture
 
 
 class OverlappingHoldTests(unittest.TestCase):
+    def test_final_hold_effect_admission_native_and_legacy_matrix(self):
+        for native in (True, False):
+            for release in (True, False):
+                for fault in ('none', 'pause', 'body', 'identity', 'progress', 'readback'):
+                    with self.subTest(native=native, release=release, fault=fault):
+                        fixture = FrontierFixture(self, native=native)
+                        database, item, github = fixture.database, fixture.item, fixture.github
+                        record = {'pins': {'stuck_assignment': 'original'}, 'status': 'release-pending' if release else 'diagnosis',
+                            'affected': [10], 'previous_statuses': {'10': 'active'},
+                            'issues': {'10': requirements.issue_pin(fixture.issues[10])}, 'blocks_verified': False}
+                        item['stuck_work'] = {'original': record}
+                        if release:
+                            fixture.members[10]['fields']['STATUS'] = 'In Progress' if native else 'Blocked'
+                        fixture.persist()
+                        reads = 0
+                        def read_issue(*args):
+                            nonlocal reads
+                            reads += 1
+                            issue = copy.deepcopy(fixture.issues[10])
+                            if reads == 2:
+                                if fault == 'pause': fixture.pause()
+                                if fault == 'body': issue['body'] += 'changed'
+                                if fault == 'identity': issue['id'] = 999
+                            return issue
+                        calls = 0
+                        def frontier(db, value, gh):
+                            nonlocal calls
+                            calls += 1
+                            observed = copy.deepcopy(value)
+                            row = copy.deepcopy(fixture.work['frontier']['items'][0])
+                            options = fixture.start_request['tracker']['statuses']
+                            row['status'] = next(role for role, name in options.items() if name == fixture.members[10]['fields']['STATUS'])
+                            if fault == 'progress' and calls == 2: row['status'] = 'done'
+                            if fault == 'readback' and calls == 3: row['membership_id'] = 'replaced'
+                            observed['ticket_work']['frontier'] = {'items': [row]}
+                            return observed
+                        with patch.object(tickets, 'frontier', side_effect=frontier), patch.object(tickets.gh, 'read_issue', side_effect=read_issue):
+                            if fault == 'none':
+                                result = diagnosis.sync_blocks(database, item, record, github, release=release)
+                                self.assertEqual(fixture.members[10]['fields']['STATUS'],
+                                    'Todo' if native and release else 'Ready' if release else 'In Progress' if native else 'Blocked')
+                                self.assertIn('hold_representation', result['stuck_work']['original'])
+                            else:
+                                with self.assertRaises(repositories.RepositoryError):
+                                    diagnosis.sync_blocks(database, item, record, github, release=release)
+                                if fault != 'readback': fixture.set_field.assert_not_called()
+                                self.assertFalse(fixture.stored()['stuck_work']['original']['blocks_verified'])
+                                if fault == 'pause': self.assertTrue(controls.blocked(database, 'product', 'm1'))
+                        fixture.stack.close()
+
     def test_overlap_restores_underlying_status_in_either_release_order_after_restart(self):
         for order in ((10, 12), (12, 10)):
             for underlying in ('ready', 'blocked', 'deferred', 'active'):
@@ -51,7 +102,7 @@ class OverlappingHoldTests(unittest.TestCase):
                         statuses[int(membership)] = option
 
                     with patch.object(tickets, 'frontier', side_effect=frontier), patch.object(diagnosis, 'source', side_effect=source), \
-                            patch.object(tickets.gh, 'read_issue', side_effect=lambda github, repository, n: {'body': bodies[n]}), \
+                            patch.object(tickets.gh, 'read_issue', side_effect=lambda github, repository, n: {'body': bodies[n], 'state': 'open', 'id': 1000+n, 'node_id': f'I{n}'}), \
                             patch.object(tickets.gh, 'set_field', side_effect=set_field):
                         item['stuck_work'] = {identities[n]: {'status': 'diagnosis', 'sequence': index + 1,
                             'pins': source(None, None, None, None, identities[n])[-1], 'affected': [n, 11],

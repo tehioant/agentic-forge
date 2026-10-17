@@ -1,9 +1,10 @@
 """Direct bug validators and durable body/edge/publication components, without workers."""
 import copy
+import json
 import unittest
 from unittest.mock import patch
 
-from factory_v1 import bugs, repositories, requirements, tickets
+from factory_v1 import assignments, bugs, repositories, requirements, restart, tickets
 from factory_v1.tests import test_tickets
 
 
@@ -197,6 +198,67 @@ class BugTests(unittest.TestCase):
                 self.fixture.issues.pop(13)
 
 
+
+    def test_bug_rescope_parks_only_clean_correlated_ownership(self):
+        original = copy.deepcopy(self.fixture.issues[10])
+        base_item = copy.deepcopy(self.item)
+        for fault in ('none', 'running', 'unknown-cleanup', 'unconfirmed', 'pin', 'handoff', 'pause'):
+            with self.subTest(fault=fault):
+                self.item = self.fixture.item = copy.deepcopy(base_item)
+                self.fixture.issues[10] = copy.deepcopy(original); self.fixture.deps[10] = []
+                self.database.execute('DELETE FROM role_assignments')
+                work = self.item['bug_work']['accent']
+                issue = self.fixture.issue(13, 'fixture bug'); self.fixture.issues[13] = issue
+                work['identity'] = {k: issue[k] for k in ('number', 'id', 'node_id')}
+                scope = {'project': 'product', 'iteration': 'm1', 'repository': 'example/product',
+                         'repository_id': 123, 'issue_number': 10, 'issue_id': original['id']}
+                handoff = {'stage': 'implementation', 'repository': 'example/product', 'repository_id': 123,
+                           'issue': requirements.issue_pin(original), 'profile': {'name': 'old-profile', 'home': '/old-profile'}}
+                old = {'assignment_id': 'old-implementation', 'claim_id': 'old-claim', 'ticket_scope': scope,
+                       'handoff': handoff, 'handoff_digest': assignments.digest(handoff),
+                       'revision': requirements.authority(self.item, 10), 'runtime': {'status': 'complete', 'container_removed': True, 'controller_pid': 999999999,
+                           'controller_start': 'fixture-absent', 'container': 'fixture-old', 'run_id': 'fixture-run', 'artifacts': str(self.fixture.root)}}
+                if fault == 'running': old['runtime']['status'] = 'running'
+                if fault == 'unknown-cleanup': old['runtime']['container_removed'] = None
+                if fault == 'unconfirmed': old['runtime']['error'] = 'stop_unconfirmed'
+                if fault == 'pin':
+                    handoff['issue']['body_sha256'] = 'f' * 64; old['handoff_digest'] = assignments.digest(handoff)
+                if fault == 'handoff': old['handoff_digest'] = 'e' * 64
+                self.item['reservation'] = {'issue_number': 10, 'status': 'reserved', 'assignment_id': 'ticket-fixture', 'input_digest': self.fixture.work['input_digest']}
+                self.database.execute('INSERT INTO role_assignments VALUES (?,?)', (old['assignment_id'], json.dumps(old)))
+                self.fixture.persist(); self.github.request.reset_mock(); self.fixture.add_dependency.reset_mock()
+                if fault == 'pause': self.fixture.pause()
+                if fault != 'none':
+                    before = self.fixture.stored()
+                    with self.assertRaises(repositories.RepositoryError): bugs.affected_edges(self.database, self.item, work, self.github, issue)
+                    self.database.rollback(); self.assertEqual(self.fixture.stored(), before)
+                    self.assertNotIn('bug_disposition', assignments.rows(self.database)[0])
+                    self.github.request.assert_not_called(); self.fixture.add_dependency.assert_not_called()
+                else:
+                    bugs.affected_edges(self.database, self.item, work, self.github, issue)
+                    parked = assignments.rows(self.database)[0]
+                    self.assertTrue(bugs.released_claim(self.database, parked))
+                    self.assertEqual(parked['handoff'], old['handoff']); self.assertEqual(parked['runtime'], old['runtime'])
+                    self.assertNotIn('reservation', self.fixture.stored())
+                    self.assertEqual(assignments.ticket_claims(self.database, {**scope, 'issue_number': 13, 'issue_id': issue['id']}), [])
+                    self.assertEqual(restart.ownership(self.database, self.fixture.stored())['assignments'], [])
+                    with self.assertRaises(repositories.RepositoryError): assignments.inspect(self.database, 'product', 'm1', '42', parked['assignment_id'])
+                    with self.assertRaises(repositories.RepositoryError): assignments.require_result_active(parked)
+                    for key, value in (('container_removed', False), ('status', 'running')):
+                        bad = copy.deepcopy(parked); bad['runtime'][key] = value
+                        self.assertFalse(bugs.released_claim(self.database, bad))
+                    work.update(status='published', publication_complete=True)
+                    tickets.checkpoint(self.database, self.item)
+                    with patch.object(restart, 'worker', return_value={'container_absent': True}), patch.object(restart, 'workspace', return_value={}), \
+                            patch.object(restart, 'tracker', return_value=self.fixture.work['frontier']):
+                        report = restart.reconcile(self.database, 'product', 'm1', '42', self.github)
+                    self.assertEqual(report['status'], 'ready', report)
+                    self.assertIn('old-implementation:bug-rescope', report['observations'])
+                if fault == 'pause':
+                    with patch.object(restart, 'reconcile', return_value={'status': 'ready'}):
+                        from factory_v1 import controls
+                        controls.resume(self.database, 'product', 'm1', '42', 'fixture resume', self.github)
+                self.fixture.issues.pop(13)
 
     def test_edge_intent_durable_and_unknown_absent_edge_not_retried(self):
         work = self.work_record; self.fixture.issues[13] = self.fixture.issue(13, 'fixture bug')

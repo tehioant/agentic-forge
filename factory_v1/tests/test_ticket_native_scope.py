@@ -47,6 +47,7 @@ class NativeScopeTests(unittest.TestCase):
 
 
     def test_completed_blocker_requires_closed_completed_done_current_scope(self):
+        original = self.fixture.issues[10]['body']
         for state, reason, status, scope, expected in (
             ('open', None, 'Done', True, False), ('closed', 'not_planned', 'Done', True, False),
             ('closed', 'completed', 'Todo', True, False), ('closed', 'completed', 'Done', True, True),
@@ -56,6 +57,12 @@ class NativeScopeTests(unittest.TestCase):
                     milestone=self.milestones[0] if scope else {'id': 502, 'number': 2, 'title': 'm2', 'state': 'open'})
                 self.fixture.members[10]['fields']['STATUS'] = status
                 self.assertEqual(11 in self.frontier()['eligible'], expected)
+        for body in ('blocked', 'deferred', 'malformed'):
+            with self.subTest(body=body):
+                self.fixture.issues[10].update(state='closed', state_reason='completed', milestone=self.milestones[0],
+                    body=original.replace('ready (GitHub Projects is authoritative for current progress).', body))
+                self.fixture.members[10]['fields']['STATUS'] = 'Done'
+                self.assertNotIn(11, self.frontier()['eligible'])
 
     def test_native_blocker_graph_identity(self):
         before = self.fixture.stored()

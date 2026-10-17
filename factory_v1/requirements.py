@@ -160,6 +160,7 @@ def checkpoint(database, item, *, receipt=False):
 
 
 def sync_blocks(database, item, record, github, release=False):
+    from .tracker_holds import option as hold_option, representation
     board = tickets.verified_board(item['ticket_work'], github, item['repository'], item['iteration_id'])
     other_holds = held_numbers(item) - set(record['affected'])
     from .diagnosis import held_numbers as stuck_holds
@@ -185,9 +186,10 @@ def sync_blocks(database, item, record, github, release=False):
                 desired = 'ready'
             elif previous == 'deferred':
                 desired = 'deferred'
-        option = board['status']['options'][item['ticket_work']['request']['tracker']['statuses'][desired]]
+
+        option = hold_option(item['ticket_work'], board, desired)
         if release:
-            blocked = board['status']['options'][item['ticket_work']['request']['tracker']['statuses']['blocked']]
+            blocked = hold_option(item['ticket_work'], board, 'blocked')
             require(member['status'] in {blocked, option},
                     'External progress changed independently of the requirement release.', 'publication_mismatch')
         if member['status'] != option:
@@ -196,6 +198,7 @@ def sync_blocks(database, item, record, github, release=False):
         member = tickets.gh.membership(github, board, item['repository'], issue)
         require(member is not None and member['id'] == record['memberships'][str(number)] and member['status'] == option,
                 'Exact revision hold/resume status did not read back.', 'publication_mismatch')
+    record['hold_representation'] = representation(item['ticket_work'])
     record['blocks_verified'] = True
     checkpoint(database, item)
     return item
