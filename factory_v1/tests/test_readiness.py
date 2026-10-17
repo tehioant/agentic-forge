@@ -832,6 +832,8 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
                 self.assertEqual(readiness_gate.policy(self.service, self.config, self.db), sealed)
                 self.assertEqual(consume(path)['exact_run'], path)
                 self.assertEqual(consume(path)['exact_run'], path)
+            with self.assertRaises(repositories.RepositoryError):
+                readiness_gate.runtime_receipt(self.db, 'p', 'i', 'merge', paths[0])
             self.assertEqual(verify.call_count, 4)  # no cached-verification consumption
             self.assertEqual(self.admit(operation='effect'), 'admitted')
             self.assertEqual(verify.call_count, 6)

@@ -392,7 +392,10 @@ def bootstrap_identity(database, config, selected, proposed, approval):
     old = item.get('planning')
     require(item['status'] == proposed.get('status') == 'active' and not item.get('completion') and
             not item.get('previous_iteration') and not item.get('requirement_authority') and
-            not item.get('requirement_changes') and not item.get('main_incident'),
+            not item.get('requirement_changes') and not item.get('main_incident') and
+            not item.get('planning_history') and not item.get('ticket_history') and
+            not any((r['ticket_scope']['project'], r['ticket_scope']['iteration']) ==
+                    (config['project'], config['iteration']) for r in assignments.rows(database)),
             'Bootstrap cannot replace existing lifecycle authority.', 'scope_mismatch')
     if old is None:
         expected = {**item, 'planning': work, 'stage': 'planning_pending', 'execution_allowed': False,

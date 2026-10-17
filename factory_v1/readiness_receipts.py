@@ -120,7 +120,11 @@ def runtime_receipt(database, project, iteration, kind, path, *, missing_ok=Fals
     expected_policy = policy(config, selected, database)
     require(current[1] == expected_policy, 'Receipt issuer policy changed.', 'readiness_inputs_changed')
     approval = receipt_policy(database, config, selected)
-    if approval is None or path not in approval['receipts'].get(kind, {}):
+    if approval is None:
+        return readiness.load_config(path)
+    if path not in approval['receipts'].get(kind, {}):
+        require(not any(path in paths for paths in approval['receipts'].values()),
+                'Receipt kind cannot be rebound.', 'scope_mismatch')
         return readiness.load_config(path)  # Legacy immutable files are still sealed.
     if not os.path.lexists(path) and missing_ok:
         _, identity = receipt_identity(database, project, iteration, kind, path)
