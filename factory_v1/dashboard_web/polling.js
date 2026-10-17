@@ -1,6 +1,7 @@
 /* Classic-script global ForgePolling; CommonJS exports for focused Node tests. */
 (function (root) {
   "use strict";
+  const STALE_AFTER_MS = 15000;
 
   /**
    * Read-only fixed-delay polling. apply(value) and onError(error) are synchronous
@@ -83,6 +84,16 @@
     };
   }
 
+  function sourceIsStale(source, options) {
+    const now = options.now;
+    const staleAfterMs = options.staleAfterMs === undefined ? STALE_AFTER_MS : options.staleAfterMs;
+    if (!Number.isFinite(now) || !Number.isFinite(staleAfterMs) || staleAfterMs < 0) {
+      throw new Error("Source freshness requires finite clock and age values");
+    }
+    const observedTime = typeof source.observedAt === "string" ? Date.parse(source.observedAt) : NaN;
+    return source.stale === true || !Number.isFinite(observedTime) || observedTime > now || now - observedTime > staleAfterMs;
+  }
+
   /**
    * Pure per-source retention. incoming[name] is {status:'ok', data, observedAt,
    * stale?} or {status:'unavailable'}. Missing/invalid sources fail independently.
@@ -93,7 +104,7 @@
    */
   function mergeSources(previous, incoming, options) {
     const now = options.now;
-    const staleAfterMs = options.staleAfterMs === undefined ? 15000 : options.staleAfterMs;
+    const staleAfterMs = options.staleAfterMs === undefined ? STALE_AFTER_MS : options.staleAfterMs;
     if (!Number.isFinite(now) || !Number.isFinite(staleAfterMs) || staleAfterMs < 0) {
       throw new Error("Source freshness requires finite clock and age values");
     }
@@ -112,8 +123,7 @@
         continue;
       }
       const observedAt = typeof source.observedAt === "string" ? source.observedAt : null;
-      const observedTime = observedAt === null ? NaN : Date.parse(observedAt);
-      const stale = source.stale === true || !Number.isFinite(observedTime) || observedTime > now || now - observedTime > staleAfterMs;
+      const stale = sourceIsStale(source, { now, staleAfterMs });
       result[name] = {
         hasData: true, data: source.data, observedAt, lastSuccessAt: now,
         checkedAt: now, status: stale ? "stale" : "ok", stale, error: null,
@@ -122,7 +132,7 @@
     return result;
   }
 
-  const api = { createPoller, mergeSources };
+  const api = { createPoller, mergeSources, sourceIsStale };
   if (typeof module === "object" && module.exports) module.exports = api;
   else root.ForgePolling = api;
 })(typeof globalThis === "object" ? globalThis : this);

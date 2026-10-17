@@ -130,6 +130,40 @@ class DashboardTests(unittest.TestCase):
                 self.assertLess(view.index('Recorded workers'), view.index('GitHub Projects tickets'))
                 self.assertIn('&lt;img&gt; ticket', view)
                 self.assertNotIn('<img>', view)
+                blocked_board = deepcopy(board)
+                blocker = {'number': 90, 'url': 'https://github.com/owner/product/issues/90'}
+                blocked_board['tickets'][0].update(column='Blocked', derived_blocked=True, blockers=[blocker])
+                github.return_value = blocked_board
+                known = dashboard.snapshot(path, 'selected', now=now, repository='owner/product', github_project='PVT_selected')
+                known_workers = {worker['id']: worker for worker in known['workers']}
+                for identity in ('assignment-1', 'assignment-4'):
+                    self.assertEqual(known_workers[identity]['status']['blocker'], blocker)
+                for identity in ('assignment-2', 'assignment-3', 'plan-1', 'tickets-1', 'bug-1'):
+                    self.assertIsNone(known_workers[identity]['status']['blocker'])
+                self.assertIn('Blocked by', known['fragments']['forge'])
+                self.assertIn('href="https://github.com/owner/product/issues/90"', known['fragments']['forge'])
+                for name, section, key, value in (
+                    ('wrong-repository', 'project', 'repository', 'other/repo'),
+                    ('wrong-project', 'project', 'id', 'PVT_other'),
+                    ('wrong-ticket', 'ticket', 'number', 62),
+                    ('wrong-ticket-url', 'ticket', 'url', 'https://github.com/other/repo/issues/61'),
+                    ('wrong-blocker-url', 'blocker', 'url', 'https://github.com/other/repo/issues/90'),
+                    ('unsafe-blocker-url', 'blocker', 'url', 'javascript:private-canary'),
+                    ('self-blocker', 'blocker', 'number', 61),
+                    ('invalid-blocker-number', 'blocker', 'number', True),
+                    ('unavailable-source', 'board', 'status', 'unavailable'),
+                ):
+                    with self.subTest(blocker_scope=name):
+                        refused_board = deepcopy(blocked_board)
+                        target = {'project': refused_board['project'], 'ticket': refused_board['tickets'][0],
+                                  'blocker': refused_board['tickets'][0]['blockers'][0], 'board': refused_board}[section]
+                        target[key] = value
+                        github.return_value = refused_board
+                        refused = dashboard.snapshot(path, 'selected', now=now, repository='owner/product', github_project='PVT_selected')
+                        self.assertTrue(all(worker['status']['blocker'] is None for worker in refused['workers']))
+                        self.assertNotIn('Blocked by', refused['fragments']['forge'])
+                        self.assertNotIn('canary', refused['fragments']['forge'])
+                github.return_value = board
                 github.reset_mock()
                 mismatch = dashboard.snapshot(path, 'selected', repository='other/repo', github_project='PVT_selected')
                 self.assertEqual(mismatch['sources']['github']['scope'], 'mismatch')

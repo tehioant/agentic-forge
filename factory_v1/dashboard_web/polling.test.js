@@ -1,7 +1,7 @@
 "use strict";
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { createPoller, mergeSources } = require("./polling.js");
+const { createPoller, mergeSources, sourceIsStale } = require("./polling.js");
 const fs = require("node:fs");
 const vm = require("node:vm");
 
@@ -108,6 +108,9 @@ test("source freshness and actual bootstrap retain independent last-good views w
   assert.equal(sources.github.hasData, false);
   assert.equal(sources.github.status, "unavailable");
   const lastGood = sources.workers;
+  assert.equal(sourceIsStale(lastGood, { now: 16000 }), false);
+  assert.equal(sourceIsStale(lastGood, { now: 26000 }), true);
+  assert.equal(lastGood.lastSuccessAt, 10000);
   sources = mergeSources(sources, {
     workers: { status: "unavailable", data: [] },
     github: { status: "ok", data: [], observedAt: new Date(100).toISOString() },
@@ -162,6 +165,14 @@ test("source freshness and actual bootstrap retain independent last-good views w
   assert.equal(requests[0].url, "http://localhost:8787/api/snapshot");
   assert.equal(requests[0].options.method, "GET");
   assert.match(elements["forge-notice"].textContent, /unknown/);
+  assert.equal(elements["github-notice"].textContent, "Source observation current.");
+  clock.tick(15000); await settle();
+  assert.equal(elements["github-notice"].textContent, "Source observation current.");
+  clock.tick(1000); await settle();
+  assert.match(elements["github-notice"].textContent, /observation stale/);
+  assert.equal(elements["github-source"].innerHTML, "github initial");
+  assert.equal(requests.length, 1); // Freshness ages while the only request hangs.
+  assert.equal(requests[0].options.signal.aborted, false);
   function respond(index, forgeStatus, githubStatus, suffix) {
     requests[index].resolve({ ok: true, json: async () => ({
       sources: { forge: { status: forgeStatus, observed_at: null },
@@ -189,10 +200,13 @@ test("source freshness and actual bootstrap retain independent last-good views w
   clock.tick(5000); await settle();
   events.pagehide();
   assert.equal(requests[4].options.signal.aborted, true);
+  assert.equal(clock.count(), 0); // Both request and independent freshness timers stop.
+  const hiddenNotices = [elements["forge-notice"].textContent, elements["github-notice"].textContent];
   respond(4, "ok", "ok", "late"); await settle();
   clock.tick(100000); await settle();
   assert.equal(requests.length, 5);
   assert.equal(elements["forge-source"].innerHTML, "<p>forge recovered</p>");
+  assert.deepEqual([elements["forge-notice"].textContent, elements["github-notice"].textContent], hiddenNotices);
   assert.equal(clock.count(), 0);
   elements["forge-source"].dataset.sourceStatus = "unavailable";
   elements["forge-source"].innerHTML = "Forge unavailable placeholder";

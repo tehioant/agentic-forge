@@ -175,6 +175,30 @@ def validate_board_selection(repository, github_project):
         raise ValueError('Select both --repository owner/repo and --github-project PVT_... .')
 
 
+def apply_board_blockers(workers, board, repository, github_project):
+    """Join sanitized native dependencies to exact selected-ticket Waiting rows."""
+    project = board.get('project') or {}
+    if (board['status'] != 'available' or project.get('repository') != repository or
+            project.get('id') != github_project):
+        return
+    tickets = {ticket['url']: ticket for ticket in board['tickets']}
+    for worker in workers:
+        number = worker['issue_number']
+        if (worker['status']['state'] != 'waiting' or type(number) is not int or
+                worker['issue_url'] != f'https://github.com/{repository}/issues/{number}'):
+            continue
+        ticket = tickets.get(worker['issue_url'])
+        if ticket is None or type(ticket['number']) is not int or ticket['number'] != number:
+            continue
+        blockers = [blocker for blocker in ticket['blockers']
+                    if type(blocker.get('number')) is int and blocker['number'] > 0 and
+                    blocker['number'] != number and
+                    blocker.get('url') == f'https://github.com/{repository}/issues/{blocker["number"]}']
+        if blockers:
+            blocker = min(blockers, key=lambda item: item['number'])
+            worker['status']['blocker'] = {'number': blocker['number'], 'url': blocker['url']}
+
+
 def snapshot(database_path, project_id, *, now=None, repository=None, github_project=None):
     """Independent source projections; fetch time is never a worker heartbeat."""
     if not identifier(project_id):
@@ -206,6 +230,8 @@ def snapshot(database_path, project_id, *, now=None, repository=None, github_pro
                           observed_at=board['observed_at'], error=board['error'],
                           fetched_at=(now or datetime.now(timezone.utc)).isoformat(),
                           scope='recorded_repository_match' if repositories else 'unverified')
+            if github['status'] == 'ok':
+                apply_board_blockers(workers, board, repository, github_project)
     data = {'version': 1, 'project': {'id': project_id, 'repositories': repositories},
             'sources': {'forge': source, 'github': github}, 'workers': workers, 'board': board}
     data['fragments'] = render_fragments(data)

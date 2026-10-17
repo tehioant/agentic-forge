@@ -6,19 +6,19 @@
   const notices = Object.fromEntries(names.map(name => [name, root.document.getElementById(name + "-notice")]));
   let sources = {};
 
-  function render() {
+  function render(updateData = true) {
     for (const name of names) {
       const source = sources[name];
       if (panels[name].dataset.sourceStatus === "unconfigured") {
         notices[name].textContent = "Board unconfigured.";
         continue;
       }
-      if (source.hasData) panels[name].innerHTML = source.data;
+      if (updateData && source.hasData) panels[name].innerHTML = source.data;
       if (source.error) {
         notices[name].textContent = source.hasData
           ? "Source unavailable; showing last successful view (stale)."
           : "Source unavailable; no successful observation available.";
-      } else if (source.stale) {
+      } else if (root.ForgePolling.sourceIsStale(source, { now: Date.now() })) {
         notices[name].textContent = source.observedAt === null
           ? "Source observation time unknown; freshness unverified (stale)."
           : "Source observation stale; dashboard fetch does not refresh source time.";
@@ -55,6 +55,17 @@
       render();
     },
   });
-  root.addEventListener("pagehide", () => poller.stop(), { once: true });
+  let stopped = false, freshnessTimer = null;
+  function ageFreshness() {
+    if (stopped) return;
+    render(false);
+    freshnessTimer = root.setTimeout(ageFreshness, 1000);
+  }
+  freshnessTimer = root.setTimeout(ageFreshness, 1000);
+  root.addEventListener("pagehide", () => {
+    stopped = true;
+    root.clearTimeout(freshnessTimer);
+    poller.stop();
+  }, { once: true });
   poller.start();
 })(globalThis);
