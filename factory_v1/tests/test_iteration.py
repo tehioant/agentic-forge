@@ -545,7 +545,7 @@ class FocusedInvariantMatrices(unittest.TestCase):
         f.setUp()
         self.addCleanup(f.doCleanups)
         f.observed['items'].append(work_row(2))
-        f.mocks['merge.load_config'].side_effect = lambda path, operator: {'issue': 1 if path == 'one.json' else 2}
+        f.mocks['merge.load_config'].side_effect = lambda path, operator, *, database, project, iteration: {'issue': 1 if path == 'one.json' else 2}
 
         def delivered(database, item, row, *args):
             return dict(f.delivered, issue=dict(f.delivered['issue'], number=row['number']))

@@ -47,7 +47,8 @@ def required_items(item, observed, github):
 
 def delivered_item(database, item, row, config_path, operator, github, main):
     """Recheck original execution/reviews and external integration, not journal booleans."""
-    config = merge.load_config(config_path, operator)
+    config = merge.load_config(config_path, operator, database=database,
+                               project=item['project_id'], iteration=item['iteration_id'])
     require(config['issue'] == row['number'] and config['base'] == 'main' and
             config['repository'] == item['repository'] and
             config['repository_id'] == item['repository_onboarding']['metadata']['id'] and
@@ -117,7 +118,8 @@ def complete(database, project, iteration, operator, request, github):
     require(saved['latest']['status'] == 'healthy', 'Unknown delivery is not completion.', 'iteration_incomplete')
     observed = frontier(database, item, github)
     required, deferred, scoped_issues = required_items(item, observed, github)
-    configs = {merge.load_config(p, operator)['issue']: p for p in request['merge_configs']}
+    configs = {merge.load_config(p, operator, database=database, project=project, iteration=iteration)['issue']: p
+               for p in request['merge_configs']}
     require(len(configs) == len(request['merge_configs']) and set(configs) == {r['number'] for r in required},
             'Cover every required item exactly; caller cannot select a subset.', 'iteration_incomplete')
     decisions = pending_decisions(database, item)
