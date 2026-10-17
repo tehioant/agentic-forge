@@ -89,6 +89,23 @@ def consumer_matrix(case, database, path, kind, consume):
         approved = json.loads(path.read_bytes())
         def select(selected_kind=kind):
             return continuation_dispatch.authority(database, conf, selected_kind, lambda value: value == approved)
+        for mismatch in ('operator', 'exact-execution', 'only-future'):
+            with case.subTest(receipt_kind=kind, selection=mismatch):
+                original_paths = conf['continuation']['authorities'][kind]
+                if mismatch == 'operator':
+                    conf['operator_id'] = 'unapproved-operator'
+                elif mismatch == 'only-future':
+                    conf['continuation']['authorities'][kind] = [str(future)]
+                else:
+                    approved = {**approved, 'execution_reference': 'different exact execution'}
+                before = list(database.iterdump())
+                with case.assertRaises(RepositoryError) as refused:
+                    select()
+                case.assertEqual(refused.exception.code, kind + '_authority_unavailable')
+                case.assertEqual(list(database.iterdump()), before)
+                conf['operator_id'] = issuer.config['operator_id']
+                conf['continuation']['authorities'][kind] = original_paths
+                approved = json.loads(path.read_bytes())
         case.assertEqual(select(), str(path))  # Approved absence is skipped, not consumed.
         result = consume()
         case.assertGreaterEqual(len(issuer.calls), 2)  # Both real boundaries freshly verify.
