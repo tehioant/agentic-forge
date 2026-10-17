@@ -10,6 +10,9 @@ from pathlib import Path
 import re
 import sqlite3
 
+from factory_v1.dashboard_status import project_worker_status
+from factory_v1.dashboard_board import read_board, render_board
+
 
 IDENTIFIER = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
 REPOSITORY = re.compile(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+')
@@ -58,6 +61,8 @@ def row(identity, iteration, kind, role=None, stage=None, number=None, run_id=No
         'role': role, 'stage': stage, 'issue_number': number,
         'issue_url': f'https://github.com/{repository}/issues/{number}' if number else None,
         'task': f'Issue #{number}' if number else None, 'run_id': run_id,
+        'status': {'state': 'unknown', 'label': 'Record (activity unknown)',
+                   'reason': None, 'blocker': None},
     }
 
 
@@ -105,8 +110,10 @@ def assignment_row(indexed_id, assignment, iterations):
     kind = 'worker_attempt' if runtime else 'prepared_assignment'
     role = optional_record(handoff.get('profile')).get('role')
     stage = handoff.get('stage')
-    return row(indexed_id, iteration, kind, role if role in ROLES else None,
-               stage if stage in STAGES else None, number, run_id)
+    projected = row(indexed_id, iteration, kind, role if role in ROLES else None,
+                    stage if stage in STAGES else None, number, run_id)
+    projected['status'] = project_worker_status(assignment, repository=iteration['repository'])
+    return projected
 
 
 def read_workers(database_path, project_id):
@@ -158,10 +165,21 @@ def read_workers(database_path, project_id):
         return sorted({item['repository'] for item in iterations.values()}), workers
 
 
-def snapshot(database_path, project_id, *, now=None):
-    """The sole public projection. Source time is unknown, never a fake heartbeat."""
+def validate_board_selection(repository, github_project):
+    if repository is None and github_project is None:
+        return
+    if (not isinstance(repository, str) or not re.fullmatch(
+            r'[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}', repository) or
+            not isinstance(github_project, str) or not re.fullmatch(
+                r'PVT_[A-Za-z0-9_-]{1,150}', github_project)):
+        raise ValueError('Select both --repository owner/repo and --github-project PVT_... .')
+
+
+def snapshot(database_path, project_id, *, now=None, repository=None, github_project=None):
+    """Independent source projections; fetch time is never a worker heartbeat."""
     if not identifier(project_id):
         raise ValueError('Select an exact project identifier.')
+    validate_board_selection(repository, github_project)
     fetched_at = (now or datetime.now(timezone.utc)).isoformat()
     source = {'status': 'ok', 'fetched_at': fetched_at, 'observed_at': None, 'error': None}
     repositories, workers = [], []
@@ -169,8 +187,26 @@ def snapshot(database_path, project_id, *, now=None):
         repositories, workers = read_workers(database_path, project_id)
     except (sqlite3.Error, OSError, ValueError, TypeError, RecursionError):
         source.update(status='unavailable', error='Forge records unavailable or invalid.')
-    return {'version': 1, 'project': {'id': project_id, 'repositories': repositories},
-            'sources': {'forge': source}, 'workers': workers}
+    github = {'status': 'unconfigured', 'fetched_at': None, 'observed_at': None,
+              'error': None, 'scope': 'unverified'}
+    board = {'status': 'unconfigured', 'observed_at': None, 'project': None,
+             'tickets': [], 'error': None}
+    if repository is not None:
+        if repositories and repository not in repositories:
+            github.update(status='unavailable', scope='mismatch',
+                          error='Selected repository does not match recorded Forge project.')
+            board.update(status='unavailable', error=github['error'])
+        else:
+            # The adapter alone owns host gh reads; never infer a board from Forge state.
+            board = read_board(repository, github_project)
+            github.update(status='ok' if board['status'] == 'available' else 'unavailable',
+                          observed_at=board['observed_at'], error=board['error'],
+                          fetched_at=(now or datetime.now(timezone.utc)).isoformat(),
+                          scope='recorded_repository_match' if repositories else 'unverified')
+    data = {'version': 1, 'project': {'id': project_id, 'repositories': repositories},
+            'sources': {'forge': source, 'github': github}, 'workers': workers, 'board': board}
+    data['fragments'] = render_fragments(data)
+    return data
 
 
 KINDS = {'prepared_assignment': 'Prepared assignment (not launched)',
@@ -183,22 +219,34 @@ h2{font-size:18px;margin-top:30px}.muted,small{color:#a9aeb7}a{color:#a8c6ff}
 table{width:100%;border-collapse:collapse;text-align:left}th,td{padding:12px 10px;
 border-bottom:1px solid #343840;vertical-align:top}th{color:#b4bac4;font-weight:500}
 small{display:block;margin-top:5px}.notice{padding:16px;background:#24282e;border:1px solid #454c57}
-.table-wrap{overflow-x:auto}code{font-size:12px}'''
+.table-wrap{overflow-x:auto}code{font-size:12px}
+#ticket-board{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+#ticket-board>h2,#ticket-board>p{grid-column:1/-1}.board-column{background:#20242a;padding:12px}
+.board-column ul{padding-left:18px}.board-column li{margin-bottom:14px}.board-column p{font-size:12px}'''
 
 
-def render_page(data):
-    """Render the actual worker-first view from the same sanitized JSON contract."""
-    def text(value):
-        return escape(str(value)) if value is not None else 'Unknown'
-    project = data['project']
+def text(value):
+    return escape(str(value)) if value is not None else 'Unknown'
+
+
+def render_workers(data):
+    """Render only allowlisted projected worker fields."""
     source = data['sources']['forge']
     rows = []
     for worker in data['workers']:
         task = text(worker['task'])
         if worker['issue_url']:
             task = f'<a href="{escape(worker["issue_url"], quote=True)}" rel="noreferrer">{task}</a>'
+        status = worker['status']
+        activity = text(status['label'])
+        if status['reason']:
+            activity += f'<small>{text(status["reason"])}</small>'
+        if status['blocker']:
+            blocker = status['blocker']
+            activity += (f'<small>Blocked by <a rel="noreferrer" href="{escape(blocker["url"], quote=True)}">'
+                         f'#{text(blocker["number"])}</a></small>')
         rows.append(f'<tr><td>{text(worker["role"])}<small>{text(KINDS[worker["kind"]])}</small></td>'
-                    f'<td>{task}</td><td>{text(worker["stage"])}</td>'
+                    f'<td>{task}</td><td>{text(worker["stage"])}</td><td>{activity}</td>'
                     f'<td>{text(worker["iteration_id"])}<small>{text(worker["id"])}</small></td></tr>')
     if source['status'] != 'ok':
         content = '<p class="notice" role="status">Forge source unavailable. No healthy empty view can be inferred.</p>'
@@ -206,18 +254,40 @@ def render_page(data):
         content = '<p class="notice">No recorded assignments or worker attempts for this project.</p>'
     else:
         content = ('<div class="table-wrap"><table><thead><tr><th>Role / record</th><th>Task</th>'
-                   '<th>Stage</th><th>Iteration / assignment</th></tr></thead><tbody>' +
+                   '<th>Stage</th><th>Recorded activity</th><th>Iteration / assignment</th></tr></thead><tbody>' +
                    ''.join(rows) + '</tbody></table></div>')
+    return ('<h2>Recorded workers &amp; assignments</h2>'
+            '<p class="muted">Recorded attempts do not establish live activity. Planning and synthesis '
+            'are conversation/workflow records, not a complete agent tree. Worker Done does not '
+            'mean ticket delivery.</p>' + content +
+            f'<p class="muted">Dashboard fetched: {text(source["fetched_at"])}<br>'
+            f'Source observation time: {text(source["observed_at"])}</p>')
+
+
+def render_fragments(data):
+    github = data['sources']['github']
+    if github['status'] == 'unconfigured':
+        board = '<h2>GitHub Projects tickets</h2><p>Board unconfigured. Select an explicit repository and GitHub Project.</p>'
+    else:
+        scope = {'recorded_repository_match': 'Repository matches recorded Forge project.',
+                 'mismatch': 'Selected repository does not match recorded Forge project.',
+                 'unverified': 'Independent selected board; Forge project scope unverified.'}[github['scope']]
+        board = (render_board(data['board']) + f'<p class="muted">{scope}<br>'
+                 f'GitHub dashboard fetched: {text(github["fetched_at"])}</p>')
+    return {'forge': render_workers(data), 'github': board}
+
+
+def render_page(data):
+    """Page and JSON share exact sanitized per-source rendered fragments."""
+    project = data['project']
+    fragments = data.get('fragments') or render_fragments(data)
     repositories = ', '.join(project['repositories']) or 'Repository unknown'
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{text(project["id"])} · Forge</title><style>{STYLE}</style><main>'
             f'<p class="muted">FORGE / READ-ONLY</p><h1>{text(project["id"])}</h1>'
-            f'<p>{text(repositories)}</p><h2>Recorded workers &amp; assignments</h2>'
-            '<p class="muted">Recorded attempts do not establish live activity. Planning and synthesis '
-            'are conversation/workflow records, not a complete agent tree.</p>' + content +
-            f'<p class="muted">Dashboard fetched: {text(source["fetched_at"])}<br>'
-            f'Source observation time: {text(source["observed_at"])}</p></main></html>')
+            f'<p>{text(repositories)}</p><div id="forge-source">{fragments["forge"]}</div>'
+            f'<div id="github-source">{fragments["github"]}</div></main></html>')
 
 
 @dataclass(frozen=True)
@@ -228,11 +298,14 @@ class Response:
 
 
 class Dashboard:
-    def __init__(self, database_path, project_id):
+    def __init__(self, database_path, project_id, *, repository=None, github_project=None):
         if not identifier(project_id):
             raise ValueError('Select an exact project identifier.')
+        validate_board_selection(repository, github_project)
         self.database_path = database_path
         self.project_id = project_id
+        self.repository = repository
+        self.github_project = github_project
 
     def route(self, method, path):
         """Only two explicit GET resources. No dynamic paths or write operations."""
@@ -240,7 +313,8 @@ class Dashboard:
             return Response(405, b'Method not allowed', 'text/plain; charset=utf-8')
         if path not in {'/', '/api/snapshot'}:
             return Response(404, b'Not found', 'text/plain; charset=utf-8')
-        data = snapshot(self.database_path, self.project_id)
+        data = snapshot(self.database_path, self.project_id, repository=self.repository,
+                        github_project=self.github_project)
         if path == '/api/snapshot':
             return Response(200, json.dumps(data, allow_nan=False).encode(), 'application/json; charset=utf-8')
         return Response(200, render_page(data).encode(), 'text/html; charset=utf-8')
@@ -288,6 +362,8 @@ def parser():
     command.add_argument('--database', type=Path, required=True, help='Existing Forge SQLite database')
     command.add_argument('--project', required=True, help='Exact registered project_id (all its iterations)')
     command.add_argument('--port', type=int, default=8787)
+    command.add_argument('--repository', help='Explicit owner/repo for the optional GitHub board')
+    command.add_argument('--github-project', help='Explicit existing ProjectV2 node ID (PVT_...)')
     return command
 
 
@@ -296,7 +372,11 @@ def main(argv=None):
     args = command.parse_args(argv)
     if not identifier(args.project) or not 1 <= args.port <= 65535:
         command.error('Use an exact project identifier and a port from 1 to 65535.')
-    application = Dashboard(args.database, args.project)
+    try:
+        application = Dashboard(args.database, args.project, repository=args.repository,
+                                github_project=args.github_project)
+    except ValueError as error:
+        command.error(str(error))
     with ThreadingHTTPServer(('127.0.0.1', args.port), handler_for(application, args.port)) as server:
         print(f'Forge dashboard: http://127.0.0.1:{args.port} (read-only)')
         try:

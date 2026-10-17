@@ -1,86 +1,96 @@
 # Local Forge dashboard
 
-Run from the repository checkout with its Python runtime (stdlib only):
+Run from the checkout (Python stdlib):
 
 ```sh
-python -m factory_v1.dashboard --database /absolute/path/to/forge.sqlite --project PROJECT_ID
+mise exec -- python -m factory_v1.dashboard --database /absolute/path/to/forge.sqlite --project PROJECT_ID
 ```
 
-With the repository's pinned tools, prefix that command with `mise exec --`.
-Open **http://127.0.0.1:8787/** on the server. `--port 8788` selects another port.
-The database must already exist; `PROJECT_ID` is the exact registered `project_id`,
-not a GitHub Projects number. All recorded iterations for that project are included,
-including historical attempts. The project ID and recorded repositories appear at
-the top of the page. Stop the dashboard with Ctrl-C; this does not stop Forge workers.
-The application is independent of Hermes and does not read service credentials or
-service configuration. It binds only to `127.0.0.1`; there is no public bind flag,
-authentication layer, remote access setup, or deployment in this increment. Do not
-publish it behind an unauthenticated proxy. Local users with browser/server access
-can see the sanitized selected-project observations.
+Open **http://127.0.0.1:8787/** on the server. `--port 8788` selects another
+loopback port. `PROJECT_ID` is an exact Forge project identifier, not a GitHub
+Projects number. All recorded iterations and historical assignments are retained.
+The database must already exist; a missing database is never created.
+
+## Optional secondary GitHub Projects board
+
+```sh
+mise exec -- python -m factory_v1.dashboard --database /absolute/path/to/forge.sqlite --project PROJECT_ID --repository owner/repo --github-project PVT_EXACT_NODE_ID
+```
+
+Both board flags are required together. Neither flag means **unconfigured**, not
+an inferred board. The repository must match a selected project's recorded
+repository when observations exist. A mismatch refuses the board read. When the
+Forge database is unavailable or has no repository observations, an explicitly
+selected board can still be read independently, labelled **Forge project scope
+unverified**. GitHub repository/project linkage is independently checked by the
+board adapter. A linked old board is not evidence of current ticket membership.
+
+The host needs `gh` installed and authenticated with read access to the selected
+repository and existing ProjectV2. The bounded adapter performs only allowlisted
+GraphQL reads via host `gh`; credentials never enter the browser. No board,
+issue, status, layout or Forge state is written. Tests mock this external boundary.
 
 ## What is shown
 
-The compact worker-first page displays role, linked issue when recorded, stage and
-iteration/assignment identity. Prepared assignments explicitly say **not launched**.
-A recorded runtime becomes a **recorded worker attempt**, not proof of a live or
-successfully launched worker (even a preparing/finished attempt is retained).
-Planning in the originating conversation and ticket/bug synthesis have separate
-record labels; these are not a complete live-agent roster or parent/subagent tree.
-Missing tasks, roles and stages stay **Unknown**. No logs, transcripts or controls
-are available. Missing/corrupt sources show **unavailable**, distinct from a healthy
-project with no recorded assignments. Unsupported schemas or ambiguous scope fail
-closed instead of silently showing an empty project.
+The worker-first view shows role, issue link, stage, iteration/assignment and
+sanitized recorded status/reason. Prepared assignments say **not launched**.
+Running is explicitly **recorded; not live-verified**. Failure, stopped,
+unconfirmed cleanup and unknown outcomes remain distinct. **Done** requires a
+correlated admitted successful assignment result and confirmed cleanup; it never
+means its ticket was merged, deployed or delivered. Finished rows remain visible.
+Planning and synthesis are labelled records with unknown activity, not a live
+roster or inferred parent/subagent tree. Known reasons and canonical blocker links
+are rendered when provided by trusted projections, never from arbitrary worker text.
 
-## Reader and extension contract
+The compact secondary board preserves authoritative GitHub source statuses, with
+Todo, In Progress, Blocked, Done and Unknown columns. Native dependency-derived
+Blocked retains the source status and is labelled derived. Worker completion
+never changes ticket status. Missing fields remain Unknown. Independent source
+failures do not hide the other source. No logs, transcripts or controls are exposed.
 
-`factory_v1.dashboard.snapshot(database_path, project_id, *, now=None)` is the single
-public projection used by both `GET /` (server-rendered HTML) and
-`GET /api/snapshot` (JSON). `Dashboard.route(method, path)` returns a `Response`
-with `status`, UTF-8 `body` bytes and `content_type`, without a server/socket.
-All other paths are 404; non-GET methods are 405. Snapshot source errors are
-represented inside a 200 snapshot/page, so consumers must inspect source status.
-Responses are non-cacheable and same-local-origin only (Host validation plus
-cross-site Fetch Metadata refusal); there is no CORS access. HTML is escaped.
+## Safety and snapshot contract
 
-Snapshot v1:
+This standalone application is independent of Hermes. It binds only to 127.0.0.1;
+there is no public bind flag, authentication layer, proxy setup or deployment.
+Do not expose it through an unauthenticated proxy. Local users can see the
+sanitized selected observations. Ctrl-C stops the dashboard, not Forge workers.
+Host validation and cross-site Fetch Metadata refusal protect the local response
+boundary. Responses are no-store, nosniff and no-referrer, with restrictive CSP.
 
-- `version`: `1`
-- `project`: `{id, repositories}` (repositories are from validated selected iterations)
-- `sources.forge`: `{status: "ok" | "unavailable", fetched_at, observed_at, error}`
-- `workers`: records with exactly `{id, iteration_id, kind, role, stage,
-  issue_number, issue_url, task, run_id}`
-- `kind`: `prepared_assignment`, `worker_attempt`, `planning_record` or `synthesis_record`
-- Unavailable optional scalar values are `null`; `observed_at` is currently always
-  `null`, because these persisted records do not establish an observation timestamp.
-  `fetched_at` is UTC dashboard fetch time, **not a worker heartbeat**. `now` is a
-  deterministic clock seam. An unavailable source has no projected rows and a
-  constant sanitized error, never the database exception or host path.
+`factory_v1.dashboard.snapshot(database_path, project_id, *, now=None,
+repository=None, github_project=None)` supplies both `GET /` and
+`GET /api/snapshot`. Snapshot v1 contains:
 
-The reader opens an SQLite URI with `mode=ro`, sets `query_only=ON` and
-`trusted_schema=OFF`, and uses one deferred consistent read transaction. It never
-uses `immutable=1`, so normal WAL observations remain visible. It runs bounded
-SELECTs, validates indexed iteration/assignment identity against payload identity,
-requires exact payload project/iteration/repository/issue scope, and allowlists
-output fields. Role-assignment absence is normal before the first preparation.
-Malformed JSON that cannot safely be scoped fails closed. Limits (5,000 records,
-4 MiB per selected payload, SQLite operation budget and one-second lock timeout)
-produce unavailable, not a misleading truncated roster. No controller imports,
-state/control locks, reconciliation, frontier, model, GitHub or subprocess calls
-are involved. This does not promise zero SQLite-internal read coordination or
-replace normal database permissions.
+- `project: {id, repositories}` from validated selected Forge iterations.
+- `sources.forge: {status, fetched_at, observed_at, error}`.
+- `sources.github`: the same metadata plus `scope` (`unverified`, `mismatch`,
+  or `recorded_repository_match`); status is `ok`, `unavailable` or `unconfigured`.
+- `workers`: allowlisted identities, kind, role, task, issue number/link, stage,
+  run ID and `status: {state, label, reason, blocker}` only.
+- `board`: sanitized board observation from the separate host read adapter.
+- `fragments: {forge, github}`: escaped server-rendered source HTML, generated
+  from those exact projections, for a single future polling consumer.
 
-Later slices extend this same snapshot/view: #62 supplies a separate structured
-status adapter (raw runtime/results stay host-side), #63 supplies bounded refresh
-with independent source freshness/retention, #64 adds a separate `sources.github`
-and secondary board. This increment deliberately does not claim live status,
-worker completion semantics, polling, or a ticket board.
+Forge `observed_at` remains null: persisted records establish no heartbeat or
+source observation time. GitHub observation time comes only from a complete
+successful board read. Dashboard fetch time is separate per source, never a
+worker heartbeat or start/finish timestamp. Source errors are fixed sanitized
+messages inside HTTP 200 responses, not healthy empty results or raw exceptions.
+
+SQLite reads use mode=ro, query_only, trusted_schema=OFF, bounded SELECTs and one
+consistent transaction. Indexed/payload project, iteration, assignment, repository
+and issue identities must agree. Historical records are not reconciled or advanced.
+No controller, frontier, model, worker or control operations run on page reads.
+
+Automatic refresh is a separate pending integration; current pages use the same
+snapshot/source fragments but do not yet load a polling asset. Unsupported routes
+are 404 and non-GET methods 405. There is no generic file/asset server.
 
 ## Focused checks
 
 ```sh
-mise exec -- python -m unittest factory_v1.tests.test_dashboard -v
+mise exec -- python -B -m unittest factory_v1.tests.test_dashboard factory_v1.tests.test_dashboard_status factory_v1.tests.test_dashboard_board -v
 ```
 
-Two methods use explicit minimal SQLite records and mocked HTTP/request boundaries.
-They exercise the actual reader, HTML renderer, router and HTTP response adapter;
-no server, worker, controller journey, installed Hermes home or container is used.
+Six focused methods use direct records and mocked external boundaries; no real
+server, service, worker, container, E2E or controller journey is required.
