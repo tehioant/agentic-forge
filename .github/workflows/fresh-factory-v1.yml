@@ -29,5 +29,10 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Unit and component tests
         run: python scripts/run_factory_tests.py
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '26'
+      - name: Dashboard refresh unit tests
+        run: node --test factory_v1/dashboard_web/polling.test.js
       - name: Compile fresh controller
         run: python -m compileall -q factory_v1
