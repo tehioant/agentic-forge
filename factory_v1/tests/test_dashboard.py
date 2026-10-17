@@ -1,5 +1,6 @@
 """Direct reader/render/router components; no server, controller or worker lifecycle."""
 from copy import deepcopy
+from contextlib import closing
 from datetime import datetime, timezone
 from email.message import Message
 import hashlib
@@ -46,7 +47,7 @@ class DashboardTests(unittest.TestCase):
         foreign['handoff']['profile']['role'] = 'foreign-canary'
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'records.sqlite'
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.executescript('CREATE TABLE iterations(project_id TEXT, iteration_id TEXT, payload TEXT);'
                                  'CREATE TABLE role_assignments(assignment_id TEXT, payload TEXT);')
                 db.execute('INSERT INTO iterations VALUES(?,?,?)', ('selected', 'iteration-1', json.dumps(project)))
@@ -156,7 +157,7 @@ class DashboardTests(unittest.TestCase):
                 ('assignment-id-mismatch', project, dict(prepared, assignment_id='changed')),
                 ('corrupt-json', project, None),
             ):
-                with self.subTest(name=name), sqlite3.connect(path) as db:
+                with self.subTest(name=name), closing(sqlite3.connect(path)) as db, db:
                     db.execute('UPDATE iterations SET payload=? WHERE project_id=?', (json.dumps(iteration), 'selected'))
                     db.execute('UPDATE role_assignments SET payload=? WHERE assignment_id=?',
                                (json.dumps(assignment) if assignment else '{', 'assignment-1'))
@@ -165,7 +166,11 @@ class DashboardTests(unittest.TestCase):
                     self.assertEqual(result['sources']['forge']['status'], 'unavailable')
                     self.assertEqual(result['workers'], [])
                     self.assertNotIn('canary', json.dumps(result))
-            with sqlite3.connect(path) as db:
+                    with patch.object(dashboard, 'read_board') as github:
+                        invalid_scope = dashboard.snapshot(path, 'selected', repository='other/repo', github_project='PVT_selected')
+                        self.assertEqual(invalid_scope['sources']['github']['status'], 'unavailable')
+                        github.assert_not_called()
+            with closing(sqlite3.connect(path)) as db, db:
                 db.executescript('DROP TABLE role_assignments; DELETE FROM iterations;')
             empty = dashboard.snapshot(path, 'selected', now=now)
             self.assertEqual(empty['sources']['forge']['status'], 'ok')
@@ -187,14 +192,25 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(html.status, 200)
             self.assertIn(b'<h1>selected</h1>', html.body)
             self.assertIn(b'No recorded assignments', html.body)
+            self.assertIn(b'data-source-status="ok" data-observed-at=""', html.body)
+            self.assertIn(b'<script src="/assets/polling.js" defer>', html.body)
+            self.assertIn(b'<script src="/assets/bootstrap.js" defer>', html.body)
             self.assertEqual(json.loads(application.route('GET', '/api/snapshot').body), data)
             self.assertEqual(read.call_count, 2)
             for method, path, status in [('POST', '/', 405), ('DELETE', '/api/snapshot', 405),
-                                         ('GET', '/logs', 404), ('GET', '/api/snapshot?project=other', 404)]:
+                                         ('GET', '/logs', 404), ('GET', '/api/snapshot?project=other', 404),
+                                         ('GET', '/assets/../dashboard.py', 404), ('GET', '/assets/polling.test.js', 404)]:
                 with self.subTest(method=method, path=path):
                     read.reset_mock()
                     self.assertEqual(application.route(method, path).status, status)
                     read.assert_not_called()
+            for name in ('polling.js', 'bootstrap.js'):
+                read.reset_mock()
+                asset = application.route('GET', '/assets/' + name)
+                self.assertEqual(asset.status, 200)
+                self.assertEqual(asset.content_type, 'text/javascript; charset=utf-8')
+                self.assertEqual(asset.body, (Path(dashboard.__file__).with_name('dashboard_web') / name).read_bytes())
+                read.assert_not_called()
         for kind, label in dashboard.KINDS.items():
             with self.subTest(kind=kind):
                 record = {'id': '<script>private()</script>', 'iteration_id': 'old-iteration', 'kind': kind,
@@ -224,6 +240,11 @@ class DashboardTests(unittest.TestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 dashboard.Dashboard(Path('/unused'), 'selected', **options)
         selected = dashboard.Dashboard(Path('/unused'), 'selected', repository='owner/product', github_project='PVT_selected')
+        with patch.object(dashboard, 'ThreadingHTTPServer') as server, patch('builtins.print'):
+            dashboard.main(['--database', '/unused', '--project', 'selected', '--repository', 'owner/product',
+                            '--github-project', 'PVT_selected'])
+            self.assertEqual(server.call_args.args[0], ('127.0.0.1', 8787))
+            server.return_value.__enter__.return_value.serve_forever.assert_called_once_with()
         with patch.object(dashboard, 'snapshot', return_value=data) as read:
             selected.route('GET', '/api/snapshot')
             read.assert_called_once_with(Path('/unused'), 'selected', repository='owner/product', github_project='PVT_selected')
@@ -246,4 +267,7 @@ class DashboardTests(unittest.TestCase):
                     handler.send_response.assert_called_once_with(status)
                     handler.send_header.assert_any_call('Cache-Control', 'no-store')
                     handler.send_header.assert_any_call('X-Content-Type-Options', 'nosniff')
+                    csp = [call.args[1] for call in handler.send_header.call_args_list if call.args[0] == 'Content-Security-Policy'][0]
+                    self.assertIn("script-src 'self'", csp)
+                    self.assertIn("connect-src 'self'", csp)
                     self.assertEqual(route.call_count, int(status == 200))

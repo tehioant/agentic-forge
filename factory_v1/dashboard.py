@@ -192,7 +192,10 @@ def snapshot(database_path, project_id, *, now=None, repository=None, github_pro
     board = {'status': 'unconfigured', 'observed_at': None, 'project': None,
              'tickets': [], 'error': None}
     if repository is not None:
-        if repositories and repository not in repositories:
+        if source['status'] != 'ok' and Path(database_path).exists():
+            github.update(status='unavailable', error='Forge repository scope unavailable; board selection cannot be verified.')
+            board.update(status='unavailable', error=github['error'])
+        elif repositories and repository not in repositories:
             github.update(status='unavailable', scope='mismatch',
                           error='Selected repository does not match recorded Forge project.')
             board.update(status='unavailable', error=github['error'])
@@ -256,7 +259,8 @@ def render_workers(data):
         content = ('<div class="table-wrap"><table><thead><tr><th>Role / record</th><th>Task</th>'
                    '<th>Stage</th><th>Recorded activity</th><th>Iteration / assignment</th></tr></thead><tbody>' +
                    ''.join(rows) + '</tbody></table></div>')
-    return ('<h2>Recorded workers &amp; assignments</h2>'
+    repositories = ', '.join(data['project']['repositories']) or 'Repository unknown'
+    return (f'<p>{text(repositories)}</p><h2>Recorded workers &amp; assignments</h2>'
             '<p class="muted">Recorded attempts do not establish live activity. Planning and synthesis '
             'are conversation/workflow records, not a complete agent tree. Worker Done does not '
             'mean ticket delivery.</p>' + content +
@@ -281,13 +285,20 @@ def render_page(data):
     """Page and JSON share exact sanitized per-source rendered fragments."""
     project = data['project']
     fragments = data.get('fragments') or render_fragments(data)
-    repositories = ', '.join(project['repositories']) or 'Repository unknown'
+    sections = []
+    for name in ('forge', 'github'):
+        source = data['sources'][name]
+        sections.append(f'<p class="muted" role="status" id="{name}-notice"></p>'
+                        f'<div id="{name}-source" data-source-status="{text(source["status"])}" '
+                        f'data-observed-at="{escape(source["observed_at"] or "", quote=True)}">'
+                        f'{fragments[name]}</div>')
     return (f'<!doctype html><html lang="en"><meta charset="utf-8">'
             f'<meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{text(project["id"])} · Forge</title><style>{STYLE}</style><main>'
-            f'<p class="muted">FORGE / READ-ONLY</p><h1>{text(project["id"])}</h1>'
-            f'<p>{text(repositories)}</p><div id="forge-source">{fragments["forge"]}</div>'
-            f'<div id="github-source">{fragments["github"]}</div></main></html>')
+            f'<p class="muted">FORGE / READ-ONLY</p><h1>{text(project["id"])}</h1>' +
+            ''.join(sections) +
+            '</main><script src="/assets/polling.js" defer></script>'
+            '<script src="/assets/bootstrap.js" defer></script></html>')
 
 
 @dataclass(frozen=True)
@@ -308,9 +319,13 @@ class Dashboard:
         self.github_project = github_project
 
     def route(self, method, path):
-        """Only two explicit GET resources. No dynamic paths or write operations."""
+        """Explicit read resources only; never a generic file server."""
         if method != 'GET':
             return Response(405, b'Method not allowed', 'text/plain; charset=utf-8')
+        assets = {'/assets/polling.js': 'polling.js', '/assets/bootstrap.js': 'bootstrap.js'}
+        if path in assets:
+            body = (Path(__file__).with_name('dashboard_web') / assets[path]).read_bytes()
+            return Response(200, body, 'text/javascript; charset=utf-8')
         if path not in {'/', '/api/snapshot'}:
             return Response(404, b'Not found', 'text/plain; charset=utf-8')
         data = snapshot(self.database_path, self.project_id, repository=self.repository,
@@ -337,7 +352,7 @@ def handler_for(application, port):
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'")
             if response.status == 405:
                 self.send_header('Allow', 'GET')
             self.end_headers()

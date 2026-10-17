@@ -20,10 +20,12 @@ mise exec -- python -m factory_v1.dashboard --database /absolute/path/to/forge.s
 Both board flags are required together. Neither flag means **unconfigured**, not
 an inferred board. The repository must match a selected project's recorded
 repository when observations exist. A mismatch refuses the board read. When the
-Forge database is unavailable or has no repository observations, an explicitly
+Forge database is missing or has no repository observations, an explicitly
 selected board can still be read independently, labelled **Forge project scope
 unverified**. GitHub repository/project linkage is independently checked by the
 board adapter. A linked old board is not evidence of current ticket membership.
+An existing invalid/unreadable database refuses the board read rather than bypassing
+an unverifiable repository scope.
 
 The host needs `gh` installed and authenticated with read access to the selected
 repository and existing ProjectV2. The bounded adapter performs only allowlisted
@@ -69,7 +71,7 @@ repository=None, github_project=None)` supplies both `GET /` and
   run ID and `status: {state, label, reason, blocker}` only.
 - `board`: sanitized board observation from the separate host read adapter.
 - `fragments: {forge, github}`: escaped server-rendered source HTML, generated
-  from those exact projections, for a single future polling consumer.
+  from those exact projections, consumed by a single shared poller.
 
 Forge `observed_at` remains null: persisted records establish no heartbeat or
 source observation time. GitHub observation time comes only from a complete
@@ -82,15 +84,36 @@ consistent transaction. Indexed/payload project, iteration, assignment, reposito
 and issue identities must agree. Historical records are not reconciled or advanced.
 No controller, frontier, model, worker or control operations run on page reads.
 
-Automatic refresh is a separate pending integration; current pages use the same
-snapshot/source fragments but do not yet load a polling asset. Unsupported routes
-are 404 and non-GET methods 405. There is no generic file/asset server.
+## Automatic refresh
+
+The page loads only `/assets/polling.js` and `/assets/bootstrap.js`. CSP permits
+scripts and connections only from the same origin. One read-only GET poll starts
+immediately, then waits five seconds after completion before the next request;
+there is no second board loop. The 75-second timeout bounds client fetch/body
+processing and allows the host adapter's bounded pagination (up to eight reads,
+eight seconds each). No overlapping browser requests accumulate. Pagehide aborts
+the current browser request, clears timers and suppresses late UI updates.
+Aborting the browser does not cancel an already admitted bounded host read.
+
+Each source independently retains its last successful sanitized HTML fragment,
+source observation timestamp and visibly stale/unavailable notice on failure.
+Initial failure never becomes a healthy empty project. Recovery replaces only
+the recovered source. Forge's null source time stays **unknown / freshness
+unverified (stale)** despite successful reads. Notices never display raw transport
+errors. An unconfigured board stays unconfigured. The UI inserts HTML only from
+the same-origin server's allowlisted escaped projections, not raw source records.
+
+Unsupported routes (including other asset paths) are 404; non-GET methods are 405.
+There is no generic file/asset server.
 
 ## Focused checks
 
 ```sh
 mise exec -- python -B -m unittest factory_v1.tests.test_dashboard factory_v1.tests.test_dashboard_status factory_v1.tests.test_dashboard_board -v
+node --test factory_v1/dashboard_web/polling.test.js
 ```
 
 Six focused methods use direct records and mocked external boundaries; no real
 server, service, worker, container, E2E or controller journey is required.
+Two Node tests use a fake clock, mocked fetch and a minimal fake DOM, executing
+the actual poller/bootstrap for partial failures, recovery, retention and pagehide.

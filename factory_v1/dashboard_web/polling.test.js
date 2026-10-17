@@ -2,6 +2,8 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const { createPoller, mergeSources } = require("./polling.js");
+const fs = require("node:fs");
+const vm = require("node:vm");
 
 function fakeClock() {
   let now = 0, next = 0;
@@ -96,7 +98,7 @@ test("read-only polling serializes slow requests, times out, recovers and stops 
   assert.throws(() => createPoller({ url: "/", baseURL: "http://localhost/", intervalMs: 0 }), /positive/);
 });
 
-test("source freshness retains independent last-good observations without inventing activity times", () => {
+test("source freshness and actual bootstrap retain independent last-good views without inventing activity times", async () => {
   const options = { now: 10000, staleAfterMs: 1000 };
   let sources = mergeSources({}, {
     workers: { status: "ok", data: [{ activityAt: null }], observedAt: new Date(9500).toISOString() },
@@ -131,4 +133,77 @@ test("source freshness retains independent last-good observations without invent
   sources = mergeSources(sources, { github: { status: "ok", observedAt: new Date(12000).toISOString() } }, { ...options, now: 12000 });
   assert.equal(sources.github.status, "unavailable"); // Missing data is not healthy empty.
   assert.deepEqual(sources.github.data, ["cache"]);
+
+  // Run the actual served scripts with a minimal DOM and mocked fetch/clock only.
+  const clock = fakeClock(), requests = [], events = {};
+  const epoch = Date.parse("2026-10-17T00:00:00Z");
+  class FakeDate extends Date { static now() { return epoch + clock.now(); } }
+  const elements = {};
+  for (const name of ["forge", "github"]) {
+    elements[name + "-source"] = { innerHTML: name + " initial",
+      dataset: { sourceStatus: "ok", observedAt: name === "forge" ? "" : new Date(epoch).toISOString() } };
+    elements[name + "-notice"] = { textContent: "" };
+  }
+  const context = vm.createContext({
+    URL, AbortController, Date: FakeDate, location: { href: "http://localhost:8787/" },
+    document: { getElementById: id => elements[id] },
+    addEventListener(name, callback) { events[name] = callback; },
+    setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+    fetch(url, options) {
+      let resolve, reject;
+      const result = new Promise((yes, no) => { resolve = yes; reject = no; });
+      requests.push({ url, options, resolve, reject });
+      return result;
+    },
+  });
+  vm.runInContext(fs.readFileSync(__dirname + "/polling.js", "utf8"), context);
+  vm.runInContext(fs.readFileSync(__dirname + "/bootstrap.js", "utf8"), context);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].url, "http://localhost:8787/api/snapshot");
+  assert.equal(requests[0].options.method, "GET");
+  assert.match(elements["forge-notice"].textContent, /unknown/);
+  function respond(index, forgeStatus, githubStatus, suffix) {
+    requests[index].resolve({ ok: true, json: async () => ({
+      sources: { forge: { status: forgeStatus, observed_at: null },
+                 github: { status: githubStatus, observed_at: new Date(FakeDate.now()).toISOString() } },
+      fragments: { forge: "<p>forge " + suffix + "</p>", github: "<p>github " + suffix + "</p>" },
+    }) });
+  }
+  respond(0, "ok", "unavailable", "first"); await settle();
+  assert.equal(elements["forge-source"].innerHTML, "<p>forge first</p>");
+  assert.equal(elements["github-source"].innerHTML, "github initial");
+  assert.match(elements["github-notice"].textContent, /last successful view \(stale\)/);
+  clock.tick(5000); await settle();
+  respond(1, "unavailable", "ok", "second"); await settle();
+  assert.equal(elements["forge-source"].innerHTML, "<p>forge first</p>");
+  assert.equal(elements["github-source"].innerHTML, "<p>github second</p>");
+  assert.equal(elements["github-notice"].textContent, "Source observation current.");
+  clock.tick(5000); await settle();
+  requests[2].reject(new Error("SECRET raw transport detail")); await settle();
+  assert.match(elements["github-notice"].textContent, /unavailable/);
+  assert.ok(!JSON.stringify(elements).includes("SECRET"));
+  clock.tick(5000); await settle();
+  respond(3, "ok", "ok", "recovered"); await settle();
+  assert.equal(elements["forge-source"].innerHTML, "<p>forge recovered</p>");
+  assert.match(elements["forge-notice"].textContent, /unknown/);
+  clock.tick(5000); await settle();
+  events.pagehide();
+  assert.equal(requests[4].options.signal.aborted, true);
+  respond(4, "ok", "ok", "late"); await settle();
+  clock.tick(100000); await settle();
+  assert.equal(requests.length, 5);
+  assert.equal(elements["forge-source"].innerHTML, "<p>forge recovered</p>");
+  assert.equal(clock.count(), 0);
+  elements["forge-source"].dataset.sourceStatus = "unavailable";
+  elements["forge-source"].innerHTML = "Forge unavailable placeholder";
+  elements["github-source"].dataset.sourceStatus = "unconfigured";
+  elements["github-source"].innerHTML = "Board unconfigured placeholder";
+  vm.runInContext(fs.readFileSync(__dirname + "/bootstrap.js", "utf8"), context);
+  assert.match(elements["forge-notice"].textContent, /no successful observation/);
+  assert.equal(elements["github-notice"].textContent, "Board unconfigured.");
+  requests[5].reject(new Error("SECRET first load")); await settle();
+  assert.equal(elements["forge-source"].innerHTML, "Forge unavailable placeholder");
+  assert.equal(elements["github-source"].innerHTML, "Board unconfigured placeholder");
+  assert.ok(!JSON.stringify(elements).includes("SECRET"));
+  events.pagehide();
 });
