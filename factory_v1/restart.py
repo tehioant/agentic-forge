@@ -430,6 +430,7 @@ def reconcile(database, project, iteration, operator, github, *, recover=None):
                         'Exact controlled bug-rescoped issue changed.', 'scope_mismatch')
                 return a['bug_disposition']
             observe(identity + ':bug-rescope', bug_scope)
+            requirement_reads.append((identity, bug_scope))
             observe(identity + ':workspace', lambda a=a: workspace(a, api))
             observe(identity + ':publication', lambda a=a: candidate(a, api))
             observe(identity + ':merge', lambda a=a: integration(a, api))

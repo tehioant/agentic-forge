@@ -271,6 +271,17 @@ class BugTests(unittest.TestCase):
                     self.assertTrue(bugs.rescope_body_matches(continued, parked, later_issue))
                     later_issue['body'] += 'uncontrolled change'
                     self.assertFalse(bugs.rescope_body_matches(continued, parked, later_issue))
+                    observed = 0
+                    def late_tracker(*args):
+                        nonlocal observed
+                        observed += 1
+                        if observed == 2: self.fixture.issues[10]['body'] += 'late unrelated edit'
+                        return self.fixture.work['frontier']
+                    with patch.object(restart, 'worker', return_value={'container_absent': True}), patch.object(restart, 'workspace', return_value={}), \
+                            patch.object(restart, 'tracker', side_effect=late_tracker):
+                        refused = restart.reconcile(self.database, 'product', 'm1', '42', self.github)
+                    self.assertEqual(refused['status'], 'blocked')
+                    self.assertIn({'boundary': 'old-implementation:final-requirements', 'code': 'scope_mismatch'}, refused['blockers'])
                 if fault == 'pause':
                     with patch.object(restart, 'reconcile', return_value={'status': 'ready'}):
                         from factory_v1 import controls
