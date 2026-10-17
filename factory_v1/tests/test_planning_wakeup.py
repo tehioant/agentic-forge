@@ -336,6 +336,24 @@ class PlanningWakeupTests(unittest.TestCase):
             self.assertTrue(native.joined.is_set())
             self.assertEqual(len(calls), 2 if hold == 'iteration_paused' else 1)
             self.assertEqual(native.status, 'stopped' if hold == 'iteration_paused' else 'held')
+        # Actual paused/current-reader path observes a fresh external resume on
+        # the next tick and stays idle without injecting a synthetic answer.
+        self.item['status'] = 'paused'; self.fixture.persist()
+        native = wakeup.NativeWakeup(self.binding, str(self.path))
+        ticks = []
+        async def resume_tick(delay):
+            ticks.append(native.status)
+            self.assertFalse(native.joined.is_set())
+            self.ctx.inject_message.assert_not_called()
+            if len(ticks) == 1:
+                self.item['status'] = 'active'; self.fixture.persist()
+            else:
+                native.stopped = True
+        with patch.object(wakeup.asyncio, 'sleep', side_effect=resume_tick):
+            operation = native.run()
+            with self.assertRaises(StopIteration): operation.send(None)
+        self.assertEqual(ticks, ['waiting', 'idle'])
+        self.assertTrue(native.joined.is_set())
         # A genuinely missing first observation is quiet, not terminal scope drift.
         self.item['planning'].pop('native_execution'); self.fixture.persist()
         self.native.step()

@@ -128,6 +128,72 @@ class ConversationBindingTests(unittest.TestCase):
 
 
 
+    def test_supervised_first_observation_uses_default_host_execution_reader(self):
+        from factory_v1 import readiness, readiness_capabilities, readiness_gate, requirement_execution
+        import hashlib
+        self.item.pop('handoff'); self.item.pop('ticket_work')
+        self.item['repository_onboarding']['api_base'] = 'https://api.github.com'
+        self.fixture.persist()
+        root = self.fixture.root
+        native_source = root / 'native-contract.py'; native_source.write_text('# reviewed native fixture\n'); native_source.chmod(0o600)
+        approval = {'binding': self.config, 'assignment_id': 'origin-assignment', 'profile_name': 'approved-profile',
+            'source_digest': None,
+            'allowance': {'reference': 'existing-grant', 'provider_route': 'approved', 'model': 'fixture',
+                          'expires_at': 9999999999, 'max_wakeups': 1}}
+        from factory_v1 import assignments
+        approval['source_digest'] = assignments.digest({'skills': self.selected, 'adaptation': planning.INSTRUCTIONS})
+        def private(name, value):
+            path = root / name; path.write_text(json.dumps(value)); path.chmod(0o600); return str(path)
+        approved_path = private('approved-native.json', approval)
+        selected = {'planning_skills': self.descriptors, 'synthesis_config': '/approved/synthesis.json'}
+        service = {**{k: self.config[k] for k in ('state', 'project', 'iteration', 'operator_id')},
+                   'dispatch_config': private('dispatch-bootstrap.json', {**{k: self.config[k] for k in ('project', 'iteration', 'operator_id')},
+                       'planning_config': approved_path, 'synthesis_config': selected['synthesis_config']})}
+        db = self.fixture.database
+        readiness_gate.register(db, '/approved/service.json', service)
+        db.execute('UPDATE supervised_readiness SET policy=?', ('sealed',)); db.commit()
+        reader = readiness_capabilities.HostReaders(db, service, selected, self.fixture.github, native_root=root)
+        calls = []
+        def collect(database, config, policy, github, **kwargs):
+            pin = reader.execution_support({**{k: self.config[k] for k in ('project', 'iteration', 'operator_id')}},
+                ('grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES), **kwargs)
+            calls.append(pin)
+            return {'checks': {'execution': {'state': 'ready'}}}
+        original = copy.deepcopy(self.fixture.stored())
+        with patch.object(readiness_gate, 'configuration', return_value=(service, selected)), \
+                patch.object(readiness_gate, 'policy', return_value='sealed'), \
+                patch('factory_v1.service.github_client', return_value=self.fixture.github), \
+                patch.object(readiness, 'collect', side_effect=collect), \
+                patch.object(requirement_execution, 'configuration', return_value={'reviewed': 'fixture'}), \
+                patch.object(readiness_capabilities, 'physical', return_value=native_source), \
+                patch.object(readiness_capabilities, 'NATIVE_FILES', {'native-contract.py': hashlib.sha256(native_source.read_bytes()).hexdigest()}):
+            with self.assertRaises(repositories.RepositoryError): readiness_gate.check(db, 'product', 'm1')
+            # First hook produces only authenticated observations; no prior execution row.
+            result = self.binding.context('native-origin', task_id='actual-task', turn_id='actual-turn',
+                sender_id='42', user_message='Use Python.', conversation_history=[])
+            self.assertTrue(result['context']); self.assertEqual(len(calls), 1)
+            stored = self.fixture.stored()
+            self.assertEqual(stored['planning']['native_execution']['observations'][-1]['content'], 'Use Python.')
+            self.assertNotIn('host_publication', stored['planning'])
+            # Fresh assignment producer is independent of the observation fixture;
+            # it consumes the already-approved ID rather than a random future ID.
+            fresh = copy.deepcopy(original); fresh.pop('planning')
+            repositories.save_iteration(db, fresh); db.commit()
+            planned = planning.plan(db, fresh, {'origin': fresh['origin'], 'expected_revision': 0, 'skills': self.descriptors})
+            self.assertEqual(planned['planning']['assignment_id'], approval['assignment_id'])
+            self.assertNotIn('native_execution', self.fixture.stored()['planning'])
+            # The same admission cannot alter arbitrary state or launder sufficient/output authority.
+            for field in ('repository', 'sufficient', 'origin'):
+                repositories.save_iteration(db, original); db.commit()
+                proposal = copy.deepcopy(stored)
+                if field == 'repository': proposal['repository'] = 'other/product'
+                elif field == 'sufficient': proposal['planning']['native_execution']['sufficient'] = True
+                else: proposal['planning']['native_execution']['origin'] = {'platform': 'other'}
+                with self.subTest(field=field), self.assertRaises(repositories.RepositoryError):
+                    planning.checkpoint(db, proposal, bootstrap=True)
+                self.assertEqual(self.fixture.stored(), original)
+        self.fixture.github.request.assert_not_called()
+
     def test_initial_plan_accepts_reviewed_installed_sources_without_repinning(self):
         original = copy.deepcopy(self.item)
         self.item.pop('planning'); self.item.pop('ticket_work'); self.item.pop('handoff')

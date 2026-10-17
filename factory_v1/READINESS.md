@@ -16,7 +16,8 @@ report = readiness.collect(database, service_config, config, host_github,
 ```
 
 `load_config` requires an owned, single-link mode-0600 physical file and rejects
-duplicate keys. Top-level keys are exactly `readiness.FIELDS`. Service and config
+duplicate keys. Required top-level keys are `readiness.FIELDS`; the only optional
+key is `runtime_receipts` (the sealed issuer policy below). Service and config
 must identify the approved registered operator/project/iteration; repository ID,
 privacy and endpoint come from its immutable onboarding. Explicit board and
 `board_pin` bind the exact linked ProjectV2/status-field/option IDs. `protection`
@@ -119,6 +120,70 @@ mutable iteration, current liveness/control status, slot consumption or changing
 health sample. Fresh health/control/selected-capacity checks remain mandatory;
 identity stability never permits skipping them. Reports expose fixed safe codes,
 static remediation and no arbitrary exception details.
+
+## Narrow planning and continuation admissions
+
+The first authenticated native hook may checkpoint its proposed host observations
+through `planning-bootstrap`. The gate compares the entire proposed row with the
+fresh durable row and permits only an initial planning assignment or its first
+native observation/binding. It validates the approved session/operator/origin,
+assignment, installed sources/adaptation and actual native API/executor support.
+The default execution reader sees this validated proposal, not an invented prior
+execution row. Initial supervised `plan` uses the already host-approved assignment
+ID. No completion, publication, model call, sufficient judgment, unrelated state
+change, independent hold or existing execution can use this route. Ordinary
+planning/publication and wakeup evidence requirements remain unchanged.
+
+`next_iteration` has a distinct `continuation` admission: exact immutable completed
+report, delivered invitation, later authenticated same-origin operator message,
+and unchanged predecessor. Ordinary work on a waiting predecessor still refuses.
+Successor insertion, monitor inheritance, predecessor linkage and supervision
+fence are one transaction. The successor's inherited binding is deliberately
+unsealed; its own scoped service/readiness configuration must be selected before
+engineering dispatch. A predecessor configuration never authorizes a successor.
+This does not install/start a service or renew any spending allowance.
+
+The native subscriber waits quietly through ordinary pause and missing first
+observations, then rereads current authority on each tick. Source/scope drift and
+uncertain enqueue remain terminal holds; explicit resume never reinjects an
+unknown, rejected or already accepted message. Unload still cancels/joins its owned
+task. No new native loop, thread or socket is created by this lifecycle.
+
+## Sealed issuer policy versus exact issued receipts
+
+Legacy authority files remain recursively sealed. To allow future exact receipts,
+select an optional `runtime_receipts` object while paused:
+
+- `scope`: the exact `readiness_gate.scope_identity(item)` digest (approved
+  project/iteration/operator/repository/origin, not a caller-provided readiness bit).
+- `verifier`: exactly `path` and `sha256` for a reviewed host-owned executable.
+  The executable and all declared policy inputs stay immutable. The approved
+  implementation must independently verify actual retained execution/evidence;
+  echoing its input is not a verifier. None is installed or generated here.
+- `receipts`: a finite map of `review`, `diagnosis`, `publication` or `merge` to
+  exact absolute JSON paths, each mapped to nonempty immutable verifier constraints.
+  Parents must be physical host-private mode-0700 directories, outside worker
+  mounts. Files must be host-private mode-0600, single-link and bounded.
+
+Only these declared issued-file bytes may change from absence to an exact receipt;
+paths, parent ownership/modes, scope, constraints, verifier bytes and unrelated
+configuration remain sealed. The verifier runs with no shell/ambient environment,
+a five-second timeout and JSON stdin containing `scope`, `kind`, `path`, exact raw
+`sha256` and `constraints`. It must return zero and exactly `{"verified": REQUEST}`.
+Controller checks ownership and bytes again afterward. Each ordinary admission
+freshly verifies every materialized slot outside the interruption lane and checks
+its unchanged accepted identity locally at the final lane boundary. Notification
+admission does not execute engineering verifiers.
+
+`readiness_gate.runtime_receipt(database, project, iteration, kind, path,
+missing_ok=False)` exposes this fresh exact read for actual consumer/selector
+seams. `missing_ok=True` returns None only for an approved not-yet-issued slot.
+Consumer-specific run/candidate/evidence and policy validation remains mandatory;
+this API is not provenance issuance or generic execution permission. First accepted
+identity is retained atomically under private `STATE.receipt-identities`; replacing
+or deleting an accepted receipt refuses even after restart. New executions need
+new preapproved finite paths, never replacement of historical receipts. Back up
+that append-only identity directory with the controller state.
 
 ## Host-controlled selection and public probe
 

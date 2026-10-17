@@ -264,7 +264,7 @@ class NativeWakeup:
                 self.status = 'waiting_input'
                 return
             identity = scope(item, config)
-            self.status = 'idle'
+            self.status = 'enqueue_unknown' if request is not None and request.get('status') == 'enqueue_unknown' else 'idle'
             if request is None or request.get('cancelled') or request.get('status') != 'requested':
                 return
             require(request.get('config_path') == self.path and all(request.get(k) == v for k, v in identity.items()) and
@@ -298,6 +298,9 @@ class NativeWakeup:
             while not self.stopped:
                 try:
                     self.step()
+                    if self.status == 'enqueue_unknown':
+                        self.status = 'held'
+                        return
                 except RepositoryError as error:
                     if error.code in {'mailbox_busy', 'iteration_paused'}:
                         self.status = 'waiting'

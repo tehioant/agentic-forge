@@ -11,6 +11,7 @@ from pathlib import Path
 
 from . import assignments, controls, readiness
 from .planning import require
+from .readiness_receipts import receipt_policy, runtime_receipt, validate_runtime_receipts
 
 _active = ContextVar('supervised_readiness_admission', default={})
 
@@ -48,6 +49,7 @@ def inherit_supervision(database, predecessor, successor):
 def configuration(path):
     # Do not call service.load: it registers state and would recurse during admission.
     from . import service
+    require(bool(path) and Path(path).is_absolute(), 'Select a successor-scoped service policy.', 'readiness_configuration_required')
     config = readiness.load_config(path)
     require(isinstance(config, dict) and set(config) == service.FIELDS,
             'Exact service configuration required.', 'invalid_service')
@@ -60,17 +62,24 @@ def policy(config, selected, database):
     files = {}
     visited = set()
     state = config['state']
+    runtime = receipt_policy(database, config, selected)
+    dynamic = {p for paths in (runtime or {}).get('receipts', {}).values() for p in paths}
 
-    def visit(value):
+    def visit(value, runtime_paths=False):
         if isinstance(value, dict):
             for key, child in value.items():
                 # Mutable execution destinations are not immutable policy inputs.
                 if key not in {'home', 'workspace', 'artifacts_root', 'artifacts', 'state', 'subscription_socket'}:
-                    visit(child)
+                    visit(child, runtime_paths or key in {'authorities', 'receipts'})
         elif isinstance(value, list):
             for child in value:
-                visit(child)
+                visit(child, runtime_paths)
         elif isinstance(value, str) and value.startswith('/') and value != state and value not in visited:
+            if runtime_paths and value in dynamic:
+                parent = Path(value).parent
+                info = parent.stat()
+                files[value] = ['issued-exact-receipt', str(parent), info.st_mode, info.st_uid]
+                return
             visited.add(value)
             path = Path(value)
             if path.is_file():
@@ -93,6 +102,8 @@ def policy(config, selected, database):
     item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
     return assignments.digest({'scope': scope_identity(item), 'service': config, 'selected': selected, 'files': files,
                                'grant_columns': grant_columns, 'grants': grants})
+
+
 
 
 def seal(database, path):
@@ -265,6 +276,8 @@ def local_check(database, project, iteration, observation, resolution, selection
     latest, latest_selected = configuration(current[0])
     require(current[1] == local == policy(latest, latest_selected, database),
             'Immutable local readiness policy changed.', 'readiness_inputs_changed')
+    if operation != 'notification':
+        validate_runtime_receipts(database, latest, latest_selected, local=True)
     item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
     require(scope_identity(item) == identity, 'Exact origin/repository/operator changed.', 'readiness_inputs_changed')
     if operation != 'notification':
@@ -319,8 +332,15 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
     before = snapshot(database, project, iteration)
     local = policy(config, selected, database)
     require(current[1] == local, 'Select/review changed local readiness inputs while paused.', 'readiness_inputs_changed')
+    if operation != 'notification':
+        validate_runtime_receipts(database, config, selected)
     client = github_client(config)
-    report = readiness.collect(database, config, selected, client)
+    arguments = {}
+    if operation == 'planning-bootstrap':
+        validate_bootstrap(database, config, selected, selection)
+        assert selection is not None
+        arguments['planning_bootstrap'] = selection['planning_bootstrap']
+    report = readiness.collect(database, config, selected, client, **arguments)
     repair = repair_scope(database, config, selection, operation)
     if repair is not None:
         from .restart import registered_recovery
@@ -350,7 +370,83 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
     return config, selected, local, before, report, repair, scope_identity(assignments.current(database, project, iteration, config['operator_id'], require_active=False))
 
 
+def initial_planning_assignment(database, item):
+    """Use the already-approved assignment identity, never invent a future approval."""
+    current = binding(database, item['project_id'], item['iteration_id'])
+    if current is None:
+        return
+    config, selected = configuration(current[0])
+    require(current[1] == policy(config, selected, database), 'Sealed planning policy required.', 'readiness_inputs_changed')
+    from . import planning_wakeup
+    dispatch = readiness.load_config(config['dispatch_config'])
+    approval = planning_wakeup.configuration(dispatch['planning_config'])
+    item['planning']['assignment_id'] = approval['assignment_id']
+    item['planning']['docs_path'] = f"docs/factory/{item['iteration_id']}/{approval['assignment_id']}"
+
+
+def bootstrap_identity(database, config, selected, proposed, approval):
+    """Authenticate only initial assignment/host-observation persistence, not dispatch."""
+    from . import planning, planning_wakeup, skills
+    item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+    work = proposed.get('planning', {})
+    old = item.get('planning')
+    require(item['status'] == proposed.get('status') == 'active' and not item.get('completion') and
+            not item.get('previous_iteration') and not item.get('requirement_authority') and
+            not item.get('requirement_changes') and not item.get('main_incident'),
+            'Bootstrap cannot replace existing lifecycle authority.', 'scope_mismatch')
+    if old is None:
+        expected = {**item, 'planning': work, 'stage': 'planning_pending', 'execution_allowed': False,
+                    'correlation': {**item['correlation'], 'stage': 'planning_pending'}}
+        require(not any(item.get(k) for k in ('handoff', 'ticket_work', 'reservation')) and
+                set(work) == {'assignment_id', 'revision', 'request', 'origin', 'status', 'skills',
+                              'instructions', 'docs_path', 'pending_questions'} and work['revision'] == 1 and
+                work['request'] == {'origin': item['origin'], 'expected_revision': 0, 'skills': selected['planning_skills']},
+                'Only a fresh initial planning assignment may bootstrap.', 'scope_mismatch')
+    else:
+        expected = {**item, 'planning': {**old, **{k: work[k] for k in ('native_binding', 'native_execution') if k in work}}}
+        require(not old.get('native_execution') and not old.get('host_publication') and not old.get('native_wakeup'),
+                'Existing execution cannot be replaced by bootstrap.', 'execution_required')
+    require(proposed == expected and work.get('status') == 'pending' and work.get('pending_questions', []) == [] and
+            work.get('origin') == item['origin'] and work.get('instructions') == planning.INSTRUCTIONS and
+            assignments.identifier(work.get('assignment_id')) and work.get('assignment_id') == approval['assignment_id'] and
+            work.get('docs_path') == f"docs/factory/{item['iteration_id']}/{approval['assignment_id']}" and
+            work.get('skills') == skills.resolve_installed(selected['planning_skills']),
+            'Only exact approved planning observations may be saved.', 'scope_mismatch')
+    host = approval['binding']
+    require(all(host.get(k) == config[k] for k in ('state', 'project', 'iteration', 'operator_id')) and
+            host.get('origin') == item['origin'] and planning.text(host.get('session_id')) and
+            planning.text(host.get('reference')) and
+            approval['source_digest'] == assignments.digest({'skills': work['skills'], 'adaptation': work['instructions']}),
+            'Exact approved host origin and source binding required.', 'scope_mismatch')
+    if old is not None:
+        native = work.get('native_execution', {})
+        require(work.get('native_binding') == {'assignment_id': approval['assignment_id'],
+                'session_id': host['session_id'], 'reference': host['reference']} and
+                native.get('loads') == ['grill-me', 'grilling'] and native.get('sufficient') is False and
+                isinstance(native.get('observations'), list) and bool(native['observations']) and
+                all(isinstance(m, dict) and set(m) == {'reference', 'role', 'content'} and
+                    m['role'] in {'user', 'assistant'} and planning.text(m['reference']) and
+                    planning.text(m['content']) and planning_wakeup.TAG not in m['content']
+                    for m in native.get('observations', [])) and
+                native.get('observations', [{}])[-1].get('role') == 'user',
+                'Only genuine first host observations and initial loads may bootstrap.', 'execution_required')
+        return planning_wakeup.scope(proposed, approval)
+    return {'approval': approval, 'assignment_id': work['assignment_id']}
+
+
+def validate_bootstrap(database, config, selected, selection):
+    require(isinstance(selection, dict) and set(selection) == {'planning_bootstrap'},
+            'Exact planning bootstrap selection required.', 'scope_mismatch')
+    from . import planning_wakeup
+    dispatch = readiness.load_config(config['dispatch_config'])
+    approval = planning_wakeup.configuration(dispatch['planning_config'])
+    return bootstrap_identity(database, config, selected, selection['planning_bootstrap'], approval)
+
+
 def validate_selection(database, config, selected, selection, *, operation='work'):
+    if operation == 'planning-bootstrap':
+        validate_bootstrap(database, config, selected, selection)
+        return
     if operation == 'continuation':
         from .iteration import validate_continuation
         item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
@@ -361,7 +457,8 @@ def validate_selection(database, config, selected, selection, *, operation='work
         return
     if selection is None:
         return
-    require('continuation' not in selection, 'Continuation permits no ordinary work.', 'scope_mismatch')
+    require(not {'continuation', 'planning_bootstrap'} & set(selection),
+            'Bootstrap/continuation permits no ordinary work.', 'scope_mismatch')
     if 'merge_reopen' in selection:
         require(operation == 'effect' and set(selection) == {'merge_reopen'},
                 'Only corrective reopening may use this selection.', 'scope_mismatch')
@@ -424,7 +521,7 @@ def compare(database, project, iteration, observation, *, resolution=None):
 
 @contextmanager
 def admission(database, project, iteration, *, resolution=None, selection=None, operation='work'):
-    require(type(operation) is str and operation in {'work', 'effect', 'notification', 'continuation'}, 'Unknown readiness operation.', 'invalid_readiness')
+    require(type(operation) is str and operation in {'work', 'effect', 'notification', 'continuation', 'planning-bootstrap'}, 'Unknown readiness operation.', 'invalid_readiness')
     key = (database.execute('PRAGMA database_list').fetchone()[2], project, iteration)
     active = _active.get()
     if key in active:

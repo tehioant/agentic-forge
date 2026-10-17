@@ -804,6 +804,66 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
         self.db.execute('UPDATE model_grants SET remaining=0'); self.db.commit()
         with self.assertRaises(repositories.RepositoryError) as caught: self.admit()
         self.assertEqual(caught.exception.code, 'readiness_blocked')
+        # Issued receipts are mutable only under an immutable, explicitly selected
+        # verifier/path/scope policy. Exact consumer checks remain separate.
+        paths = [str(self.root / name) for name in ('future-review.json', 'next-review.json')]
+        verifier = self.root / 'receipt-verifier'
+        verifier.write_bytes(b'explicit trusted verifier fixture'); verifier.chmod(0o700)
+        self.config['runtime_receipts'] = {'scope': readiness_gate.scope_identity(self.item),
+            'verifier': {'path': str(verifier), 'sha256': sha(verifier.read_bytes())},
+            'receipts': {'review': {path: {'axis': 'both', 'repository_id': 7} for path in paths}}}
+        self.service['dispatch_config'] = self.file('receipt-dispatch.json', {'continuation': {'authorities': {'review': paths}}})
+        self.file('readiness.json', self.config); self.file('service.json', self.service)
+        sealed = readiness_gate.policy(self.service, self.config, self.db)
+        self.db.execute('UPDATE supervised_readiness SET policy=?', (sealed,)); self.db.commit()
+        def consume(path, **kwargs):
+            return readiness_gate.runtime_receipt(self.db, 'p', 'i', 'review', path, **kwargs)
+        self.assertIsNone(consume(paths[0], missing_ok=True))
+        def independently_verified(argv, **kwargs):
+            self.assertEqual(argv, [str(verifier)])
+            request = json.loads(kwargs['input'])
+            self.assertEqual(request['scope'], self.config['runtime_receipts']['scope'])
+            self.assertEqual(request['constraints'], {'axis': 'both', 'repository_id': 7})
+            self.assertEqual(request['sha256'], sha(Path(request['path']).read_bytes()))
+            return SimpleNamespace(returncode=0, stdout=json.dumps({'verified': request}).encode())
+        with patch('factory_v1.readiness_receipts.subprocess.run', side_effect=independently_verified) as verify:
+            for path in paths:
+                Path(path).write_text(json.dumps({'operator_id': 'operator', 'exact_run': path})); Path(path).chmod(0o600)
+                self.assertEqual(readiness_gate.policy(self.service, self.config, self.db), sealed)
+                self.assertEqual(consume(path)['exact_run'], path)
+                self.assertEqual(consume(path)['exact_run'], path)
+            self.assertEqual(verify.call_count, 4)  # no cached-verification consumption
+            self.assertEqual(self.admit(operation='effect'), 'admitted')
+            self.assertEqual(verify.call_count, 6)
+            accepted = Path(paths[1]).read_bytes()
+            authority = self.readers.github_authority.side_effect
+            def late_receipt_change(*args):
+                result = authority(*args)
+                Path(paths[1]).write_text('{"operator_id":"operator","exact_run":"late-change"}')
+                return result
+            with patch.object(self.readers.github_authority, 'side_effect', late_receipt_change):
+                with self.assertRaises(repositories.RepositoryError): self.admit(operation='effect')
+            Path(paths[1]).write_bytes(accepted)
+            Path(paths[1]).unlink()
+            with self.assertRaises(repositories.RepositoryError): consume(paths[1], missing_ok=True)
+            Path(paths[1]).write_bytes(accepted); Path(paths[1]).chmod(0o600)
+            Path(paths[0]).write_text(json.dumps({'operator_id': 'operator', 'exact_run': 'replacement'}))
+            with self.assertRaisesRegex(repositories.RepositoryError, 'immutable'): consume(paths[0])
+            # Trusted verifier refusal cannot be replaced by path/private-file checks.
+            verify.side_effect = None; verify.return_value = SimpleNamespace(returncode=0, stdout=b'{}')
+            with self.assertRaises(repositories.RepositoryError): consume(paths[1])
+        for field in ('scope', 'constraints', 'path', 'verifier'):
+            changed = deepcopy(self.config)
+            if field == 'scope': changed['runtime_receipts']['scope'] = '0' * 64
+            elif field == 'constraints': changed['runtime_receipts']['receipts']['review'][paths[0]]['axis'] = 'none'
+            elif field == 'path': changed['runtime_receipts']['receipts']['review'][str(self.root / 'unapproved.json')] = {'axis': 'both'}
+            else: changed['runtime_receipts']['verifier']['sha256'] = '0' * 64
+            with self.subTest(field=field):
+                try: changed_policy = readiness_gate.policy(self.service, changed, self.db)
+                except repositories.RepositoryError: pass
+                else: self.assertNotEqual(changed_policy, sealed)
+        verifier.write_bytes(b'drifted verifier')
+        with self.assertRaises(repositories.RepositoryError): consume(paths[1])
 
     def test_real_model_admission_preserves_allowance_quota_and_final_no_forward(self):
         EnforcedReadinessTests.setUp(self)

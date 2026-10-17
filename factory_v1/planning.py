@@ -108,7 +108,10 @@ def plan(database, item, request):
     if item.get('reservation'):
         item['reservation']['status'] = 'invalidated'
     transition(item, 'planning_pending')
-    checkpoint(database, item)
+    from .readiness_gate import initial_planning_assignment
+    if previous is None:
+        initial_planning_assignment(database, item)
+    checkpoint(database, item, bootstrap=previous is None)
     return item
 
 
@@ -128,9 +131,12 @@ def validate_documents(docs):
                 for i, h in enumerate(headings)), 'Use the real to-spec prose template with substantive sections.')
 
 
-def checkpoint(database, item, *, resolution=None, operation='work'):
+def checkpoint(database, item, *, resolution=None, operation='work', bootstrap=False):
     from .controls import admission
-    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation=operation):
+    selection = {'planning_bootstrap': item} if bootstrap else None
+    if bootstrap:
+        operation = 'planning-bootstrap'
+    with admission(database, item['project_id'], item['iteration_id'], resolution=resolution, operation=operation, selection=selection):
         require(item['status'] == 'active', 'Paused/out-of-iteration work cannot advance.', 'iteration_paused')
         save_iteration(database, item)
         database.commit()

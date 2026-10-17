@@ -39,7 +39,7 @@ def load_config(path):
                       object_pairs_hook=repositories.unambiguous_fields)
 
 
-def collect(database, service, config, github, *, readers=None, running=None, now=None):
+def collect(database, service, config, github, *, readers=None, running=None, now=None, planning_bootstrap=None):
     """Inspect exact registered inputs without claims, reservations, execution or sends.
 
     running is a separately observed liveness fact, not readiness or permission.
@@ -66,7 +66,7 @@ def collect(database, service, config, github, *, readers=None, running=None, no
             return None
 
     def scope_check():
-        require(isinstance(config, dict) and set(config) == FIELDS and
+        require(isinstance(config, dict) and FIELDS <= set(config) <= FIELDS | {'runtime_receipts'} and
                 all(assignments.identifier(config[k]) and config[k] == service[k]
                     for k in ('operator_id', 'project', 'iteration')) and planning.text(config['reference']),
                 'Exact scoped configuration required.', 'invalid_readiness')
@@ -155,7 +155,8 @@ def collect(database, service, config, github, *, readers=None, running=None, no
     def execution():
         require(stages is not None, 'Installed sources required.', 'skill_blocked')
         synthesis = requirement_execution.configuration(database, config['synthesis_config'], config['operator_id'])
-        pin = readers.execution_support(deepcopy(scope), tuple(['grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES]))
+        arguments = {} if planning_bootstrap is None else {'planning_bootstrap': planning_bootstrap}
+        pin = readers.execution_support(deepcopy(scope), tuple(['grill-me', 'grilling', 'to-spec', 'to-tickets', *assignments.ROLES]), **arguments)
         require(assignments.sha(pin), 'Independent capacity/verifier support required.', 'execution_required')
         return {'synthesis': synthesis, 'support': pin}
     check('execution', 'Verify native planning, host synthesis, engineering executors and independent evidence verifiers without running skills.', execution)

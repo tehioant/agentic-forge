@@ -377,6 +377,15 @@ class ContinuationComponents(unittest.TestCase):
             with self.assertRaises(RepositoryError):
                 readiness_gate.check(self.db, 'product', 'm1')
             before = copy.deepcopy(self.item)
+            def last_read_pause(*args, **kwargs):
+                controls.request(self.db, 'product', 'm1', '42', 'pause', 'continuation-last-read')
+                return report
+            with patch.object(readiness, 'collect', side_effect=last_read_pause):
+                with self.assertRaises(RepositoryError): self.start()
+            self.assertTrue(controls.blocked(self.db, 'product', 'm1'))
+            self.assertIsNone(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m2'").fetchone())
+            # Restore the independent no-control fixture for the atomic crash case.
+            controls.paths(self.db, 'product', 'm1')[1].unlink()
             with patch.object(readiness_gate, 'inherit_supervision', side_effect=RuntimeError('atomic crash')):
                 with self.assertRaises(RuntimeError): self.start()
             self.assertIsNone(self.db.execute("SELECT payload FROM iterations WHERE iteration_id='m2'").fetchone())
