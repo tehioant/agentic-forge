@@ -198,13 +198,9 @@ def continuation_inputs(item):
     return {'previous_spec': next(iter(specs.values())), 'previous_specs': specs, 'input_loads': loads}
 
 
-def next_iteration(database, project, iteration, operator, request):
-    """Authenticated later operator input is the only continuation admission."""
-    from . import planning
-    from .skills import resolve_installed
-    database.execute('BEGIN IMMEDIATE')
-    item = delivery.context(database, project, iteration, operator)
-    controls.require_active(database, project, iteration)
+def validate_continuation(database, item, operator, request):
+    """Revalidate the exact completed invitation and authenticated later input."""
+    iteration = item['iteration_id']
     fields = {'iteration_id', 'event_id', 'operator_id', 'origin', 'reference', 'message_id', 'input', 'skills'}
     require(isinstance(request, dict) and set(request) == fields and request['operator_id'] == operator and
             request['origin'] == item['origin'] and text(request['reference']) and text(request['input']) and
@@ -224,6 +220,17 @@ def next_iteration(database, project, iteration, operator, request):
             int(request['message_id']) > int(record['receipt']['message_id']) and
             request['reference'] != record['receipt']['reference'],
             'Verify exact-origin report delivery, then retain a distinct later operator message.', 'delivery_required')
+    return completion
+
+
+def next_iteration(database, project, iteration, operator, request):
+    """Authenticated later operator input is the only continuation admission."""
+    from . import planning, readiness_gate
+    from .skills import resolve_installed
+    database.execute('BEGIN IMMEDIATE')
+    item = delivery.context(database, project, iteration, operator)
+    controls.require_active(database, project, iteration)
+    completion = validate_continuation(database, item, operator, request)
     if item.get('next_iteration'):
         require(item['next_iteration']['request'] == request, 'Continuation input cannot be rebound.', 'iteration_conflict')
         result = delivery.context(database, project, request['iteration_id'], operator)
@@ -249,9 +256,11 @@ def next_iteration(database, project, iteration, operator, request):
         'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
         'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
         'Publish new updated-spec pointers, never overwrite the preceding milestone.')
-    with controls.admission(database, project, iteration):
+    with controls.admission(database, project, iteration, operation='continuation',
+                            selection={'continuation': request, 'predecessor': assignments.digest(item)}):
         delivery.inherit_monitor(database, item, result, operator)
         database.execute('INSERT INTO iterations VALUES (?, ?, ?)', (project, result['iteration_id'], json.dumps(result)))
+        readiness_gate.inherit_supervision(database, item, result)
         item['next_iteration'] = {'iteration_id': result['iteration_id'], 'request': request}
         save_iteration(database, item)
         database.commit()

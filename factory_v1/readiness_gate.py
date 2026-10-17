@@ -28,10 +28,21 @@ def register(database, service_path, config):
     database.execute('CREATE TABLE IF NOT EXISTS supervised_readiness '
                      '(project TEXT, iteration TEXT, service TEXT, policy TEXT, PRIMARY KEY(project, iteration))')
     old = binding(database, config['project'], config['iteration'])
-    require(old is None or old[0] == str(service_path), 'Supervised service binding changed.', 'readiness_binding_changed')
+    require(old is None or old[0] == str(service_path) or (old == ('', None) and
+            assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False).get('previous_iteration')), 'Supervised service binding changed.', 'readiness_binding_changed')
+    if old == ('', None):
+        database.execute('UPDATE supervised_readiness SET service=? WHERE project=? AND iteration=?',
+                         (str(service_path), config['project'], config['iteration']))
     database.execute('INSERT OR IGNORE INTO supervised_readiness VALUES (?,?,?,NULL)',
                      (config['project'], config['iteration'], str(service_path)))
     database.commit()
+
+
+def inherit_supervision(database, predecessor, successor):
+    """Atomically fence a successor until its own scoped service policy is selected."""
+    if binding(database, predecessor['project_id'], predecessor['iteration_id']) is not None:
+        database.execute('INSERT INTO supervised_readiness VALUES (?,?,?,NULL)',
+                         (successor['project_id'], successor['iteration_id'], ''))
 
 
 def configuration(path):
@@ -257,21 +268,22 @@ def local_check(database, project, iteration, observation, resolution, selection
     item = assignments.current(database, project, iteration, config['operator_id'], require_active=False)
     require(scope_identity(item) == identity, 'Exact origin/repository/operator changed.', 'readiness_inputs_changed')
     if operation != 'notification':
-        require(item['status'] == 'active' and not controls.blocked(database, project, iteration),
+        required_status = 'waiting-for-operator' if operation == 'continuation' else 'active'
+        require(item['status'] == required_status and not controls.blocked(database, project, iteration),
                 'Iteration held.', 'iteration_paused')
     controls.resume_scope(database, project, iteration)
     ownership(database, config, resolution)
     current_repair = repair_scope(database, config, selection, operation)
-    if operation != 'notification':
+    if operation not in {'notification', 'continuation'}:
         require(not item.get('main_incident') or current_repair is not None,
                 'Ordinary work remains frozen by the incident.', 'main_frozen')
     require(current_repair == repair, 'Recovery admission scope changed.', 'recovery_held')
     excluded = {'controls'}
-    if operation in {'effect', 'notification'}:
+    if operation in {'effect', 'notification', 'continuation'}:
         excluded |= {'capacity', 'spending'}
-    if operation == 'notification':
+    if operation in {'notification', 'continuation'}:
         excluded |= {'containers', 'execution'}
-    if operation == 'notification' or repair is not None:
+    if operation in {'notification', 'continuation'} or repair is not None:
         excluded.add('delivery')
     if resolution is not None:
         from .effect_resolution import permitted
@@ -315,11 +327,11 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
         require(registered_recovery(database, assignments.current(database, project, iteration, config['operator_id'], require_active=False), client) == repair,
                 'Registered repair authority changed.', 'recovery_held')
     excluded = {'controls'}
-    if operation in {'effect', 'notification'}:
+    if operation in {'effect', 'notification', 'continuation'}:
         excluded |= {'capacity', 'spending'}
-    if operation == 'notification':
+    if operation in {'notification', 'continuation'}:
         excluded |= {'containers', 'execution'}
-    if operation == 'notification' or repair is not None:
+    if operation in {'notification', 'continuation'} or repair is not None:
         excluded.add('delivery')
     if resolution is not None:
         from .effect_resolution import permitted
@@ -339,8 +351,17 @@ def observe(database, project, iteration, *, resolution=None, selection=None, op
 
 
 def validate_selection(database, config, selected, selection, *, operation='work'):
+    if operation == 'continuation':
+        from .iteration import validate_continuation
+        item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
+        require(isinstance(selection, dict) and set(selection) == {'continuation', 'predecessor'} and
+                selection['predecessor'] == assignments.digest(item),
+                'Exact completed predecessor required.', 'iteration_conflict')
+        validate_continuation(database, item, config['operator_id'], selection['continuation'])
+        return
     if selection is None:
         return
+    require('continuation' not in selection, 'Continuation permits no ordinary work.', 'scope_mismatch')
     if 'merge_reopen' in selection:
         require(operation == 'effect' and set(selection) == {'merge_reopen'},
                 'Only corrective reopening may use this selection.', 'scope_mismatch')
@@ -403,7 +424,7 @@ def compare(database, project, iteration, observation, *, resolution=None):
 
 @contextmanager
 def admission(database, project, iteration, *, resolution=None, selection=None, operation='work'):
-    require(type(operation) is str and operation in {'work', 'effect', 'notification'}, 'Unknown readiness operation.', 'invalid_readiness')
+    require(type(operation) is str and operation in {'work', 'effect', 'notification', 'continuation'}, 'Unknown readiness operation.', 'invalid_readiness')
     key = (database.execute('PRAGMA database_list').fetchone()[2], project, iteration)
     active = _active.get()
     if key in active:
