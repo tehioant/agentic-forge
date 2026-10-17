@@ -95,7 +95,12 @@ class Docker:
         if binary is None:
             raise RepositoryError('isolation_unavailable', 'Docker is required for whole-process isolation.')
         self.binary = binary
-        self.env = {key: os.environ[key] for key in ('PATH', 'HOME', 'DOCKER_HOST', 'DOCKER_CONTEXT', 'XDG_RUNTIME_DIR') if key in os.environ}
+        host = os.environ.get('DOCKER_HOST', 'unix:///var/run/docker.sock')
+        require(host.startswith('unix:///') and os.environ.get('DOCKER_CONTEXT', 'default') == 'default',
+                'Bounded bind storage requires the local host Docker daemon, not a remote context.', 'storage_unbounded')
+        self.env = {key: os.environ[key] for key in ('PATH', 'HOME', 'XDG_RUNTIME_DIR') if key in os.environ}
+        # Explicit DOCKER_HOST overrides a remotely selected context in ~/.docker.
+        self.env['DOCKER_HOST'] = host
 
     def call(self, *args, optional=False, timeout=30):
         try:

@@ -2,6 +2,7 @@
 No Docker/model acceptance claims, source mutation, commits or permission changes.
 """
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -35,6 +36,19 @@ class CleanupErrorTests(unittest.TestCase):
         self.database.commit()
 
     def test_docker_exec_errors_structured_matrix(self):
+        for host, context, admitted in (('unix:///var/run/docker.sock', 'default', True),
+                                         ('tcp://remote:2375', 'default', False),
+                                         ('ssh://remote', 'default', False),
+                                         ('unix:///run/user/1000/docker.sock', 'remote', False)):
+            with self.subTest(host=host, context=context), patch.dict(os.environ, {'DOCKER_HOST': host, 'DOCKER_CONTEXT': context}), \
+                    patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
+                if admitted:
+                    self.assertEqual(Docker().env['DOCKER_HOST'], host)
+                    self.assertNotIn('DOCKER_CONTEXT', Docker().env)
+                else:
+                    with self.assertRaises(RepositoryError) as refusal:
+                        Docker()
+                    self.assertEqual(refusal.exception.code, 'storage_unbounded')
         with patch('factory_v1.sandbox_policy.shutil.which', return_value='/fixture/docker'):
             docker = Docker()
         for operation, args, kwargs, error in (
@@ -165,6 +179,7 @@ class CleanupErrorTests(unittest.TestCase):
                 self.assertEqual(result['runtime']['status'], 'unconfirmed' if failure else 'failed')
                 self.assertEqual(result['runtime']['error'], 'stop_unconfirmed' if failure else 'source_blocked')
                 self.assertEqual(result['runtime']['container_removed'], failure is None)
+                self.assertEqual(result['runtime']['diagnostics_error'], 'artifacts_unavailable')
 
 
 

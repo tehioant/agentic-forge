@@ -594,6 +594,11 @@ root, so each attempt is bounded at least as strictly as `scratch_mb`. Retention
 must leave room for later attempts; use separate provisioned roots for independent
 project capacity. Docker's separate `/opt/data` and `/tmp` tmpfs limits remain in
 force. A writable-layer size option would not bound these host binds.
+The trusted Docker daemon must share the controller host's mount view: remote
+TCP/SSH routes and nondefault `DOCKER_CONTEXT` are refused, and an explicit local
+Unix `DOCKER_HOST` overrides any ambient selected context. A containerized/private-
+mount controller must not be deployed with a different daemon mount view; that
+platform arrangement is not supported or qualified by these component checks.
 
 Tmpfs evidence is volatile across unmount/reboot. Export needed evidence through
 the trusted controller's separately managed retention policy before removal; do

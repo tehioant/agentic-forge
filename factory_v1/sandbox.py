@@ -241,6 +241,7 @@ def finalize_result(state, project, iteration, operator, assignment_id, run_id, 
 def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, root, runtime, stop, docker, guard, broker, broker_errors, capability, signals, status, error_code, config_path):
     from .readiness_gate import check
     stop.set()
+    diagnostics_error = None
     try:
         docker.remove(runtime['container'])
     except (RepositoryError, OSError):
@@ -248,7 +249,7 @@ def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, 
     try:
         (root / 'guard-finish').touch()
     except OSError:
-        pass  # Diagnostic storage cannot skip joins, signal restoration or durable cleanup.
+        diagnostics_error = 'artifacts_unavailable'
     if guard:
         try:
             guard.wait(timeout=35)
@@ -281,6 +282,8 @@ def cleanup_attempt(state, project, iteration, operator, assignment_id, run_id, 
                 status, error_code = 'failed', error.code
         assignment['runtime'].update(status=status, error=error_code, source_artifacts=str(root / 'source-artifacts.json') if (root / 'source-artifacts.json').is_file() else None,
                                      container_removed=status != 'unconfirmed', recoverable=status != 'complete')
+        if diagnostics_error:
+            assignment['runtime']['diagnostics_error'] = diagnostics_error
         save(database, assignment)
     return assignment
 
