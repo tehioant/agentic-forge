@@ -402,11 +402,19 @@ def continuation_tick(service, github, *, stop_event=None):
             context = {}
         else:
             ancestor = next(r for r in rows if r['assignment_id'] == target)
-            context = {'assignment_id': target} if stage == 'launch' else {'request': {
-                **ancestor['handoff'], 'stage': ('diagnosis' if stage in {
-                    'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'} else
-                    'corrections' if stage == 'simplification-corrections' else
-                    'simplify' if stage == 'simplification-direction' else stage)}}
+            if stage == 'launch':
+                context = {'assignment_id': target}
+            else:
+                restart_request = {**ancestor['handoff']}
+                if stage in {'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'}:
+                    restart_request['stage'] = 'diagnosis'
+                elif stage == 'simplification-corrections':
+                    restart_request['stage'] = 'corrections'
+                elif stage == 'simplification-direction':
+                    restart_request['stage'] = 'simplify'
+                else:
+                    restart_request['stage'] = stage
+                context = {'request': restart_request}
         if recovery.active(item):
             restart.require_reconciled(database, *scope(service)[:2], allow_recovery=True)
         restart.before_dispatch(database, *scope(service), github, force=True, **context)
