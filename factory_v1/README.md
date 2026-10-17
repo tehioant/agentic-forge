@@ -550,7 +550,10 @@ gates, not permissions granted by this interface.
 Only the trusted operator/controller supplies `--launcher-config`. It is a
 controller-owned mode-0600 regular JSON file outside the assignment workspace,
 with these fields and optional `verification_commands` (the artifact root must already exist, be mode 0700,
-and belong to the controller):
+and belong to the controller). It must also be a **dedicated tmpfs mount root**,
+with a kernel-enforced byte capacity no larger than `scratch_mb` MiB and a finite
+inode capacity no larger than `scratch_mb * 256`. Ordinary host directories and
+binds of shared tmpfs subdirectories are refused with `storage_unbounded`:
 
 ```json
 {
@@ -576,6 +579,29 @@ inspected digest. The launcher checks image identity, the known original image
 entrypoint/working directory and its declared volume; it deliberately bypasses
 that root-oriented bootstrap with the image's Python running the immutable worker
 harness. The entire `AIAgent` runs inside the container, not just its terminal.
+
+Before runtime activation, an administrator must provision that private tmpfs
+with explicit `size` and `nr_inodes` limits (for the example: at most 128 MiB and
+32768 inodes), controller ownership and mode 0700. This is an independently
+validated prerequisite, not a JSON quota attestation: the controller reads Linux
+`/proc/self/mountinfo` and `statvfs`, rejects nested mounts, and verifies that every
+writable bind remains under that same filesystem. It rechecks at command creation,
+container inspection and immediately before start, for engineering **and** check
+containers. No mount is created automatically and no new privilege is granted.
+The aggregate filesystem ceiling covers source snapshots, writable workspace,
+scratch/home, controller evidence and concurrent/retained attempts sharing that
+root, so each attempt is bounded at least as strictly as `scratch_mb`. Retention
+must leave room for later attempts; use separate provisioned roots for independent
+project capacity. Docker's separate `/opt/data` and `/tmp` tmpfs limits remain in
+force. A writable-layer size option would not bound these host binds.
+
+Tmpfs evidence is volatile across unmount/reboot. Export needed evidence through
+the trusted controller's separately managed retention policy before removal; do
+not replace the runtime backing with an unbounded disk directory. Missing evidence
+after restart is a fail-closed reconciliation prerequisite, not accepted execution.
+Controller SQLite/control state and upstream credentials must remain outside the
+worker-writable artifact filesystem. Component tests mock kernel observations;
+actual mount/quota/exhaustion qualification has not been performed.
 
 ```bash
 python -m factory_v1 --state <private-state.sqlite> --operator-id 42 \
@@ -604,6 +630,9 @@ PID/start identity and TTL; controller death removes the actual container and
 retains logs. Stop and reconciliation read back container absence; an unavailable
 Docker daemon is **not** treated as proof of removal. Claims remain held, including
 failed, stopped and stale runs: retry/release/scheduling are not introduced here.
+Artifact-root, stop-marker and diagnostic-write failures cannot skip mandatory
+removal. Stop/reconcile persist verified absence or `unconfirmed/stop_unconfirmed`;
+marker failure is retained separately as `diagnostics_error=artifacts_unavailable`.
 
 Launch consumes only the persisted handoff and rechecks operator/iteration,
 spending allowance, frontier, exact ticket body/IDs, spec/input revisions, skills
@@ -640,6 +669,12 @@ their original 32 KB default); counts/TTL and the approved allowance remain
 mandatory. Pending upstream work gets SSE keepalives, not fabricated model output.
 Only actual approved completed response items are forwarded. No paid fallback.
 The state lock is released during upstream I/O.
+After slow authorization callbacks, a final short scoped interruption admission
+rechecks stop, TTL and grant expiry. Refusal before forwarding releases the exact
+reservation as failed/zero; interruption after forwarding remains uncertain.
+Independent check creation/start, cooperative wait and receipt admission use the
+owning iteration's scoped admission too; ordinary pause is not just a stop marker.
+Cleanup and truthful logs of already-admitted work remain possible while paused.
 
 The harness probes shell/file/mount/network denials before constructing the agent,
 loads every selected pinned skill/support/input using actual executing-process

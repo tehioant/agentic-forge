@@ -293,6 +293,14 @@ def _execute_admitted(database, scope, operation_id, payload, reserve, fixture_u
             raise SpendingError('spending_blocked', 'Current model access remains blocked.')
         if admission_check:
             admission_check(database)
+        # Slow authorization/readiness observations precede the short local
+        # admission. Never hold this lane across transport I/O.
+        with state_lock(database), admission(database, scope[0], scope[1], SpendingError, operation='effect'):
+            _iteration(database, scope[0], scope[1], require_active=True)
+            if ((stop_event is not None and stop_event.is_set())
+                    or (deadline is not None and time.monotonic() >= deadline)
+                    or (int(time.time()) if now is None else now) >= admitted['grant_expires']):
+                raise SpendingError('capability_exhausted', 'Authorization expired before outbound I/O.')
     except (RepositoryError, SpendingError) as error:
         with state_lock(database), database:
             _finish(database, operation_id, 'failed', 0, 'refused_before_outbound_io')
