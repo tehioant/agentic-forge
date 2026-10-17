@@ -357,7 +357,10 @@ def authorization(database, path, operator, axis):
     root = physical(axis['runtime']['artifacts'], directory=True)
     require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
             'Private host execution envelope required.', 'execution_required')
-    config = simplification.object_json(path.read_text(), 'invalid_diagnosis')
+    from .readiness_gate import runtime_receipt
+    scope = axis['ticket_scope']
+    config = runtime_receipt(database, scope['project'], scope['iteration'], 'diagnosis', str(path))
+    assert config is not None
     require(set(config) == {'operator_id', 'execution_reference', 'diagnosis'} and config['operator_id'] == operator and
             text(config['execution_reference']) and config['diagnosis'] == execution_binding(axis),
             'Independent host verification must bind the exact debug execution.', 'execution_required')

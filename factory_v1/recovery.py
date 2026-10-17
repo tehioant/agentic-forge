@@ -552,7 +552,7 @@ def reopen_removed(database, item, record, report, github):
 
 def verify(database, project, iteration, operator, config_path, github):
     from . import merge
-    config = merge.load_config(config_path, operator)
+    config = merge.load_config(config_path, operator, database=database, project=project, iteration=iteration)
     merge.controller_paths(database, config_path)
     require(github.base == config['api_base'], 'Wrong configured tracker route.', 'scope_mismatch')
     existing = assignments.current(database, project, iteration, operator)

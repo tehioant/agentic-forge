@@ -610,7 +610,7 @@ def advance_delivered(database, item, github, merge_config_path):
     operator = item['approval']['operator_id']
     item = assignments.current(database, project, iteration_id, operator, require_active=False)
     require(item['status'] == 'active', 'Retirement requires active iteration.', 'iteration_paused')
-    config = merge.load_config(merge_config_path, operator)
+    config = merge.load_config(merge_config_path, operator, database=database, project=project, iteration=iteration_id)
     from .effect_resolution import bound
     resolution = bound(database, item, 'delivered-retirement', config['candidate_assignment'])
     authority = {k: v for k, v in config.items() if k != 'bearer'}

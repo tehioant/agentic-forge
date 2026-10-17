@@ -608,6 +608,18 @@ class PublicationComponentTests(unittest.TestCase):
         self.assertEqual(sum(c[1] == '/pulls' for c in self.writes()), 1)
 
     def test_private_host_authority_and_mount_exclusion_matrix(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        # Public plan-only consumes the exact authorization without publication effects.
+        with closing(sqlite3.connect(self.state)) as db:
+            result = consumer_matrix(self, db, self.config_path, 'publication', lambda: publication.publish(
+                db, 'product', 'm1', '42', self.assignment['assignment_id'], self.config_path, plan_only=True))
+            self.assertEqual(result['status'], 'plan_only')
+        self.assertEqual(self.writes(), [])
+        # The remaining legacy immutable-policy cases use their original fixture.
+        with closing(sqlite3.connect(self.state)) as db:
+            db.execute('DROP TABLE supervised_readiness')
+            db.commit()
+        self.calls.clear()
         before = self.state.read_bytes()
         self.config_path.chmod(0o644)
         self.refuse('approval_required')

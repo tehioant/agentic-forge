@@ -58,6 +58,7 @@ class SelectionComponents(unittest.TestCase):
         waiting = dict(item(), status='waiting-for-operator', completion={'report_id': 'report'})
         cases = (
             ('retired-root', retired, [row('old')], frontier(), c.action('implementation', 2)),
+            ('bug-rescoped-root', item(), [dict(row('old'), bug_disposition={'status': 'parked'})], frontier(), c.action('implementation', 2)),
             ('held-frontier', retired, [row('old')], held, c.action('implementation', 3)),
             ('foreign-active', retired, [], foreign, {'stage': 'blocked'}),
             ('unregistered', incident, [row()], frontier(), c.action('blocked', 'registered_repair_required')),
@@ -107,8 +108,10 @@ class CapacityComponents(unittest.TestCase):
 
     def test_literal_capacity_and_launcher_limits_matrix(self):
         from factory_v1.model_access import SUBSCRIPTION_SCOPE
+        from factory_v1.tests.test_sandbox import bounded_storage_observation
         provider, model, operation = SUBSCRIPTION_SCOPE
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+                c.sandbox_policy, 'storage_observation', side_effect=bounded_storage_observation):
             root = Path(directory)
             artifacts = root / 'artifacts'
             artifacts.mkdir(mode=0o700)
@@ -182,8 +185,8 @@ class CapacityComponents(unittest.TestCase):
                 github.request.return_value = {'ref': 'refs/heads/main', 'object': {'type': 'commit', 'sha': 'c' * 40}}
                 with patch.object(c.tickets.gh, 'read_issue', return_value={'number': 2, 'id': 20, 'node_id': 'I_2', 'body': 'fresh body'}), \
                      patch.object(c.requirements, 'authority', return_value={'spec': {'commit': 'd' * 40}}), \
-                     patch.object(c.merge, 'controller_paths'), patch.object(c.merge, 'private_file', side_effect=lambda p: p), \
-                     patch.object(c.publication, 'read_json', side_effect=lambda p: values[p]):
+                     patch.object(c.merge, 'controller_paths'), \
+                     patch('factory_v1.readiness_gate.runtime_receipt', side_effect=lambda db, project, iteration, kind, path, **kw: values[path]):
                     bounded = c.request(conf, item(), 2, self.slot('fresh'), github)
                     with self.assertRaises(RepositoryError) if expected is None else nullcontext():
                         self.assertEqual(c.authority(Mock(), conf, 'review', lambda v: v.get('axes') == ['correct']), expected)

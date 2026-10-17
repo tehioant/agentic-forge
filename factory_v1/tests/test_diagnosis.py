@@ -324,6 +324,7 @@ class DiagnosisComponentTests(unittest.TestCase):
                                    'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
         self.item = {'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
             'repository': 'example/product', 'approval': {'operator_id': '42', 'reference': 'Local diagnosis fixture'},
+            'repository_onboarding': {'metadata': {'id': 123}, 'api_base': 'https://api.github.com'},
             'ticket_work': {'board': {'project_id': 'BOARD', 'status': {'id': 'STATUS', 'options': {'Ready': 'READY', 'Blocked': 'BLOCKED'}}},
                             'request': {'tracker': {'statuses': {'ready': 'Ready', 'blocked': 'Blocked'}}}}}
         self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps(self.item)))
@@ -773,6 +774,13 @@ class DiagnosisComponentTests(unittest.TestCase):
         self.assertEqual(self.set_field.call_count, 0)
 
     def test_request_direction_requires_fresh_authority_and_persists_exact_pending_event_replay(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        with component_case(DiagnosisComponentTests) as case:
+            _, axis = case.completed_inputs()
+            path, config = case.host_grant(axis)
+            self.assertEqual(consumer_matrix(case, case.database, path, 'diagnosis',
+                lambda: diagnosis.authorization(case.database, path, '42', axis)), config)
+            self.assertEqual(case.set_field.call_count, 0)
         _, axis = self.completed_inputs()
         request = {'stuck_assignment': self.prior['assignment_id']}
         path, config = self.host_grant(axis)

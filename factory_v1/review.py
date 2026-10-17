@@ -254,7 +254,7 @@ def adverse_reviews(database, candidate_pins):
     return adverse
 
 
-def authorization(path, operator, axes):
+def authorization(path, operator, axes, *, database=None, project=None, iteration=None):
     path = physical(path)
     info = path.stat()
     require(info.st_uid == os.getuid() and info.st_nlink == 1 and stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 8_000_000,
@@ -266,7 +266,12 @@ def authorization(path, operator, axes):
         root = physical(axis['runtime']['artifacts'], directory=True)
         require(root.stat().st_uid == os.getuid() and stat.S_IMODE(root.stat().st_mode) == 0o700,
                 'Private host evidence envelope required.', 'execution_required')
-    config = simplification.object_json(path.read_text(), 'invalid_review')
+    if database is None:
+        config = simplification.object_json(path.read_text(), 'invalid_review')
+    else:
+        from .readiness_gate import runtime_receipt
+        config = runtime_receipt(database, project, iteration, 'review', str(path))
+        assert config is not None  # missing_ok is deliberately false at consumers.
     require(set(config) == {'operator_id', 'execution_reference', 'axes', 'policy_decision'} and
             config['operator_id'] == operator and text(config['execution_reference']) and
             config['axes'] == [execution_binding(axis) for axis in axes],
@@ -289,7 +294,7 @@ def evaluate(database, project, iteration, operator, request, github, config_pat
                 for a in evidence.values() for finding in a['review_result']['findings']]
     sensitive = sorted({p for a in evidence.values() for p in a['handoff']['review']['policy_paths']})
     weakening = sorted({f['axis'] + ':' + f['id'] for f in findings if f['kind'] in {'gate-weakening', 'security-weakening'}})
-    config = authorization(config_path, operator, axes) if config_path else None
+    config = authorization(config_path, operator, axes, database=database, project=project, iteration=iteration) if config_path else None
     if config is None and axes[0].get('review_authorization') is not None:
         saved = axes[0]['review_authorization']
         require(saved == axes[1].get('review_authorization') and saved.get('operator_id') == operator and

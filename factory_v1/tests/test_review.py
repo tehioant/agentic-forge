@@ -201,6 +201,8 @@ class ReviewComponentTests(unittest.TestCase):
                                    'CREATE TABLE role_assignments (assignment_id TEXT PRIMARY KEY, payload TEXT);')
         self.database.execute('INSERT INTO iterations VALUES (?,?,?)', ('product', 'm1', json.dumps({
             'project_id': 'product', 'iteration_id': 'm1', 'status': 'active', 'execution_allowed': False,
+            'repository': 'example/product',
+            'repository_onboarding': {'metadata': {'id': 123}, 'api_base': 'https://api.github.com'},
             'approval': {'operator_id': '42', 'reference': 'local review fixture'}})))
         root = self.root / 'candidate'
         root.mkdir(mode=0o700)
@@ -300,6 +302,12 @@ class ReviewComponentTests(unittest.TestCase):
         return review.evaluate(self.database, 'product', 'm1', '42', self.request, self.github, config)
 
     def test_review_host_authority_cases(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        with component_case(ReviewComponentTests) as case:
+            path = case.authorization()
+            feedback = consumer_matrix(case, case.database, path, 'review', lambda: case.evaluate(path))
+            self.assertEqual(feedback['status'], 'accepted')
+            self.assertTrue(feedback['advance_allowed'])
         cases = [('absent', None), ('durable', None), ('public', 'approval_required'),
                  ('pin', 'execution_required'), ('mounted', 'approval_required'), ('saved-drift', 'execution_required')]
         for mode, code in cases:

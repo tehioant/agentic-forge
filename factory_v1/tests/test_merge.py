@@ -861,6 +861,18 @@ class MergeComponentTests(unittest.TestCase):
                 self.assertNotIn('main_incident', assignments.current(self.db, 'product', 'm1', '42'))
 
     def test_controller_config_private_scope_and_fixed_intent(self):
+        from factory_v1.tests.receipt_policy import consumer_matrix
+        preflight = consumer_matrix(self, self.db, self.config_path, 'merge', lambda: self.lifecycle('merge-preflight'))
+        self.assertFalse(preflight['merge_allowed'])
+        self.assertEqual(self.mutations(), [])
+        self.db.execute('DROP TABLE supervised_readiness')
+        self.db.commit()
+        self.calls.clear()
+        parked = {**self.candidate, 'bug_disposition': {'status': 'parked'}}
+        self.store(parked)
+        self.assertEqual(merge.inspect_merge(self.db, 'product', 'm1', '42', parked['assignment_id'])['bug_disposition'],
+                         parked['bug_disposition'])
+        self.store(self.candidate)
         self.config_path.chmod(0o644)
         with self.assertRaises(RepositoryError) as refusal: self.lifecycle()
         self.assertEqual(refusal.exception.code, 'execution_required')

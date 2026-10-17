@@ -60,8 +60,14 @@ def controller_paths(database, config_path):
                     'Controller config/state must be outside every worker mount.', 'execution_required')
 
 
-def load_config(path, operator):
-    config = publication.read_json(private_file(path))
+def load_config(path, operator, *, database=None, project=None, iteration=None):
+    path = private_file(path)
+    if database is None:
+        config = publication.read_json(path)
+    else:
+        from .readiness_gate import runtime_receipt
+        config = runtime_receipt(database, project, iteration, 'merge', str(path))
+        assert config is not None
     require(isinstance(config, dict) and set(config) == CONFIG_FIELDS and config['operator_id'] == operator and
             text(config['execution_reference']) and text(config['bearer']) and
             isinstance(config['executions'], list) and len(config['executions']) == 4 and
@@ -384,6 +390,7 @@ def inspect_merge(database, project, iteration, operator, assignment_id):
     current_revision = authority(item, assignment['ticket_scope']['issue_number'])
     return {'assignment_id': assignment_id, 'revision': assignment['revision'], 'current_spec': current_revision['spec'],
             'current_revision': current_revision, 'requirement_disposition': assignment.get('requirement_disposition'),
+            'bug_disposition': assignment.get('bug_disposition'),
             'merge': assignment.get('merge'), 'refusal': assignment.get('merge_refusal'),
             'iteration_complete': False, 'deployment_verified': False}
 
@@ -448,7 +455,7 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                 require(len(row[0].encode()) <= 8 * 1024 * 1024 and
                         isinstance(json.loads(row[0], object_pairs_hook=publication.unambiguous_fields), dict),
                         'Unambiguous bounded persistent evidence required.', 'invalid_merge')
-    config = load_config(config_path, operator)
+    config = load_config(config_path, operator, database=database, project=project, iteration=iteration)
     controller_paths(database, config_path)
     api = MergeGitHub(config)
     item = assignments.current(database, project, iteration, operator, require_active=False)
@@ -509,6 +516,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             require(pr.get('state') == 'open' and pr.get('merged') is False and type(pr.get('draft')) is bool,
                     'PR must be open and its readiness known.', 'merge_not_ready')
             def revalidate_admission(expected_incident):
+                # Local equality to the freshly verified bytes, never an issuer
+                # subprocess in a final interruption/admission lane.
                 require(load_config(config_path, operator) == config, 'Merge authority changed.', 'stale_admission')
                 chain(database, project, iteration, operator, config, config_path)
                 require(publication.ref_sha(api.read('/git/ref/heads/' + config['base']), config['base']) == config['baseline'],

@@ -57,14 +57,19 @@ def valid_ref(value):
             '..' not in value and '@{' not in value)
 
 
-def load_config(path, operator):
+def load_config(path, operator, *, database=None, project=None, iteration=None):
     try:
         path = physical(path)
         info = path.stat()
         require(info.st_nlink == 1 and info.st_uid == os.getuid() and
                 stat.S_IMODE(info.st_mode) == 0o600 and info.st_size <= 8 * 1024 * 1024,
                 'Use a private controller-owned publication authorization.', 'approval_required')
-        config = read_json(path)
+        if database is None:
+            config = read_json(path)
+        else:
+            from .readiness_gate import runtime_receipt
+            config = runtime_receipt(database, project, iteration, 'publication', str(path))
+            assert config is not None
         fields = {'operator_id', 'reference', 'execution_reference', 'binding', 'manifest', 'paths',
                   'policy_paths', 'repository', 'repository_id', 'branch', 'base', 'issue',
                   'expected_head', 'candidate', 'commit_date', 'api_base', 'bearer'}
@@ -242,7 +247,7 @@ def assemble(api, config, assignment, root):
 
 
 def publish(database, project, iteration, operator, assignment_id, config_path, plan_only=False):
-    config = load_config(config_path, operator)
+    config = load_config(config_path, operator, database=database, project=project, iteration=iteration)
     state_path = database.execute('PRAGMA database_list').fetchone()[2]
     with open(state_path + '.onboarding.lock', 'r') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)

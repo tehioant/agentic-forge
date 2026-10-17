@@ -112,7 +112,7 @@ def select(item, rows, observed):
             return action('direction', identity, event_id=record['event_id'])
         return action('request-direction', identity, diagnosis=debug['assignment_id'])
     active_rows = [r for r in rows if not any(r.get(k) for k in
-                   ('requirement_disposition', 'recovery_disposition', 'restart_disposition')) and
+                   ('requirement_disposition', 'recovery_disposition', 'restart_disposition', 'bug_disposition')) and
                    r.get('stuck_disposition') not in {'held', 'superseded'} and
                    r['assignment_id'] not in {identity for v in item.get('delivered_ticket_retirements', {}).values()
                                               for identity in v['proof']['lineage']}]
@@ -231,10 +231,13 @@ def request(config, item, number, slot, github):
 
 def authority(database, config, kind, predicate):
     """Select an exact host-owned authority, never materialize one from reports."""
+    from .readiness_gate import runtime_receipt
     matches = []
     for path in config['continuation']['authorities'][kind]:
+        value = runtime_receipt(database, config['project'], config['iteration'], kind, path, missing_ok=True)
+        if value is None:
+            continue  # Only an approved, never-issued future slot may be absent.
         merge.controller_paths(database, path)
-        value = publication.read_json(merge.private_file(path))
         if value.get('operator_id') == config['operator_id'] and predicate(value):
             matches.append(path)
     require(len(matches) == 1, 'Missing, stale or ambiguous exact ' + kind + ' authority.', kind + '_authority_unavailable')

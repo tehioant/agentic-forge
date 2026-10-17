@@ -334,7 +334,8 @@ def tick(service, github, *, stop_event=None):
             else:
                 if config['merge_config'] is None:
                     return blocked('merge_authority_unavailable')
-                authority = merge.load_config(config['merge_config'], service['operator_id'])
+                authority = merge.load_config(config['merge_config'], service['operator_id'], database=database,
+                                              project=service['project'], iteration=service['iteration'])
                 require(authority['candidate_assignment'] == candidate['assignment_id'],
                         'Merge authority targets a different candidate.', 'scope_mismatch')
                 journal = candidate.get('merge', {})
