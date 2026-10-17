@@ -144,6 +144,9 @@ concurrent head drift and block progression; the subsequent merge remains SHA-bo
 Lost responses reconcile from exact readback. Pending intent plus a still-draft PR
 is uncertain and is never blindly resent. Publication replay accepts a ready PR
 only with the correlated local readiness intent; it never converts it back to draft.
+The earlier `prepared` checkpoint has not reached the transport and may resume
+through all guards. A pre-transport refusal records that known-no-effect state;
+it does not downgrade an uncertain attempted mutation into permission to retry.
 
 Ordinary candidates also require passing required checks on baseline main. Failed
 or unknown main checks refuse ordinary admission. A durable iteration `main_incident`

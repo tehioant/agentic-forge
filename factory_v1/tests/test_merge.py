@@ -485,15 +485,15 @@ class MergeComponentTests(unittest.TestCase):
 
     def test_controlled_ready_intent_readback_and_replay_matrix(self):
         original = copy.deepcopy(self.pr)
-        for case in ('ready', 'lost-response', 'unknown', 'replay-ready', 'replay-draft', 'head-drift', 'late-pause'):
+        for case in ('ready', 'lost-response', 'unknown', 'replay-ready', 'replay-draft', 'prepared-draft', 'head-drift', 'late-pause'):
             with self.subTest(case=case):
                 self.pr = {**copy.deepcopy(original), 'draft': case != 'replay-ready', 'node_id': 'PR_exact20'}
                 self.store(copy.deepcopy(self.candidate))
                 self.calls.clear()
                 authority = {k: v for k, v in self.config.items() if k != 'bearer'}
-                if case.startswith('replay'):
+                if case.startswith('replay') or case == 'prepared-draft':
                     saved = self.stored()
-                    saved['pr_readiness'] = {'status': 'pending', 'authority': authority, 'pr_number': 20,
+                    saved['pr_readiness'] = {'status': 'prepared' if case == 'prepared-draft' else 'pending', 'authority': authority, 'pr_number': 20,
                                             'node_id': 'PR_exact20', 'head': self.config['head']}
                     self.store(saved)
                 writes = []

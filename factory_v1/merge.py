@@ -130,6 +130,9 @@ class MergeGitHub:
         c = self.config
         require(pr.get('number') == c['pr_number'] and text(pr.get('node_id')) and
                 pr.get('head', {}).get('sha') == c['head'] and pr.get('draft') is True and
+                pr.get('state') == 'open' and pr.get('merged') is False and
+                pr.get('head', {}).get('ref') == c['branch'] and pr.get('base', {}).get('ref') == c['base'] and
+                pr.get('base', {}).get('sha') == c['baseline'] and
                 all(pr.get(side, {}).get('repo', {}).get('id') == c['repository_id'] and
                     pr[side]['repo'].get('full_name') == c['repository'] for side in ('head', 'base')),
                 'Ready capability requires the exact reviewed PR/head.', 'capability_blocked')
@@ -400,7 +403,7 @@ def ready_candidate(database, scope, prior, api, config, pr, revalidate):
         return False  # Independently ready PRs still face the unchanged merge gates.
     expected = {'authority': authority, 'pr_number': config['pr_number'], 'node_id': pr.get('node_id'), 'head': config['head']}
     require(text(expected['node_id']), 'Exact PR node identity required for readiness.', 'github_mismatch')
-    require(old is None or (all(old.get(k) == v for k, v in expected.items()) and old.get('status') in {'pending', 'ready'}),
+    require(old is None or (all(old.get(k) == v for k, v in expected.items()) and old.get('status') in {'prepared', 'pending', 'ready'}),
             'Ready intent cannot be rebound to another PR/head/authority.', 'readiness_conflict')
 
     def retain(record):
@@ -408,16 +411,23 @@ def ready_candidate(database, scope, prior, api, config, pr, revalidate):
         fresh['pr_readiness'] = record
         publication.save(database, fresh)
 
-    if old is not None:
+    if old is not None and (old['status'] != 'prepared' or pr.get('draft') is False):
         require(pr.get('draft') is False, 'Ready outcome uncertain; reconcile exact PR without resending.', 'readiness_uncertain')
         retain({**expected, 'status': 'ready'})
         return False
     with admission(database, *scope[:2], operation='effect'):
         require_active(database, *scope[:2])
-        retain({**expected, 'status': 'pending'})
+        retain({**expected, 'status': 'prepared'})
     revalidate()
-    check(database, *scope[:2], operation='effect')
-    require_active(database, *scope[:2])
+    with admission(database, *scope[:2], operation='effect'):
+        require_active(database, *scope[:2])
+        retain({**expected, 'status': 'pending'})
+    try:
+        check(database, *scope[:2], operation='effect')
+        require_active(database, *scope[:2])
+    except RepositoryError:
+        retain({**expected, 'status': 'prepared'})  # This attempt never reached the transport.
+        raise
     try:
         api.ready(pr)
     except RepositoryError:
@@ -551,6 +561,10 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                 require_publication(database, latest, api, config['issue'])
                 require(issue(api, prior, config) == observed_issue,
                         'Requirements changed before readiness.', 'stale_requirements')
+                if boundary_incident is not None:
+                    from .recovery import merge_boundary
+                    _, checked_builder, checked_root = chain(database, project, iteration, operator, config, config_path)
+                    merge_boundary(database, latest, config, checked_builder, checked_root)
             if ready_candidate(database, (project, iteration, operator), prior, api, config, pr, revalidate_ready):
                 return {'status': 'ready', 'merge_allowed': False, 'close_allowed': False}
             require(pr.get('draft') is False and pr.get('state') == 'open' and pr.get('merged') is False and
