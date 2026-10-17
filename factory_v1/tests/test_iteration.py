@@ -387,6 +387,8 @@ class ContinuationComponents(unittest.TestCase):
             save_iteration(self.db, self.item)
             self.db.execute('CREATE TABLE supervised_readiness (project TEXT, iteration TEXT, service TEXT, policy TEXT, PRIMARY KEY(project,iteration))')
             self.db.execute('INSERT INTO supervised_readiness VALUES (?,?,?,?)', ('product', 'm1', '/approved/service.json', 'sealed'))
+            self.db.execute('CREATE TABLE model_grants (project TEXT, iteration TEXT, grant_id TEXT, remaining INTEGER)')
+            self.db.execute('INSERT INTO model_grants VALUES (?,?,?,?)', ('product', 'm1', 'predecessor-only-grant', 10))
         config = {'project': 'product', 'iteration': 'm1', 'operator_id': '42',
                   'state': str(self.root / 'state.sqlite')}
         report = {'checks': {k: {'state': 'ready'} for k in ('scope', 'stages', 'notification')}}
@@ -413,6 +415,8 @@ class ContinuationComponents(unittest.TestCase):
             result = self.start()
             self.assertEqual(result['status'], 'active')
             self.assertEqual(readiness_gate.binding(self.db, 'product', 'm2'), ('', None))
+            self.assertEqual(self.db.execute('SELECT * FROM model_grants').fetchall(),
+                             [('product', 'm1', 'predecessor-only-grant', 10)])
             self.assertEqual(self.start(), result)
             with self.assertRaises(RepositoryError): readiness_gate.check(self.db, 'product', 'm1')
         # The new row cannot acquire ordinary work through an unsupervised window.
