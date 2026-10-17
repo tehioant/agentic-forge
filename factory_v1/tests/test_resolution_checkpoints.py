@@ -32,7 +32,7 @@ class ResolutionCheckpointTests(unittest.TestCase):
 
     def test_candidate_late_holds_at_intent_receipt_and_success(self):
         for boundary in ('intent', 'write', 'receipt', 'success'):
-            for field, resolving in product(('stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause',
+            for field, resolving in product(('bug_disposition', 'stuck_disposition', 'recovery_disposition', 'requirement_disposition', 'restart_disposition', 'stop', 'pause',
                                              'execution_trust', 'result_disposition', 'runtime_status', 'runtime_removed', 'runtime_pin'), (False, True)):
                 with self.subTest(boundary=boundary, field=field, resolving=resolving):
                     f = self.fixture(fixtures.CandidateResolutionTests)

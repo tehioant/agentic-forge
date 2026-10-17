@@ -2,9 +2,11 @@
 import copy
 import json
 import unittest
+from typing import Any
 from unittest.mock import patch
 
-from factory_v1 import assignments, bugs, repositories, requirements, restart, tickets
+from factory_v1 import assignments, bugs, effect_resolution, readiness, repositories, requirements, restart, tickets
+from factory_v1.model_access import SUBSCRIPTION_SCOPE
 from factory_v1.tests import test_tickets
 
 
@@ -200,6 +202,53 @@ class BugTests(unittest.TestCase):
 
 
     def test_bug_rescope_parks_only_clean_correlated_ownership(self):
+        # Independent inventory records: historical slots are not selectable or reusable,
+        # regardless of cleanup state. Ownership release remains bugs.released_claim's job.
+        profile = dict(name='parked-profile', home=str(self.fixture.root / 'parked-profile'),
+                       role=assignments.ROLES['implementation'], reasoning='high',
+                       **dict(zip(('provider', 'model', 'operation'), SUBSCRIPTION_SCOPE)))
+        slot = dict(stage='implementation', profile=profile, claim_id='parked-claim')
+        fresh = dict(stage='implementation', claim_id='fresh-slot',
+                     profile={**profile, 'name': 'fresh-profile', 'home': str(self.fixture.root / 'fresh-profile')})
+        scope = dict(project='product', iteration='m1', repository='example/product', repository_id=123)
+        handoff = dict(stage='implementation', profile=profile, repository='example/product', repository_id=123,
+                       issue=dict(number=10, id=1010))
+        row: dict[str, Any] = dict(assignment_id='parked-assignment', claim_id='parked-claim', ticket_scope={**scope, 'issue_number': 10},
+                   handoff=handoff, handoff_digest=assignments.digest(handoff), revision={},
+                   bug_disposition={'bug_assignment': 'explicit-bug'})
+        for status in (None, 'running', 'complete'):
+            with self.subTest(inventory_status=status):
+                row['runtime'] = None if status is None else dict(status=status, run_id='old-run', container_removed=True)
+                with patch.object(assignments, 'rows', return_value=[row]):
+                    self.assertEqual(readiness.slot_capacity(self.database, [slot, fresh], scope),
+                                     {'available': [{'stage': 'implementation', 'claim_id': 'fresh-slot'}], 'active': []})
+                    readiness.slot_capacity(self.database, [slot, fresh], scope, stage='implementation')
+                    with self.assertRaises(repositories.RepositoryError) as caught:
+                        readiness.slot_capacity(self.database, [slot], scope)
+                    self.assertEqual(caught.exception.code, 'slot_capacity_unavailable')
+                    for terminal in (False, True):
+                        with self.assertRaises(repositories.RepositoryError) as caught:
+                            readiness.slot_capacity(self.database, [slot, fresh], scope, stage='implementation',
+                                assignment_id=row['assignment_id'], run_id=(row['runtime'] or {}).get('run_id'), terminal=terminal)
+                        self.assertEqual(caught.exception.code, 'slot_binding_changed')
+
+        # Corrective reopening is not result admission, but its retained token must
+        # still be invalidated by newly parked ownership, including later pin changes.
+        row.pop('bug_disposition')
+        row['merge'] = dict(status='incomplete', close_allowed=False, authority=dict(
+            candidate_assignment=row['assignment_id'], operator_id=self.item['approval']['operator_id'],
+            repository='example/product', repository_id=123, api_base=self.item['repository_onboarding']['api_base'],
+            issue=10, head='c' * 40, baseline='a' * 40, pr_number=20))
+        with patch.object(assignments, 'rows', return_value=[row]), patch.object(assignments, 'current', return_value=self.item):
+            resolution = effect_resolution.bound(self.database, self.item, 'merge-reopen', row['assignment_id'])
+            self.assertEqual(effect_resolution.permitted(self.database, 'product', 'm1', resolution), {('delivery', 'corrective_reopen')})
+            for disposition in ({'bug_assignment': 'explicit-bug'}, {'bug_assignment': 'other-bug'}):
+                row['bug_disposition'] = disposition
+                with self.assertRaises(repositories.RepositoryError) as caught:
+                    effect_resolution.permitted(self.database, 'product', 'm1', resolution)
+                self.assertEqual(caught.exception.code, 'stale_admission')
+                resolution = effect_resolution.bound(self.database, self.item, 'merge-reopen', row['assignment_id'])
+
         original = copy.deepcopy(self.fixture.issues[10])
         base_item = copy.deepcopy(self.item)
         for fault in ('none', 'running', 'unknown-cleanup', 'unconfirmed', 'pin', 'handoff', 'pause'):
@@ -247,6 +296,12 @@ class BugTests(unittest.TestCase):
                     for key, value in (('container_removed', False), ('status', 'running')):
                         bad = copy.deepcopy(parked); bad['runtime'][key] = value
                         self.assertFalse(bugs.released_claim(self.database, bad))
+                    for field in ('revision', 'claim_id', 'handoff_digest', 'body_sha256'):
+                        with self.subTest(release_binding=field):
+                            bad = copy.deepcopy(parked)
+                            if field == 'body_sha256': bad['bug_disposition'][field] = 'f' * 64
+                            else: bad[field] = {'changed': True} if field == 'revision' else 'changed'
+                            self.assertFalse(bugs.released_claim(self.database, bad))
                     work.update(status='published', publication_complete=True)
                     tickets.checkpoint(self.database, self.item)
                     with patch.object(restart, 'worker', return_value={'container_absent': True}), patch.object(restart, 'workspace', return_value={}), \
@@ -257,6 +312,8 @@ class BugTests(unittest.TestCase):
                     fresh_request = {'stage': 'implementation', 'claim_id': 'fresh-claim',
                                      'profile': {'name': 'fresh-profile', 'home': '/fresh-profile'}}
                     assignments.claims(self.database, fresh_request, scope, 'fresh-assignment')
+                    assignments.claims(self.database, fresh_request,
+                                       {**scope, 'issue_number': 13, 'issue_id': issue['id']}, 'fresh-bug-assignment')
                     with self.assertRaises(repositories.RepositoryError):
                         assignments.claims(self.database, {**fresh_request, 'claim_id': 'old-claim'}, scope, 'fresh-assignment')
                     with self.assertRaises(repositories.RepositoryError):

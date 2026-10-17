@@ -63,7 +63,7 @@ def authority(item, rows, kind, target):
                 type(config.get('pr_number')) is int and config['pr_number'] > 0,
                 'Exact incomplete merge authority required for corrective reopening.', 'scope_mismatch')
         assert row is not None
-        return [row['handoff'], row['revision'], journal]
+        return [row['handoff'], row['revision'], journal, row.get('bug_disposition')]
     if kind == 'delivered-retirement':
         row = next((a for a in rows if a['assignment_id'] == target), None)
         require(row is not None and row.get('merge', {}).get('status') == 'delivered' and
@@ -85,7 +85,7 @@ def authority(item, rows, kind, target):
         assignments.require_result_active(row)
         return [row['handoff_digest'], row['revision'], row['runtime'], row.get('result_disposition'),
                 journal['approval'], journal['candidate'],
-                *[row.get(k) for k in ('recovery_disposition', 'restart_disposition',
+                *[row.get(k) for k in ('bug_disposition', 'recovery_disposition', 'restart_disposition',
                                       'requirement_disposition', 'stuck_disposition')]]
     if kind == 'bug-publication':
         from .bugs import assigned
