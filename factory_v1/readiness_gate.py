@@ -65,17 +65,17 @@ def policy(config, selected, database):
     runtime = receipt_policy(database, config, selected)
     dynamic = {p for paths in (runtime or {}).get('receipts', {}).values() for p in paths}
 
-    def visit(value, runtime_paths=False):
+    def visit(value):
         if isinstance(value, dict):
             for key, child in value.items():
                 # Mutable execution destinations are not immutable policy inputs.
                 if key not in {'home', 'workspace', 'artifacts_root', 'artifacts', 'state', 'subscription_socket'}:
-                    visit(child, runtime_paths or key in {'authorities', 'receipts'})
+                    visit(child)
         elif isinstance(value, list):
             for child in value:
-                visit(child, runtime_paths)
+                visit(child)
         elif isinstance(value, str) and value.startswith('/') and value != state and value not in visited:
-            if runtime_paths and value in dynamic:
+            if value in dynamic:
                 parent = Path(value).parent
                 info = parent.stat()
                 files[value] = ['issued-exact-receipt', str(parent), info.st_mode, info.st_uid]
@@ -385,13 +385,17 @@ def initial_planning_assignment(database, item):
 
 
 def bootstrap_identity(database, config, selected, proposed, approval):
-    """Authenticate only initial assignment/host-observation persistence, not dispatch."""
+    """Authenticate only a fresh assignment or first host observation, not dispatch."""
     from . import planning, planning_wakeup, skills
     item = assignments.current(database, config['project'], config['iteration'], config['operator_id'], require_active=False)
     work = proposed.get('planning', {})
     old = item.get('planning')
+    if item.get('previous_iteration'):
+        from .iteration import validate_successor
+        require(old is not None, 'Successor must retain its admitted planning assignment.', 'scope_mismatch')
+        validate_successor(database, item)
     require(item['status'] == proposed.get('status') == 'active' and not item.get('completion') and
-            not item.get('previous_iteration') and not item.get('requirement_authority') and
+            not item.get('requirement_authority') and
             not item.get('requirement_changes') and not item.get('main_incident') and
             not item.get('planning_history') and not item.get('ticket_history') and
             not any((r['ticket_scope']['project'], r['ticket_scope']['iteration']) ==
@@ -410,7 +414,7 @@ def bootstrap_identity(database, config, selected, proposed, approval):
         require(not old.get('native_execution') and not old.get('host_publication') and not old.get('native_wakeup'),
                 'Existing execution cannot be replaced by bootstrap.', 'execution_required')
     require(proposed == expected and work.get('status') == 'pending' and work.get('pending_questions', []) == [] and
-            work.get('origin') == item['origin'] and work.get('instructions') == planning.INSTRUCTIONS and
+            work.get('origin') == item['origin'] and work.get('instructions') == planning.instructions(item) and
             assignments.identifier(work.get('assignment_id')) and work.get('assignment_id') == approval['assignment_id'] and
             work.get('docs_path') == f"docs/factory/{item['iteration_id']}/{approval['assignment_id']}" and
             work.get('skills') == skills.resolve_installed(selected['planning_skills']),

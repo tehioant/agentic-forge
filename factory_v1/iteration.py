@@ -228,6 +228,32 @@ def validate_continuation(database, item, operator, request):
     return completion
 
 
+def validate_successor(database, item):
+    """Recheck the completed predecessor, delivered invitation and exact successor."""
+    from . import planning
+    previous = item.get('previous_iteration')
+    require(isinstance(previous, dict) and set(previous) == {'iteration_id', 'completion', 'input'} and
+            previous['iteration_id'] != item['iteration_id'],
+            'Exact successor lineage required.', 'scope_mismatch')
+    operator = item['approval']['operator_id']
+    predecessor = assignments.current(database, item['project_id'], previous['iteration_id'], operator, require_active=False)
+    request = previous['input']
+    completion = validate_continuation(database, predecessor, operator, request)
+    work = item.get('planning', {})
+    require(previous['completion'] == completion and request['iteration_id'] == item['iteration_id'] and
+            predecessor.get('next_iteration') == {'iteration_id': item['iteration_id'], 'request': request} and
+            all(item[k] == predecessor[k] for k in ('project_id', 'repository', 'origin', 'repository_onboarding')) and
+            item.get('idea') == request['input'] and
+            item['approval'] == {'operator_id': operator, 'reference': request['reference']} and
+            work.get('revision') == 1 and work.get('origin') == item['origin'] and
+            work.get('request') == {'origin': item['origin'], 'expected_revision': 0, 'skills': request['skills']} and
+            work.get('continuation') == {**continuation_inputs(predecessor), 'input': request,
+                'adaptation': planning.NEXT_ADAPTATION,
+                'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}} and
+            work.get('instructions') == planning.instructions(item),
+            'Completed predecessor or successor input/adaptation changed.', 'scope_mismatch')
+
+
 def next_iteration(database, project, iteration, operator, request):
     """Authenticated later operator input is the only continuation admission."""
     from . import planning, readiness_gate
@@ -256,11 +282,7 @@ def next_iteration(database, project, iteration, operator, request):
     result['planning']['continuation'] = {**continuation_inputs(item), 'input': request,
                                        'adaptation': planning.NEXT_ADAPTATION,
                                        'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}}
-    result['planning']['instructions'] += ('\nContinue this SAME product from ALL continuation.previous_specs and the explicit input. '
-        'Preserve any explicit round-completion gate; no synthesis before actual answers. '
-        'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
-        'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
-        'Publish new updated-spec pointers, never overwrite the preceding milestone.')
+    result['planning']['instructions'] = planning.NEXT_INSTRUCTIONS
     with controls.admission(database, project, iteration, operation='continuation',
                             selection={'continuation': request, 'predecessor': assignments.digest(item)}):
         delivery.inherit_monitor(database, item, result, operator)

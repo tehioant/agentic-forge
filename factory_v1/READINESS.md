@@ -110,9 +110,10 @@ or the actual claim under the existing controls lane.
 pending-outcome and quota validation without requiring active controls. Thus a
 paused iteration can have ready infrastructure but remain ineligible. Existing
 `admission_preview` and per-call `_prepare` still enforce active controls; nothing
-is reserved/granted during inventory. Unknown health still blocks. No-deployment
-contracts remain unsupported by the existing delivery validator, never healthy by
-default. Image/socket metadata do not prove actual sandbox/provider capability;
+is reserved/granted during inventory. Unknown health still blocks. Explicit pinned
+no-deployment contracts require deployment/health applicability set to N/A plus
+exact-main CI/workflow-backed acceptance; absence never means healthy by default.
+Image/socket metadata do not prove actual sandbox/provider capability;
 notification routing/executable identity do not prove platform send permission.
 
 `input_identity` projects stable authority/config/source inputs, not the entire
@@ -125,8 +126,12 @@ static remediation and no arbitrary exception details.
 
 The first authenticated native hook may checkpoint its proposed host observations
 through `planning-bootstrap`. The gate compares the entire proposed row with the
-fresh durable row and permits only an initial planning assignment or its first
-native observation/binding. It validates the approved session/operator/origin,
+fresh durable row and permits only an initial planning assignment or the first
+native observation/binding of that assignment or an admitted successor. Successors
+retain the exact completed predecessor/report, delivered invitation, later
+authenticated input, updated-spec pins and separately pinned continuation
+adaptation; their own scoped sealed policy and allowance remain required.
+It validates the approved session/operator/origin,
 assignment, installed sources/adaptation and actual native API/executor support.
 The default execution reader sees this validated proposal, not an invented prior
 execution row. Initial supervised `plan` uses the already host-approved assignment
@@ -165,7 +170,8 @@ select an optional `runtime_receipts` object while paused:
   Parents must be physical host-private mode-0700 directories, outside worker
   mounts. Files must be host-private mode-0600, single-link and bounded.
 
-Only these declared issued-file bytes may change from absence to an exact receipt;
+Only these declared issued-file bytes may change from absence to an exact receipt,
+including aliases in fixed review/publication/merge dispatch configurations;
 paths, parent ownership/modes, scope, constraints, verifier bytes and unrelated
 configuration remain sealed. The verifier runs with no shell/ambient environment,
 a five-second timeout and JSON stdin containing `scope`, `kind`, `path`, exact raw

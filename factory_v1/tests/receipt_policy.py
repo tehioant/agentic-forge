@@ -44,7 +44,21 @@ def issued_policy(case, database, path, kind, *, future=()):
         destination.chmod(0o600)
     selected_path = root / 'readiness.json'
     write(selected_path, selected)
-    write(root / 'dispatch.json', {'continuation': {'authorities': {kind: paths}}})
+    # Exercise fixed-envelope aliases AND continuation selection against one seal.
+    from factory_v1 import service_dispatch
+    dispatch = dict.fromkeys(service_dispatch.FIELDS)
+    dispatch.update(operator_id=config['operator_id'], project=project, iteration=iteration,
+                    reference='approved-fixed-envelope', roles={}, launchers={},
+                    continuation={'authorities': {kind: paths}})
+    if kind in {'review', 'publication', 'merge'}:
+        dispatch[kind + '_config'] = str(path)
+    # Do not invoke continuation validation: this fixture only supplies its finite
+    # authority list, not the unrelated engineering slot configuration.
+    service_dispatch.validate({k: v for k, v in dispatch.items() if k != 'continuation'}, config)
+    legacy = root / 'legacy-synthesis.json'
+    write(legacy, {'immutable': 'legacy authority'})
+    dispatch['synthesis_config'] = str(legacy)
+    write(root / 'dispatch.json', dispatch)
     service_path = root / 'service.json'
     write(service_path, config)
     database.execute('CREATE TABLE IF NOT EXISTS model_grants '
@@ -72,7 +86,7 @@ def issued_policy(case, database, path, kind, *, future=()):
         calls.append(request)
         return SimpleNamespace(returncode=0, stdout=json.dumps({'verified': request}).encode())
     fixture = SimpleNamespace(config=config, selected=selected, selected_path=selected_path,
-                              sealed=sealed, calls=calls, project=project, iteration=iteration)
+                              sealed=sealed, calls=calls, project=project, iteration=iteration, legacy=legacy)
     case.assertEqual(readiness_gate.policy(config, selected, database), sealed)
     with patch('factory_v1.readiness_receipts.subprocess.run', side_effect=verify):
         yield fixture
@@ -110,6 +124,12 @@ def consumer_matrix(case, database, path, kind, consume):
         result = consume()
         case.assertGreaterEqual(len(issuer.calls), 2)  # Both real boundaries freshly verify.
         case.assertEqual(readiness_gate.policy(issuer.config, issuer.selected, database), issuer.sealed)
+        legacy_raw = issuer.legacy.read_bytes()
+        issuer.legacy.write_text('{"immutable":"unapproved change"}')
+        case.assertNotEqual(readiness_gate.policy(issuer.config, issuer.selected, database), issuer.sealed)
+        with case.assertRaises(RepositoryError):
+            consume()
+        issuer.legacy.write_bytes(legacy_raw)
         before = list(database.iterdump())
         with case.assertRaises(RepositoryError):
             select(next(k for k in continuation_dispatch.KINDS if k != kind))
@@ -123,11 +143,23 @@ def consumer_matrix(case, database, path, kind, consume):
             consume()  # A caller cannot bypass selection's immutable identity check.
         path.write_bytes(raw)
         selected_raw = issuer.selected_path.read_bytes()
-        drift = json.loads(selected_raw)
-        drift['runtime_receipts']['scope'] = '0' * 64
-        issuer.selected_path.write_text(json.dumps(drift))
-        with case.assertRaises(RepositoryError):
-            consume()
-        issuer.selected_path.write_bytes(selected_raw)
+        for defect in ('scope', 'constraints', 'kind', 'path', 'parent-mode'):
+            with case.subTest(receipt_kind=kind, policy_drift=defect):
+                drift = json.loads(selected_raw)
+                parent_mode = path.parent.stat().st_mode & 0o777
+                if defect == 'scope': drift['runtime_receipts']['scope'] = '0' * 64
+                elif defect == 'constraints': drift['runtime_receipts']['receipts'][kind][str(path)] = {'different': 'authority'}
+                elif defect == 'kind':
+                    other = next(k for k in continuation_dispatch.KINDS if k != kind)
+                    drift['runtime_receipts']['receipts'][other] = drift['runtime_receipts']['receipts'].pop(kind)
+                elif defect == 'path': drift['runtime_receipts']['receipts'][kind][str(path.parent / 'other.json')] = {'different': 'path'}
+                else: path.parent.chmod(0o755)
+                issuer.selected_path.write_text(json.dumps(drift))
+                try:
+                    with case.assertRaises(RepositoryError):
+                        consume()
+                finally:
+                    issuer.selected_path.write_bytes(selected_raw)
+                    path.parent.chmod(parent_mode)
         case.assertEqual(list(database.iterdump()), before)
         return result

@@ -33,8 +33,11 @@ class ConversationBinding:
                 'The native binding does not match the planning origin.', 'scope_mismatch')
         from .controls import require_active
         require_active(database, item['project_id'], item['iteration_id'])
+        if item.get('previous_iteration'):
+            from .iteration import validate_successor
+            validate_successor(database, item)
         selected = skills.resolve_installed(item['planning']['request']['skills'])
-        require(selected == item['planning']['skills'] and item['planning']['instructions'] == planning.INSTRUCTIONS,
+        require(selected == item['planning']['skills'] and item['planning']['instructions'] == planning.instructions(item),
                 'Planning sources or approved adaptation changed.', 'skill_blocked')
         return item, selected
 

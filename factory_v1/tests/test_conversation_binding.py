@@ -129,10 +129,49 @@ class ConversationBindingTests(unittest.TestCase):
 
 
     def test_supervised_first_observation_uses_default_host_execution_reader(self):
+        for mode in ('initial', 'successor'):
+            with self.subTest(mode=mode):
+                case = ConversationBindingTests()
+                case.setUp()
+                try:
+                    case.supervised_first_observation(mode)
+                finally:
+                    case.doCleanups()
+
+    def supervised_first_observation(self, mode):
         from factory_v1 import readiness, readiness_capabilities, readiness_gate, requirement_execution
         import hashlib
         self.item.pop('handoff'); self.item.pop('ticket_work')
         self.item['repository_onboarding']['api_base'] = 'https://api.github.com'
+        predecessor = {}
+        if mode == 'successor':
+            from factory_v1 import attention, iteration
+            from factory_v1.tests.test_iteration import context
+            predecessor = context()
+            predecessor.update(iteration_id='m0', origin=copy.deepcopy(self.item['origin']), status='waiting-for-operator')
+            predecessor['repository_onboarding'] = copy.deepcopy(self.item['repository_onboarding'])
+            report = {k: predecessor[k] for k in ('project_id', 'iteration_id', 'repository')}
+            report_id = iteration.assignments.digest(report)
+            completion = {'report_id': report_id, 'event_id': 'completion-' + report_id, 'report': report}
+            predecessor['completion'] = completion
+            request = {'iteration_id': 'm1', 'event_id': completion['event_id'], 'operator_id': '42',
+                       'origin': copy.deepcopy(self.item['origin']), 'reference': 'later-authenticated-input',
+                       'message_id': '102', 'input': 'Add search.', 'skills': self.descriptors}
+            predecessor['next_iteration'] = {'iteration_id': 'm1', 'request': request}
+            self.fixture.database.execute('INSERT INTO iterations VALUES (?,?,?)',
+                (predecessor['project_id'], predecessor['iteration_id'], json.dumps(predecessor)))
+            self.item.update(previous_iteration={'iteration_id': 'm0', 'completion': completion, 'input': request},
+                             idea=request['input'], approval={'operator_id': '42', 'reference': request['reference']})
+            self.item['planning']['continuation'] = {**iteration.continuation_inputs(predecessor), 'input': request,
+                'adaptation': planning.NEXT_ADAPTATION,
+                'dependencies': {'grill-me': ['grilling'], 'grilling': [], 'to-spec': []}}
+            self.item['planning']['instructions'] += ('\nContinue this SAME product from ALL continuation.previous_specs and the explicit input. '
+                'Preserve any explicit round-completion gate; no synthesis before actual answers. '
+                'Load continuation input_loads, planning:input and planning:adaptation; retain correlated '
+                'instruction loads, ordered skill work and actual rounds through complete-planning execution. '
+                'Publish new updated-spec pointers, never overwrite the preceding milestone.')
+            patch.object(attention, 'get_record', return_value={'state': 'delivered',
+                'receipt': {'reference': 'delivered-invitation', 'message_id': '101'}}).start()
         self.fixture.persist()
         root = self.fixture.root
         native_source = root / 'native-contract.py'; native_source.write_text('# reviewed native fixture\n'); native_source.chmod(0o600)
@@ -141,7 +180,7 @@ class ConversationBindingTests(unittest.TestCase):
             'allowance': {'reference': 'existing-grant', 'provider_route': 'approved', 'model': 'fixture',
                           'expires_at': 9999999999, 'max_wakeups': 1}}
         from factory_v1 import assignments
-        approval['source_digest'] = assignments.digest({'skills': self.selected, 'adaptation': planning.INSTRUCTIONS})
+        approval['source_digest'] = assignments.digest({'skills': self.selected, 'adaptation': self.item['planning']['instructions']})
         def private(name, value):
             path = root / name; path.write_text(json.dumps(value)); path.chmod(0o600); return str(path)
         approved_path = private('approved-native.json', approval)
@@ -168,6 +207,39 @@ class ConversationBindingTests(unittest.TestCase):
                 patch.object(readiness_capabilities, 'physical', return_value=native_source), \
                 patch.object(readiness_capabilities, 'NATIVE_FILES', {'native-contract.py': hashlib.sha256(native_source.read_bytes()).hexdigest()}):
             with self.assertRaises(repositories.RepositoryError): readiness_gate.check(db, 'product', 'm1')
+            if mode == 'successor':
+                valid_predecessor = copy.deepcopy(predecessor)
+                for defect in ('report', 'predecessor-status', 'backlink', 'late-input', 'origin', 'specs', 'adaptation', 'installed-source'):
+                    with self.subTest(successor_refusal=defect):
+                        candidate = copy.deepcopy(original)
+                        prior = copy.deepcopy(valid_predecessor)
+                        source = Path(self.descriptors[1]['path'])
+                        source_bytes = source.read_bytes()
+                        if defect == 'report': prior['completion']['report']['repository'] = 'other/product'
+                        elif defect == 'predecessor-status': prior['status'] = 'active'
+                        elif defect == 'backlink': prior['next_iteration']['iteration_id'] = 'other'
+                        elif defect == 'late-input':
+                            candidate['previous_iteration']['input']['message_id'] = '100'
+                            candidate['planning']['continuation']['input']['message_id'] = '100'
+                            prior['next_iteration']['request']['message_id'] = '100'
+                        elif defect == 'origin': candidate['origin'] = {'platform': 'other'}
+                        elif defect == 'specs': candidate['planning']['continuation']['input_loads'] = {}
+                        elif defect == 'adaptation': candidate['planning']['continuation']['adaptation'] = 'unapproved'
+                        else: source.write_bytes(source_bytes + b'drift')
+                        repositories.save_iteration(db, candidate)
+                        repositories.save_iteration(db, prior); db.commit()
+                        self.ctx.dispatch_tool.reset_mock()
+                        before = list(db.iterdump())
+                        try:
+                            with self.assertRaises(repositories.RepositoryError):
+                                self.binding.context('native-origin', task_id='actual-task', turn_id='actual-turn',
+                                    sender_id='42', user_message='Use Python.', conversation_history=[])
+                            self.assertEqual(list(db.iterdump()), before)
+                            self.ctx.dispatch_tool.assert_not_called()
+                        finally:
+                            source.write_bytes(source_bytes)
+                            repositories.save_iteration(db, original)
+                            repositories.save_iteration(db, valid_predecessor); db.commit()
             # First hook produces only authenticated observations; no prior execution row.
             result = self.binding.context('native-origin', task_id='actual-task', turn_id='actual-turn',
                 sender_id='42', user_message='Use Python.', conversation_history=[])
@@ -177,18 +249,23 @@ class ConversationBindingTests(unittest.TestCase):
             self.assertNotIn('host_publication', stored['planning'])
             # Fresh assignment producer is independent of the observation fixture;
             # it consumes the already-approved ID rather than a random future ID.
-            fresh = copy.deepcopy(original); fresh.pop('planning')
-            repositories.save_iteration(db, fresh); db.commit()
-            planned = planning.plan(db, fresh, {'origin': fresh['origin'], 'expected_revision': 0, 'skills': self.descriptors})
-            self.assertEqual(planned['planning']['assignment_id'], approval['assignment_id'])
-            self.assertNotIn('native_execution', self.fixture.stored()['planning'])
+            if mode == 'initial':
+                fresh = copy.deepcopy(original); fresh.pop('planning')
+                repositories.save_iteration(db, fresh); db.commit()
+                planned = planning.plan(db, fresh, {'origin': fresh['origin'], 'expected_revision': 0, 'skills': self.descriptors})
+                self.assertEqual(planned['planning']['assignment_id'], approval['assignment_id'])
+                self.assertNotIn('native_execution', self.fixture.stored()['planning'])
             # The same admission cannot alter arbitrary state or launder sufficient/output authority.
-            for field in ('repository', 'sufficient', 'origin'):
+            for field in ('repository', 'sufficient', 'origin', *(['predecessor', 'input', 'adaptation', 'source'] if mode == 'successor' else [])):
                 repositories.save_iteration(db, original); db.commit()
                 proposal = copy.deepcopy(stored)
                 if field == 'repository': proposal['repository'] = 'other/product'
                 elif field == 'sufficient': proposal['planning']['native_execution']['sufficient'] = True
-                else: proposal['planning']['native_execution']['origin'] = {'platform': 'other'}
+                elif field == 'origin': proposal['planning']['native_execution']['origin'] = {'platform': 'other'}
+                elif field == 'predecessor': proposal['previous_iteration']['completion']['report_id'] = 'stale'
+                elif field == 'input': proposal['previous_iteration']['input']['message_id'] = '100'
+                elif field == 'adaptation': proposal['planning']['continuation']['adaptation'] = 'unapproved'
+                else: proposal['planning']['skills']['grilling']['instructions'] += 'drift'
                 with self.subTest(field=field), self.assertRaises(repositories.RepositoryError):
                     planning.checkpoint(db, proposal, bootstrap=True)
                 self.assertEqual(self.fixture.stored(), original)

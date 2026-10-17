@@ -74,7 +74,7 @@ def scope(item, config):
             binding.get('operator_id') == native.get('operator_id') and
             binding.get('reference') == native.get('binding_reference') and
             native.get('sources') == selected == work['skills'] and
-            native.get('adaptation') == work['instructions'] == planning.INSTRUCTIONS and
+            native.get('adaptation') == work['instructions'] == planning.instructions(item) and
             config['source_digest'] == assignments.digest({'skills': selected, 'adaptation': work['instructions']}) and
             native.get('observations') and text(native.get('run_id')) and
             text(native.get('task_id')) and text(native.get('turn_id')),
