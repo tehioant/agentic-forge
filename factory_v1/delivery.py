@@ -57,10 +57,16 @@ def safe_url(value, api=False):
         return False
 
 
+def deployment_applies(config):
+    return config.get('deployment_applicability', 'configured') == 'configured'
+
+
 def validate_config(config, operator):
-    require(isinstance(config, dict) and set(config) == CONFIG_FIELDS and config['operator_id'] == operator and
+    require(isinstance(config, dict) and set(config) in (CONFIG_FIELDS, CONFIG_FIELDS | {'deployment_applicability'}) and
+            config.get('deployment_applicability', 'configured') in {'configured', 'not-applicable'} and config['operator_id'] == operator and
             valid_repository(config['repository']) and positive(config['repository_id']) and positive(config['issue']) and
-            safe_url(config['api_base'], api=True) and text(config['environment']) and len(config['environment']) <= 100 and
+            safe_url(config['api_base'], api=True) and
+            ((text(config['environment']) and len(config['environment']) <= 100) if deployment_applies(config) else config['environment'] is None) and
             type(config['timeout']) in {int, float} and math.isfinite(config['timeout']) and 0 < config['timeout'] <= 30,
             'Explicit exact host delivery target required.', 'invalid_delivery')
     checks = config['required_checks']
@@ -74,10 +80,13 @@ def validate_config(config, operator):
     contract = config['contract']
     require(isinstance(contract, dict) and set(contract) == {'reference', 'revision', 'health_url', 'acceptance'} and
             text(contract['reference']) and len(contract['reference']) <= 1000 and assignments.commit(contract['revision']) and
-            safe_url(contract['health_url']) and isinstance(contract['acceptance'], dict) and 0 < len(contract['acceptance']) <= 20 and
+            (safe_url(contract['health_url']) if deployment_applies(config) else contract['health_url'] is None) and isinstance(contract['acceptance'], dict) and 0 < len(contract['acceptance']) <= 20 and
             all(attention.identifier(k) and type(v) in {str, bool, int} and (not isinstance(v, str) or 0 < len(v) <= 200) and
                 (type(v) is not int or abs(v) < 2 ** 63) for k, v in contract['acceptance'].items()),
             'Pinned product-agreed explicit health/acceptance contract required.', 'invalid_delivery')
+    if not deployment_applies(config):
+        require(all(positive(value) and value in {w['id'] for w in workflows} for value in contract['acceptance'].values()),
+                'Every non-deployment acceptance criterion must bind a required exact-main workflow ID.', 'invalid_delivery')
     return config
 
 
@@ -160,6 +169,9 @@ def retained_record(record, fields):
 
 def _expected_health(config, sha, deployment_id):
     contract = config['contract']
+    if not deployment_applies(config):
+        return {'repository': config['repository'], 'sha': sha, 'deployment_applicability': 'not-applicable',
+                'contract_sha256': assignments.digest(contract), 'acceptance': contract['acceptance']}
     return {'repository': config['repository'], 'sha': sha, 'deployment_id': deployment_id,
             'environment': config['environment'], 'contract_sha256': assignments.digest(contract),
             'acceptance': contract['acceptance']}
@@ -205,27 +217,12 @@ def observe(config, api=None):
             r = max(runs, key=lambda r: r['id'])
             evidence['workflows'].append(retained_record(r, ('id', 'workflow_id', 'head_sha', 'head_branch', 'event', 'status', 'conclusion')))
             successful(r)
-        query = urllib.parse.urlencode({'environment': config['environment'], 'per_page': 100})
-        deployments = bounded_list(read('/deployments?' + query))
-        require(deployments and all(positive(d.get('id')) and d.get('environment') == config['environment'] for d in deployments) and
-                len({d['id'] for d in deployments}) == len(deployments), 'Deployment identity unknown.', 'delivery_unknown')
-        deployed = max(deployments, key=lambda d: d['id'])
-        evidence['deployment'] = retained_record(deployed, ('id', 'sha', 'ref', 'environment'))
-        require(deployed.get('sha') == sha and deployed.get('ref') in {'main', sha}, 'Latest deployment is not exact current main.', 'delivery_unknown')
-        statuses = bounded_list(read('/deployments/' + str(deployed['id']) + '/statuses?per_page=100'))
-        require(statuses and all(positive(s.get('id')) for s in statuses) and len({s['id'] for s in statuses}) == len(statuses),
-                'Latest deployment status unknown.', 'delivery_unknown')
-        status = max(statuses, key=lambda s: s['id'])
-        evidence['deployment']['status'] = retained_record(status, ('id', 'state'))
-        require(status.get('state') == 'success', 'Deployment failed, pending or unknown.', 'delivery_failed')
-        contract = config['contract']
-        health = http_json(contract['health_url'], config['timeout'])
-        expected_health = _expected_health(config, sha, deployed['id'])
-        response_sha256 = assignments.digest(health)
-        evidence['health'] = {'response_sha256': response_sha256, 'expected': expected_health,
-                              'matched': isinstance(health, dict) and response_sha256 == assignments.digest(expected_health)}
-        require(evidence['health']['matched'],
-                'Exact deployment health/acceptance contract not satisfied.', 'delivery_unhealthy')
+        if not deployment_applies(config):
+            expected = _expected_health(config, sha, None)
+            evidence['deployment'] = {'applicability': 'not-applicable', 'contract_sha256': assignments.digest(config['contract'])}
+            evidence['health'] = {'response_sha256': assignments.digest(expected), 'expected': expected, 'matched': True}
+        else:
+            _observe_deployment(config, read, evidence, sha)
         require(all(api.read(suffix) == value for suffix, value in reads.items()) and
                 api.read('/git/ref/heads/main') == main,
                 'Main/checks/workflows/deployment changed during observation.', 'delivery_race')
@@ -236,6 +233,30 @@ def observe(config, api=None):
     except (ValueError, TypeError, KeyError, AttributeError, IndexError, RecursionError):
         evidence['failure'] = 'delivery_unknown'
     return evidence
+
+
+def _observe_deployment(config, read, evidence, sha):
+    query = urllib.parse.urlencode({'environment': config['environment'], 'per_page': 100})
+    deployments = bounded_list(read('/deployments?' + query))
+    require(deployments and all(positive(d.get('id')) and d.get('environment') == config['environment'] for d in deployments) and
+            len({d['id'] for d in deployments}) == len(deployments), 'Deployment identity unknown.', 'delivery_unknown')
+    deployed = max(deployments, key=lambda d: d['id'])
+    evidence['deployment'] = retained_record(deployed, ('id', 'sha', 'ref', 'environment'))
+    require(deployed.get('sha') == sha and deployed.get('ref') in {'main', sha}, 'Latest deployment is not exact current main.', 'delivery_unknown')
+    statuses = bounded_list(read('/deployments/' + str(deployed['id']) + '/statuses?per_page=100'))
+    require(statuses and all(positive(s.get('id')) for s in statuses) and len({s['id'] for s in statuses}) == len(statuses),
+            'Latest deployment status unknown.', 'delivery_unknown')
+    status = max(statuses, key=lambda s: s['id'])
+    evidence['deployment']['status'] = retained_record(status, ('id', 'state'))
+    require(status.get('state') == 'success', 'Deployment failed, pending or unknown.', 'delivery_failed')
+    contract = config['contract']
+    health = http_json(contract['health_url'], config['timeout'])
+    expected_health = _expected_health(config, sha, deployed['id'])
+    response_sha256 = assignments.digest(health)
+    evidence['health'] = {'response_sha256': response_sha256, 'expected': expected_health,
+                          'matched': isinstance(health, dict) and response_sha256 == assignments.digest(expected_health)}
+    require(evidence['health']['matched'],
+            'Exact deployment health/acceptance contract not satisfied.', 'delivery_unhealthy')
 
 
 def context(database, project, iteration, operator):
@@ -285,13 +306,18 @@ def validate_evidence(payload, evidence_id, config):
             'Malformed/inconsistent persisted delivery evidence.', 'invalid_delivery')
     if evidence['status'] == 'healthy':
         sha, deployed, health = evidence['main'], evidence['deployment'], evidence['health']
-        require(assignments.commit(sha) and isinstance(deployed, dict) and set(deployed) == {'id', 'sha', 'ref', 'environment', 'status'} and
-                positive(deployed['id']) and deployed['sha'] == sha and deployed['ref'] in {'main', sha} and
-                deployed['environment'] == config['environment'] and isinstance(deployed['status'], dict) and
-                set(deployed['status']) == {'id', 'state'} and positive(deployed['status']['id']) and deployed['status']['state'] == 'success' and
-                len(evidence['checks']) == len(config['required_checks']) and
+        require(assignments.commit(sha) and len(evidence['checks']) == len(config['required_checks']) and
                 len(evidence['workflows']) == len(config['required_workflows']),
-                'Healthy persisted delivery has incomplete deployment/check evidence.', 'invalid_delivery')
+                'Healthy persisted delivery has incomplete check evidence.', 'invalid_delivery')
+        if deployment_applies(config):
+            require(isinstance(deployed, dict) and set(deployed) == {'id', 'sha', 'ref', 'environment', 'status'} and
+                    positive(deployed['id']) and deployed['sha'] == sha and deployed['ref'] in {'main', sha} and
+                    deployed['environment'] == config['environment'] and isinstance(deployed['status'], dict) and
+                    set(deployed['status']) == {'id', 'state'} and positive(deployed['status']['id']) and deployed['status']['state'] == 'success',
+                    'Healthy persisted delivery has incomplete deployment/check evidence.', 'invalid_delivery')
+        else:
+            require(deployed == {'applicability': 'not-applicable', 'contract_sha256': assignments.digest(config['contract'])},
+                    'Explicit pinned non-deployment evidence required.', 'invalid_delivery')
         for expected, record in zip(config['required_checks'], evidence['checks'], strict=True):
             require(isinstance(record, dict) and set(record) == {'id', 'name', 'head_sha', 'status', 'conclusion', 'app_id'} and
                     record['name'] == expected['context'] and type(record['app_id']) is int and record['app_id'] == expected['app_id'] and
@@ -303,7 +329,7 @@ def validate_evidence(payload, evidence_id, config):
                     record['head_branch'] == 'main' and record['event'] == expected['event'],
                     'Healthy persisted main workflow binding inconsistent.', 'invalid_delivery')
             successful(record)
-        expected_health = _expected_health(config, sha, deployed['id'])
+        expected_health = _expected_health(config, sha, deployed['id'] if deployment_applies(config) else None)
         expected_sha256 = assignments.digest(expected_health)
         require(set(health) == {'response_sha256', 'expected', 'matched'} and
                 assignments.digest(health['expected']) == expected_sha256 and
