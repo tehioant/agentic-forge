@@ -98,6 +98,10 @@ def select(item, rows, config):
     wait = pending(child)
     if wait:
         return wait
+    route = simplification.findings_route(child)
+    if route:
+        # Legacy fixed envelopes have no fresh corrective slots; explicitly escalate.
+        return 'simplification-direction', child['assignment_id']
     axes = {}
     for axis in ('review-standards', 'review-spec'):
         found = unique(rows, lambda row: row['handoff']['stage'] == axis and
@@ -301,6 +305,9 @@ def tick(service, github, *, stop_event=None):
                 simplification.prepare(database, *scope(service), {'implementation_assignment': target, **role}, github)
             else:
                 review.prepare(database, *scope(service), {'candidate_assignment': target, 'axis': action, **role}, github)
+        elif action == 'simplification-direction':
+            simplification.request_findings_direction(database, *scope(service), target)
+            return blocked('simplification_operator_revision_required')
         elif action == 'launch':
             assignment = assignments.inspect(database, *scope(service), target)
             stage = assignment['handoff']['stage']
@@ -395,8 +402,10 @@ def continuation_tick(service, github, *, stop_event=None):
         else:
             ancestor = next(r for r in rows if r['assignment_id'] == target)
             context = {'assignment_id': target} if stage == 'launch' else {'request': {
-                **ancestor['handoff'], 'stage': 'diagnosis' if stage in {
-                    'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'} else stage}}
+                **ancestor['handoff'], 'stage': ('diagnosis' if stage in {
+                    'diagnosis', 'declare-stuck', 'direction', 'apply-direction', 'request-direction'} else
+                    'corrections' if stage == 'simplification-corrections' else
+                    'simplify' if stage == 'simplification-direction' else stage)}}
         if recovery.active(item):
             restart.require_reconciled(database, *scope(service)[:2], allow_recovery=True)
         restart.before_dispatch(database, *scope(service), github, force=True, **context)

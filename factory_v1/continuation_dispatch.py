@@ -153,6 +153,9 @@ def select(item, rows, observed):
         waiting = pending(simplified)
         if waiting:
             return waiting
+        route = simplification.findings_route(simplified)
+        if route:
+            return action(route, simplified['assignment_id'])
         axes = {}
         for stage in ('review-standards', 'review-spec'):
             axis = one([r for r in active_rows if r['handoff']['stage'] == stage and r['handoff'].get(
@@ -294,7 +297,7 @@ def launcher_for(database, config, row):
 def prepare_action(database, scope, config, item, rows, selected, github):
     stage, target = selected['stage'], selected['target']
     commands = None
-    if stage in {'simplify', 'review-standards', 'review-spec', 'corrections'}:
+    if stage in {'simplify', 'review-standards', 'review-spec', 'corrections', 'simplification-corrections'}:
         prior = next(r for r in rows if r['assignment_id'] == target)
         contract = prior['handoff'].get('simplification') or prior['handoff'].get('corrections')
         if contract:
@@ -302,7 +305,7 @@ def prepare_action(database, scope, config, item, rows, selected, github):
         else:
             _, _, receipt = simplification.check_receipt(Path(prior['runtime']['artifacts']), prior['runtime'])
             commands = [r['command'] for r in receipt['records']]
-    slot = selected.get('slot') or slot_for(config, rows, stage, commands)
+    slot = selected.get('slot') or slot_for(config, rows, 'corrections' if stage == 'simplification-corrections' else stage, commands)
     merge.controller_paths(database, slot['launcher'])
     if stage in {'implementation', 'repair'}:
         bounded = selected.get('request') or request(config, item, target, slot, github)
@@ -314,6 +317,8 @@ def prepare_action(database, scope, config, item, rows, selected, github):
         return review.prepare(database, *scope, {'candidate_assignment': target, 'axis': stage, **role(slot)}, github)
     if stage == 'corrections':
         return review.prepare_corrections(database, *scope, {**selected['axes'], **role(slot)}, github)
+    if stage == 'simplification-corrections':
+        return review.prepare_findings_corrections(database, *scope, {'candidate_assignment': target, **role(slot)}, github)
     if stage == 'diagnosis':
         return diagnosis.prepare(database, *scope, {'stuck_assignment': target, **role(slot)}, github)
     require(False, 'Unsupported continuation preparation.', 'invalid_dispatch')
@@ -343,8 +348,11 @@ def retire_delivered(database, scope, config, item, rows, github):
 def execute(database, scope, config, item, rows, selected, github):
     """Caller holds state_lock. Return outside-lock operations to the existing tick."""
     stage, target = selected['stage'], selected['target']
-    if stage in assignments.ROLES:
+    if stage in assignments.ROLES or stage == 'simplification-corrections':
         prepare_action(database, scope, config, item, rows, selected, github)
+    elif stage == 'simplification-direction':
+        simplification.request_findings_direction(database, *scope, target)
+        return {'result': {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['simplification_operator_revision_required']}}
     elif stage == 'launch':
         row = next(r for r in rows if r['assignment_id'] == target)
         return {'launch': (target, launcher_for(database, config, row))}

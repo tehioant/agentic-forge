@@ -34,7 +34,36 @@ GitHub Git Data API assembles bounded blobs/tree/commit from host-validated sour
 
 Pending approval/intent is committed before the first remote object/ref/PR write, with the existing state lock held through readbacks. Publication requires the lifecycle's existing lock file and never creates a replacement lock or SQLite state. Malformed configuration, artifact JSON or stored state is refused with structured stderr and exit 2, without a traceback. JSON reads and source reads remain bounded. Journal candidate/status/PR identity drift and disappearance or reset of a published branch are held, not silently repaired. An identical restart checks the fixed ref/commit and fixed PR target before replay. Lost ref or PR responses reconcile the existing candidate/marker without duplicate PR creation. Pending authorization cannot be replaced; unknown identity, disappearance, replacement, duplicate/closed/merged PR, changed base or unexpected branch are held for the operator. Published updates keep the same draft PR and append one fast-forward commit. Publication uses the stable marker `<!-- factory-v1-publication:ASSIGNMENT_ID -->` and only `Refs #N`, never closing commands. Readback checks commit/tree/parent/message, ref, PR repository ID/name/base/head/candidate/title/body/draft/open status, the PR's issue representation, and the assigned issue remaining unchanged/open. The result is `published`, with `close_allowed: false` and `merge_allowed: false`, never delivered/done.
 
-## Trusted-host live acceptance recipe (parent only)
+## Findings rework and readiness
+
+The finite continuation routes a completed simplifier's checked `findings` outcome
+to corrective implementation only when every finding is `correctness` within the
+original ticket diff. Preparation revalidates the exact retained result, scope,
+candidate/check pins and fresh corrective profile/claim. It uses the existing
+finite `corrections` slots and inherits the exact verification commands; exhausted
+capacity remains blocked. Stuck corrective work follows the existing independent
+diagnosis path, never a recursive simplifier fix.
+
+Behavior/out-of-scope risk (including correctness outside the original diff) is
+sent to a deterministic exact-origin decision outbox, bound to the simplifier's
+candidate/run/check pins and retained findings digest. Fixed-envelope dispatch has
+no fresh correction capacity and escalates all findings through this same decision
+route. Re-polling cannot duplicate the decision. An acknowledgement/reply does not
+approve this candidate or rewrite its scope: any requirement change uses the
+existing explicit versioned requirement-revision operation before fresh work.
+
+Findings candidates still cannot enter either acceptance-review axis. Corrections
+must yield new checked bytes; simplification cannot restore the rejected candidate.
+Fresh simplification and both independent Standards/Spec axes are mandatory before
+publication/merge progression. Ordinary adverse-review holds remain independent.
+No new model allowance or runtime is activated by this routing implementation.
+
+Publication starts draft. The exact reviewed host merge capability now owns the
+separate readiness intent/write/readback described in [MERGE.md](MERGE.md).
+Publication replay accepts the exact ready PR only with that correlated intent;
+it neither marks arbitrary PRs ready nor rewrites readiness to draft.
+
+## Historical trusted-host live acceptance recipe (not current permission)
 
 No live mutation was performed by the implementation worker. The approved target is exactly `tehioant/agentic-forge-fresh-v1-validation`, base/default branch `fresh-spec-validation`. Execute this recipe only after isolated simplification and independent Standards+Spec review, with approved host-only authentication. Do not substitute test-fixture runtime flags for actual launch receipts.
 

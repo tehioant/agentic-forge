@@ -137,6 +137,10 @@ def prepare(database, project, iteration, operator, request, github, dry_run=Fal
             'Supply the preceding assignment and a fresh simplifier profile/skills/claim.', 'invalid_assignment')
     prior, root, source, baseline, receipt = implementation(database, project, iteration, operator, request['implementation_assignment'])
     assert prior is not None
+    corrections = prior['handoff'].get('corrections')
+    if corrections:
+        require(assignments.digest(source) != corrections['pins']['tree_sha256'],
+                'Corrections require a new checked candidate before fresh simplification and both axes.', 'candidate_unverified')
     bounded = {key: prior['handoff'][key] for key in assignments.REQUEST_FIELDS}
     bounded.update(stage='simplify', profile=request['profile'], skills=request['skills'], claim_id=request['claim_id'],
                    candidate=prior['handoff']['candidate'] or prior['handoff']['baseline'],
@@ -225,3 +229,29 @@ def validate_result(assignment, result):
             'native_execution_trusted': False, 'approval': False, 'advance_allowed': False,
             'review_required': ['Standards', 'Spec'], 'findings': report['findings'],
             'reason': 'findings_require_rework' if report['findings'] else 'native_execution_unattested_and_independent_review_required'}
+
+
+def findings_route(assignment):
+    stage = assignment.get('simplification_result', {})
+    if stage.get('outcome') != 'findings':
+        return None
+    return ('simplification-corrections' if stage.get('findings') and
+            all(f.get('kind') == 'correctness' and f.get('path') in assignment['handoff']['simplification']['scope']
+                for f in stage['findings']) else 'simplification-direction')
+
+
+def request_findings_direction(database, project, iteration, operator, assignment_id):
+    from . import attention, review
+    from .readiness_gate import admission
+    prior, _, source, baseline, _ = review.candidate(database, project, iteration, operator, assignment_id, findings=True)
+    require(findings_route(prior) is not None, 'Risk findings required.', 'corrections_held')
+    evidence = assignments.digest({'pins': review.pins(prior, source, baseline), 'feedback': prior['simplification_result']})
+    event = 'simplification-' + evidence
+    with admission(database, project, iteration, operation='effect'):
+        item = assignments.current(database, project, iteration, operator)
+        assignments.require_result_active(prior)
+        record = attention.enqueue(database, item, {'event_id': event, 'decision_id': event, 'kind': 'decision',
+            'message': 'Simplifier found behavior or out-of-scope risk. Review the pinned findings and use an explicit versioned requirement revision before rework; a reply alone cannot approve this candidate.',
+            'issue_number': prior['handoff']['issue']['number'], 'run_id': prior['runtime']['run_id'], 'evidence_ids': [evidence]})
+        database.commit()
+    return record

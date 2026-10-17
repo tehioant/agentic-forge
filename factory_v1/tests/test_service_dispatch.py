@@ -32,6 +32,11 @@ class DispatchSelectionTests(unittest.TestCase):
             ('standards', self.item, [completed, simplified], ('review-standards', simplified['assignment_id'])),
             ('spec', self.item, [completed, simplified, standards], ('review-spec', simplified['assignment_id'])),
         ]
+        for kind in ('correctness', 'behavior', 'out-of-scope'):
+            findings = deepcopy(simplified)
+            findings['handoff']['simplification']['scope'] = ['app.py']
+            findings['simplification_result'] = {'outcome': 'findings', 'findings': [{'kind': kind, 'path': 'app.py'}]}
+            cases.append((kind, self.item, [completed, findings], ('simplification-direction', findings['assignment_id'])))
         for label, item, rows, expected in cases:
             with self.subTest(case=label):
                 self.assertEqual(dispatch.select(deepcopy(item), deepcopy(rows), self.config), expected)

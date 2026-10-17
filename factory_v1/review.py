@@ -18,7 +18,7 @@ FINDING_FIELDS = {'id', 'kind', 'path', 'requirement', 'evidence', 'correction'}
 KINDS = {'missing', 'partial', 'incorrect', 'scope', 'standards', 'harmful-simplification', 'test-weakening', 'gate-weakening', 'security-weakening'}
 
 
-def candidate(database, project, iteration, operator, assignment_id):
+def candidate(database, project, iteration, operator, assignment_id, *, findings=False):
     prior = assignments.inspect(database, project, iteration, operator, assignment_id)
     assert prior is not None
     for child in assignments.rows(database):
@@ -29,8 +29,9 @@ def candidate(database, project, iteration, operator, assignment_id):
     stage = prior.get('simplification_result', {})
     require(prior['handoff']['stage'] == 'simplify' and runtime.get('status') == 'complete' and
             runtime.get('container_removed') is True and prior.get('submitted_result', {}).get('status') == 'done' and
-            stage.get('outcome') in {'cleanup', 'no-op'} and stage.get('checks_verified') is True and
-            not stage.get('findings'),
+            stage.get('checks_verified') is True and
+            ((stage.get('outcome') == 'findings' and bool(stage.get('findings'))) if findings else
+             (stage.get('outcome') in {'cleanup', 'no-op'} and not stage.get('findings'))),
             'An unchanged completed simplified candidate without unresolved findings is required.', 'candidate_unverified')
     try:
         root = physical(runtime['artifacts'], directory=True)
@@ -42,6 +43,12 @@ def candidate(database, project, iteration, operator, assignment_id):
                 hashlib.sha256(raw.encode()).hexdigest() == runtime.get('checks_sha256') and
                 [r['command'] for r in checks['records']] == prior['handoff']['simplification']['verification_commands'],
                 'Candidate, baseline or check evidence changed.', 'candidate_unverified')
+        modifier = next((a for a in assignments.rows(database) if a['assignment_id'] ==
+                         prior['handoff']['simplification'].get('implementation_assignment')), None)
+        correction = modifier['handoff'].get('corrections') if modifier else None
+        if correction:
+            require(assignments.digest(source) != correction['pins']['tree_sha256'],
+                    'A simplified correction cannot restore the rejected candidate.', 'candidate_unverified')
     except (OSError, KeyError, UnicodeError) as error:
         raise RepositoryError('candidate_unverified', 'Private candidate evidence unavailable.') from error
     return prior, root, source, baseline, checks
@@ -98,7 +105,8 @@ def handoff(database, project, iteration, operator, request):
 
 def copy_candidate(database, project, iteration, operator, assignment, destination, source_pins):
     contract = assignment['handoff'].get('review') or assignment['handoff']['corrections']
-    prior, root, source, baseline, _ = candidate(database, project, iteration, operator, contract['pins']['candidate_assignment'])
+    prior, root, source, baseline, _ = candidate(database, project, iteration, operator, contract['pins']['candidate_assignment'],
+                                              findings=contract.get('source') == 'simplification')
     require(pins(prior, source, baseline) == contract['pins'] and source_pins['baseline'] == baseline,
             'Candidate pins changed before staging.', 'scope_mismatch')
     shutil.rmtree(destination / 'workspace')
@@ -332,6 +340,18 @@ def prepare_corrections(database, project, iteration, operator, request, github,
 
 def corrections_handoff(database, project, iteration, operator, request, github):
     evidence = simplification.handoff_evidence(next(a['content'] for a in request['preceding'] if a['name'] == 'findings'))
+    if set(evidence) == {'simplification', 'feedback'}:
+        require(assignments.sha(evidence['simplification']), 'Exact simplifier assignment required.', 'invalid_review')
+        prior, _, source, baseline, checks = candidate(database, project, iteration, operator, evidence['simplification'], findings=True)
+        require(prior['simplification_result'] == evidence['feedback'] and
+                simplification.findings_route(prior) == 'simplification-corrections',
+                'Exact correctness findings required; scope/behavior needs operator direction.', 'corrections_held')
+        require(all(request[k] == prior['handoff'][k] for k in
+                    ('repository', 'repository_id', 'workspace', 'issue', 'spec_commit', 'baseline', 'candidate', 'standards')),
+                'Findings corrections must retain exact rejected scope.', 'scope_mismatch')
+        return {'source': 'simplification', 'pins': pins(prior, source, baseline), 'findings': evidence['feedback']['findings'],
+                'verification_commands': [r['command'] for r in checks['records']],
+                'rerun_required': ['implementation-checks', 'simplify', 'Standards', 'Spec'], 'advance_allowed': False}
     require(set(evidence) == {'reviews', 'feedback'}, 'Controller-correlated review feedback required.', 'invalid_review')
     feedback = evaluate(database, project, iteration, operator, evidence['reviews'], github)
     require(feedback == evidence['feedback'] and feedback['status'] == 'corrections', 'Exact unresolved findings required.', 'corrections_held')
@@ -343,3 +363,18 @@ def corrections_handoff(database, project, iteration, operator, request, github)
             'verification_commands': axes[0]['handoff']['review']['verification_commands'],
             'rerun_required': ['implementation-checks', 'simplify', 'Standards', 'Spec'],
             'advance_allowed': False}
+
+
+def prepare_findings_corrections(database, project, iteration, operator, request, github, dry_run=False):
+    require(isinstance(request, dict) and set(request) == {'candidate_assignment', 'profile', 'skills', 'claim_id'},
+            'Findings require the exact simplifier and a fresh corrective context.', 'invalid_review')
+    require(assignments.sha(request['candidate_assignment']), 'Exact simplifier assignment required.', 'invalid_review')
+    prior, _, _, _, _ = candidate(database, project, iteration, operator, request['candidate_assignment'], findings=True)
+    require(simplification.findings_route(prior) == 'simplification-corrections',
+            'Behavior/out-of-scope findings require operator direction.', 'corrections_held')
+    bounded = {k: prior['handoff'][k] for k in assignments.REQUEST_FIELDS}
+    bounded.update(stage='corrections', profile=request['profile'], skills=request['skills'], claim_id=request['claim_id'],
+                   capabilities=['read_workspace', 'scratch', 'model', 'write_workspace'],
+                   preceding=[simplification.artifact('candidate', bounded['candidate']), simplification.artifact('findings',
+                       simplification.handoff_json({'simplification': prior['assignment_id'], 'feedback': prior['simplification_result']}))])
+    return assignments.prepare(database, project, iteration, operator, bounded, github, dry_run)
