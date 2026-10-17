@@ -254,6 +254,11 @@ class ConversationBindingTests(unittest.TestCase):
                 repositories.save_iteration(db, fresh); db.commit()
                 planned = planning.plan(db, fresh, {'origin': fresh['origin'], 'expected_revision': 0, 'skills': self.descriptors})
                 self.assertEqual(planned['planning']['assignment_id'], approval['assignment_id'])
+                self.assertEqual(planned['planning']['skills'], self.selected)
+                self.assertEqual(original['planning']['skills'], self.selected)
+                drift = copy.deepcopy(self.descriptors); drift[0]['sha256'] = '0' * 64
+                with self.assertRaises(repositories.RepositoryError):
+                    skills.resolve_planning(drift)
                 self.assertNotIn('native_execution', self.fixture.stored()['planning'])
             # The same admission cannot alter arbitrary state or launder sufficient/output authority.
             for field in ('repository', 'sufficient', 'origin', *(['predecessor', 'input', 'adaptation', 'source'] if mode == 'successor' else [])):
@@ -270,15 +275,3 @@ class ConversationBindingTests(unittest.TestCase):
                     planning.checkpoint(db, proposal, bootstrap=True)
                 self.assertEqual(self.fixture.stored(), original)
         self.fixture.github.request.assert_not_called()
-
-    def test_initial_plan_accepts_reviewed_installed_sources_without_repinning(self):
-        original = copy.deepcopy(self.item)
-        self.item.pop('planning'); self.item.pop('ticket_work'); self.item.pop('handoff')
-        self.fixture.persist()
-        planned = planning.plan(self.fixture.database, self.item,
-                                {'origin': self.item['origin'], 'expected_revision': 0, 'skills': self.descriptors})
-        self.assertEqual(planned['planning']['skills'], self.selected)
-        drift = copy.deepcopy(self.descriptors); drift[0]['sha256'] = '0' * 64
-        with self.assertRaises(repositories.RepositoryError):
-            skills.resolve_planning(drift)
-        self.assertEqual(original['planning']['skills'], self.selected)

@@ -47,55 +47,39 @@ class ReportPolicyTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 'invalid_result')
 
     def test_diagnosis_report_shape_and_identity_cases(self):
-        cases = [('valid', {}, None)]
-        cases += [('missing-' + field, {}, field) for field in sorted(diagnosis.REPORT_FIELDS)]
-        cases += [(name, change, None) for name, change in [
+        cases = [('valid', {}, None, True)]
+        cases += [('missing-' + field, {}, field, False) for field in sorted(diagnosis.REPORT_FIELDS)]
+        cases += [(name, change, None, False) for name, change in [
             ('contract', {'contract': 'made-up'}), ('pin', {'pins': {**self.pins, 'tree_sha256': '0' * 64}}),
             ('adaptation', {'adaptation': 'write-fix'}), ('extra', {'accepted_fix': True}),
             ('attempts-empty', {'attempted_repairs': []}), ('findings-empty', {'findings': []}),
             ('uncertainty-empty', {'cause_or_uncertainty': ''}), ('commands-type', {'commands': None}),
             ('blockers-type', {'blockers': 'missing'}), ('attempt-type', {'attempted_repairs': [None]})]]
-        for name, change, omitted in cases:
-            with self.subTest(case=name):
-                report = copy.deepcopy(self.report)
-                report.update(change)
-                if omitted is not None:
-                    del report[omitted]
-                if name == 'valid':
-                    self.validate(report)
-                else:
-                    self.reject(report)
-
-
-
-    def test_diagnosis_feedback_loop_cases(self):
         unavailable = {'feedback_loop': None, 'hypotheses': [], 'blockers': ['Missing environment / HITL template']}
-        cases = [('unavailable', unavailable, True),
-                 ('unexplained', {**unavailable, 'blockers': []}, False),
-                 ('unsupported-theory', {**unavailable, 'hypotheses': self.report['hypotheses']}, False)]
-        cases += [(name, change, False) for name, change in [
+        cases += [('unavailable', unavailable, None, True),
+                  ('unexplained', {**unavailable, 'blockers': []}, None, False),
+                  ('unsupported-theory', {**unavailable, 'hypotheses': self.report['hypotheses']}, None, False)]
+        cases += [(name, change, None, False) for name, change in [
             ('commands-empty', {'commands': []}), ('invented-command', {'commands': [{'command': 'invented', 'result': 'pass'}]}),
             ('invented-result', {'feedback_loop': {**self.report['feedback_loop'], 'result': 'invented green'}}),
             ('empty-symptom', {'feedback_loop': {**self.report['feedback_loop'], 'symptom': ''}}),
             ('missing-symptom', {'feedback_loop': self.command}), ('missing-hypotheses', {'hypotheses': []})]]
-        cases += [('hypothesis-' + str(i), {'hypotheses': [value]}, False) for i, value in enumerate((
+        cases += [('hypothesis-' + str(i), {'hypotheses': [value]}, None, False) for i, value in enumerate((
             {'hypothesis': 'theory'}, {'hypothesis': 'theory', 'prediction': '', 'evidence': 'none'}, 'theory'))]
-        for name, change, accepted in cases:
+        cases += [(name, change, None, False) for name, change in [
+            ('unknown-recommendation', {'recommendation': 'accept-fix'}), ('directions-empty', {'directions': []}),
+            ('directions-duplicate', {'directions': self.report['directions'] * 2}),
+            ('direction-schema', {'directions': [{'id': 'retry', 'direction': 'relax requirements'}]})]]
+        for name, change, omitted, accepted in cases:
             with self.subTest(case=name):
                 report = copy.deepcopy(self.report)
                 report.update(copy.deepcopy(change))
+                if omitted is not None:
+                    del report[omitted]
                 if accepted:
                     self.validate(report)
                 else:
                     self.reject(report)
-
-
-
-    def test_recommendation_names_one_unique_direction_not_approval(self):
-        for change in ({'recommendation': 'accept-fix'}, {'directions': []},
-                       {'directions': self.report['directions'] * 2},
-                       {'directions': [{'id': 'retry', 'direction': 'relax requirements'}]}):
-            self.reject({**self.report, **change})
 
 
     def test_malformed_duplicate_and_oversized_report_json_refuse(self):

@@ -355,6 +355,8 @@ class CoreReadinessTests(SupervisedFixture, unittest.TestCase):
 
 
 class ConsolidatedReadinessTests(CoreReadinessTests):
+    config: dict[str, Any]
+
     # Fixtures remain public for sibling focused components; each invariant picks
     # its smallest fixture explicitly rather than initializing a host for API rows.
     def setUp(self):
@@ -401,9 +403,14 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
     def test_collector_preserves_exact_private_repository_and_board(self):
         ReadinessTests.setUp(self)
         restore = self.snapshot()
-        for fault in ('projects', 'private', 'id', 'field', 'option', 'provider'):
+        cases = [('projects', 'github_authority'), ('private', 'repository'), ('id', 'repository'),
+                 ('field', 'board'), ('option', 'board'), ('provider', 'repository')]
+        cases += [(fault, 'stages') for fault in
+                  ('bytes', 'review-bytes', 'dependency', 'stage-provider', 'collision', 'missing-stage')]
+        cases += [('health', 'delivery'), ('delivery-id', 'delivery'), ('origin', 'notification'),
+                  ('scope', 'scope'), ('allowance', 'spending')]
+        for fault, family in cases:
             with self.subTest(fault=fault):
-                restore()
                 try:
                     if fault == 'projects': self.write_authority['operations'].remove('projects')
                     if fault == 'private': self.repository['private'] = False
@@ -411,41 +418,13 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
                     if fault == 'field': self.board['status']['id'] = 'REPLACED'
                     if fault == 'option': self.board['status']['options']['Todo'] = 'REPLACED'
                     if fault == 'provider': self.github.request.side_effect = RuntimeError('sensitive arbitrary provider error')
-                    result = self.collect()
-                    family = {'projects': 'github_authority', 'field': 'board', 'option': 'board'}.get(fault, 'repository')
-                    self.assertEqual(result['checks'][family]['state'], 'blocked')
-                    if fault == 'provider': self.assertNotIn('sensitive', json.dumps(result))
-                finally: restore()
-
-    def test_collector_requires_complete_pinned_subscription_stage_inventory(self):
-        ReadinessTests.setUp(self)
-        baseline = deepcopy(self.config)
-        for mutation in ('bytes', 'review-bytes', 'dependency', 'provider', 'collision', 'missing-stage'):
-            with self.subTest(mutation=mutation):
-                self.config = deepcopy(baseline); slot = self.config['slots'][0]
-                source = Path(slot['skills'][0]['path']); source_raw = source.read_bytes()
-                review = Path(role_skills.SELECTED['code-review'][0]); review_raw = review.read_bytes()
-                if mutation == 'bytes': Path(slot['skills'][0]['path']).write_text('drift')
-                if mutation == 'review-bytes':
-                    Path(role_skills.SELECTED['code-review'][0]).write_text('drift')
-                if mutation == 'dependency': slot['skills'][0]['dependencies'] = ['invented']
-                if mutation == 'provider': slot['profile']['provider'] = 'paid-fallback'
-                if mutation == 'collision':
-                    self.config['slots'][1]['profile']['name'] = slot['profile']['name']
-                if mutation == 'missing-stage': self.config['slots'].pop()
-                self.assertEqual(self.collect()['checks']['stages']['state'], 'blocked')
-                if mutation == 'bytes': source.write_bytes(source_raw)
-                if mutation == 'review-bytes':
-                    review.write_bytes(review_raw)
-
-    def test_collector_refuses_delivery_origin_scope_and_allowance_drift(self):
-        ReadinessTests.setUp(self)
-        restore = self.snapshot()
-        for fault, family in (('health', 'delivery'), ('delivery-id', 'delivery'),
-                              ('origin', 'notification'), ('scope', 'scope'), ('allowance', 'spending')):
-            with self.subTest(fault=fault):
-                restore()
-                try:
+                    slot = self.config['slots'][0]
+                    if fault == 'bytes': Path(slot['skills'][0]['path']).write_text('drift')
+                    if fault == 'review-bytes': Path(role_skills.SELECTED['code-review'][0]).write_text('drift')
+                    if fault == 'dependency': slot['skills'][0]['dependencies'] = ['invented']
+                    if fault == 'stage-provider': slot['profile']['provider'] = 'paid-fallback'
+                    if fault == 'collision': self.config['slots'][1]['profile']['name'] = slot['profile']['name']
+                    if fault == 'missing-stage': self.config['slots'].pop()
                     if fault == 'health': self.health['sha'] = 'b'*40
                     if fault == 'delivery-id':
                         self.delivery_config['repository_id'] = 8; self.file('delivery.json', self.delivery_config)
@@ -455,6 +434,7 @@ class ConsolidatedReadinessTests(CoreReadinessTests):
                     result = self.collect()
                     if fault == 'scope': self.assertEqual(set(result['checks']), {'scope'})
                     else: self.assertEqual(result['checks'][family]['state'], 'blocked')
+                    if fault == 'provider': self.assertNotIn('sensitive', json.dumps(result))
                 finally: restore()
 
     def test_paused_inventory_changes_neither_authority_nor_budget_admission(self):

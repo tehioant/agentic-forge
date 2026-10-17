@@ -82,6 +82,9 @@ class IntakeComponentTests(unittest.TestCase):
                 self.register_direct(request)
             self.assertEqual(raised.exception.code, 'invalid_intake')
             self.assertFalse(self.state.exists())
+            if request['repository'] == 'https://github.com/example/product':
+                with mock.patch.object(intake, 'valid_repository', return_value=True):
+                    intake.validate_intake(request, '42')
 
 
     def test_intake_replay_and_inspection_are_read_only(self):
@@ -184,10 +187,3 @@ class IntakeComponentTests(unittest.TestCase):
         finally:
             os.umask(old)
         self.assertEqual(self.state.stat().st_mode & 0o777, 0o600)
-
-    def test_repository_guard_sensitivity(self):
-        request = dict(self.request, repository='https://github.com/example/product')
-        with self.assertRaises(IntakeError):
-            intake.validate_intake(request, '42')
-        with mock.patch.object(intake, 'valid_repository', return_value=True):
-            intake.validate_intake(request, '42')
