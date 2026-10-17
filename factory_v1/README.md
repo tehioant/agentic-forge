@@ -684,16 +684,12 @@ unattested and all review/merge/close authority stays disabled. See
 [the production contract and smallest live harness](../docs/fresh-simplification.md)
 for request/result schemas, exact revision hashing and remaining proof limits.
 
-Default CI tests exercise the public lifecycle using **labeled deterministic
-Docker, model and tracker fixtures**, plus real local HTTP/UDS protocol seams.
-They cover pinned source, packed objects/config exclusion, fresh homes, scoped
-permissions, admission/large request bounds, forbidden upstream tools, launch
-replay, pause, cancellation/controller death, read-only review, bad mounts and
-malformed/forged artifacts. They do **not** establish live container, approved
-model or GitHub acceptance. A real pinned image `docker create` inspection has
-been checked, but real Hermes/model/tool denial journeys remain a separate live
-acceptance obligation; retain exact run artifact handles rather than claiming
-fixture output proves isolation or delivery.
+Current CI uses unit tests and small focused components with mocked Docker,
+model, tracker and process boundaries. The canonical runner blocks actual socket,
+process and signal execution. Retained legacy journey helpers are historical;
+they are not the active verification contract. See the current verification
+section below. Component results establish their checked predicates, not native
+container enforcement, approved model execution or live GitHub delivery.
 
 ## Attention delivery (#15)
 
@@ -846,14 +842,35 @@ sandbox implementation does not merge, close #15 or call any worker GitHub route
 
 ## Verification and honest boundary
 
+Run the current policy-compliant suite from the repository root:
+
 ```bash
-PYTHONDONTWRITEBYTECODE=1 python -m unittest discover -s factory_v1/tests -v
-PYTHONPYCACHEPREFIX=/scratch/factory-v1-pycache python -m compileall -q factory_v1
+mise run test
+mise exec -- python -m compileall -q factory_v1
 ```
 
-Tests exercise the public CLI in fresh processes with durable SQLite and deterministic loopback HTTP fixtures. Original integrated intake/onboarding and tempfile portability regressions remain unchanged. Planning tests cover actual pinned skill composition, pending answers, restart/idempotence, missing/ambiguous/changed skills, stale assignment/publication, repository/issue/endpoint identity, malformed input, unchanged parent issue, exact immutable docs/issue handoff and disabled ticket execution. Bundled skill snapshots keep tests independent of `/inputs` availability after integration.
+The suite discovers every test once, refuses duplicate identities, and enforces a
+500-method ceiling without filtering. Unit and focused component fixtures use
+explicit durable records and mock external boundaries; complete simulated worker/
+controller journeys, real network/services/containers and E2E checks are not part
+of routine CI. The execution guard supplements source/fixture review: it does not
+by itself prove that mocked setup is a small component.
 
-Verification is **operator-selected mock-only** in the existing credential-blind whole-process sandbox: network access and GitHub broker routes are denied; no host credentials, spending or fallback are authorized. No disposable live repository or board is required for this verification. Fixtures are **not live GitHub publication, conversation authentication, worker isolation, merge, deployment or external success evidence**, and passing them does not establish live compatibility. Ticket controls and model spending admission remain separate capabilities; neither starts workers or supplies merge or deployment execution. This controller implements no scheduler, worker launcher, chargeable provider adapter, generalized publisher or merge service, and changes no existing gate. Attention delivery is the scoped supported Hermes CLI adapter described above, verified mock-only under the #15 amendment. Controlled integration remains host-owned; functional ticket requirements, including the linked board and exact readback, remain unchanged.
+The controller implements deterministic scheduling, scoped worker launch,
+simplification, separate Standards/Spec review, publication, merge, integrated
+verification and delivery observation. Source availability does not mean those
+capabilities are installed, authorized or enabled. Exact private host execution
+and candidate authorizations remain prerequisites; the service does not manufacture
+trusted provenance from worker reports. Supplying an authorization can be automated
+only by an independently approved host verifier, not by this documentation.
+
+Passing tests do not prove conversation authentication, effective GitHub permissions,
+native worker confinement, actual model execution, production health or notification
+delivery. Historical slice acceptance descriptions below and in linked documents
+retain their original evidence scope; use current configuration contracts and
+candidate-bound receipts rather than treating old fixture/live claims as current
+installation observations. [SERVICE.md](SERVICE.md) is the service entry point;
+[READINESS.md](READINESS.md) describes execution prerequisites and refusal states.
 
 ## Tickets (#8): selected to-tickets → controlled publication → frontier → one reservation
 

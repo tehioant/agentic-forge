@@ -146,6 +146,32 @@ class IntakeComponentTests(unittest.TestCase):
             intake.main()
         self.assertEqual(raised.exception.code, 'not_found')
         self.assertFalse(self.state.exists())
+        from factory_v1 import controls, repositories
+        with closing(sqlite3.connect(self.state)):
+            pass
+        for command in ('pause', 'emergency-stop', 'resume', 'inspect-control'):
+            operation = 'inspect' if command == 'inspect-control' else 'resume' if command == 'resume' else 'request'
+            args = ['factory', '--state', str(self.state), '--operator-id', '42', command,
+                    '--project', 'product', '--iteration', 'm1']
+            if command != 'inspect-control':
+                args += ['--reference', 'operator-message']
+            if command == 'resume':
+                args += ['--api-base', 'https://api.github.com']
+            with self.subTest(command=command), mock.patch.object(sys, 'argv', args), \
+                    mock.patch.object(controls, operation, autospec=True, return_value={'command': command}) as run, \
+                    mock.patch.object(repositories, 'GitHub', autospec=True) as github, redirect_stdout(io.StringIO()) as out:
+                intake.main()
+                self.assertEqual(json.loads(out.getvalue()), {'command': command})
+                positional = run.call_args.args
+                self.assertEqual(positional[1:4], ('product', 'm1', '42'))
+                if command in ('pause', 'emergency-stop'):
+                    self.assertEqual(positional[4:], (command, 'operator-message'))
+                elif command == 'resume':
+                    self.assertEqual(positional[4:], ('operator-message', github.return_value))
+                    github.assert_called_once_with('https://api.github.com', 'credential-blind-controller', 10)
+                else:
+                    self.assertEqual(len(positional), 4)
+                    github.assert_not_called()
 
     def test_cli_private_state_creation_seam_under_permissive_umask(self):
         # Only the file-opening wrapper owns this permission contract.

@@ -117,9 +117,11 @@ stage artifacts and SQLite journals, never a second backlog.
 
 `service.json` has a fixed schema: `version`, `state`, `operator_id`, `project`,
 `iteration`, `api_base`, `interval` (integer seconds, 1–3600), `delivery_config`,
-`transport_config`, `dispatch_config`. The last three default to null. State is
-fixed to `controller.sqlite` adjacent to the private, controller-owned 0600
-configuration; its directory is 0700, outside controller source and assistant
+`transport_config`, `dispatch_config`, `readiness_config`, `github_config`.
+Initialization writes null for unselected configuration paths; a supervised runtime
+must supply and validate the required readiness and GitHub capability paths.
+State is fixed to `controller.sqlite` adjacent to the private, controller-owned
+0600 configuration; its directory is 0700, outside controller source and assistant
 profiles. Existing worker-mount exclusions are rechecked. Do not put tokens here.
 
 A reviewed host can explicitly select existing private delivery and transport
@@ -166,7 +168,10 @@ availability are not authority. Existing implementation/simplification validator
 two-axis execution authorization, controlled publication/merge and integrated
 delivery checks remain authoritative. Missing host authority returns its specific
 capability name; it does not invoke a fallback agent or fabricate a ready result.
-A reviewed merge authority is still required by the existing human-approved seam.
+An exact reviewed host merge authority is still required. The runtime consumes
+that authorization; it does not implement its independent issuer. Whether the
+approved issuer requires an operator decision is a deployment policy, not proof
+that arbitrary worker output can authorize integration.
 
 ## Optional finite continuation capacity
 
