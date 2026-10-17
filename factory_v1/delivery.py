@@ -63,6 +63,7 @@ def deployment_applies(config):
 
 def validate_config(config, operator):
     require(isinstance(config, dict) and set(config) in (CONFIG_FIELDS, CONFIG_FIELDS | {'deployment_applicability'}) and
+            isinstance(config.get('deployment_applicability', 'configured'), str) and
             config.get('deployment_applicability', 'configured') in {'configured', 'not-applicable'} and config['operator_id'] == operator and
             valid_repository(config['repository']) and positive(config['repository_id']) and positive(config['issue']) and
             safe_url(config['api_base'], api=True) and

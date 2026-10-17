@@ -188,7 +188,7 @@ class DeliveryComponentTests(unittest.TestCase):
         self.config.update(deployment_applicability='not-applicable', environment=None)
         self.config['contract'].update(health_url=None, acceptance={'cli-acceptance': 11})
         self.assertEqual(delivery.validate_config(self.config, '42'), self.config)
-        for change in ({'deployment_applicability': 'unknown'}, {'environment': 'invented'},
+        for change in ({'deployment_applicability': 'unknown'}, {'deployment_applicability': []}, {'environment': 'invented'},
                        {'contract': {**self.config['contract'], 'health_url': 'https://example.com/health'}},
                        {'contract': {**self.config['contract'], 'acceptance': {'not-verified': True}}},
                        {'contract': {**self.config['contract'], 'acceptance': {'not-required': 12}}}):
@@ -198,6 +198,15 @@ class DeliveryComponentTests(unittest.TestCase):
         self.assertEqual(sampled['evidence']['status'], 'healthy')
         self.assertEqual(sampled['evidence']['deployment']['applicability'], 'not-applicable')
         self.assertEqual(self.inspect()['monitor']['config'], self.config)
+        from factory_v1 import service
+        self.write_config()
+        scoped_service = {'state': str(self.state), 'project': 'product', 'iteration': 'm1', 'operator_id': '42',
+                          'delivery_config': str(self.config_path), 'dispatch_config': '/private/dispatch', 'transport_config': None}
+        with mock.patch.object(service, 'inspect_readiness', return_value={'iteration_runnable': True}), \
+             mock.patch.object(service, 'dispatch', return_value={'status': 'component-dispatch'}) as dispatch, \
+             mock.patch('factory_v1.merge.controller_paths'):
+            self.assertEqual(service.cycle(scoped_service, mock.Mock())['status'], 'component-dispatch')
+            dispatch.assert_called_once()
         self.assertFalse(any('/deployments' in path or path == '/health' for path in self.target.calls))
         for field in ('checks', 'workflows', 'deployment', 'health'):
             forged = copy.deepcopy(sampled['evidence'])
