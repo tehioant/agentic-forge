@@ -254,6 +254,23 @@ class BugTests(unittest.TestCase):
                         report = restart.reconcile(self.database, 'product', 'm1', '42', self.github)
                     self.assertEqual(report['status'], 'ready', report)
                     self.assertIn('old-implementation:bug-rescope', report['observations'])
+                    fresh_request = {'stage': 'implementation', 'claim_id': 'fresh-claim',
+                                     'profile': {'name': 'fresh-profile', 'home': '/fresh-profile'}}
+                    assignments.claims(self.database, fresh_request, scope, 'fresh-assignment')
+                    with self.assertRaises(repositories.RepositoryError):
+                        assignments.claims(self.database, {**fresh_request, 'claim_id': 'old-claim'}, scope, 'fresh-assignment')
+                    with self.assertRaises(repositories.RepositoryError):
+                        assignments.claims(self.database, {**fresh_request, 'profile': handoff['profile']}, scope, 'fresh-assignment')
+                    later_issue = copy.deepcopy(self.fixture.issues[10])
+                    later_issue['body'] = later_issue['body'].replace('- #13', '- #13\n- #14')
+                    later = copy.deepcopy(work)
+                    later['assignment_id'] = 'later-bug'
+                    later['candidates'][0]['issue'] = copy.deepcopy(self.fixture.issues[10])
+                    later['affected_intents'] = {'10': {'before': self.fixture.issues[10]['body'], 'body': later_issue['body']}}
+                    continued = self.fixture.stored(); continued['bug_work']['later'] = later
+                    self.assertTrue(bugs.rescope_body_matches(continued, parked, later_issue))
+                    later_issue['body'] += 'uncontrolled change'
+                    self.assertFalse(bugs.rescope_body_matches(continued, parked, later_issue))
                 if fault == 'pause':
                     with patch.object(restart, 'reconcile', return_value={'status': 'ready'}):
                         from factory_v1 import controls

@@ -594,7 +594,8 @@ def frontier(database, item, github, *, resolution=None):
     eligible = [n for n, r in rows.items() if r['admissible'] and r['status'] == 'ready']
     work['frontier'] = {'authority': 'github', 'items': list(rows.values()), 'eligible': sorted(eligible),
                         'foreign_active': foreign_active,
-                        'active': sorted(n for n, r in rows.items() if r['status'] == 'active' and r['issue_state'] == 'open')}
+                        'active': sorted(n for n, r in rows.items() if r['status'] == 'active' and
+                                         r['issue_state'] == 'open' and not r['held'])}
     if resolution is None:
         checkpoint(database, item)
     else:

@@ -186,7 +186,6 @@ def sync_blocks(database, item, record, github, release=False):
                 desired = 'ready'
             elif previous == 'deferred':
                 desired = 'deferred'
-
         option = hold_option(item['ticket_work'], board, desired)
         if release:
             blocked = hold_option(item['ticket_work'], board, 'blocked')
@@ -265,7 +264,8 @@ def record_change(database, project, iteration, operator, request, github):
     previous_statuses = {str(n): rows[n]['status'] for n in affected}
     for number in affected:
         holds = [r for r in item.get('stuck_work', {}).values() if r['status'] != 'released' and number in r['affected']]
-        if holds and rows[number]['status'] == 'blocked':
+        if holds and (rows[number]['status'] == 'blocked' or
+                      'blocked' not in item['ticket_work']['request']['tracker']['statuses'] and rows[number]['status'] == 'active'):
             previous_statuses[str(number)] = min(holds, key=lambda r: r['sequence'])['previous_statuses'][str(number)]
     record = {'request': request, 'kind': request['kind'], 'status': 'held' if request['kind'] == 'material' else 'clarified',
               'affected': sorted(affected), 'requirements': request['requirements'], 'direction': request['direction'],

@@ -212,7 +212,7 @@ def delivered_ticket_proof(database, item, delivered, authority, lineage=None):
         assert a is not None
         runtime = a.get('runtime')
         require((runtime is None and not a.get('submitted_result') and
-                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a))) or
+                 (requirements.released_claim(database, a) or diagnosis.released_claim(database, a) or bugs.released_claim(database, a))) or
                 (isinstance(runtime, dict) and runtime.get('status') in {'complete', 'stopped', 'failed'} and
                  runtime.get('container_removed') is True and runtime.get('error') != 'stop_unconfirmed'),
                 'Every launched lineage worker needs verified terminal cleanup.', 'cleanup_required')

@@ -347,7 +347,7 @@ class DiagnosisComponentTests(unittest.TestCase):
         return observed
 
     def read_issue(self, github, repository, number):
-        return {'body': 'Local issue ' + str(number)}
+        return {'body': 'Local issue ' + str(number), 'state': 'open', 'id': 100+number, 'node_id': 'ISSUE'+str(number)}
 
     def change_status(self, github, project, member, field, value):
         row = next(r for r in self.rows if r['membership_id'] == member)
@@ -375,7 +375,7 @@ class DiagnosisComponentTests(unittest.TestCase):
             'issues': {str(n): {'id': 100+n, 'node_id': 'ISSUE'+str(n),
                 'body_sha256': diagnosis.hashlib.sha256(('Local issue '+str(n)).encode()).hexdigest()} for n in (10, 11, 13)},
             'previous_statuses': {str(n): 'ready' for n in (10, 11, 13)},
-            'retired_assignments': [self.prior['assignment_id']], 'blocks_verified': True,
+            'retired_assignments': [self.prior['assignment_id']], 'blocks_verified': True, 'hold_representation': 'blocked-option',
             'diagnosis_assignment': None, 'event_id': None, 'applied_response': None}
         self.prior['stuck_disposition'] = 'held'
         self.store(self.prior)

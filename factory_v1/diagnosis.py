@@ -91,9 +91,8 @@ def sync_blocks(database, item, record, github, release=False):
              r['pins'] != record['pins'] and r['status'] != 'released' for n in r['affected']}
     from .requirements import held_numbers as revision_holds
     other |= revision_holds(observed)
-    from .tracker_holds import option, representation
+    from .tracker_holds import option, representation, represented_role
     board = observed['ticket_work']['board']
-
     for number in record['affected']:
         row = rows.get(number)
         require(row is not None and row['issue_state'] == 'open' and
@@ -119,7 +118,7 @@ def sync_blocks(database, item, record, github, release=False):
         require(issue.get('state') == 'open' and issue.get('id') == row['id'] and issue.get('node_id') == row['node_id'] and
                 hashlib.sha256(issue['body'].encode()).hexdigest() == record['issues'][str(number)]['body_sha256'],
                 'Affected requirements changed during status synchronization.', 'scope_mismatch')
-        represented = target if target in observed['ticket_work']['request']['tracker']['statuses'] else 'active'
+        represented = represented_role(observed['ticket_work'], target)
         if release:
             require(row['status'] in {'blocked', represented} or
                     representation(observed['ticket_work']) == 'native-active-with-durable-hold' and row['status'] == 'active',
@@ -130,7 +129,6 @@ def sync_blocks(database, item, record, github, release=False):
                                  desired)
         readback = tickets.frontier(database, observed, github)
         exact = next(r for r in readback['ticket_work']['frontier']['items'] if r['number'] == number)
-        represented = target if target in observed['ticket_work']['request']['tracker']['statuses'] else 'active'
         require(exact['status'] == represented and exact['issue_state'] == 'open' and
                 all(exact[k] == row[k] for k in ('id', 'node_id', 'membership_id')),
                 'Exact blocked/retry status did not read back.', 'publication_mismatch')

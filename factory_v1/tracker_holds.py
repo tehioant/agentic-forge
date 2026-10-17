@@ -2,13 +2,20 @@
 from .planning import require
 
 
-def option(work, board, role):
+def represented_role(work, role):
     statuses = work['request']['tracker']['statuses']
     # Native boards deliberately have only ready/active/done. In Progress is
     # the visible waiting state; the correlated durable hold denies dispatch.
-    represented = role if role in statuses else 'active' if role in {'blocked', 'deferred'} else role
-    require(represented in statuses, 'Tracker cannot represent this progress.', 'projects_blocked')
-    return board['status']['options'][statuses[represented]]
+    if role in statuses:
+        return role
+    require(role in {'blocked', 'deferred'} and 'active' in statuses,
+            'Tracker cannot represent this progress.', 'projects_blocked')
+    return 'active'
+
+
+def option(work, board, role):
+    statuses = work['request']['tracker']['statuses']
+    return board['status']['options'][statuses[represented_role(work, role)]]
 
 
 def representation(work):

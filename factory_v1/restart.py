@@ -420,13 +420,13 @@ def reconcile(database, project, iteration, operator, github, *, recover=None):
         if not observe(identity + ':scope', scope):
             continue
         observe(identity + ':worker', lambda a=a: worker(a))
-        from .bugs import released_claim as bug_parked
-        if a.get('bug_disposition'):
+        from .bugs import released_claim as bug_parked, rescope_body_matches
+        if a.get('bug_disposition') and not a.get('requirement_disposition'):
             def bug_scope(a=a):
                 require(bug_parked(database, a), 'Bug rescope or cleanup correlation changed.', 'scope_mismatch')
                 issue = tickets.gh.read_issue(api, item['repository'], a['handoff']['issue']['number'])
                 require(all(issue[k] == a['handoff']['issue'][k] for k in ('number', 'id', 'node_id')) and
-                        hashlib.sha256(issue['body'].encode()).hexdigest() == a['bug_disposition']['body_sha256'],
+                        rescope_body_matches(item, a, issue),
                         'Exact controlled bug-rescoped issue changed.', 'scope_mismatch')
                 return a['bug_disposition']
             observe(identity + ':bug-rescope', bug_scope)
