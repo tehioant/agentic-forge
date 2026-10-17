@@ -164,7 +164,10 @@ def complete(database, project, iteration, operator, request, github):
             database.execute('CREATE TABLE IF NOT EXISTS notifications (project TEXT, iteration TEXT, event_id TEXT, payload TEXT, PRIMARY KEY(project, iteration, event_id))')
             lines = [f"Iteration {iteration} delivered for {item['repository']} ({report['verification']}). Report {identity}."]
             lines += [f"#{r['issue']['number']} {r['issue']['url']} PR {r['pr']['url']} commit {r['integration']['integrated']}" for r in delivered]
-            lines += [f"Deployment {health['deployment']['id']} at {health['main']}: healthy. Deferred issues: {deferred}. Pending decisions: {decisions}.",
+            acceptance = (f"Deployment {health['deployment']['id']} at {health['main']}: healthy."
+                          if delivery.deployment_applies(saved['config']) else
+                          f"Deployment not applicable; exact-main CI and acceptance verified at {health['main']}.")
+            lines += [f"{acceptance} Deferred issues: {deferred}. Pending decisions: {decisions}.",
                       f"Retained bug discoveries: {len(bug_records)}. Inspect the durable completion report for scope/evidence.", report['invitation']]
             message = '\n'.join(lines)
             attention.enqueue(database, item, {'event_id': completion['event_id'], 'kind': 'completion',

@@ -111,6 +111,26 @@ class IterationComponents(unittest.TestCase):
                 self.complete()
         self.assertNotIn('completion', self.stored())
         self.assertEqual(attention.records(self.db, 'product', 'm1', self.item), [])
+        for applicability in ('configured', 'not-applicable'):
+            with self.subTest(deployment_applicability=applicability):
+                self.db.execute('DELETE FROM notifications')
+                self.item = context()
+                self.store()
+                config = dict(self.saved['config'], deployment_applicability=applicability)
+                health = dict(self.health)
+                if applicability == 'not-applicable':
+                    health['deployment'] = {'applicability': applicability, 'contract_sha256': 'e' * 64}
+                with patch.object(delivery, 'monitor_state', return_value=dict(self.saved, config=config)), \
+                        patch.object(delivery, 'observe', return_value=health):
+                    report = self.complete()
+                self.assertEqual(report['report']['delivery'], health)
+                message = attention.records(self.db, 'product', 'm1', self.stored())[0]['event']['message']
+                self.assertIn(SHA, message)
+                self.assertIn('Deferred issues: []. Pending decisions: [].', message)
+                if applicability == 'not-applicable':
+                    self.assertIn('Deployment not applicable; exact-main CI and acceptance verified', message)
+                else:
+                    self.assertIn('Deployment 9', message)
 
     def test_required_scope_and_tracker_guards_matrix(self):
         cases = [('field', (field, value)) for field, value in [('status', 'blocked'), ('status', 'ready'), ('status', 'deferred'), ('issue_state', 'open'), ('held', True), ('contract_valid', False), ('state_reason', 'not_planned')]]

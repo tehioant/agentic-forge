@@ -80,6 +80,8 @@ class ReadinessTests(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        from factory_v1.tests.test_sandbox import bounded_storage_observation
+        self.stack.enter_context(patch.object(sandbox_policy, 'storage_observation', bounded_storage_observation))
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.db = sqlite3.connect(self.root / 'state.sqlite')
         self.addCleanup(self.db.close)

@@ -45,7 +45,7 @@ boundary](../docs/fresh-independent-review.md).
 
 ## Candidate publication (#14)
 
-`publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes only a fixed candidate branch and draft PR; it never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
+`publish-candidate` is a trusted host-only CLI operation, not a worker endpoint. It requires private authenticated-operator authorization, completed controller-observed execution, exact persisted assignment/pins and source bytes/modes. It publishes a fixed candidate branch and draft PR. The separately gated merge lifecycle can mark that exact reviewed PR ready with durable intent/readback before a later merge attempt; publication alone never merges, closes, or marks delivery complete. See [publication boundary and live acceptance recipe](PUBLICATION.md). Submitted worker evidence remains untrusted.
 
 ## Gated merge and integrated delivery (#17)
 
@@ -66,7 +66,10 @@ fixtures and baseline CI do not satisfy them.
 
 `observe-delivery`, bounded `watch-delivery` and `inspect-delivery` observe exact
 main checks/workflows and an explicitly configured, pinned deployment/acceptance
-contract. Failed **or unknown** delivery atomically records a correlated incident,
+contract, including explicit `deployment_applicability: "not-applicable"` for
+CI-only projects. N/A still requires pinned exact-main checks, required workflows
+and workflow-backed acceptance criteria; omission is unknown, not N/A. Failed **or
+unknown** delivery atomically records a correlated incident,
 freezes ordinary merges and enqueues durable exact-origin attention. The merge
 boundary re-observes installed health before mutation; exact gated recovery scope
 remains eligible. Routine health is silent. No production URL, deployment, repair
