@@ -19,6 +19,9 @@ CONFIG_FIELDS = {'operator_id', 'execution_reference', 'executions', 'candidate_
                  'base', 'branch', 'pr_number', 'head', 'baseline', 'issue', 'api_base', 'bearer',
                  'required_checks', 'protection_sha256', 'recovery'}
 
+READY_MUTATION = ('mutation($input: MarkPullRequestReadyForReviewInput!) {'
+                  ' markPullRequestReadyForReview(input: $input) { pullRequest { id isDraft headRefOid } } }')
+
 
 def execution_binding(assignment):
     """Fingerprint retained host execution, not a role label or worker assertion.
@@ -122,6 +125,16 @@ class MergeGitHub:
 
     def read(self, suffix):
         return self.request(self.prefix + suffix)
+
+    def ready(self, pr):
+        c = self.config
+        require(pr.get('number') == c['pr_number'] and text(pr.get('node_id')) and
+                pr.get('head', {}).get('sha') == c['head'] and pr.get('draft') is True and
+                all(pr.get(side, {}).get('repo', {}).get('id') == c['repository_id'] and
+                    pr[side]['repo'].get('full_name') == c['repository'] for side in ('head', 'base')),
+                'Ready capability requires the exact reviewed PR/head.', 'capability_blocked')
+        return self.github.request('/graphql', {'query': READY_MUTATION, 'variables': {
+            'input': {'pullRequestId': pr['node_id'], 'clientMutationId': 'factory-ready-' + c['head']}}}, 'POST')
 
     def issue_state(self, state, expected):
         self.request(self.prefix + '/issues/' + str(self.config['issue']),
@@ -377,6 +390,46 @@ def require_publication(database, item, api, number):
     revalidate_inputs(database, item, assignments.ReadOnlyGitHub(api.github), number)
 
 
+def ready_candidate(database, scope, prior, api, config, pr, revalidate):
+    """One exact intent, no blind retry; the next tick independently admits merge."""
+    from .controls import require_active
+    from .readiness_gate import admission, check
+    authority = {k: v for k, v in config.items() if k != 'bearer'}
+    old = prior.get('pr_readiness')
+    if old is None and pr.get('draft') is False:
+        return False  # Independently ready PRs still face the unchanged merge gates.
+    expected = {'authority': authority, 'pr_number': config['pr_number'], 'node_id': pr.get('node_id'), 'head': config['head']}
+    require(text(expected['node_id']), 'Exact PR node identity required for readiness.', 'github_mismatch')
+    require(old is None or (all(old.get(k) == v for k, v in expected.items()) and old.get('status') in {'pending', 'ready'}),
+            'Ready intent cannot be rebound to another PR/head/authority.', 'readiness_conflict')
+
+    def retain(record):
+        fresh = next(a for a in assignments.rows(database) if a['assignment_id'] == prior['assignment_id'])
+        fresh['pr_readiness'] = record
+        publication.save(database, fresh)
+
+    if old is not None:
+        require(pr.get('draft') is False, 'Ready outcome uncertain; reconcile exact PR without resending.', 'readiness_uncertain')
+        retain({**expected, 'status': 'ready'})
+        return False
+    with admission(database, *scope[:2], operation='effect'):
+        require_active(database, *scope[:2])
+        retain({**expected, 'status': 'pending'})
+    revalidate()
+    check(database, *scope[:2], operation='effect')
+    require_active(database, *scope[:2])
+    try:
+        api.ready(pr)
+    except RepositoryError:
+        pass  # Even a lost response is resolved only by exact readback.
+    observed = target(api, config)
+    require(observed.get('node_id') == expected['node_id'] and observed.get('draft') is False and
+            observed.get('state') == 'open' and observed.get('merged') is False,
+            'Ready effect needs exact PR/head readback; never resend blindly.', 'readiness_uncertain')
+    retain({**expected, 'status': 'ready'})
+    return True
+
+
 def lifecycle(database, project, iteration, operator, config_path, action):
     """Caller holds the shared state lock across reads, intent and network writes."""
     for table in ('iterations', 'role_assignments'):
@@ -443,9 +496,8 @@ def lifecycle(database, project, iteration, operator, config_path, action):
                     pr['base'].get('sha') == config['baseline'], 'Main baseline moved; refresh reviews.', 'stale_baseline')
             require(publication.ref_sha(api.read('/git/ref/heads/' + config['branch']), config['branch']) == config['head'],
                     'Published branch moved.', 'stale_head')
-            require(pr.get('state') == 'open' and pr.get('merged') is False and pr.get('draft') is False and
-                    pr.get('mergeable') is True and pr.get('mergeable_state') == 'clean',
-                    'PR must be ready and all authoritative merge gates clean.', 'merge_not_ready')
+            require(pr.get('state') == 'open' and pr.get('merged') is False and type(pr.get('draft')) is bool,
+                    'PR must be open and its readiness known.', 'merge_not_ready')
             def revalidate_admission(expected_incident):
                 require(load_config(config_path, operator) == config, 'Merge authority changed.', 'stale_admission')
                 chain(database, project, iteration, operator, config, config_path)
@@ -492,6 +544,18 @@ def lifecycle(database, project, iteration, operator, config_path, action):
             from .controls import require_active
             from .readiness_gate import admission
             require_active(database, project, iteration)
+            def revalidate_ready():
+                latest = revalidate_admission(boundary_incident)
+                require(review.evaluate(database, project, iteration, operator, pair, assignments.ReadOnlyGitHub(api.github))['status'] == 'accepted',
+                        'Both current axes required at ready mutation.', 'stale_review')
+                require_publication(database, latest, api, config['issue'])
+                require(issue(api, prior, config) == observed_issue,
+                        'Requirements changed before readiness.', 'stale_requirements')
+            if ready_candidate(database, (project, iteration, operator), prior, api, config, pr, revalidate_ready):
+                return {'status': 'ready', 'merge_allowed': False, 'close_allowed': False}
+            require(pr.get('draft') is False and pr.get('state') == 'open' and pr.get('merged') is False and
+                    pr.get('mergeable') is True and pr.get('mergeable_state') == 'clean',
+                    'PR must be ready and all authoritative merge gates clean.', 'merge_not_ready')
             journal = {'status': 'pending', 'authority': authority, 'branch_checks': branch_checks,
                        'protection': gate, 'integrated_evidence': None, 'delivery_checks': [], 'failure': None,
                        'close_allowed': False, 'iteration_complete': False, 'deployment_verified': False}

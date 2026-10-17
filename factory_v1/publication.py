@@ -345,7 +345,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
                     'Fixed PR identity drifted.', 'publication_conflict')
             require(old is not None or publication['pr_number'] == prs[0].get('number'),
                     'Unowned PR collision.', 'publication_conflict')
-            verify_pr(prs[0], config, dict(plan, candidate=head), title, body)
+            verify_pr(prs[0], config, dict(plan, candidate=head), title, body, assignment.get('pr_readiness'))
         else:
             require(publication['pr_number'] is None, 'Fixed PR disappeared.', 'publication_conflict')
         api.approve(plan, content, pr_payload)
@@ -395,7 +395,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
             number = pr.get('number')
             require(type(number) is int and number > 0 and
                     (publication['pr_number'] is None or publication['pr_number'] == number), 'PR identity changed.', 'github_mismatch')
-            verify_pr(pr, config, plan, title, body)
+            verify_pr(pr, config, plan, title, body, assignment.get('pr_readiness'))
         else:
             require(publication['pr_number'] is None, 'Published PR disappeared.', 'publication_conflict')
             write('/pulls', pr_payload)
@@ -406,7 +406,7 @@ def publish(database, project, iteration, operator, assignment_id, config_path, 
         publication['pr_number'] = number
         save(database, assignment, publication_only=True)
         pr = api.read('/pulls/' + str(number))
-        verify_pr(pr, config, plan, title, body)
+        verify_pr(pr, config, plan, title, body, assignment.get('pr_readiness'))
         associated = api.read('/issues/' + str(number))
         require(isinstance(associated, dict) and associated.get('number') == number and
                 associated.get('body') == body and associated.get('state') == 'open' and 'pull_request' in associated and
@@ -455,9 +455,14 @@ def verify_commit(api, plan, config):
             value.get('message') in (plan['message'], plan['message'] + '\n'), 'Exact commit readback failed.', 'github_mismatch')
 
 
-def verify_pr(value, config, plan, title, body):
+def verify_pr(value, config, plan, title, body, readiness=None):
+    ready = (isinstance(value, dict) and isinstance(readiness, dict) and readiness.get('status') in {'pending', 'ready'} and
+             readiness.get('head') == plan['candidate'] and readiness.get('pr_number') == value.get('number') and
+             readiness.get('node_id') == value.get('node_id') and
+             all(readiness.get('authority', {}).get(k) == config[k] for k in ('repository', 'repository_id', 'branch', 'base')))
     require(isinstance(value, dict) and value.get('state') == 'open' and value.get('merged') in {None, False} and
-            value.get('title') == title and value.get('body') == body and value.get('draft') is True,
+            value.get('title') == title and value.get('body') == body and
+            (value.get('draft') is True or ready and value.get('draft') is False),
             'PR is changed, closed or merged.', 'github_mismatch')
     for side, branch in (('head', config['branch']), ('base', config['base'])):
         observed = value.get(side, {})

@@ -519,6 +519,30 @@ class PublicationComponentTests(unittest.TestCase):
         namespace = dict(vars(publication))
         exec(compile(source, '<commit-message-guard-probe>', 'exec'), namespace)
         namespace['verify_commit'](api, self.plan, self.config)
+        # A later controlled readiness intent permits replay, never an arbitrary draft bypass.
+        pr = self.read_prs()[0]
+        pr.update(draft=False, node_id='PR_exact20')
+        title, body = pr['title'], pr['body']
+        ready = {'status': 'pending', 'pr_number': pr['number'], 'node_id': pr['node_id'],
+                 'head': self.plan['candidate'], 'authority': {k: self.config[k] for k in ('repository', 'repository_id', 'branch', 'base')}}
+        for defect in ('exact', 'absent', 'head', 'node', 'number', 'repository'):
+            with self.subTest(ready_replay=defect):
+                binding = copy.deepcopy(ready)
+                if defect in ('head', 'node', 'number'):
+                    binding[{'node': 'node_id', 'number': 'pr_number'}.get(defect, defect)] = 'wrong'
+                if defect == 'repository':
+                    binding['authority']['repository'] = 'other/product'
+                if defect == 'exact':
+                    publication.verify_pr(pr, self.config, self.plan, title, body, binding)
+                else:
+                    with self.assertRaises(RepositoryError):
+                        publication.verify_pr(pr, self.config, self.plan, title, body, None if defect == 'absent' else binding)
+        self.prs[0].update(draft=False, node_id='PR_exact20')
+        self.assignment = self.stored()
+        self.assignment['pr_readiness'] = ready
+        self.persist()
+        self.assertEqual(self.publish(), result)
+        self.assertEqual(self.writes(), writes)
 
 
     def test_commit_readback_blocks_followup_matrix(self):
