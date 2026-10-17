@@ -334,7 +334,8 @@ def target(api, config):
     require(isinstance(repo, dict) and repo.get('id') == config['repository_id'] and repo.get('full_name') == config['repository'] and
             repo.get('default_branch') == config['base'], 'Wrong exact repository/main target.', 'scope_mismatch')
     pr = api.read('/pulls/' + str(config['pr_number']))
-    require(isinstance(pr, dict) and pr.get('number') == config['pr_number'], 'Exact PR unavailable.', 'scope_mismatch')
+    if not isinstance(pr, dict) or pr.get('number') != config['pr_number']:
+        raise RepositoryError('scope_mismatch', 'Exact PR unavailable.')
     for side, branch in (('head', config['branch']), ('base', config['base'])):
         value = pr.get(side, {})
         require(value.get('ref') == branch and value.get('repo', {}).get('id') == config['repository_id'] and

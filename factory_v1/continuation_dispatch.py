@@ -321,7 +321,8 @@ def prepare_action(database, scope, config, item, rows, selected, github):
     if stage == 'corrections':
         return review.prepare_corrections(database, *scope, {**selected['axes'], **role(slot)}, github)
     if stage == 'simplification-corrections':
-        return review.prepare_findings_corrections(database, *scope, {'candidate_assignment': target, **role(slot)}, github)
+        return review.prepare_findings_corrections(database, scope[0], scope[1], scope[2],
+                                                  {'candidate_assignment': target, **role(slot)}, github)
     if stage == 'diagnosis':
         return diagnosis.prepare(database, *scope, {'stuck_assignment': target, **role(slot)}, github)
     require(False, 'Unsupported continuation preparation.', 'invalid_dispatch')
@@ -354,7 +355,7 @@ def execute(database, scope, config, item, rows, selected, github):
     if stage in assignments.ROLES or stage == 'simplification-corrections':
         prepare_action(database, scope, config, item, rows, selected, github)
     elif stage == 'simplification-direction':
-        simplification.request_findings_direction(database, *scope, target)
+        simplification.request_findings_direction(database, scope[0], scope[1], scope[2], target)
         return {'result': {'status': 'waiting', 'dispatch_allowed': False, 'blockers': ['simplification_operator_revision_required']}}
     elif stage == 'launch':
         row = next(r for r in rows if r['assignment_id'] == target)
